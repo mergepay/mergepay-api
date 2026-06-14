@@ -33,12 +33,29 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   await app.register(helmet, { contentSecurityPolicy: false });
-  const corsOrigin =
-    config.WEB_URL === "*"
-      ? true
-      : config.WEB_URL.split(",").map((o) => o.trim());
+  // CORS allowlist. "*" allows any origin; otherwise a comma-separated whitelist.
+  // Trailing slashes are stripped so "https://app.com/" still matches the
+  // browser-sent origin "https://app.com". Vercel preview deploys (*.vercel.app)
+  // are also allowed when the configured origin is itself a vercel.app domain.
+  const allowAll = config.WEB_URL === "*";
+  const allowed = config.WEB_URL
+    .split(",")
+    .map((o) => o.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  const allowVercelPreviews = allowed.some((o) => o.endsWith(".vercel.app"));
   await app.register(cors, {
-    origin: corsOrigin,
+    origin: allowAll
+      ? true
+      : (origin, cb) => {
+          // Same-origin / server-to-server requests have no Origin header.
+          if (!origin) return cb(null, true);
+          const normalized = origin.replace(/\/+$/, "");
+          if (allowed.includes(normalized)) return cb(null, true);
+          if (allowVercelPreviews && normalized.endsWith(".vercel.app")) {
+            return cb(null, true);
+          }
+          return cb(null, false);
+        },
     credentials: false,
   });
   await app.register(rateLimit, {

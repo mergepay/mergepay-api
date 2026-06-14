@@ -33,8 +33,12 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   await app.register(helmet, { contentSecurityPolicy: false });
+  const corsOrigin =
+    config.WEB_URL === "*"
+      ? true
+      : config.WEB_URL.split(",").map((o) => o.trim());
   await app.register(cors, {
-    origin: config.WEB_URL === "*" ? true : config.WEB_URL,
+    origin: corsOrigin,
     credentials: false,
   });
   await app.register(rateLimit, {

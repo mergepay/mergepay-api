@@ -6,13 +6,15 @@ const schema = z.object({
   DATABASE_URL: z.string().default("postgresql://postgres:postgres@localhost:5432/mergepay"),
   PORT: z.coerce.number().default(4000),
   API_PUBLIC_URL: z.string().default("http://localhost:4000"),
-  WEB_URL: z.string().default("http://localhost:3000"),
+  // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
+  WEB_URL: z.string().default("*"),
   JWT_SECRET: z.string().default("change-me-in-production"),
   STELLAR_NETWORK: z.enum(["testnet", "public"]).default("testnet"),
   HORIZON_URL: z.string().default("https://horizon-testnet.stellar.org"),
   SEP10_SIGNING_SECRET: z.string().optional(),
-  SEP10_HOME_DOMAIN: z.string().default("localhost:4000"),
-  WEB_AUTH_DOMAIN: z.string().default("localhost:4000"),
+  // If not set, derived from API_PUBLIC_URL so the deployed domain is used automatically.
+  SEP10_HOME_DOMAIN: z.string().optional(),
+  WEB_AUTH_DOMAIN: z.string().optional(),
   ANCHOR_HOME_DOMAIN: z.string().default("testanchor.stellar.org"),
   ANCHOR_NAME: z.string().default("Stellar Test Anchor"),
   ANCHOR_WEBHOOK_SECRET: z.string().default("change-me"),
@@ -26,8 +28,20 @@ const schema = z.object({
 
 const parsed = schema.parse(process.env);
 
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "localhost:4000";
+  }
+}
+
+const apiHost = hostOf(parsed.API_PUBLIC_URL);
+
 export const config = {
   ...parsed,
+  SEP10_HOME_DOMAIN: parsed.SEP10_HOME_DOMAIN ?? apiHost,
+  WEB_AUTH_DOMAIN: parsed.WEB_AUTH_DOMAIN ?? apiHost,
   isTest: process.env.NODE_ENV === "test" || process.env.VITEST === "true",
   networkPassphrase:
     parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET,

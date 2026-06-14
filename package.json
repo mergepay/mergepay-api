@@ -14,7 +14,7 @@
     "lint": "eslint \"src/**/*.ts\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:deploy": "prisma migrate deploy",
+    "prisma:deploy": "prisma db push --accept-data-loss",
     "db:seed": "tsx prisma/seed.ts",
     "gen:sep10key": "tsx scripts/gen-sep10-key.ts"
   },

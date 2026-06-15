@@ -9,8 +9,8 @@ const schema = z.object({
   // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
   WEB_URL: z.string().default("*"),
   JWT_SECRET: z.string().default("change-me-in-production"),
-  STELLAR_NETWORK: z.enum(["testnet", "public"]).default("testnet"),
-  HORIZON_URL: z.string().default("https://horizon-testnet.stellar.org"),
+  STELLAR_NETWORK: z.enum(["testnet", "public"]).default("public"),
+  HORIZON_URL: z.string().default("https://horizon.stellar.org"),
   SEP10_SIGNING_SECRET: z.string().optional(),
   // If not set, derived from API_PUBLIC_URL so the deployed domain is used automatically.
   SEP10_HOME_DOMAIN: z.string().optional(),
@@ -21,7 +21,7 @@ const schema = z.object({
   STABLE_ASSET_CODE: z.string().default("USDC"),
   STABLE_ASSET_ISSUER: z
     .string()
-    .default("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"),
+    .default("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
   UPLOADS_DIR: z.string().default("./uploads"),
   NODE_ENV: z.string().default("development"),
 });

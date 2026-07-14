@@ -6,3 +6,7 @@ coverage
 uploads/*
 !uploads/.gitkeep
 .DS_Store
+
+# Local Wave build scaffolding (task prompts, not product)
+01-labels-issues-api/
+02-hygiene-api/

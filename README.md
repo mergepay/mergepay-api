@@ -10,7 +10,20 @@ integration, treasury multisig, anchor (SEP-24) flows, and background jobs.
 [Web repo](https://github.com/mergepay/mergepay-web) ·
 [API repo](https://github.com/mergepay/mergepay-api)
 
+![CI](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/github/license/mergepay/mergepay-api)
+![Stellar](https://img.shields.io/badge/stellar-testnet-blueviolet)
+
 </div>
+
+## Maintainers
+
+| Maintainer | Role | GitHub |
+|---|---|---|
+| Fuhad (K1NGD4VID) | Maintainer | [@K1NGD4VID](https://github.com/K1NGD4VID) |
+
+Questions and contributions are welcome — open an issue or PR, or start a
+[discussion](https://github.com/mergepay/mergepay-api/discussions).
 
 ---
 
@@ -175,6 +188,12 @@ Deploys to **Render / Fly.io / Railway**. Provision Postgres (Neon/Supabase/RDS)
 set the env vars, run `npm run prisma:deploy` on release, start the API with
 `npm run start`, and run the worker as a separate process (`npm run worker:start`).
 
+## Security
+
+Found a vulnerability? Please report it privately — see [SECURITY.md](SECURITY.md).
+This is testnet, unaudited software; don't run it against mainnet with real funds
+without your own review.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Open-source public good — issues and PRs
@@ -183,3 +202,7 @@ welcome.
 ## License
 
 [MIT](LICENSE) © 2026 Mergepay contributors.
+
+## Contributors
+
+[![Contributors](https://contrib.rocks/image?repo=mergepay/mergepay-api)](https://github.com/mergepay/mergepay-api/graphs/contributors)

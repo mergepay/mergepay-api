@@ -7,6 +7,7 @@
 Authentication, group & expense logic, the settlement engine, Stellar
 integration, treasury multisig, anchor (SEP-24) flows, and background jobs.
 
+[Live app](https://mergepay.vercel.app) ·
 [Web repo](https://github.com/mergepay/mergepay-web) ·
 [API repo](https://github.com/mergepay/mergepay-api)
 

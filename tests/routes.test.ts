@@ -106,7 +106,10 @@ describe("auth routes", () => {
       payload: { account: "not-a-key" },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error.code).toBe("invalid_account");
+    const body = res.json();
+    expect(body.error).toBe("INVALID_ACCOUNT");
+    expect(body.statusCode).toBe(400);
+    expect(body.requestId).toBeTruthy();
   });
 
   it("POST /auth/verify issues a JWT for a signed challenge", async () => {
@@ -133,6 +136,10 @@ describe("auth routes", () => {
   it("GET /me requires a token", async () => {
     const res = await app.inject({ method: "GET", url: "/me" });
     expect(res.statusCode).toBe(401);
+    const body = res.json();
+    expect(body.error).toBe("UNAUTHORIZED");
+    expect(body.statusCode).toBe(401);
+    expect(body.requestId).toBeTruthy();
   });
 
   it("GET /me returns the user with a valid token", async () => {
@@ -184,7 +191,11 @@ describe("group routes", () => {
       payload: { name: "" },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error.code).toBe("validation_error");
+    const body = res.json();
+    expect(body.error).toBe("VALIDATION_ERROR");
+    expect(body.statusCode).toBe(400);
+    expect(body.requestId).toBeTruthy();
+    expect(Array.isArray(body.details)).toBe(true);
   });
 
   it("GET /groups/:id returns 403 for a non-member", async () => {
@@ -196,7 +207,10 @@ describe("group routes", () => {
       headers: authHeader(),
     });
     expect(res.statusCode).toBe(403);
-    expect(res.json().error.code).toBe("forbidden");
+    const body = res.json();
+    expect(body.error).toBe("FORBIDDEN");
+    expect(body.statusCode).toBe(403);
+    expect(body.requestId).toBeTruthy();
   });
 
   it("GET /groups/:id returns the detail for a member", async () => {

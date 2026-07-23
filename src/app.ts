@@ -76,45 +76,94 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   await app.register(authPlugin);
 
-  // Centralised error handling -> { error: { code, message } }.
-  // Set on the root BEFORE registering routes so encapsulated route plugins
-  // inherit it.
-  app.setErrorHandler((err, _req, reply) => {
+  // ---------------------------------------------------------------------------
+  // Centralised error handler — produces the standard error envelope:
+  //
+  //   {
+  //     error:      string,   // machine-readable code  (e.g. "NOT_FOUND")
+  //     message:    string,   // human-readable description
+  //     statusCode: number,   // HTTP status (mirrors the response status)
+  //     details?:   unknown,  // structured detail payload (e.g. Zod issues)
+  //     requestId:  string    // Fastify request.id for correlation / tracing
+  //   }
+  //
+  // Registered BEFORE routes so all encapsulated plugins inherit it.
+  // ---------------------------------------------------------------------------
+  app.setErrorHandler((err, req, reply) => {
+    const requestId = req.id as string;
+
+    // -- Zod validation errors ------------------------------------------------
     if (err instanceof ZodError) {
+      const details = err.errors.map((e) => ({
+        field: e.path.join("."),
+        message: e.message,
+        code: e.code,
+      }));
       const first = err.errors[0];
       const field = first?.path.join(".");
+      const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
+
       return reply.code(400).send({
-        error: {
-          code: "validation_error",
-          message: field ? `${field}: ${first.message}` : first.message,
-        },
+        error: "VALIDATION_ERROR",
+        message,
+        statusCode: 400,
+        details,
+        requestId,
       });
     }
+
+    // -- Known application errors ---------------------------------------------
     if (err instanceof AppError) {
-      return reply.code(err.status).send({
-        error: { code: err.code, message: err.message },
-      });
+      const body: Record<string, unknown> = {
+        error: err.code,
+        message: err.message,
+        statusCode: err.status,
+        requestId,
+      };
+      if (err.details !== undefined) {
+        body.details = err.details;
+      }
+      return reply.code(err.status).send(body);
     }
+
+    // -- Rate-limit (injected by @fastify/rate-limit) -------------------------
     if ((err as any).statusCode === 429) {
       return reply.code(429).send({
-        error: { code: "rate_limited", message: "Too many requests, slow down." },
+        error: "RATE_LIMITED",
+        message: "Too many requests, slow down.",
+        statusCode: 429,
+        requestId,
       });
     }
-    // Multipart / fastify validation errors.
+
+    // -- Other Fastify / plugin 4xx errors ------------------------------------
     if ((err as any).statusCode && (err as any).statusCode < 500) {
-      return reply.code((err as any).statusCode).send({
-        error: { code: "bad_request", message: err.message },
+      const status: number = (err as any).statusCode;
+      return reply.code(status).send({
+        error: "BAD_REQUEST",
+        message: err.message,
+        statusCode: status,
+        requestId,
       });
     }
-    app.log.error(err);
+
+    // -- Unexpected / unhandled errors (5xx) ----------------------------------
+    // Log the full error server-side; never leak stack traces to the client.
+    app.log.error({ err, requestId }, "Unhandled error");
     return reply.code(500).send({
-      error: { code: "internal_error", message: "Something went wrong." },
+      error: "INTERNAL_ERROR",
+      message: "Something went wrong.",
+      statusCode: 500,
+      requestId,
     });
   });
 
-  app.setNotFoundHandler((_req, reply) => {
+  app.setNotFoundHandler((req, reply) => {
     reply.code(404).send({
-      error: { code: "not_found", message: "Route not found" },
+      error: "NOT_FOUND",
+      message: "Route not found",
+      statusCode: 404,
+      requestId: req.id as string,
     });
   });
 

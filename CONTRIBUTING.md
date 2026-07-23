@@ -32,8 +32,8 @@ Wave task:
    work isn't duplicated.
 3. **Keep all communication on the issue/PR thread.** No DMs — discussion, questions,
    and decisions stay public and linked to the task.
-4. **One PR per issue, and link it** — every PR must reference the issue it resolves
-   (`Closes #NN`). PRs not tied to an issue will be asked to open one first.
+4. **One PR per issue, and link it** — every PR must reference the issue it
+   resolves (`Closes #NN`). PRs not tied to an issue will be asked to open one first.
 5. Reward points map to the issue's `complexity:*` label.
 
 ## PR checklist
@@ -49,3 +49,46 @@ Wave task:
 
 Tests must run offline. Mock Prisma (`vi.mock("../src/db")`) and the Stellar
 service (`vi.mock("../src/services/stellar")`). Use `app.inject` for route tests.
+
+## Integration Tests
+
+Integration tests cover the full user journey from SEP-10 authentication through
+group creation, expense addition, and settlement via the Stellar testnet.
+
+### Running Integration Tests
+
+1. Ensure your backend server is running with the test database configuration:
+   ```bash
+   export DATABASE_URL="postgresql://user:pass@localhost:5432/mergepay_test"
+   npm run dev
+   ```
+
+2. In a separate terminal, run the integration tests:
+   ```bash
+   npm run test:integration
+   ```
+
+### Integration Test Configuration
+
+The following environment variables can be used to configure integration tests:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HORIZON_URL` | Stellar Horizon endpoint | `https://horizon-testnet.stellar.org` |
+| `API_BASE_URL` | Base URL of the running API | `http://localhost:3000` |
+| `DATABASE_URL_TEST` | Test database connection string | Uses `DATABASE_URL` |
+
+### Integration Test Details
+
+- Tests run against the **public Stellar testnet** by default.
+- Test accounts are generated on-the-fly and funded via friendbot.
+- No real private keys are used; all keys are ephemeral.
+- Tests are idempotent and use unique identifiers to avoid collisions.
+- Each test has a 30-second timeout to account for Stellar network latency.
+- Expected runtime is under 5 minutes for the full suite.
+
+### Troubleshooting
+
+- If tests fail with network errors, check that the testnet is accessible.
+- If friendbot funding fails, the tests include retry logic with backoff.
+- Ensure the backend server is fully started before running integration tests.

@@ -60,11 +60,13 @@ async function fetchFeeStats(): Promise<FeeStats> {
 /** Return Horizon fee statistics, refreshing the short-lived in-memory cache as needed. */
 export async function getFeeStats(): Promise<FeeStats> {
   if (cached && cached.expiresAt > Date.now()) return cached.stats;
+
   if (!refresh) {
     refresh = fetchFeeStats().finally(() => {
       refresh = null;
     });
   }
+
   return refresh;
 }
 

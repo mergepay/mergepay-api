@@ -45,6 +45,7 @@ model Group {
   settlements Settlement[]
   treasuryTxs TreasuryTransaction[]
   invites     Invite[]
+  invitations Invitation[]
 
   @@index([createdByUserId])
   @@map("groups")
@@ -169,6 +170,21 @@ model Invite {
 
   @@index([groupId])
   @@map("invites")
+}
+
+model Invitation {
+  id               String   @id @default(cuid())
+  groupId          String   @map("group_id")
+  inviteePublicKey String   @map("invitee_public_key")
+  status           String   @default("PENDING")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @default(now()) @updatedAt @map("updated_at")
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, inviteePublicKey, status])
+  @@index([groupId])
+  @@map("invitations")
 }
 
 model AnchorSession {

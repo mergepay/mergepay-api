@@ -115,6 +115,17 @@ export function serializeTreasuryTx(t: any) {
   };
 }
 
+export function serializeInvitation(i: any) {
+  return {
+    id: i.id,
+    groupId: i.groupId,
+    inviteePublicKey: i.inviteePublicKey,
+    status: i.status,
+    createdAt: iso(i.createdAt),
+    updatedAt: iso(i.updatedAt),
+  };
+}
+
 export function serializeInvite(i: any, webUrl: string) {
   return {
     id: i.id,

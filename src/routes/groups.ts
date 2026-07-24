@@ -9,6 +9,7 @@ import { inviteCode } from "../services/codes";
 import { audit } from "../services/audit";
 import {
   serializeGroup,
+  serializeInvitation,
   serializeInvite,
   serializeMember,
 } from "../serializers";
@@ -95,11 +96,77 @@ export default async function groupRoutes(app: FastifyInstance) {
     };
   });
 
-  // -- invite -----------------------------------------------------------------
-  app.post("/groups/:id/invite", async (req) => {
+  // -- invite (by public key or invite code) ---------------------------------
+  app.post("/groups/:id/invite", async (req, reply) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireAdmin(id, auth.id);
+
+    // Direct invitation by Stellar public key
+    if (
+      typeof req.body === "object" &&
+      req.body &&
+      "publicKey" in req.body
+    ) {
+      const body = z
+        .object({
+          publicKey: z.string().regex(/^G[A-Z0-9]{55}$/),
+        })
+        .parse(req.body);
+
+      // Check if invitee is already a member
+      const inviteeUser = await prisma.user.findUnique({
+        where: { stellarPublicKey: body.publicKey },
+      });
+      if (inviteeUser) {
+        const existingMember = await prisma.groupMember.findUnique({
+          where: {
+            groupId_userId: { groupId: id, userId: inviteeUser.id },
+          },
+        });
+        if (existingMember) {
+          throw Errors.conflict(
+            "ALREADY_MEMBER",
+            "This user is already a member of the group"
+          );
+        }
+      }
+
+      // Check for existing pending invitation
+      const existingInvitation = await prisma.invitation.findFirst({
+        where: {
+          groupId: id,
+          inviteePublicKey: body.publicKey,
+          status: "PENDING",
+        },
+      });
+      if (existingInvitation) {
+        throw Errors.conflict(
+          "INVITATION_PENDING",
+          "An invitation for this user is already pending"
+        );
+      }
+
+      const invitation = await prisma.invitation.create({
+        data: {
+          groupId: id,
+          inviteePublicKey: body.publicKey,
+          status: "PENDING",
+        },
+      });
+
+      await audit({
+        userId: auth.id,
+        action: "group.invite",
+        entityType: "invitation",
+        entityId: invitation.id,
+        metadata: { groupId: id, inviteePublicKey: body.publicKey },
+      });
+
+      return reply.status(201).send({ invitation: serializeInvitation(invitation) });
+    }
+
+    // Legacy invite code generation
     const body = z
       .object({
         maxUses: z.number().int().positive().optional(),

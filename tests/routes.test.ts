@@ -24,6 +24,7 @@ const h = vi.hoisted(() => {
     settlement: model(),
     treasuryTransaction: model(),
     invite: model(),
+    invitation: model(),
     anchorSession: model(),
     auditLog: model(),
     idempotencyKey: model(),
@@ -252,5 +253,131 @@ describe("group routes", () => {
     const body = res.json();
     expect(body.yourRole).toBe("admin");
     expect(body.members).toHaveLength(1);
+  });
+
+  describe("POST /groups/:id/invite (direct invitation by public key)", () => {
+    const validPubKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    it("returns 201 and creates an invitation", async () => {
+      const user = fakeUser();
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: user.id,
+        role: "admin",
+      });
+      prisma.user.findUnique.mockResolvedValueOnce(null);
+      prisma.invitation.findFirst.mockResolvedValueOnce(null);
+      const invitation = {
+        id: "inv_1",
+        groupId: "group_1",
+        inviteePublicKey: validPubKey,
+        status: "PENDING",
+        createdAt: new Date("2026-03-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-01T00:00:00.000Z"),
+      };
+      prisma.invitation.create.mockResolvedValueOnce(invitation);
+      prisma.auditLog.create.mockResolvedValueOnce({});
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/groups/group_1/invite",
+        headers: authHeader(user),
+        payload: { publicKey: validPubKey },
+      });
+
+      expect(res.statusCode).toBe(201);
+      const body = res.json();
+      expect(body.invitation.inviteePublicKey).toBe(validPubKey);
+      expect(body.invitation.status).toBe("PENDING");
+      expect(prisma.invitation.create).toHaveBeenCalledOnce();
+    });
+
+    it("returns 403 for a non-admin member", async () => {
+      const user = fakeUser();
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: user.id,
+        role: "member",
+      });
+      prisma.group.findUnique.mockResolvedValueOnce({ id: "group_1" });
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/groups/group_1/invite",
+        headers: authHeader(user),
+        payload: { publicKey: validPubKey },
+      });
+
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toBe("FORBIDDEN");
+    });
+
+    it("returns 400 for an invalid public key", async () => {
+      const user = fakeUser();
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: user.id,
+        role: "admin",
+      });
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/groups/group_1/invite",
+        headers: authHeader(user),
+        payload: { publicKey: "not-a-valid-key" },
+      });
+
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("returns 409 when invitee is already a member", async () => {
+      const user = fakeUser();
+      const inviteeUser = fakeUser({ id: "user_2", stellarPublicKey: validPubKey });
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: user.id,
+        role: "admin",
+      });
+      prisma.user.findUnique.mockResolvedValueOnce(inviteeUser);
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: inviteeUser.id,
+        role: "member",
+      });
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/groups/group_1/invite",
+        headers: authHeader(user),
+        payload: { publicKey: validPubKey },
+      });
+
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error).toBe("ALREADY_MEMBER");
+    });
+
+    it("returns 409 when a pending invitation already exists", async () => {
+      const user = fakeUser();
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: user.id,
+        role: "admin",
+      });
+      prisma.user.findUnique.mockResolvedValueOnce(null);
+      prisma.invitation.findFirst.mockResolvedValueOnce({
+        id: "existing_inv",
+        status: "PENDING",
+      });
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/groups/group_1/invite",
+        headers: authHeader(user),
+        payload: { publicKey: validPubKey },
+      });
+
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error).toBe("INVITATION_PENDING");
+    });
   });
 });

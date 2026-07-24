@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    exclude: ["tests/integration/**"],
     env: { NODE_ENV: "test", VITEST: "true" },
     globals: true,
   },

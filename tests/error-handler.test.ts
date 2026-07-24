@@ -15,6 +15,7 @@ vi.mock("../src/db", () => ({
     user: { findUnique: vi.fn(), upsert: vi.fn() },
     group: { findUnique: vi.fn() },
     groupMember: { findUnique: vi.fn() },
+    idempotencyKey: { findUnique: vi.fn(), create: vi.fn() },
     auditLog: { create: vi.fn() },
     $disconnect: vi.fn(),
   },

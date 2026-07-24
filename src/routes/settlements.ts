@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
@@ -150,10 +151,32 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
-  app.post("/settlements/:id/confirm", async (req) => {
+  app.post("/settlements/:id/confirm", async (req, reply) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+
+    const idempotencyKey = (req.headers["idempotency-key"] as string | undefined) ?? null;
+    const requestHash = idempotencyKey
+      ? crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")
+      : null;
+
+    if (idempotencyKey) {
+      const existing = await prisma.idempotencyKey.findUnique({
+        where: { key: idempotencyKey },
+      });
+      if (existing) {
+        if (existing.requestHash !== requestHash) {
+          return reply.code(409).send({
+            error: "idempotency_conflict",
+            message: "Idempotency key already used with a different request body",
+            statusCode: 409,
+            requestId: req.id as string,
+          });
+        }
+        return reply.code(200).send(JSON.parse(existing.responseJson));
+      }
+    }
 
     const settlement = await prisma.settlement.findUnique({
       where: { id },
@@ -164,7 +187,17 @@ export default async function settlementRoutes(app: FastifyInstance) {
       throw Errors.forbidden("Only the payer can confirm this settlement");
     }
     if (settlement.status === "confirmed") {
-      return { settlement: serializeSettlement(settlement) };
+      const response200 = { settlement: serializeSettlement(settlement) };
+      if (idempotencyKey) {
+        await prisma.idempotencyKey.create({
+          data: {
+            key: idempotencyKey,
+            requestHash: requestHash!,
+            responseJson: JSON.stringify(response200),
+          },
+        });
+      }
+      return response200;
     }
 
     let hash: string;
@@ -207,7 +240,17 @@ export default async function settlementRoutes(app: FastifyInstance) {
       metadata: { hash },
     });
 
-    return { settlement: serializeSettlement(updated) };
+    const response200 = { settlement: serializeSettlement(updated) };
+    if (idempotencyKey) {
+      await prisma.idempotencyKey.create({
+        data: {
+          key: idempotencyKey,
+          requestHash: requestHash!,
+          responseJson: JSON.stringify(response200),
+        },
+      });
+    }
+    return response200;
   });
 
   // -- balances + suggestions -------------------------------------------------

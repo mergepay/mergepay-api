@@ -48,7 +48,7 @@ function normalize(raw: Record<string, unknown>): FeeStats {
 }
 
 async function fetchFeeStats(): Promise<FeeStats> {
-  const response = await horizon().feeStats().call();
+  const response = await horizon().feeStats();
   const stats = normalize(response as unknown as Record<string, unknown>);
   cached = {
     stats,

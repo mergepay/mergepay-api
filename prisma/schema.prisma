@@ -191,6 +191,16 @@ model AnchorSession {
   @@map("anchor_sessions")
 }
 
+model IdempotencyKey {
+  id            String   @id @default(cuid())
+  key           String   @unique
+  requestHash   String   @map("request_hash")
+  responseJson  String   @map("response_json")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@map("idempotency_keys")
+}
+
 model AuditLog {
   id         String   @id @default(cuid())
   userId     String?  @map("user_id")

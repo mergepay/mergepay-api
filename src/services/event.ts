@@ -1,8 +1,6 @@
 import { EventEmitter } from "node:events";
 
-export const webhookEvents = new EventEmitter();
-
-export const EVENT_TYPES = [
+export const WEBHOOK_EVENT_TYPES = [
   "expense.created",
   "expense.settled",
   "settlement.completed",
@@ -12,15 +10,18 @@ export const EVENT_TYPES = [
   "treasury.proposal.submitted",
 ] as const;
 
-export type WebhookEventType = (typeof EVENT_TYPES)[number];
+export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 
-export interface WebhookEvent {
+export interface MergepayEvent {
   eventType: WebhookEventType;
-  payload: Record<string, unknown>;
+  payload: unknown;
   groupId?: string;
   userId?: string;
 }
 
-export function emitWebhookEvent(event: WebhookEvent): void {
-  webhookEvents.emit("event", event);
+export const eventBus = new EventEmitter();
+eventBus.setMaxListeners(100);
+
+export function emitEvent(event: MergepayEvent): void {
+  eventBus.emit("event", event);
 }

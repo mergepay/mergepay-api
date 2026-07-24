@@ -1,45 +1,51 @@
-import { createHmac } from "node:crypto";
+import crypto from "node:crypto";
 import { prisma } from "../db";
 import {
-  EVENT_TYPES,
-  webhookEvents,
-  type WebhookEvent,
+  eventBus,
+  type MergepayEvent,
   type WebhookEventType,
 } from "./event";
 
-const MAX_PAYLOAD_SIZE = 1024 * 1024;
+const MAX_PAYLOAD_BYTES = 1024 * 1024;
 const MAX_ATTEMPTS = 5;
-const DELIVERY_TIMEOUT = 5_000;
-
-export { EVENT_TYPES };
+const DELIVERY_TIMEOUT_MS = 5_000;
+const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000] as const;
 
 interface WebhookRecord {
   id: string;
-  groupId: string | null;
-  userId: string | null;
   url: string;
   secret: string;
-  events: string[];
   enabled: boolean;
 }
 
-function eventPayload(
-  eventType: WebhookEventType,
-  payload: Record<string, unknown>
-): Record<string, unknown> {
-  return { eventType, data: payload, timestamp: new Date().toISOString() };
+function serialisePayload(eventType: WebhookEventType, payload: unknown): string {
+  const body = JSON.stringify({
+    eventType,
+    data: payload,
+    timestamp: new Date().toISOString(),
+  });
+
+  if (Buffer.byteLength(body, "utf8") > MAX_PAYLOAD_BYTES) {
+    throw new Error("Webhook payload exceeds the 1MB limit");
+  }
+
+  return body;
 }
 
-export async function deliverWebhook(
+function createSignature(body: string, secret: string): string {
+  return crypto.createHmac("sha256", secret).update(body).digest("hex");
+}
+
+async function deliver(
   webhook: WebhookRecord,
   eventType: WebhookEventType,
-  payload: string
+  body: string
 ): Promise<void> {
   const delivery = await (prisma as any).webhookDelivery.create({
     data: {
       webhookId: webhook.id,
       eventType,
-      payload,
+      payload: body,
       responseStatusCode: null,
       responseBody: null,
       success: false,
@@ -47,86 +53,145 @@ export async function deliverWebhook(
     },
   });
 
+  let lastStatusCode: number | null = null;
+  let lastResponseBody: string | null = null;
+
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    let responseStatusCode: number | null = null;
-    let responseBody = "";
-    let success = false;
+    if (attempt > 1) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, RETRY_DELAYS_MS[attempt - 2]);
+      });
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT);
-      try {
-        const signature = createHmac("sha256", webhook.secret)
-          .update(payload)
-          .digest("hex");
-        const response = await fetch(webhook.url, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-mergepay-signature": signature,
+      const response = await fetch(webhook.url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "Mergepay-Webhooks/1.0",
+          "x-mergepay-signature": createSignature(body, webhook.secret),
+        },
+        body,
+        signal: controller.signal,
+      });
+
+      lastStatusCode = response.status;
+      lastResponseBody = (await response.text()).slice(0, 16_384);
+
+      if (response.ok) {
+        await (prisma as any).webhookDelivery.update({
+          where: { id: delivery.id },
+          data: {
+            responseStatusCode: lastStatusCode,
+            responseBody: lastResponseBody,
+            success: true,
+            attempts: attempt,
           },
-          body: payload,
-          signal: controller.signal,
         });
-        responseStatusCode = response.status;
-        responseBody = (await response.text()).slice(0, MAX_PAYLOAD_SIZE);
-        success = response.ok;
-      } finally {
-        clearTimeout(timeout);
+        return;
       }
     } catch (error) {
-      responseBody = error instanceof Error ? error.message : "Delivery failed";
+      lastStatusCode = null;
+      lastResponseBody =
+        error instanceof Error ? error.message : "Webhook delivery failed";
+    } finally {
+      clearTimeout(timeout);
     }
 
     await (prisma as any).webhookDelivery.update({
       where: { id: delivery.id },
       data: {
-        responseStatusCode,
-        responseBody,
-        success,
+        responseStatusCode: lastStatusCode,
+        responseBody: lastResponseBody,
+        success: false,
         attempts: attempt,
       },
     });
-
-    if (success) return;
-    if (attempt < MAX_ATTEMPTS) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, 2 ** (attempt - 1) * 1000)
-      );
-    }
   }
+}
+
+async function findWebhook(webhookId: string): Promise<WebhookRecord | null> {
+  return (await (prisma as any).webhook.findFirst({
+    where: { id: webhookId, enabled: true },
+    select: { id: true, url: true, secret: true, enabled: true },
+  })) as WebhookRecord | null;
+}
+
+export async function dispatchWebhook(
+  webhookId: string,
+  eventType: WebhookEventType,
+  payload: unknown
+): Promise<void> {
+  const webhook = await findWebhook(webhookId);
+  if (!webhook) {
+    throw new Error("Webhook not found or disabled");
+  }
+
+  await deliver(webhook, eventType, serialisePayload(eventType, payload));
 }
 
 export async function dispatchEvent(
   eventType: WebhookEventType,
-  payload: Record<string, unknown>,
+  payload: unknown,
   groupId?: string,
   userId?: string
 ): Promise<void> {
-  const serialized = JSON.stringify(eventPayload(eventType, payload));
-  if (Buffer.byteLength(serialized, "utf8") > MAX_PAYLOAD_SIZE) return;
+  const body = serialisePayload(eventType, payload);
+  const where: Record<string, unknown> = {
+    enabled: true,
+    events: { has: eventType },
+  };
+
+  if (groupId && userId) {
+    where.OR = [
+      { groupId, userId: null },
+      { groupId: null, userId },
+      { groupId, userId },
+    ];
+  } else if (groupId) {
+    where.groupId = groupId;
+  } else if (userId) {
+    where.userId = userId;
+  } else {
+    return;
+  }
 
   const webhooks = (await (prisma as any).webhook.findMany({
-    where: {
-      enabled: true,
-      events: { has: eventType },
-      OR: [
-        ...(groupId ? [{ groupId }] : []),
-        ...(userId ? [{ userId }] : []),
-        { groupId: null, userId: null },
-      ],
-    },
+    where,
+    select: { id: true, url: true, secret: true, enabled: true },
   })) as WebhookRecord[];
 
-  await Promise.all(
-    webhooks.map((webhook) => deliverWebhook(webhook, eventType, serialized))
+  await Promise.allSettled(
+    webhooks.map((webhook) => deliver(webhook, eventType, body))
   );
 }
 
-webhookEvents.on("event", (event: WebhookEvent) => {
-  void dispatchEvent(event.eventType, event.payload, event.groupId, event.userId);
-});
+let dispatcherStarted = false;
+let dispatchQueue = Promise.resolve();
 
-export function isWebhookEventType(value: string): value is WebhookEventType {
-  return (EVENT_TYPES as readonly string[]).includes(value);
+export function startWebhookDispatcher(): void {
+  if (dispatcherStarted) return;
+  dispatcherStarted = true;
+
+  eventBus.on("event", (event: MergepayEvent) => {
+    dispatchQueue = dispatchQueue
+      .then(() =>
+        dispatchEvent(
+          event.eventType,
+          event.payload,
+          event.groupId,
+          event.userId
+        )
+      )
+      .catch(() => undefined);
+  });
+}
+
+startWebhookDispatcher();
+
+export function createWebhookSecret(): string {
+  return crypto.randomBytes(32).toString("hex");
 }

@@ -5,10 +5,9 @@ import rateLimit from "@fastify/rate-limit";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
-import { ZodError } from "zod";
 import { config } from "./config";
-import { AppError } from "./errors";
 import authPlugin from "./plugins/auth";
+import errorHandlerPlugin from "./plugins/error-handler";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
@@ -75,88 +74,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   await app.register(authPlugin);
-
-  // ---------------------------------------------------------------------------
-  // Centralised error handler — produces the standard error envelope:
-  //
-  //   {
-  //     error:      string,   // machine-readable code  (e.g. "NOT_FOUND")
-  //     message:    string,   // human-readable description
-  //     statusCode: number,   // HTTP status (mirrors the response status)
-  //     details?:   unknown,  // structured detail payload (e.g. Zod issues)
-  //     requestId:  string    // Fastify request.id for correlation / tracing
-  //   }
-  //
-  // Registered BEFORE routes so all encapsulated plugins inherit it.
-  // ---------------------------------------------------------------------------
-  app.setErrorHandler((err, req, reply) => {
-    const requestId = req.id as string;
-
-    // -- Zod validation errors ------------------------------------------------
-    if (err instanceof ZodError) {
-      const details = err.errors.map((e) => ({
-        field: e.path.join("."),
-        message: e.message,
-        code: e.code,
-      }));
-      const first = err.errors[0];
-      const field = first?.path.join(".");
-      const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
-
-      return reply.code(400).send({
-        error: "VALIDATION_ERROR",
-        message,
-        statusCode: 400,
-        details,
-        requestId,
-      });
-    }
-
-    // -- Known application errors ---------------------------------------------
-    if (err instanceof AppError) {
-      const body: Record<string, unknown> = {
-        error: err.code,
-        message: err.message,
-        statusCode: err.status,
-        requestId,
-      };
-      if (err.details !== undefined) {
-        body.details = err.details;
-      }
-      return reply.code(err.status).send(body);
-    }
-
-    // -- Rate-limit (injected by @fastify/rate-limit) -------------------------
-    if ((err as any).statusCode === 429) {
-      return reply.code(429).send({
-        error: "RATE_LIMITED",
-        message: "Too many requests, slow down.",
-        statusCode: 429,
-        requestId,
-      });
-    }
-
-    // -- Other Fastify / plugin 4xx errors ------------------------------------
-    if ((err as any).statusCode && (err as any).statusCode < 500) {
-      const status: number = (err as any).statusCode;
-      return reply.code(status).send({
-        error: "BAD_REQUEST",
-        message: err.message,
-        statusCode: status,
-        requestId,
-      });
-    }
-
-    // -- Unexpected / unhandled errors (5xx) ----------------------------------
-    // Log the full error server-side; never leak stack traces to the client.
-    app.log.error({ err, requestId }, "Unhandled error");
-    return reply.code(500).send({
-      error: "INTERNAL_ERROR",
-      message: "Something went wrong.",
-      statusCode: 500,
-      requestId,
-    });
-  });
+  await app.register(errorHandlerPlugin);
 
   app.setNotFoundHandler((req, reply) => {
     reply.code(404).send({

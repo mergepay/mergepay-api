@@ -26,6 +26,7 @@ const h = vi.hoisted(() => {
     invite: model(),
     anchorSession: model(),
     auditLog: model(),
+    idempotencyKey: model(),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),

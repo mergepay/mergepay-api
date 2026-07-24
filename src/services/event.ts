@@ -14,7 +14,7 @@ export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 
 export interface MergepayEvent {
   eventType: WebhookEventType;
-  payload: Record<string, unknown>;
+  payload: unknown;
   groupId?: string;
   userId?: string;
 }

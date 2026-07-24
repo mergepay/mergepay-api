@@ -114,7 +114,10 @@ model Settlement {
   assetCode      String   @map("asset_code")
   assetIssuer    String?  @map("asset_issuer")
   stellarTxHash  String?  @map("stellar_tx_hash")
+  transactionXdr String?  @map("transaction_xdr")
   status         String   @default("pending")
+  retryCount     Int      @default(0) @map("retry_count")
+  failureReason  String?  @map("failure_reason")
   memo           String?
   expenseId      String?  @map("expense_id")
   expenseShareId String?  @map("expense_share_id")

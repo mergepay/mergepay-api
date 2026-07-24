@@ -26,6 +26,7 @@ const schema = z.object({
     .string()
     .default("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
   UPLOADS_DIR: z.string().default("./uploads"),
+  WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
   NODE_ENV: z.string().default("development"),
 });
 

@@ -200,36 +200,27 @@ export default async function settlementRoutes(app: FastifyInstance) {
       return response200;
     }
 
-    let hash: string;
-    try {
-      hash = await stellar.submitPayment(body.signedXdr, {
-        sourcePublicKey: settlement.from.stellarPublicKey,
-        destination: settlement.to.stellarPublicKey,
-        asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
-        amount: settlement.amount.toString(),
-        memoCode: settlement.shortCode,
-      });
-    } catch (e) {
-      await prisma.settlement.update({
-        where: { id },
-        data: { status: "failed" },
-      });
-      throw e;
-    }
-
-    const updated = await prisma.$transaction(async (tx) => {
-      const s = await tx.settlement.update({
-        where: { id },
-        data: { status: "confirmed", stellarTxHash: hash },
-        include: settlementInclude,
-      });
-      if (settlement.expenseShareId) {
-        await tx.expenseShare.update({
-          where: { id: settlement.expenseShareId },
-          data: { status: "settled" },
+    if (settlement.status !== "pending") {
+      const response200 = { settlement: serializeSettlement(settlement) };
+      if (idempotencyKey) {
+        await prisma.idempotencyKey.create({
+          data: {
+            key: idempotencyKey,
+            requestHash: requestHash!,
+            responseJson: JSON.stringify(response200),
+          },
         });
       }
-      return s;
+      return response200;
+    }
+
+    const updated = await prisma.settlement.update({
+      where: { id },
+      data: {
+        transactionXdr: body.signedXdr,
+        status: "submitted",
+      },
+      include: settlementInclude,
     });
 
     await audit({
@@ -237,7 +228,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       action: "settlement.confirm",
       entityType: "settlement",
       entityId: id,
-      metadata: { hash },
+      metadata: { status: "submitted" },
     });
 
     const response200 = { settlement: serializeSettlement(updated) };

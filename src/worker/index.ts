@@ -2,6 +2,9 @@ import { config } from "../config";
 import { prisma } from "../db";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { runReconciliation, startReconciliation } from "./reconciliation";
+import { runBalanceSync } from "./tasks/balance-sync";
+
+const DEFAULT_BALANCE_SYNC_INTERVAL_MS = 600_000; // 10 minutes
 
 const log = (...args: unknown[]) =>
   // eslint-disable-next-line no-console
@@ -59,8 +62,13 @@ export async function expireInvites(): Promise<void> {
 export function startWorker(opts?: {
   fastMs?: number;
   slowMs?: number;
+  balanceSyncMs?: number;
 }): () => void {
   const slowMs = opts?.slowMs ?? 60_000;
+  const balanceSyncMs =
+    opts?.balanceSyncMs ??
+    config.BALANCE_SYNC_INTERVAL_MS ??
+    DEFAULT_BALANCE_SYNC_INTERVAL_MS;
   const stopReconciliation = opts?.fastMs
     ? startReconciliation({ intervalMs: opts.fastMs })
     : startReconciliation();
@@ -70,13 +78,19 @@ export function startWorker(opts?: {
     expireInvites().catch((error) => log("expireInvites error", error));
   }, slowMs);
 
+  // Balance sync runs on its own interval
+  const balanceSync = setInterval(() => {
+    runBalanceSync().catch((error) => log("balanceSync error", error));
+  }, balanceSyncMs);
+
   log(
-    `worker started (reconciliation=${opts?.fastMs ?? "configured"}ms slow=${slowMs}ms)`
+    `worker started (reconciliation=${opts?.fastMs ?? "configured"}ms slow=${slowMs}ms balanceSync=${balanceSyncMs}ms)`
   );
 
   return () => {
     stopReconciliation();
     clearInterval(slow);
+    clearInterval(balanceSync);
   };
 }
 

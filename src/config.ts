@@ -27,6 +27,7 @@ const schema = z.object({
     .default("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
   UPLOADS_DIR: z.string().default("./uploads"),
   NODE_ENV: z.string().default("development"),
+  BALANCE_SYNC_INTERVAL_MS: z.coerce.number().positive().default(600_000), // 10 minutes
 });
 
 const parsed = schema.parse(process.env);

@@ -231,3 +231,15 @@ model AuditLog {
   @@index([userId])
   @@map("audit_logs")
 }
+
+model AccountBalance {
+  id         String   @id @default(cuid())
+  accountId  String   @map("account_id")
+  assetCode  String   @map("asset_code")
+  balance    Decimal  @db.Decimal(20, 7)
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([accountId, assetCode])
+  @@index([accountId])
+  @@map("account_balances")
+}

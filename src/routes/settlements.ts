@@ -9,6 +9,7 @@ import { requireMembership } from "../services/access";
 import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { auditLog } from "../lib/auditLog";
 import {
   serializeSettlement,
   serializeExpense,
@@ -229,6 +230,10 @@ export default async function settlementRoutes(app: FastifyInstance) {
       entityType: "settlement",
       entityId: id,
       metadata: { status: "submitted" },
+    });
+    await auditLog.log("SETTLEMENT_CONFIRMED", auth.id, settlement.groupId, {
+      settlementId: id,
+      status: "submitted",
     });
 
     const response200 = { settlement: serializeSettlement(updated) };

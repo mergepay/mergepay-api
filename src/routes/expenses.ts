@@ -8,6 +8,7 @@ import { computeShares, type SplitType } from "../services/settlement";
 import { isPositive } from "../services/money";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { auditLog } from "../lib/auditLog";
 import { serializeExpense } from "../serializers";
 
 const shareInput = z.object({
@@ -111,6 +112,11 @@ export default async function expenseRoutes(app: FastifyInstance) {
       entityId: expense.id,
       metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
     });
+    await auditLog.log("EXPENSE_CREATED", auth.id, groupId, {
+      expenseId: expense.id,
+      amount: body.amount,
+      title: body.title,
+    });
 
     return { expense: serializeExpense(expense) };
   });
@@ -172,6 +178,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
       },
       include: expenseInclude,
     });
+    await auditLog.log("EXPENSE_UPDATED", auth.id, expense.groupId, { expenseId: id });
     return { expense: serializeExpense(updated) };
   });
 
@@ -206,6 +213,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
       entityType: "expense",
       entityId: id,
     });
+    await auditLog.log("EXPENSE_DELETED", auth.id, expense.groupId, { expenseId: id });
     return { ok: true };
   });
 }

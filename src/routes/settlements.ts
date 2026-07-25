@@ -151,7 +151,17 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
-  app.post("/settlements/:id/confirm", async (req, reply) => {
+  app.post(
+    "/settlements/:id/confirm",
+    {
+      config: {
+        rateLimit: {
+          max: config.RATE_LIMIT_SETTLE_MAX,
+          timeWindow: config.RATE_LIMIT_SETTLE_WINDOW,
+        },
+      },
+    },
+    async (req, reply) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);

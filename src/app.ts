@@ -1,7 +1,7 @@
 import Fastify, { FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
+import rateLimitPlugin from "./plugins/rate-limit";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
@@ -57,11 +57,7 @@ export async function buildApp(): Promise<FastifyInstance> {
         },
     credentials: false,
   });
-  await app.register(rateLimit, {
-    max: 100,
-    timeWindow: "1 minute",
-    allowList: config.isTest ? () => true : undefined,
-  });
+  await app.register(rateLimitPlugin);
   await app.register(multipart, {
     limits: { fileSize: 6 * 1024 * 1024, files: 1 },
   });

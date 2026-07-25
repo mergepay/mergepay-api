@@ -381,3 +381,30 @@ describe("group routes", () => {
     });
   });
 });
+
+describe("rate limiting", () => {
+  it("POST /auth/challenge returns 429 after exceeding the rate limit", async () => {
+    const client = Keypair.random();
+    let got429 = false;
+    for (let i = 0; i < 20; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/auth/challenge",
+        payload: { account: client.publicKey() },
+      });
+      if (res.statusCode === 429) {
+        got429 = true;
+        expect(res.headers["retry-after"]).toBeTruthy();
+        break;
+      }
+    }
+    expect(got429).toBe(true);
+  });
+
+  it("GET /health is not subject to the tighter auth endpoint rate limit", async () => {
+    for (let i = 0; i < 15; i++) {
+      const res = await app.inject({ method: "GET", url: "/health" });
+      expect(res.statusCode).toBe(200);
+    }
+  });
+});

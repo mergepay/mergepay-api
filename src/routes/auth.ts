@@ -2,6 +2,7 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { config } from "../config";
 import { Errors } from "../errors";
 import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
@@ -13,9 +14,8 @@ function shortName(pk: string): string {
 }
 
 export default async function authRoutes(app: FastifyInstance) {
-  // Tighter rate limit on auth endpoints.
   const authLimit = {
-    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+    config: { rateLimit: { max: config.RATE_LIMIT_AUTH_MAX, timeWindow: config.RATE_LIMIT_AUTH_WINDOW } },
   };
 
   app.post(

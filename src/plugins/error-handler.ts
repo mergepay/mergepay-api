@@ -40,12 +40,17 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     }
 
     if ((err as any).statusCode === 429) {
-      return reply.code(429).send({
+      const retryAfter = reply.getHeader("Retry-After") as string | undefined;
+      const body: Record<string, unknown> = {
         error: "RATE_LIMITED",
         message: "Too many requests, slow down.",
         statusCode: 429,
         requestId,
-      });
+      };
+      if (retryAfter) {
+        body.retryAfter = retryAfter;
+      }
+      return reply.code(429).send(body);
     }
 
     if ((err as any).statusCode && (err as any).statusCode < 500) {

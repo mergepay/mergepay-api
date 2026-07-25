@@ -346,6 +346,8 @@ export async function runReconciliation(
     "treasuryProposal",
   ];
 
+  const processedByTable: Record<string, number> = {};
+
   for (const table of tables) {
     let records: ReconciliationRecord[];
 
@@ -355,6 +357,8 @@ export async function runReconciliation(
       log.error({ err: error, table }, "unable to load pending transactions");
       continue;
     }
+
+    processedByTable[table] = records.length;
 
     for (const record of records) {
       try {
@@ -367,6 +371,16 @@ export async function runReconciliation(
       }
     }
   }
+
+  const totalProcessed = Object.values(processedByTable).reduce(
+    (sum, count) => sum + count,
+    0
+  );
+
+  log.info(
+    { processedByTable, totalProcessed },
+    `reconciliation cycle processed ${totalProcessed} record(s)`
+  );
 }
 
 export function startReconciliation(

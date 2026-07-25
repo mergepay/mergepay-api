@@ -119,6 +119,7 @@ model Settlement {
   expenseId      String?  @map("expense_id")
   expenseShareId String?  @map("expense_share_id")
   createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
 
   group        Group         @relation(fields: [groupId], references: [id], onDelete: Cascade)
   from         User          @relation("SettlementFrom", fields: [fromUserId], references: [id])

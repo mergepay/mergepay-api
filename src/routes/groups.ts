@@ -265,6 +265,53 @@ export default async function groupRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
+  // -- remove member ---------------------------------------------------------
+  app.delete("/groups/:id/members/:memberId", async (req) => {
+    const auth = requireUser(req);
+    const { id, memberId } = z
+      .object({ id: z.string(), memberId: z.string() })
+      .parse(req.params);
+    await requireAdmin(id, auth.id);
+
+    if (memberId === auth.id) {
+      throw Errors.badRequest(
+        "SELF_REMOVE",
+        "Cannot remove yourself from the group; use the leave endpoint instead"
+      );
+    }
+
+    const target = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId: id, userId: memberId } },
+    });
+    if (!target) {
+      throw Errors.notFound("Member not found in this group");
+    }
+
+    if (target.role === "admin") {
+      const adminCount = await prisma.groupMember.count({
+        where: { groupId: id, role: "admin" },
+      });
+      if (adminCount <= 1) {
+        throw Errors.conflict(
+          "last_admin",
+          "Cannot remove the last admin from the group"
+        );
+      }
+    }
+
+    await prisma.groupMember.delete({
+      where: { groupId_userId: { groupId: id, userId: memberId } },
+    });
+    await audit({
+      userId: auth.id,
+      action: "group.member_remove",
+      entityType: "group",
+      entityId: id,
+      metadata: { removedUserId: memberId },
+    });
+    return { ok: true };
+  });
+
   // -- archive ----------------------------------------------------------------
   app.post("/groups/:id/archive", async (req) => {
     const auth = requireUser(req);

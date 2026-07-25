@@ -83,20 +83,29 @@ export async function expireInvites(): Promise<void> {
 // Settlement submission worker
 // ---------------------------------------------------------------------------
 
+class PermanentSettlementError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentSettlementError";
+  }
+}
+
 async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
  * Attempt to submit one settlement's signed XDR to the Stellar network.
- * Returns the submitted transaction hash on success, or throws on permanent failure.
+ * Returns the submitted transaction hash on success, or throws on failure.
+ * Transient errors are retryable; permanent errors (including exhausted
+ * retries) throw PermanentSettlementError.
  */
 export async function submitSettlement(
   settlement: SettlementSubmissionRecord,
   retryAttempt: number
 ): Promise<string> {
   if (!settlement.transactionXdr) {
-    throw new Error("settlement has no transaction XDR");
+    throw new PermanentSettlementError("settlement has no transaction XDR");
   }
 
   try {
@@ -131,7 +140,7 @@ export async function submitSettlement(
       { id: settlement.id, attempt: retryAttempt, err: msg },
       "settlement submission failed permanently"
     );
-    throw error;
+    throw new PermanentSettlementError(msg);
   }
 }
 
@@ -185,7 +194,7 @@ export async function processSubmittedSettlements(): Promise<void> {
           );
           break;
         } catch (error: any) {
-          if (attempt >= SETTLEMENT_MAX_RETRIES) {
+          if (error instanceof PermanentSettlementError || attempt >= SETTLEMENT_MAX_RETRIES) {
             throw error;
           }
           attempt++;

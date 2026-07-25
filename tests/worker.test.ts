@@ -141,4 +141,81 @@ describe("processSubmittedSettlements", () => {
       })
     );
   });
+
+  it("marks a settlement as failed when all retries are exhausted", async () => {
+    const settlement = {
+      id: "settle_3",
+      shortCode: "FAIL1",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "5.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-3",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.submitPayment.mockRejectedValue(new Error("timeout"));
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(4);
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_3" },
+        data: expect.objectContaining({
+          status: "failed",
+          failureReason: expect.any(String),
+          retryCount: { increment: 1 },
+        }),
+      })
+    );
+    expect(h.audit).toHaveBeenCalled();
+  });
+
+  it("marks a settlement as failed immediately on non-transient error without retrying", async () => {
+    const settlement = {
+      id: "settle_4",
+      shortCode: "NORETRY",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "5.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-4",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.submitPayment.mockRejectedValue(new Error("invalid signature"));
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(1);
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_4" },
+        data: expect.objectContaining({
+          status: "failed",
+          failureReason: expect.any(String),
+          retryCount: { increment: 1 },
+        }),
+      })
+    );
+  });
 });

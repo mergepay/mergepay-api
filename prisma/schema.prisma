@@ -23,6 +23,8 @@ model User {
   treasuryTxs      TreasuryTransaction[]
   invites          Invite[]
   anchorSessions   AnchorSession[]
+  withdrawals      Withdrawal[]
+  proposals        TreasuryProposal[]   @relation("ProposalCreator")
   auditLogs        AuditLog[]
 
   @@map("users")
@@ -44,6 +46,7 @@ model Group {
   expenses    Expense[]
   settlements Settlement[]
   treasuryTxs TreasuryTransaction[]
+  proposals   TreasuryProposal[]
   invites     Invite[]
   invitations Invitation[]
 
@@ -209,6 +212,64 @@ model AnchorSession {
   @@index([userId])
   @@index([externalTransactionId])
   @@map("anchor_sessions")
+}
+
+/// SEP-24 fiat off-ramp request. Augments the existing
+/// `AnchorSession`-based 2-step flow with a simpler, user-facing
+/// numeric record that the frontend polls. See Issue #40.
+model Withdrawal {
+  id             String   @id @default(cuid())
+  userId         String   @map("user_id")
+  amount         Decimal  @db.Decimal(20, 7)
+  assetCode      String   @map("asset_code")
+  assetIssuer    String?  @map("asset_issuer")
+  memo           String?
+  /// Anchor's external transaction id / SEP-24 `id`, populated on completion.
+  anchorTxId     String?  @map("anchor_tx_id")
+  /// Interactive URL the user opens to complete KYC / off-ramp.
+  interactiveUrl String?  @map("interactive_url")
+  status         String   @default("pending")
+  failureReason  String?  @map("failure_reason")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@index([anchorTxId])
+  @@map("withdrawals")
+}
+
+/// Multisig treasury proposal. Holds an unsigned transaction XDR that
+/// group members incrementally sign; once `signatures.length >= threshold`
+/// the backend concatenates the signatures and submits to Horizon. See
+/// Issue #41.
+model TreasuryProposal {
+  id         String   @id @default(cuid())
+  groupId    String   @map("group_id")
+  creatorId  String   @map("creator_id")
+  /// Unsigned transaction envelope (XDR). The field is named `xdr` per the
+  /// issue spec; values are always pre-signature when this row is created.
+  xdr        String   @map("xdr")
+  threshold  Int      @default(1)
+  /// Array of `{ publicKey, signature }` records explicitly verified by
+  /// the backend. Stored as JSON for simplicity (signatures are bounded
+  /// by the group threshold, ~few entries per proposal).
+  signatures Json     @default("[]")
+  status     String   @default("pending")
+  stellarTxHash String? @map("stellar_tx_hash")
+  failureReason  String? @map("failure_reason")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+
+  group   Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  creator User  @relation("ProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([groupId])
+  @@index([status])
+  @@index([creatorId])
+  @@map("treasury_proposals")
 }
 
 model IdempotencyKey {

@@ -156,9 +156,16 @@ export default async function anchorRoutes(app: FastifyInstance) {
     const externalId = body.transaction?.id ?? body.id;
     const status = body.transaction?.status ?? body.status;
     if (externalId && status) {
+      const mappedStatus = mapAnchorStatus(status);
       await prisma.anchorSession.updateMany({
         where: { externalTransactionId: externalId },
-        data: { status: mapAnchorStatus(status) },
+        data: { status: mappedStatus },
+      });
+      // Also surface the new status on any matching Withdrawal record so the
+      // public polling endpoint at GET /withdraw/:id transitions.
+      await prisma.withdrawal.updateMany({
+        where: { anchorTxId: externalId },
+        data: { status: mappedStatus },
       });
     }
     return reply.code(200).send({ ok: true });

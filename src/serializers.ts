@@ -152,3 +152,42 @@ export function serializeAnchorSession(s: any) {
     createdAt: iso(s.createdAt),
   };
 }
+
+export function serializeWithdrawal(w: any) {
+  return {
+    id: w.id,
+    userId: w.userId,
+    amount: dec(w.amount),
+    assetCode: w.assetCode,
+    assetIssuer: w.assetIssuer ?? null,
+    memo: w.memo ?? null,
+    anchorTxId: w.anchorTxId ?? null,
+    interactiveUrl: w.interactiveUrl ?? null,
+    status: w.status,
+    failureReason: w.failureReason ?? null,
+    createdAt: iso(w.createdAt),
+    updatedAt: iso(w.updatedAt),
+  };
+}
+
+export function serializeTreasuryProposal(p: any) {
+  const sigs = Array.isArray(p.signatures) ? p.signatures : [];
+  return {
+    id: p.id,
+    groupId: p.groupId,
+    creatorId: p.creatorId,
+    xdr: p.xdr,
+    threshold: p.threshold,
+    signatures: sigs.map((s: any) => ({
+      publicKey: s.publicKey,
+      // Don't expose the raw signature bytes by default; surface count instead.
+      signedAt: s.signedAt ?? null,
+    })),
+    signatureCount: sigs.length,
+    status: p.status,
+    stellarTxHash: p.stellarTxHash ?? null,
+    failureReason: p.failureReason ?? null,
+    createdAt: iso(p.createdAt),
+    updatedAt: iso(p.updatedAt),
+  };
+}

@@ -139,6 +139,25 @@ export const stellar = {
     }
   },
 
+  /**
+   * Submit a fully-signed envelope without a content-level matching check.
+   * Used by the multisig proposal flow, which has already verified each
+   * signer against the proposal's stored transaction hash.
+   */
+  async submitSigned(signedXdr: string): Promise<string> {
+    const tx = new Transaction(signedXdr, config.networkPassphrase);
+    try {
+      const res = await server().submitTransaction(tx);
+      return res.hash;
+    } catch (e: any) {
+      const codes =
+        e?.response?.data?.extras?.result_codes ??
+        e?.response?.data?.result_codes;
+      const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
+      throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+    }
+  },
+
   /** Look up a transaction by hash. Returns null if not yet visible. */
   async getTransaction(
     hash: string

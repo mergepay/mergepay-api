@@ -13,9 +13,11 @@ import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
+import treasuryProposalRoutes from "./routes/treasury-proposals";
 import anchorRoutes from "./routes/anchors";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
+import withdrawRoutes from "./routes/withdraw";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -98,7 +100,9 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(expenseRoutes);
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
+  await app.register(treasuryProposalRoutes);
   await app.register(anchorRoutes);
+  await app.register(withdrawRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
 

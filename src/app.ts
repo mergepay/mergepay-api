@@ -6,6 +6,7 @@ import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
 import { config } from "./config";
+import { prisma } from "./db";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
 import authRoutes from "./routes/auth";
@@ -86,11 +87,16 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   // Health check.
-  app.get("/health", async () => ({
-    status: "ok",
-    network: config.STELLAR_NETWORK,
-    time: new Date().toISOString(),
-  }));
+  app.get("/health", async (request, reply) => {
+    const timestamp = new Date().toISOString();
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      return { status: "ok", timestamp, db: "healthy" };
+    } catch {
+      reply.code(503);
+      return { status: "degraded", timestamp, db: "unhealthy" };
+    }
+  });
 
   // Routes.
   await app.register(authRoutes);

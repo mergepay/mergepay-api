@@ -28,6 +28,7 @@ const h = vi.hoisted(() => {
     anchorSession: model(),
     auditLog: model(),
     idempotencyKey: model(),
+    $queryRaw: vi.fn(async () => [{ "?column?": 1 }]),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),

@@ -7,27 +7,8 @@ import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
 import { isPositive } from "../services/money";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
 import { serializeExpense } from "../serializers";
-
-const shareInput = z.object({
-  userId: z.string(),
-  amount: z.string().optional(),
-  percent: z.number().optional(),
-});
-
-const createExpenseSchema = z.object({
-  title: z.string().min(1).max(80),
-  description: z.string().max(500).optional(),
-  amount: z.string().min(1),
-  assetCode: z.string().min(1).max(12),
-  assetIssuer: z.string().nullable().optional(),
-  splitType: z.enum(["equal", "custom", "percentage"]),
-  shares: z.array(shareInput).min(1),
-  payerUserId: z.string().optional(),
-  memo: z.string().max(24).optional(),
-  receiptUrl: z.string().nullable().optional(),
-});
+import { createExpenseSchema, updateExpenseSchema } from "../validations/expense";
 
 const expenseInclude = {
   payer: true,
@@ -151,14 +132,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.patch("/expenses/:id", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z
-      .object({
-        title: z.string().min(1).max(80).optional(),
-        description: z.string().max(500).nullable().optional(),
-        memo: z.string().max(24).optional(),
-        receiptUrl: z.string().nullable().optional(),
-      })
-      .parse(req.body);
+    const body = updateExpenseSchema.parse(req.body);
 
     const expense = await prisma.expense.findUnique({ where: { id } });
     if (!expense) throw Errors.notFound("Expense not found");

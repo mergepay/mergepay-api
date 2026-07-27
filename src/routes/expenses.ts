@@ -80,36 +80,41 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
-    const expense = await prisma.expense.create({
-      data: {
-        groupId,
-        payerUserId,
-        title: body.title,
-        description: body.description,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        splitType: body.splitType,
-        memo,
-        receiptUrl: body.receiptUrl ?? null,
-        shares: {
-          create: computed.map((c) => ({
-            userId: c.userId,
-            shareAmount: c.shareAmount,
-            // The payer's own share is already covered — mark it settled.
-            status: c.userId === payerUserId ? "settled" : "pending",
-          })),
+    const expense = await prisma.$transaction(async (tx) => {
+      const created = await tx.expense.create({
+        data: {
+          groupId,
+          payerUserId,
+          title: body.title,
+          description: body.description,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          splitType: body.splitType,
+          memo,
+          receiptUrl: body.receiptUrl ?? null,
+          shares: {
+            create: computed.map((c) => ({
+              userId: c.userId,
+              shareAmount: c.shareAmount,
+              status: c.userId === payerUserId ? "settled" : "pending",
+            })),
+          },
         },
-      },
-      include: expenseInclude,
-    });
+        include: expenseInclude,
+      });
 
-    await audit({
-      userId: auth.id,
-      action: "expense.create",
-      entityType: "expense",
-      entityId: expense.id,
-      metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.create",
+          entityType: "expense",
+          entityId: created.id,
+          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+        },
+      });
+
+      return created;
     });
 
     return { expense: serializeExpense(expense) };
@@ -199,12 +204,16 @@ export default async function expenseRoutes(app: FastifyInstance) {
       );
     }
 
-    await prisma.expense.delete({ where: { id } });
-    await audit({
-      userId: auth.id,
-      action: "expense.delete",
-      entityType: "expense",
-      entityId: id,
+    await prisma.$transaction(async (tx) => {
+      await tx.expense.delete({ where: { id } });
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.delete",
+          entityType: "expense",
+          entityId: id,
+        },
+      });
     });
     return { ok: true };
   });

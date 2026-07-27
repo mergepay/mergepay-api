@@ -49,6 +49,10 @@ export const anchorService = {
     return value;
   },
 
+  async getAnchorConfig(): Promise<AnchorToml> {
+    return this.getToml(config.ANCHOR_HOME_DOMAIN);
+  },
+
   /** Step 1: get a SEP-10 challenge from the anchor for the user account. */
   async getChallenge(
     webAuthEndpoint: string,
@@ -73,10 +77,11 @@ export const anchorService = {
     });
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 token exchange failed");
     const data: any = await res.json();
+    if (!data.token) throw Errors.upstream("Anchor did not return a SEP-10 token");
     return data.token;
   },
 
-  /** Step 3: start a SEP-24 interactive deposit/withdraw. */
+  /** Start a SEP-24 interactive deposit or withdrawal flow. */
   async startInteractive(params: {
     transferServer: string;
     token: string;
@@ -99,7 +104,52 @@ export const anchorService = {
     });
     if (!res.ok) throw Errors.upstream("Anchor interactive flow request failed");
     const data: any = await res.json();
+    if (!data.url || !data.id) {
+      throw Errors.upstream("Anchor returned an invalid interactive response");
+    }
     return { url: data.url, id: data.id };
+  },
+
+  async initiateWithdrawal(params: {
+    signedXdr: string;
+    amount: string;
+    assetCode: string;
+    account: string;
+    memo?: string;
+  }): Promise<{ url: string; id: string; token: string }> {
+    const anchor = await this.getAnchorConfig();
+    const token = await this.getToken(anchor.webAuthEndpoint, params.signedXdr);
+    const res = await fetch(
+      `${anchor.transferServerSep24}/transactions/withdraw/interactive`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          asset_code: params.assetCode,
+          amount: params.amount,
+          account: params.account,
+          ...(params.memo ? { memo: params.memo } : {}),
+        }),
+      }
+    );
+    if (!res.ok) {
+      let detail = "Anchor withdrawal request failed";
+      try {
+        const data: any = await res.json();
+        detail = data.error ?? data.message ?? detail;
+      } catch {
+        // Preserve the stable upstream error for non-JSON responses.
+      }
+      throw Errors.upstream(detail);
+    }
+    const data: any = await res.json();
+    if (!data.url || !data.id) {
+      throw Errors.upstream("Anchor returned an invalid withdrawal response");
+    }
+    return { url: data.url, id: data.id, token };
   },
 
   /** Poll a single SEP-24 transaction's status. */

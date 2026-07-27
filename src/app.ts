@@ -8,6 +8,8 @@ import path from "node:path";
 import { config } from "./config";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import loggingPlugin from "./plugins/logging";
+import openAPIPlugin from "./plugins/openapi";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
@@ -73,8 +75,10 @@ export async function buildApp(): Promise<FastifyInstance> {
     decorateReply: false,
   });
 
+  await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {
     reply.code(404).send({

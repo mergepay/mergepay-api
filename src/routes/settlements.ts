@@ -19,6 +19,7 @@ import {
   groupPrimaryAsset,
 } from "../services/group-balances";
 import { memoText } from "../services/stellar";
+import { paginationQuerySchema } from "../services/pagination";
 
 const settlementInclude = { from: true, to: true } as const;
 
@@ -292,40 +293,114 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(groupId, auth.id);
 
+    const querySchema = z.object({
+      limit: z.coerce.number().int().min(1).max(100).default(25),
+      cursor: z.string().optional(),
+      assetCode: z.string().optional(),
+      status: z.string().optional(),
+      fromDate: z.string().optional(),
+      toDate: z.string().optional(),
+    });
+    const query = querySchema.parse(req.query);
+
+    let expenseWhere: any = { groupId };
+    let settlementWhere: any = { groupId };
+    let treasuryWhere: any = { groupId };
+
+    if (query.cursor) {
+      const cursor = JSON.parse(Buffer.from(query.cursor, "base64").toString("utf-8"));
+      const cursorDate = new Date(cursor.createdAt);
+      const cursorCondition = {
+        OR: [
+          { createdAt: { lt: cursorDate } },
+          { createdAt: { equals: cursorDate }, id: { lt: cursor.id } },
+        ],
+      };
+      expenseWhere = { ...expenseWhere, AND: cursorCondition };
+      settlementWhere = { ...settlementWhere, AND: cursorCondition };
+      treasuryWhere = { ...treasuryWhere, AND: cursorCondition };
+    }
+
+    if (query.assetCode) {
+      expenseWhere.assetCode = query.assetCode;
+      settlementWhere.assetCode = query.assetCode;
+      treasuryWhere.assetCode = query.assetCode;
+    }
+
+    if (query.status) {
+      settlementWhere.status = query.status;
+      treasuryWhere.status = query.status;
+    }
+
+    if (query.fromDate || query.toDate) {
+      const dateFilter: any = {};
+      if (query.fromDate) dateFilter.gte = new Date(query.fromDate);
+      if (query.toDate) dateFilter.lte = new Date(query.toDate);
+      expenseWhere.createdAt = dateFilter;
+      settlementWhere.createdAt = dateFilter;
+      treasuryWhere.createdAt = dateFilter;
+    }
+
     const [expenses, settlements, treasuryTxs] = await Promise.all([
       prisma.expense.findMany({
-        where: { groupId },
+        where: expenseWhere,
         include: { payer: true, shares: { include: { user: true } } },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: query.limit + 1,
       }),
       prisma.settlement.findMany({
-        where: { groupId },
+        where: settlementWhere,
         include: { from: true, to: true },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: query.limit + 1,
       }),
       prisma.treasuryTransaction.findMany({
-        where: { groupId },
+        where: treasuryWhere,
         include: { user: true },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: query.limit + 1,
       }),
     ]);
 
     const entries = [
-      ...expenses.map((e) => ({
+      ...expenses.slice(0, query.limit).map((e) => ({
         type: "expense" as const,
-        createdAt: e.createdAt.toISOString(),
+        createdAt: e.createdAt,
+        id: e.id,
         expense: serializeExpense(e),
       })),
-      ...settlements.map((s) => ({
+      ...settlements.slice(0, query.limit).map((s) => ({
         type: "settlement" as const,
-        createdAt: s.createdAt.toISOString(),
+        createdAt: s.createdAt,
+        id: s.id,
         settlement: serializeSettlement(s),
       })),
-      ...treasuryTxs.map((t) => ({
+      ...treasuryTxs.slice(0, query.limit).map((t) => ({
         type: "treasury" as const,
-        createdAt: t.createdAt.toISOString(),
+        createdAt: t.createdAt,
+        id: t.id,
         treasuryTransaction: serializeTreasuryTx(t),
       })),
     ].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 
-    return { entries };
+    let nextCursor: string | null = null;
+    if (entries.length > query.limit) {
+      const lastEntry = entries[query.limit - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({ createdAt: lastEntry.createdAt, id: lastEntry.id })
+      ).toString("base64");
+      entries.splice(query.limit);
+    }
+
+    return {
+      items: entries.map(({ type, expense, settlement, treasuryTransaction }) => ({
+        type,
+        ...(expense && { expense }),
+        ...(settlement && { settlement }),
+        ...(treasuryTransaction && { treasuryTransaction }),
+      })),
+      nextCursor,
+    };
   });
 }
 

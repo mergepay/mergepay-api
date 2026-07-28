@@ -139,6 +139,21 @@ export const stellar = {
     }
   },
 
+  /** Submit an already validated, fully signed transaction XDR. */
+  async submitSignedTransaction(signedXdr: string): Promise<string> {
+    try {
+      const tx = new Transaction(signedXdr, config.networkPassphrase);
+      const res = await server().submitTransaction(tx);
+      return res.hash;
+    } catch (e: any) {
+      const codes =
+        e?.response?.data?.extras?.result_codes ??
+        e?.response?.data?.result_codes;
+      const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
+      throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+    }
+  },
+
   /** Look up a transaction by hash. Returns null if not yet visible. */
   async getTransaction(
     hash: string

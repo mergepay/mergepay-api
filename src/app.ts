@@ -13,6 +13,7 @@ import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
+import treasuryProposalRoutes from "./routes/treasury-proposals";
 import anchorRoutes from "./routes/anchors";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
@@ -32,10 +33,6 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   await app.register(helmet, { contentSecurityPolicy: false });
-  // CORS allowlist. "*" allows any origin; otherwise a comma-separated whitelist.
-  // Trailing slashes are stripped so "https://app.com/" still matches the
-  // browser-sent origin "https://app.com". Vercel preview deploys (*.vercel.app)
-  // are also allowed when the configured origin is itself a vercel.app domain.
   const allowAll = config.WEB_URL === "*";
   const allowed = config.WEB_URL
     .split(",")
@@ -46,11 +43,13 @@ export async function buildApp(): Promise<FastifyInstance> {
     origin: allowAll
       ? true
       : (origin, cb) => {
-          // Same-origin / server-to-server requests have no Origin header.
           if (!origin) return cb(null, true);
           const normalized = origin.replace(/\/+$/, "");
           if (allowed.includes(normalized)) return cb(null, true);
-          if (allowVercelPreviews && normalized.endsWith(".vercel.app")) {
+          if (
+            allowVercelPreviews &&
+            normalized.endsWith(".vercel.app")
+          ) {
             return cb(null, true);
           }
           return cb(null, false);
@@ -65,14 +64,11 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(multipart, {
     limits: { fileSize: 6 * 1024 * 1024, files: 1 },
   });
-
-  // Serve uploaded receipts.
   await app.register(fastifyStatic, {
     root: path.resolve(config.UPLOADS_DIR),
     prefix: "/uploads/",
     decorateReply: false,
   });
-
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
 
@@ -85,19 +81,18 @@ export async function buildApp(): Promise<FastifyInstance> {
     });
   });
 
-  // Health check.
   app.get("/health", async () => ({
     status: "ok",
     network: config.STELLAR_NETWORK,
     time: new Date().toISOString(),
   }));
 
-  // Routes.
   await app.register(authRoutes);
   await app.register(groupRoutes);
   await app.register(expenseRoutes);
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
+  await app.register(treasuryProposalRoutes);
   await app.register(anchorRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);

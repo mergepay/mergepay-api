@@ -87,6 +87,7 @@ model Expense {
 
   @@index([groupId])
   @@index([payerUserId])
+  @@index([groupId, createdAt])
   @@map("expenses")
 }
 
@@ -135,6 +136,7 @@ model Settlement {
   @@index([fromUserId])
   @@index([toUserId])
   @@index([status])
+  @@index([createdAt])
   @@map("settlements")
 }
 
@@ -235,5 +237,7 @@ model AuditLog {
   user User? @relation(fields: [userId], references: [id])
 
   @@index([userId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
   @@map("audit_logs")
 }

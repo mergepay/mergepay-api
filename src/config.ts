@@ -28,6 +28,10 @@ const schema = z.object({
   UPLOADS_DIR: z.string().default("./uploads"),
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
   NODE_ENV: z.string().default("development"),
+  RATE_LIMIT_AUTH: z.coerce.number().int().positive().default(5),
+  RATE_LIMIT_GROUP: z.coerce.number().int().positive().default(20),
+  RATE_LIMIT_SETTLEMENT: z.coerce.number().int().positive().default(20),
+  RATE_LIMIT_HISTORY: z.coerce.number().int().positive().default(100),
 });
 
 const parsed = schema.parse(process.env);

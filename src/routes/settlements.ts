@@ -25,8 +25,10 @@ const settlementInclude = { from: true, to: true } as const;
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
+  const settleLimit = { config: { rateLimit: { max: config.RATE_LIMIT_SETTLEMENT, timeWindow: "1 minute" } } };
+
   // -- settle a specific expense share ----------------------------------------
-  app.post("/expenses/:id/settle", async (req) => {
+  app.post("/expenses/:id/settle", settleLimit, async (req) => {
     const auth = requireUser(req);
     const { id: expenseId } = z.object({ id: z.string() }).parse(req.params);
     const body = z
@@ -96,7 +98,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- freeform settle-up against net balance ---------------------------------
-  app.post("/groups/:id/settlements", async (req) => {
+  app.post("/groups/:id/settlements", settleLimit, async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(groupId, auth.id);

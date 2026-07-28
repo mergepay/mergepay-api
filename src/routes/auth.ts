@@ -7,6 +7,7 @@ import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
 import { audit } from "../services/audit";
+import { config } from "../config";
 
 function shortName(pk: string): string {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
@@ -15,7 +16,7 @@ function shortName(pk: string): string {
 export default async function authRoutes(app: FastifyInstance) {
   // Tighter rate limit on auth endpoints.
   const authLimit = {
-    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+    config: { rateLimit: { max: config.RATE_LIMIT_AUTH, timeWindow: "1 minute" } },
   };
 
   app.post(

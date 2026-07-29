@@ -6,6 +6,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
+import { applyAnchorSessionTransition } from "../services/anchor-status";
 import { audit } from "../services/audit";
 import { ipKey } from "../services/rate-limit-keys";
 import { serializeAnchorSession } from "../serializers";
@@ -116,13 +117,17 @@ export default async function anchorRoutes(app: FastifyInstance) {
         account: auth.stellarPublicKey,
       });
 
-      const updated = await prisma.anchorSession.update({
-        where: { id },
-        data: {
+      // Never store the anchor JWT alongside the transition's audit
+      // metadata — only the status change and its source are recorded.
+      const { session: updated } = await applyAnchorSessionTransition({
+        sessionId: id,
+        nextStatus: "pending_user_transfer_start",
+        source: "user",
+        ownerUserId: auth.id,
+        extraData: {
           interactiveUrl: interactive.url,
           externalTransactionId: interactive.id,
           anchorToken: token,
-          status: "pending_user_transfer_start",
         },
       });
 

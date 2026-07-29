@@ -9,6 +9,7 @@ import {
   Asset,
   BASE_FEE,
   Horizon,
+  Keypair,
   Memo,
   Operation,
   Transaction,
@@ -16,6 +17,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { Errors } from "../errors";
+import { validateAssetSpec, assetConfigToSpec } from "./assets";
 
 let _server: Horizon.Server | null = null;
 function server(): Horizon.Server {
@@ -29,8 +31,10 @@ export interface AssetSpec {
 }
 
 export function toAsset(spec: AssetSpec): Asset {
-  if (!spec.issuer || spec.code === "XLM") return Asset.native();
-  return new Asset(spec.code, spec.issuer);
+  // Validate the asset is supported before constructing the SDK object.
+  const config = validateAssetSpec(spec);
+  if (config.type === "native") return Asset.native();
+  return new Asset(config.code, config.issuer!);
 }
 
 export function memoText(code: string): string {
@@ -125,7 +129,12 @@ export const stellar = {
       memoCode: string;
     }
   ): Promise<string> {
-    const tx = new Transaction(signedXdr, config.networkPassphrase);
+    let tx: Transaction;
+    try {
+      tx = new Transaction(signedXdr, config.networkPassphrase);
+    } catch {
+      throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
+    }
     validatePaymentTx(tx, expected);
     try {
       const res = await server().submitTransaction(tx);
@@ -170,12 +179,19 @@ export function validatePaymentTx(
   if (tx.source !== expected.sourcePublicKey) {
     throw Errors.badRequest("xdr_mismatch", "Transaction source does not match");
   }
+  const expectedFee = String(Number(BASE_FEE) * 2);
+  if (String(tx.fee) !== expectedFee) {
+    throw Errors.badRequest("xdr_mismatch", "Transaction fee does not match");
+  }
   if (tx.operations.length !== 1) {
     throw Errors.badRequest("xdr_mismatch", "Expected exactly one operation");
   }
   const op = tx.operations[0] as any;
   if (op.type !== "payment") {
     throw Errors.badRequest("xdr_mismatch", "Expected a payment operation");
+  }
+  if (op.source && op.source !== expected.sourcePublicKey) {
+    throw Errors.badRequest("xdr_mismatch", "Payment operation source does not match");
   }
   if (op.destination !== expected.destination) {
     throw Errors.badRequest("xdr_mismatch", "Payment destination does not match");
@@ -195,6 +211,17 @@ export function validatePaymentTx(
       : "";
   if (gotMemo !== wantMemo) {
     throw Errors.badRequest("xdr_mismatch", "Memo does not match the expense reference");
+  }
+
+  // Verify at least one signature matches the expected source account.
+  // This implicitly validates the network passphrase, as the signature hash includes it.
+  const sourceKeypair = Keypair.fromPublicKey(expected.sourcePublicKey);
+  const txHash = tx.hash();
+  const hasValidSignature = tx.signatures.some((sig) =>
+    sourceKeypair.verify(txHash, sig.signature())
+  );
+  if (!hasValidSignature) {
+    throw Errors.badRequest("xdr_mismatch", "Transaction signature is invalid or for the wrong network");
   }
 }
 

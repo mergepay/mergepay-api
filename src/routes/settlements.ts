@@ -22,6 +22,16 @@ import { memoText } from "../services/stellar";
 
 const settlementInclude = { from: true, to: true } as const;
 
+// Tighter rate limit on settlement confirm endpoint from config.
+const settleLimit = {
+  config: {
+    rateLimit: {
+      max: config.RATE_LIMIT_SETTLE_MAX,
+      timeWindow: config.RATE_LIMIT_SETTLE_WINDOW,
+    },
+  },
+};
+
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
@@ -151,7 +161,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
-  app.post("/settlements/:id/confirm", async (req, reply) => {
+  app.post("/settlements/:id/confirm", settleLimit, async (req, reply) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);

@@ -212,12 +212,21 @@ model AnchorSession {
 }
 
 model IdempotencyKey {
-  id            String   @id @default(cuid())
-  key           String   @unique
-  requestHash   String   @map("request_hash")
-  responseJson  String   @map("response_json")
-  createdAt     DateTime @default(now()) @map("created_at")
+  id           String   @id @default(cuid())
+  userId       String   @map("user_id")
+  key          String
+  requestHash  String   @map("request_hash")
+  // "in_progress" | "succeeded" | "failed" — distinguishes an attempt that's
+  // still running (or crashed mid-flight) from one that finished either way,
+  // so a client's key isn't mistaken for proof that the operation succeeded.
+  status       String   @default("in_progress")
+  responseJson String?  @map("response_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at")
 
+  // Scoped per authenticated principal: two different users are never able
+  // to collide on (or read back) each other's idempotency key.
+  @@unique([userId, key])
   @@map("idempotency_keys")
 }
 

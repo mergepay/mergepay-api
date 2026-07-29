@@ -10,6 +10,11 @@ import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import {
+  claimIdempotencyKey,
+  completeIdempotencyKey,
+  failIdempotencyKey,
+} from "../services/idempotency";
+import {
   serializeSettlement,
   serializeExpense,
   serializeTreasuryTx,
@@ -156,28 +161,6 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
 
-    const idempotencyKey = (req.headers["idempotency-key"] as string | undefined) ?? null;
-    const requestHash = idempotencyKey
-      ? crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")
-      : null;
-
-    if (idempotencyKey) {
-      const existing = await prisma.idempotencyKey.findUnique({
-        where: { key: idempotencyKey },
-      });
-      if (existing) {
-        if (existing.requestHash !== requestHash) {
-          return reply.code(409).send({
-            error: "idempotency_conflict",
-            message: "Idempotency key already used with a different request body",
-            statusCode: 409,
-            requestId: req.id as string,
-          });
-        }
-        return reply.code(200).send(JSON.parse(existing.responseJson));
-      }
-    }
-
     const settlement = await prisma.settlement.findUnique({
       where: { id },
       include: { from: true, to: true },
@@ -186,62 +169,92 @@ export default async function settlementRoutes(app: FastifyInstance) {
     if (settlement.fromUserId !== auth.id) {
       throw Errors.forbidden("Only the payer can confirm this settlement");
     }
-    if (settlement.status === "confirmed") {
-      const response200 = { settlement: serializeSettlement(settlement) };
-      if (idempotencyKey) {
-        await prisma.idempotencyKey.create({
-          data: {
-            key: idempotencyKey,
-            requestHash: requestHash!,
-            responseJson: JSON.stringify(response200),
-          },
-        });
-      }
-      return response200;
-    }
 
-    if (settlement.status !== "pending") {
-      const response200 = { settlement: serializeSettlement(settlement) };
-      if (idempotencyKey) {
-        await prisma.idempotencyKey.create({
-          data: {
-            key: idempotencyKey,
-            requestHash: requestHash!,
-            responseJson: JSON.stringify(response200),
-          },
-        });
-      }
-      return response200;
-    }
+    // Idempotency key is scoped to the authenticated user and the full
+    // settlement intent (not just the request body) so reusing a key against
+    // a different settlement, or after the underlying amount/asset/
+    // participants/memo somehow changed, is treated as a conflict rather
+    // than silently replaying an unrelated response.
+    const idempotencyKey = (req.headers["idempotency-key"] as string | undefined) ?? null;
+    let idempotencyRecordId: string | null = null;
 
-    const updated = await prisma.settlement.update({
-      where: { id },
-      data: {
-        transactionXdr: body.signedXdr,
-        status: "submitted",
-      },
-      include: settlementInclude,
-    });
-
-    await audit({
-      userId: auth.id,
-      action: "settlement.confirm",
-      entityType: "settlement",
-      entityId: id,
-      metadata: { status: "submitted" },
-    });
-
-    const response200 = { settlement: serializeSettlement(updated) };
     if (idempotencyKey) {
-      await prisma.idempotencyKey.create({
-        data: {
-          key: idempotencyKey,
-          requestHash: requestHash!,
-          responseJson: JSON.stringify(response200),
-        },
-      });
+      const requestHash = crypto
+        .createHash("sha256")
+        .update(
+          JSON.stringify({
+            settlementId: id,
+            amount: settlement.amount.toString(),
+            assetCode: settlement.assetCode,
+            assetIssuer: settlement.assetIssuer,
+            fromUserId: settlement.fromUserId,
+            toUserId: settlement.toUserId,
+            memo: settlement.memo,
+            signedXdr: body.signedXdr,
+          })
+        )
+        .digest("hex");
+
+      const claim = await claimIdempotencyKey(auth.id, idempotencyKey, requestHash);
+      if (claim.outcome === "conflict") {
+        return reply.code(409).send({
+          error: "IDEMPOTENCY_CONFLICT",
+          message: "Idempotency key already used with a different settlement request",
+          statusCode: 409,
+          requestId: req.id as string,
+        });
+      }
+      if (claim.outcome === "in_progress") {
+        return reply.code(409).send({
+          error: "IDEMPOTENCY_IN_PROGRESS",
+          message: "A request with this idempotency key is already being processed",
+          statusCode: 409,
+          requestId: req.id as string,
+        });
+      }
+      if (claim.outcome === "completed") {
+        return reply.code(200).send(JSON.parse(claim.responseJson));
+      }
+      idempotencyRecordId = claim.id;
     }
-    return response200;
+
+    try {
+      if (settlement.status !== "pending") {
+        const response200 = { settlement: serializeSettlement(settlement) };
+        if (idempotencyRecordId) {
+          await completeIdempotencyKey(idempotencyRecordId, response200);
+        }
+        return response200;
+      }
+
+      const updated = await prisma.settlement.update({
+        where: { id },
+        data: {
+          transactionXdr: body.signedXdr,
+          status: "submitted",
+        },
+        include: settlementInclude,
+      });
+
+      await audit({
+        userId: auth.id,
+        action: "settlement.confirm",
+        entityType: "settlement",
+        entityId: id,
+        metadata: { status: "submitted" },
+      });
+
+      const response200 = { settlement: serializeSettlement(updated) };
+      if (idempotencyRecordId) {
+        await completeIdempotencyKey(idempotencyRecordId, response200);
+      }
+      return response200;
+    } catch (e) {
+      if (idempotencyRecordId) {
+        await failIdempotencyKey(idempotencyRecordId);
+      }
+      throw e;
+    }
   });
 
   // -- balances + suggestions -------------------------------------------------

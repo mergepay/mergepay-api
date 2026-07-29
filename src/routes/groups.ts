@@ -7,6 +7,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { inviteCode } from "../services/codes";
 import { audit, AuditAction } from "../services/audit";
+import { stellarPublicKeySchema } from "../lib/stellar-validation";
 import {
   serializeGroup,
   serializeInvitation,
@@ -116,7 +117,7 @@ export default async function groupRoutes(app: FastifyInstance) {
     ) {
       const body = z
         .object({
-          publicKey: z.string().regex(/^G[A-Z0-9]{55}$/),
+          publicKey: stellarPublicKeySchema,
         })
         .parse(req.body);
 

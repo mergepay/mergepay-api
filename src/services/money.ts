@@ -43,6 +43,16 @@ export function stroopsToStellarAmount(stroops: bigint): string {
   return `${negative ? "-" : ""}${whole}.${frac.toString().padStart(7, "0")}`;
 }
 
+/**
+ * Canonicalize a decimal amount string via a stroop round-trip, so the same
+ * value ("10.50", "10.5000000", "10.5") always persists and compares as one
+ * consistent string across expense creation, balance math, and settlement
+ * intents. Value-preserving — never changes what the amount actually is.
+ */
+export function normalizeAmount(value: string): string {
+  return fromStroops(toStroops(value));
+}
+
 export function isPositive(value: string | number): boolean {
   try {
     return toStroops(value) > 0n;

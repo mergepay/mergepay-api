@@ -5,10 +5,11 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
-import { isPositive } from "../services/money";
+import { normalizeAmount } from "../services/money";
 import { shortCode } from "../services/codes";
 import { audit, AuditAction } from "../services/audit";
 import { serializeExpense } from "../serializers";
+import { stellarAmountSchema, refineStellarAsset } from "../lib/stellar-validation";
 
 const shareInput = z.object({
   userId: z.string(),
@@ -16,18 +17,20 @@ const shareInput = z.object({
   percent: z.number().optional(),
 });
 
-const createExpenseSchema = z.object({
-  title: z.string().min(1).max(80),
-  description: z.string().max(500).optional(),
-  amount: z.string().min(1),
-  assetCode: z.string().min(1).max(12),
-  assetIssuer: z.string().nullable().optional(),
-  splitType: z.enum(["equal", "custom", "percentage"]),
-  shares: z.array(shareInput).min(1),
-  payerUserId: z.string().optional(),
-  memo: z.string().max(24).optional(),
-  receiptUrl: z.string().nullable().optional(),
-});
+const createExpenseSchema = z
+  .object({
+    title: z.string().min(1).max(80),
+    description: z.string().max(500).optional(),
+    amount: stellarAmountSchema,
+    assetCode: z.string().min(1).max(12),
+    assetIssuer: z.string().nullable().optional(),
+    splitType: z.enum(["equal", "custom", "percentage"]),
+    shares: z.array(shareInput).min(1),
+    payerUserId: z.string().optional(),
+    memo: z.string().max(24).optional(),
+    receiptUrl: z.string().nullable().optional(),
+  })
+  .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer));
 
 const expenseInclude = {
   payer: true,
@@ -44,9 +47,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
     await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
-    if (!isPositive(body.amount)) {
-      throw Errors.badRequest("invalid_amount", "Amount must be greater than zero");
-    }
+    const amount = normalizeAmount(body.amount);
 
     const payerUserId = body.payerUserId ?? auth.id;
 
@@ -73,7 +74,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     let computed;
     try {
-      computed = computeShares(body.amount, body.splitType as SplitType, body.shares);
+      computed = computeShares(amount, body.splitType as SplitType, body.shares);
     } catch (e: any) {
       throw Errors.badRequest("invalid_split", e?.message ?? "Invalid split");
     }
@@ -87,7 +88,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
           payerUserId,
           title: body.title,
           description: body.description,
-          amount: body.amount,
+          amount,
           assetCode: body.assetCode,
           assetIssuer: body.assetIssuer ?? null,
           splitType: body.splitType,
@@ -111,7 +112,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
           action: AuditAction.ExpenseCreate,
           entityType: "expense",
           entityId: created.id,
-          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+          metadata: { groupId, amount, assetCode: body.assetCode },
         },
         tx
       );

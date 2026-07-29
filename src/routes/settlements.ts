@@ -9,6 +9,7 @@ import { requireMembership } from "../services/access";
 import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, AuditAction } from "../services/audit";
+import { normalizeAmount } from "../services/money";
 import {
   serializeSettlement,
   serializeExpense,
@@ -19,6 +20,7 @@ import {
   groupPrimaryAsset,
 } from "../services/group-balances";
 import { memoText } from "../services/stellar";
+import { stellarAmountSchema, refineStellarAsset } from "../lib/stellar-validation";
 
 const settlementInclude = { from: true, to: true } as const;
 
@@ -31,8 +33,12 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const { id: expenseId } = z.object({ id: z.string() }).parse(req.params);
     const body = z
       .object({
-        assetCode: z.string().optional(),
+        assetCode: z.string().min(1).max(12).optional(),
         assetIssuer: z.string().nullable().optional(),
+      })
+      .superRefine((val, ctx) => {
+        // assetCode omitted means "use the expense's own asset" — already validated at creation.
+        if (val.assetCode !== undefined) refineStellarAsset(ctx, val.assetCode, val.assetIssuer);
       })
       .parse(req.body ?? {});
 
@@ -123,10 +129,11 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const body = z
       .object({
         toUserId: z.string(),
-        amount: z.string().min(1),
-        assetCode: z.string().min(1),
+        amount: stellarAmountSchema,
+        assetCode: z.string().min(1).max(12),
         assetIssuer: z.string().nullable().optional(),
       })
+      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
 
     if (body.toUserId === auth.id) {
@@ -138,6 +145,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
     });
     if (!recipient) throw Errors.badRequest("invalid_recipient", "Recipient is not a member");
 
+    const amount = normalizeAmount(body.amount);
     const code = shortCode();
     const settlement = await prisma.$transaction(async (tx) => {
       const created = await tx.settlement.create({
@@ -146,7 +154,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           groupId,
           fromUserId: auth.id,
           toUserId: body.toUserId,
-          amount: body.amount,
+          amount,
           assetCode: body.assetCode,
           assetIssuer: body.assetIssuer ?? null,
           status: "pending",
@@ -160,7 +168,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           action: AuditAction.SettlementCreate,
           entityType: "settlement",
           entityId: created.id,
-          metadata: { groupId, toUserId: body.toUserId, amount: body.amount, assetCode: body.assetCode },
+          metadata: { groupId, toUserId: body.toUserId, amount, assetCode: body.assetCode },
         },
         tx
       );
@@ -172,7 +180,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       toPublicKey: recipient.user.stellarPublicKey,
       assetCode: body.assetCode,
       assetIssuer: body.assetIssuer ?? null,
-      amount: body.amount,
+      amount,
       memoCode: code,
     });
 

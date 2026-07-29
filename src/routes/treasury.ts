@@ -1,6 +1,5 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
 import { Errors } from "../errors";
@@ -9,7 +8,13 @@ import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, AuditAction } from "../services/audit";
+import { normalizeAmount } from "../services/money";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
+import {
+  stellarPublicKeySchema,
+  stellarAmountSchema,
+  refineStellarAsset,
+} from "../lib/stellar-validation";
 
 export default async function treasuryRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -21,14 +26,10 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     await requireAdmin(id, auth.id);
     const body = z
       .object({
-        publicKey: z.string(),
+        publicKey: stellarPublicKeySchema,
         requiredSigners: z.number().int().min(1).max(20).optional(),
       })
       .parse(req.body);
-
-    if (!StrKey.isValidEd25519PublicKey(body.publicKey)) {
-      throw Errors.badRequest("invalid_public_key", "Not a valid Stellar public key");
-    }
 
     // Confirm the account exists on-chain (skipped in test mode via mock).
     if (!config.isTest) {
@@ -95,10 +96,11 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     await requireMembership(id, auth.id);
     const body = z
       .object({
-        amount: z.string().min(1),
-        assetCode: z.string().min(1),
+        amount: stellarAmountSchema,
+        assetCode: z.string().min(1).max(12),
         assetIssuer: z.string().nullable().optional(),
       })
+      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
 
     const group = await prisma.group.findUnique({ where: { id } });
@@ -106,6 +108,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
+    const amount = normalizeAmount(body.amount);
     const code = shortCode();
     const ttx = await prisma.$transaction(async (tx) => {
       const created = await tx.treasuryTransaction.create({
@@ -114,7 +117,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           groupId: id,
           userId: auth.id,
           direction: "deposit",
-          amount: body.amount,
+          amount,
           assetCode: body.assetCode,
           assetIssuer: body.assetIssuer ?? null,
           destination: group.treasuryAccountPublicKey,
@@ -129,7 +132,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           action: AuditAction.TreasuryDepositCreate,
           entityType: "treasury_transaction",
           entityId: created.id,
-          metadata: { groupId: id, amount: body.amount, assetCode: body.assetCode },
+          metadata: { groupId: id, amount, assetCode: body.assetCode },
         },
         tx
       );
@@ -145,7 +148,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       sourceSequence: account.sequence,
       destination: group.treasuryAccountPublicKey,
       asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
-      amount: body.amount,
+      amount,
       memoCode: code,
     });
 
@@ -163,22 +166,20 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     await requireAdmin(id, auth.id);
     const body = z
       .object({
-        amount: z.string().min(1),
-        assetCode: z.string().min(1),
+        amount: stellarAmountSchema,
+        assetCode: z.string().min(1).max(12),
         assetIssuer: z.string().nullable().optional(),
-        destination: z.string(),
+        destination: stellarPublicKeySchema,
       })
+      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
-
-    if (!StrKey.isValidEd25519PublicKey(body.destination)) {
-      throw Errors.badRequest("invalid_destination", "Invalid destination public key");
-    }
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
+    const amount = normalizeAmount(body.amount);
     const requiresMulti = (group.treasuryRequiredSigners ?? 1) > 1;
     const code = shortCode();
     const ttx = await prisma.$transaction(async (tx) => {
@@ -188,7 +189,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           groupId: id,
           userId: auth.id,
           direction: "withdrawal",
-          amount: body.amount,
+          amount,
           assetCode: body.assetCode,
           assetIssuer: body.assetIssuer ?? null,
           destination: body.destination,
@@ -205,7 +206,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           entityId: created.id,
           metadata: {
             groupId: id,
-            amount: body.amount,
+            amount,
             assetCode: body.assetCode,
             destination: body.destination,
           },
@@ -224,7 +225,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       sourceSequence: account.sequence,
       destination: body.destination,
       asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
-      amount: body.amount,
+      amount,
       memoCode: code,
     });
 

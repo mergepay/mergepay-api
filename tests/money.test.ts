@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toStroops, fromStroops, stroopsToStellarAmount } from "../src/services/money";
+import { toStroops, fromStroops, stroopsToStellarAmount, normalizeAmount } from "../src/services/money";
 
 describe("money math", () => {
   it("parses and formats decimals at 7dp", () => {
@@ -29,5 +29,12 @@ describe("money math", () => {
   it("rejects garbage", () => {
     expect(() => toStroops("abc")).toThrow();
     expect(() => toStroops("1.2.3")).toThrow();
+  });
+
+  it("normalizeAmount produces one canonical string for equivalent inputs", () => {
+    expect(normalizeAmount("10.50")).toBe("10.5");
+    expect(normalizeAmount("10.5000000")).toBe("10.5");
+    expect(normalizeAmount("10.5")).toBe("10.5");
+    expect(normalizeAmount("007.10")).toBe("7.1");
   });
 });

@@ -8,6 +8,7 @@ import { computeShares, type SplitType } from "../services/settlement";
 import { isPositive } from "../services/money";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
 
 const shareInput = z.object({
@@ -44,9 +45,8 @@ export default async function expenseRoutes(app: FastifyInstance) {
     await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
-    if (!isPositive(body.amount)) {
-      throw Errors.badRequest("invalid_amount", "Amount must be greater than zero");
-    }
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
 

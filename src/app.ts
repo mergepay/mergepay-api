@@ -6,6 +6,7 @@ import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
 import { config } from "./config";
+import { validateAsset, supportedAssetCodes } from "./services/assets";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
 import authRoutes from "./routes/auth";
@@ -17,7 +18,26 @@ import anchorRoutes from "./routes/anchors";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 
+/** Validate supported asset configuration at startup. */
+function validateAssetConfig(): void {
+  // Eagerly check each supported asset so misconfiguration surfaces at boot.
+  // This runs once when the app starts, catching issues like an invalid
+  // STABLE_ASSET_ISSUER before any request is processed.
+  const codes = supportedAssetCodes();
+  for (const code of codes) {
+    try {
+      validateAsset(code);
+    } catch (e: any) {
+      throw new Error(
+        `Startup asset validation failed for "${code}": ${e?.message ?? e}`
+      );
+    }
+  }
+}
+
 export async function buildApp(): Promise<FastifyInstance> {
+  validateAssetConfig();
+
   const app = Fastify({
     logger: config.isTest
       ? false

@@ -129,7 +129,7 @@ describe("payment XDR validation", () => {
   });
 
   it("validates USDC issuer details", () => {
-    const usdcIssuer = Keypair.random().publicKey();
+    const usdcIssuer = config.STABLE_ASSET_ISSUER;
     const tx = new Transaction(
       buildCustomXdr({ asset: { code: "USDC", issuer: usdcIssuer } }),
       config.networkPassphrase
@@ -146,7 +146,7 @@ describe("payment XDR validation", () => {
         ...intent,
         asset: { code: "USDC", issuer: Keypair.random().publicKey() },
       })
-    ).toThrow(/asset/i);
+    ).toThrow(/issuer mismatch/i);
   });
 
   it("returns a controlled validation error for malformed XDR", async () => {

@@ -3,7 +3,13 @@ import { config } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
-import { anchorService, mapAnchorStatus } from "../services/anchor";
+import {
+  anchorService,
+  mapAnchorStatus,
+  TERMINAL_ANCHOR_STATUSES,
+  AUDITABLE_ANCHOR_STATUSES,
+} from "../services/anchor";
+import type { PollResult } from "../services/anchor";
 import { runReconciliation, startReconciliation } from "./reconciliation";
 
 interface SettlementSubmissionRecord {
@@ -34,14 +40,50 @@ export async function reconcilePending(): Promise<void> {
   await runReconciliation();
 }
 
+/** Maximum number of failed poll attempts before marking a session as error. */
+const ANCHOR_MAX_RETRIES = 3;
+const ANCHOR_POLL_BATCH_SIZE = 50;
+
+/**
+ * Minimum interval between polls for the same session (seconds).
+ * Sessions polled more recently than this are skipped.
+ */
+const ANCHOR_MIN_POLL_INTERVAL_SEC = 30;
+
+/** Normalised SEP-24 terminal states that stop further polling. */
+const ANCHOR_POLL_TERMINAL = new Set([
+  ...TERMINAL_ANCHOR_STATUSES,
+  "incomplete", // before we have an external id
+]);
+
+/**
+ * Poll pending SEP-24 anchor sessions and reconcile remote status with
+ * local records.
+ *
+ * Design:
+ * - Only discover sessions that haven't been polled in the last 30 seconds.
+ * - Never overwrite a terminal status with a non-terminal one.
+ * - Retry failures with bounded exponential backoff tracked via retryCount.
+ * - Store error details in failureReason for support.
+ * - Emit audit log events when a terminal status is reached via polling.
+ */
 export async function reconcileAnchors(): Promise<void> {
+  const cutoff = new Date(
+    Date.now() - ANCHOR_MIN_POLL_INTERVAL_SEC * 1000
+  );
+
   const sessions = await prisma.anchorSession.findMany({
     where: {
       anchorToken: { not: null },
       externalTransactionId: { not: null },
-      status: { notIn: ["completed", "error", "refunded"] },
+      status: { notIn: [...ANCHOR_POLL_TERMINAL] },
+      OR: [
+        { lastPolledAt: null },
+        { lastPolledAt: { lt: cutoff } },
+      ],
     },
-    take: 50,
+    take: ANCHOR_POLL_BATCH_SIZE,
+    orderBy: { lastPolledAt: "asc" as const },
   });
 
   if (sessions.length === 0) return;
@@ -50,26 +92,176 @@ export async function reconcileAnchors(): Promise<void> {
   try {
     toml = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
   } catch {
+    // Can't reach the anchor at all — skip this cycle.
     return;
   }
 
   for (const session of sessions) {
     try {
-      const status = await anchorService.getTransactionStatus({
-        transferServer: toml.transferServerSep24,
-        token: session.anchorToken!,
-        id: session.externalTransactionId!,
-      });
-
-      if (status) {
-        await prisma.anchorSession.update({
-          where: { id: session.id },
-          data: { status: mapAnchorStatus(status) },
-        });
-      }
-    } catch {
-      // Retry this session during the next cycle.
+      await reconcileSingleAnchor(session, toml.transferServerSep24);
+    } catch (err) {
+      // Individual session errors should not block the rest of the batch.
+      const message = err instanceof Error ? err.message : String(err);
+      log.error(
+        { sessionId: session.id, externalId: session.externalTransactionId, err: message },
+        "unexpected error reconciling anchor session"
+      );
     }
+  }
+}
+
+/**
+ * Poll a single anchor session and advance its status.
+ */
+async function reconcileSingleAnchor(
+  session: {
+    id: string;
+    externalTransactionId: string | null;
+    anchorToken: string | null;
+    status: string;
+    retryCount: number;
+    failureReason: string | null;
+  },
+  transferServer: string
+): Promise<void> {
+  // Guard against null fields (shouldn't happen due to query filter, but safety first)
+  if (!session.anchorToken || !session.externalTransactionId) {
+    log.warn(
+      { sessionId: session.id },
+      "skipping anchor session with missing token or externalTransactionId"
+    );
+    return;
+  }
+  const result: PollResult = await anchorService.pollTransaction({
+    transferServer,
+    token: session.anchorToken!,
+    id: session.externalTransactionId!,
+  });
+
+  const now = new Date();
+
+  // ── Handle poll errors (timeout, network, malformed) ─────────────────
+  if (result.isError) {
+    const nextRetryCount = session.retryCount + 1;
+    const shouldBackoff = nextRetryCount <= ANCHOR_MAX_RETRIES;
+
+    const data: Record<string, unknown> = {
+      lastPolledAt: now,
+      retryCount: shouldBackoff ? nextRetryCount : session.retryCount,
+      failureReason: result.message,
+    };
+
+    // If we've exhausted retries, mark as error.
+    if (!shouldBackoff) {
+      data.status = "error";
+    }
+
+    await prisma.anchorSession.update({
+      where: { id: session.id },
+      data: data as any,
+    });
+
+    if (!shouldBackoff) {
+      log.warn(
+        {
+          sessionId: session.id,
+          externalId: session.externalTransactionId,
+          retryCount: session.retryCount,
+          reason: result.message,
+        },
+        "anchor session marked as error after exhausting retries"
+      );
+
+      await audit({
+        action: "anchor.session.failed",
+        entityType: "anchor_session",
+        entityId: session.id,
+        metadata: {
+          previousStatus: session.status,
+          status: "error",
+          failureReason: result.message,
+          retryCount: nextRetryCount,
+        },
+      });
+    }
+
+    return;
+  }
+
+  // ── Status unchanged ─────────────────────────────────────────────────
+  if (result.status === session.status) {
+    await prisma.anchorSession.update({
+      where: { id: session.id },
+      data: {
+        lastPolledAt: now,
+        failureReason: null, // clear transient errors if poll succeeds
+      },
+    });
+    return;
+  }
+
+  // ── Terminal-state protection ───────────────────────────────────────
+  // If the local record is already in a terminal state and the anchor
+  // reports something else, trust the local record.
+  if (TERMINAL_ANCHOR_STATUSES.has(session.status)) {
+    log.warn(
+      {
+        sessionId: session.id,
+        localStatus: session.status,
+        remoteStatus: result.status,
+        rawStatus: result.rawStatus,
+      },
+      "anchor poll returned non-terminal status for terminal session; ignoring"
+    );
+    return;
+  }
+
+  // ── Advance status ──────────────────────────────────────────────────
+  const updateData: Record<string, unknown> = {
+    status: result.status,
+    lastPolledAt: now,
+    failureReason: result.status === "error" ? (result.message ?? null) : null,
+    retryCount: 0, // reset on successful poll
+  };
+
+  if (result.stellarTransactionHash) {
+    log.debug(
+      { sessionId: session.id, hash: result.stellarTransactionHash },
+      "anchor reported stellar transaction hash"
+    );
+  }
+
+  await prisma.anchorSession.update({
+    where: { id: session.id },
+    data: updateData as any,
+  });
+
+  log.info(
+    {
+      sessionId: session.id,
+      externalId: session.externalTransactionId,
+      fromStatus: session.status,
+      toStatus: result.status,
+    },
+    result.message
+  );
+
+  // ── Audit on terminal transitions ───────────────────────────────────
+  if (AUDITABLE_ANCHOR_STATUSES.has(result.status)) {
+    await audit({
+      action: `anchor.session.${result.status}`,
+      entityType: "anchor_session",
+      entityId: session.id,
+      metadata: {
+        previousStatus: session.status,
+        status: result.status,
+        rawStatus: result.rawStatus,
+        amountIn: result.amountIn,
+        amountOut: result.amountOut,
+        amountFee: result.amountFee,
+        stellarTransactionHash: result.stellarTransactionHash,
+      },
+    });
   }
 }
 

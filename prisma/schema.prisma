@@ -64,6 +64,7 @@ model GroupMember {
 
   @@unique([groupId, userId])
   @@index([userId])
+  @@index([groupId])
   @@map("group_members")
 }
 
@@ -86,6 +87,7 @@ model Expense {
   shares ExpenseShare[]
 
   @@index([groupId])
+  @@index([payerUserId])
   @@map("expenses")
 }
 

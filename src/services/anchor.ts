@@ -1,11 +1,5 @@
-/**
- * Anchor (SEP-1 / SEP-10 / SEP-24) integration.
- *
- * All outbound HTTP to the anchor is funnelled through this module so tests can
- * mock it. The default anchor is the SDF test anchor (testanchor.stellar.org).
- */
-
 import toml from "toml";
+import { z } from "zod";
 import { config } from "../config";
 import { Errors } from "../errors";
 
@@ -20,6 +14,45 @@ export interface AnchorToml {
 const tomlCache = new Map<string, { value: AnchorToml; at: number }>();
 const TOML_TTL = 5 * 60 * 1000;
 
+const sep24TransactionResponseSchema = z
+  .object({
+    transaction: z
+      .object({
+        status: z.string().min(1).optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+
+const interactiveResponseSchema = z
+  .object({
+    url: z.string().url(),
+    id: z.string().min(1),
+  })
+  .passthrough();
+
+const challengeResponseSchema = z
+  .object({
+    transaction: z.string().min(1),
+    network_passphrase: z.string().min(1).optional(),
+  })
+  .passthrough();
+
+const tokenResponseSchema = z
+  .object({
+    token: z.string().min(1),
+  })
+  .passthrough();
+
+function parseJson<T>(schema: z.ZodType<T>, value: unknown): T {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    throw Errors.upstream("Anchor returned an invalid response");
+  }
+  return parsed.data;
+}
+
 export const anchorService = {
   /** Fetch & parse the anchor's stellar.toml (cached 5 min). */
   async getToml(homeDomain: string): Promise<AnchorToml> {
@@ -31,12 +64,29 @@ export const anchorService = {
     if (!res.ok) {
       throw Errors.upstream(`Could not load stellar.toml for ${homeDomain}`);
     }
-    const parsed = toml.parse(await res.text());
 
-    const assets = (parsed.CURRENCIES ?? []).map((c: any) => ({
-      code: c.code,
-      issuer: c.issuer ?? null,
-    }));
+    let parsed: any;
+    try {
+      parsed = toml.parse(await res.text());
+    } catch {
+      throw Errors.upstream("Anchor returned invalid stellar.toml");
+    }
+
+    const currencies = Array.isArray(parsed.CURRENCIES) ? parsed.CURRENCIES : [];
+    const assets = currencies
+      .filter((currency: any) => typeof currency?.code === "string")
+      .map((currency: any) => ({
+        code: currency.code,
+        issuer: typeof currency.issuer === "string" ? currency.issuer : null,
+      }));
+
+    if (
+      typeof parsed.WEB_AUTH_ENDPOINT !== "string" ||
+      typeof parsed.TRANSFER_SERVER_SEP0024 !== "string" ||
+      typeof parsed.SIGNING_KEY !== "string"
+    ) {
+      throw Errors.upstream("Anchor stellar.toml is missing required SEP-24 fields");
+    }
 
     const value: AnchorToml = {
       homeDomain,
@@ -57,7 +107,7 @@ export const anchorService = {
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
     const res = await fetch(url);
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 challenge request failed");
-    const data: any = await res.json();
+    const data = parseJson(challengeResponseSchema, await res.json());
     return {
       transaction: data.transaction,
       networkPassphrase: data.network_passphrase ?? config.networkPassphrase,
@@ -72,8 +122,7 @@ export const anchorService = {
       body: JSON.stringify({ transaction: signedXdr }),
     });
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 token exchange failed");
-    const data: any = await res.json();
-    return data.token;
+    return parseJson(tokenResponseSchema, await res.json()).token;
   },
 
   /** Step 3: start a SEP-24 interactive deposit/withdraw. */
@@ -98,8 +147,7 @@ export const anchorService = {
       }),
     });
     if (!res.ok) throw Errors.upstream("Anchor interactive flow request failed");
-    const data: any = await res.json();
-    return { url: data.url, id: data.id };
+    return parseJson(interactiveResponseSchema, await res.json());
   },
 
   /** Poll a single SEP-24 transaction's status. */
@@ -111,31 +159,57 @@ export const anchorService = {
     const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
       params.id
     )}`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${params.token}` },
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { Authorization: `Bearer ${params.token}` },
+      });
+    } catch {
+      return null;
+    }
+
     if (!res.ok) return null;
-    const data: any = await res.json();
-    return data?.transaction?.status ?? null;
+
+    try {
+      const data = parseJson(sep24TransactionResponseSchema, await res.json());
+      const rawStatus = data.transaction?.status;
+      return rawStatus ? rawStatus.trim().toLowerCase() : null;
+    } catch {
+      return null;
+    }
   },
 };
 
-/** Map a raw SEP-24 status to Mergepay's AnchorSessionStatus enum. */
+/** Map a raw SEP-24 status to Mergepay's stable AnchorSessionStatus values. */
 export function mapAnchorStatus(raw: string): string {
-  switch (raw) {
+  switch (raw.trim().toLowerCase()) {
     case "completed":
       return "completed";
     case "pending_user_transfer_start":
       return "pending_user_transfer_start";
-    case "error":
-    case "too_small":
-    case "too_large":
-      return "error";
+    case "pending_user_transfer_complete":
+      return "pending_user_transfer_complete";
+    case "pending_external":
+      return "pending_external";
+    case "pending_anchor":
+      return "pending_anchor";
+    case "pending_stellar":
+      return "pending_stellar";
     case "refunded":
       return "refunded";
     case "incomplete":
       return "incomplete";
+    case "error":
+    case "too_small":
+    case "too_large":
+    case "expired":
+      return "error";
     default:
       return "pending_anchor";
   }
+}
+
+/** Whether a normalized status is terminal and no longer needs polling. */
+export function isTerminalAnchorStatus(status: string): boolean {
+  return status === "completed" || status === "error" || status === "refunded";
 }

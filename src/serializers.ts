@@ -149,6 +149,9 @@ export function serializeAnchorSession(s: any) {
     interactiveUrl: s.interactiveUrl ?? null,
     externalTransactionId: s.externalTransactionId ?? null,
     status: s.status,
+    failureReason: s.failureReason ?? null,
+    retryCount: s.retryCount ?? 0,
+    lastPolledAt: s.lastPolledAt ? iso(s.lastPolledAt) : null,
     createdAt: iso(s.createdAt),
   };
 }

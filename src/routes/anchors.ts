@@ -7,6 +7,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { audit } from "../services/audit";
+import { ipKey } from "../services/rate-limit-keys";
 import { serializeAnchorSession } from "../serializers";
 
 export default async function anchorRoutes(app: FastifyInstance) {
@@ -136,33 +137,48 @@ export default async function anchorRoutes(app: FastifyInstance) {
   });
 
   // -- webhook (signed) -------------------------------------------------------
-  app.post("/anchors/webhook", async (req, reply) => {
-    const secret = (req.headers["x-anchor-signature"] ??
-      req.headers["x-webhook-secret"]) as string | undefined;
-    if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
-      return reply.code(200).send({ ok: true }); // don't reveal verification result
-    }
-    const body = z
-      .object({
-        transaction: z
-          .object({ id: z.string(), status: z.string() })
-          .optional(),
-        id: z.string().optional(),
-        status: z.string().optional(),
-      })
-      .passthrough()
-      .parse(req.body ?? {});
+  // Rate limiting here is abuse protection for an unauthenticated-until-
+  // checked endpoint; it never substitutes for the shared-secret check
+  // below, which remains the actual authentication/authorization gate.
+  app.post(
+    "/anchors/webhook",
+    {
+      config: {
+        rateLimit: {
+          max: config.RATE_LIMIT_ANCHOR_WEBHOOK_MAX,
+          timeWindow: config.RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS,
+          keyGenerator: ipKey("anchor.webhook"),
+        },
+      },
+    },
+    async (req, reply) => {
+      const secret = (req.headers["x-anchor-signature"] ??
+        req.headers["x-webhook-secret"]) as string | undefined;
+      if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
+        return reply.code(200).send({ ok: true }); // don't reveal verification result
+      }
+      const body = z
+        .object({
+          transaction: z
+            .object({ id: z.string(), status: z.string() })
+            .optional(),
+          id: z.string().optional(),
+          status: z.string().optional(),
+        })
+        .passthrough()
+        .parse(req.body ?? {});
 
-    const externalId = body.transaction?.id ?? body.id;
-    const status = body.transaction?.status ?? body.status;
-    if (externalId && status) {
-      await prisma.anchorSession.updateMany({
-        where: { externalTransactionId: externalId },
-        data: { status: mapAnchorStatus(status) },
-      });
+      const externalId = body.transaction?.id ?? body.id;
+      const status = body.transaction?.status ?? body.status;
+      if (externalId && status) {
+        await prisma.anchorSession.updateMany({
+          where: { externalTransactionId: externalId },
+          data: { status: mapAnchorStatus(status) },
+        });
+      }
+      return reply.code(200).send({ ok: true });
     }
-    return reply.code(200).send({ ok: true });
-  });
+  );
 }
 
 function constantTimeEqual(a: string, b: string): boolean {

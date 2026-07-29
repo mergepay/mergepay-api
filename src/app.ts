@@ -6,6 +6,8 @@ import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
 import { config } from "./config";
+import { PrismaRateLimitStore } from "./services/rate-limit-store";
+import { userOrIpKey } from "./services/rate-limit-keys";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
 import authRoutes from "./routes/auth";
@@ -57,10 +59,25 @@ export async function buildApp(): Promise<FastifyInstance> {
         },
     credentials: false,
   });
+  // Global default limit. Sensitive routes (SEP-10 auth, settlement
+  // submission, the SEP-24 callback) override this with their own,
+  // route-appropriate config — see routes/auth.ts, routes/settlements.ts,
+  // routes/anchors.ts. Keys are the authenticated user id when available,
+  // otherwise the resolved client IP — never a wallet public key.
+  //
+  // RATE_LIMIT_STORE=database shares counters across instances via Postgres
+  // (src/services/rate-limit-store.ts) and fails OPEN if that store errors
+  // (skipOnError), so a database hiccup degrades to "unlimited" rather than
+  // blocking all traffic. The default "memory" store is per-process and
+  // needs no failure handling of its own.
   await app.register(rateLimit, {
-    max: 100,
-    timeWindow: "1 minute",
+    max: config.RATE_LIMIT_GLOBAL_MAX,
+    timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
+    keyGenerator: userOrIpKey("global"),
     allowList: config.isTest ? () => true : undefined,
+    ...(config.RATE_LIMIT_STORE === "database"
+      ? { store: PrismaRateLimitStore, skipOnError: true }
+      : {}),
   });
   await app.register(multipart, {
     limits: { fileSize: 6 * 1024 * 1024, files: 1 },

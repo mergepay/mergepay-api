@@ -28,6 +28,27 @@ const schema = z.object({
   UPLOADS_DIR: z.string().default("./uploads"),
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
   NODE_ENV: z.string().default("development"),
+
+  // -- rate limiting ----------------------------------------------------------
+  // "memory" (default) keeps per-instance counters and is fine for a single
+  // API process. "database" persists counters in Postgres so limits are
+  // shared across multiple instances behind a load balancer; it adds a query
+  // per rate-limited request and fails OPEN (requests are allowed through)
+  // if that query errors, so a database outage degrades to "unlimited" rather
+  // than "everything blocked".
+  RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
+  RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().default(100),
+  RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().default(20),
+  RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().default(10),
+  RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  RATE_LIMIT_SETTLEMENT_CREATE_MAX: z.coerce.number().int().positive().default(20),
+  RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_MAX: z.coerce.number().int().positive().default(30),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().default(60),
+  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
 });
 
 const parsed = schema.parse(process.env);

@@ -239,3 +239,16 @@ model AuditLog {
   @@index([userId])
   @@map("audit_logs")
 }
+
+// Backing store for the optional database-backed rate limiter (see
+// src/services/rate-limit-store.ts). Only used when RATE_LIMIT_STORE=database;
+// the default in-memory store never touches this table. Rows are
+// short-lived counters, not business records — safe to truncate at any time.
+model RateLimitBucket {
+  key       String   @id
+  count     Int      @default(0)
+  resetAt   DateTime @map("reset_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("rate_limit_buckets")
+}

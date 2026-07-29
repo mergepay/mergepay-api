@@ -7,7 +7,11 @@ export interface MembershipContext {
   role: string;
 }
 
-/** Ensure the user is a member of the group; returns their membership row. */
+/**
+ * Ensure the user is currently a member of the group; returns their membership
+ * row. A missing membership is intentionally reported as not-found so callers
+ * cannot use an authenticated token to determine whether another group exists.
+ */
 export async function requireMembership(
   groupId: string,
   userId: string
@@ -15,16 +19,19 @@ export async function requireMembership(
   const member = await prisma.groupMember.findUnique({
     where: { groupId_userId: { groupId, userId } },
   });
+
   if (!member) {
-    // Don't leak existence — treat as not found for non-members.
-    const group = await prisma.group.findUnique({ where: { id: groupId } });
-    if (!group) throw Errors.notFound("Group not found");
-    throw Errors.forbidden("You are not a member of this group");
+    throw Errors.notFound("Group not found");
   }
+
   return { groupId, userId, role: member.role };
 }
 
-/** Ensure the user is an admin of the group. */
+/**
+ * Ensure the user is currently an administrator of the group. The role is
+ * always read from the database membership row and is never taken from
+ * request data.
+ */
 export async function requireAdmin(
   groupId: string,
   userId: string

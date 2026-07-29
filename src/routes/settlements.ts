@@ -9,6 +9,7 @@ import { requireMembership } from "../services/access";
 import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { userOrIpKey } from "../services/rate-limit-keys";
 import {
   serializeSettlement,
   serializeExpense,
@@ -27,8 +28,35 @@ const settlementInclude = { from: true, to: true } as const;
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
+  // Settlement submission builds a real Stellar payment XDR (create) or
+  // hands a signed one off for submission (confirm) — both are the kind of
+  // expensive, state-changing operation that needs its own explicit budget
+  // rather than sharing the blanket global limit. Rate-limiting runs as a
+  // preHandler (after the app.authenticate hook above sets req.user) so the
+  // key can be the authenticated user rather than falling back to IP.
+  const createLimit = {
+    config: {
+      rateLimit: {
+        max: config.RATE_LIMIT_SETTLEMENT_CREATE_MAX,
+        timeWindow: config.RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS,
+        hook: "preHandler" as const,
+        keyGenerator: userOrIpKey("settlement.create"),
+      },
+    },
+  };
+  const confirmLimit = {
+    config: {
+      rateLimit: {
+        max: config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX,
+        timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
+        hook: "preHandler" as const,
+        keyGenerator: userOrIpKey("settlement.confirm"),
+      },
+    },
+  };
+
   // -- settle a specific expense share ----------------------------------------
-  app.post("/expenses/:id/settle", async (req) => {
+  app.post("/expenses/:id/settle", createLimit, async (req) => {
     const auth = requireUser(req);
     const { id: expenseId } = z.object({ id: z.string() }).parse(req.params);
     const body = z
@@ -98,7 +126,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- freeform settle-up against net balance ---------------------------------
-  app.post("/groups/:id/settlements", async (req) => {
+  app.post("/groups/:id/settlements", createLimit, async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(groupId, auth.id);
@@ -156,7 +184,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
-  app.post("/settlements/:id/confirm", async (req, reply) => {
+  app.post("/settlements/:id/confirm", confirmLimit, async (req, reply) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);

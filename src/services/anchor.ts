@@ -27,6 +27,7 @@
  */
 
 import toml from "toml";
+import { z } from "zod";
 import { config } from "../config";
 import { Errors } from "../errors";
 
@@ -108,12 +109,29 @@ export const anchorService = {
     if (!res.ok) {
       throw Errors.upstream(`Could not load stellar.toml for ${homeDomain}`);
     }
-    const parsed = toml.parse(await res.text());
 
-    const assets = (parsed.CURRENCIES ?? []).map((c: any) => ({
-      code: c.code,
-      issuer: c.issuer ?? null,
-    }));
+    let parsed: any;
+    try {
+      parsed = toml.parse(await res.text());
+    } catch {
+      throw Errors.upstream("Anchor returned invalid stellar.toml");
+    }
+
+    const currencies = Array.isArray(parsed.CURRENCIES) ? parsed.CURRENCIES : [];
+    const assets = currencies
+      .filter((currency: any) => typeof currency?.code === "string")
+      .map((currency: any) => ({
+        code: currency.code,
+        issuer: typeof currency.issuer === "string" ? currency.issuer : null,
+      }));
+
+    if (
+      typeof parsed.WEB_AUTH_ENDPOINT !== "string" ||
+      typeof parsed.TRANSFER_SERVER_SEP0024 !== "string" ||
+      typeof parsed.SIGNING_KEY !== "string"
+    ) {
+      throw Errors.upstream("Anchor stellar.toml is missing required SEP-24 fields");
+    }
 
     const value: AnchorToml = {
       homeDomain,
@@ -134,7 +152,7 @@ export const anchorService = {
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
     const res = await fetch(url);
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 challenge request failed");
-    const data: any = await res.json();
+    const data = parseJson(challengeResponseSchema, await res.json());
     return {
       transaction: data.transaction,
       networkPassphrase: data.network_passphrase ?? config.networkPassphrase,
@@ -149,8 +167,7 @@ export const anchorService = {
       body: JSON.stringify({ transaction: signedXdr }),
     });
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 token exchange failed");
-    const data: any = await res.json();
-    return data.token;
+    return parseJson(tokenResponseSchema, await res.json()).token;
   },
 
   /** Step 3: start a SEP-24 interactive deposit/withdraw. */
@@ -175,8 +192,7 @@ export const anchorService = {
       }),
     });
     if (!res.ok) throw Errors.upstream("Anchor interactive flow request failed");
-    const data: any = await res.json();
-    return { url: data.url, id: data.id };
+    return parseJson(interactiveResponseSchema, await res.json());
   },
 
   /**
@@ -193,12 +209,24 @@ export const anchorService = {
     const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
       params.id
     )}`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${params.token}` },
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { Authorization: `Bearer ${params.token}` },
+      });
+    } catch {
+      return null;
+    }
+
     if (!res.ok) return null;
-    const data: any = await res.json();
-    return data?.transaction?.status ?? null;
+
+    try {
+      const data = parseJson(sep24TransactionResponseSchema, await res.json());
+      const rawStatus = data.transaction?.status;
+      return rawStatus ? rawStatus.trim().toLowerCase() : null;
+    } catch {
+      return null;
+    }
   },
 
   /**
@@ -388,4 +416,9 @@ export function mapAnchorStatus(raw: string): string {
     default:
       return "pending_anchor";
   }
+}
+
+/** Whether a normalized status is terminal and no longer needs polling. */
+export function isTerminalAnchorStatus(status: string): boolean {
+  return status === "completed" || status === "error" || status === "refunded";
 }

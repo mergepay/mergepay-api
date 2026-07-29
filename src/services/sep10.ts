@@ -33,10 +33,43 @@ export function serverKeypair(): Keypair {
   return _serverKeypair;
 }
 
+function cleanupChallenges(now: number): void {
+  for (const [hash, challenge] of issuedChallenges) {
+    if (challenge.expiresAt <= now) issuedChallenges.delete(hash);
+  }
+  for (const [hash, expiresAt] of consumedChallenges) {
+    if (expiresAt <= now) consumedChallenges.delete(hash);
+  }
+}
+
+function validAccount(account: string): boolean {
+  try {
+    Keypair.fromPublicKey(account);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function genericChallengeError(): never {
+  throw Errors.badRequest("invalid_challenge", "Invalid or expired authentication challenge");
+}
+
+function operationValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  return String(value);
+}
+
 export function buildChallenge(account: string): {
   transaction: string;
   networkPassphrase: string;
 } {
+  if (!validAccount(account)) {
+    throw Errors.badRequest("invalid_account", "Not a valid Stellar public key");
+  }
+
   const transaction = WebAuth.buildChallengeTx(
     serverKeypair(),
     account,
@@ -45,6 +78,15 @@ export function buildChallenge(account: string): {
     config.networkPassphrase,
     config.WEB_AUTH_DOMAIN
   );
+
+  const parsed = new Transaction(transaction, config.networkPassphrase);
+  const now = Date.now();
+  cleanupChallenges(now);
+  issuedChallenges.set(parsed.hash().toString("hex"), {
+    account,
+    expiresAt: now + CHALLENGE_TTL_SECONDS * 1000,
+  });
+
   return { transaction, networkPassphrase: config.networkPassphrase };
 }
 
@@ -194,6 +236,12 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
     }
     invalidChallenge();
   }
+
+  // Mark only after all validation and signature checks pass. JavaScript's
+  // synchronous map update makes subsequent requests unable to reuse it.
+  const expiresAt = issuedChallenges.get(challengeHash)?.expiresAt ?? now;
+  issuedChallenges.delete(challengeHash);
+  consumedChallenges.set(challengeHash, expiresAt);
 
   return clientAccountId;
 }

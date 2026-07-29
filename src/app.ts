@@ -1,4 +1,4 @@
-import Fastify, { FastifyInstance } from "fastify";
+import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -6,7 +6,7 @@ import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
 import { config } from "./config";
-import { validateAsset, supportedAssetCodes } from "./services/assets";
+import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
 import authRoutes from "./routes/auth";
@@ -19,21 +19,16 @@ import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import { getCorrelationId } from "./lib/correlation";
 
-/** Validate supported asset configuration at startup. */
-function validateAssetConfig(): void {
-  // Eagerly check each supported asset so misconfiguration surfaces at boot.
-  // This runs once when the app starts, catching issues like an invalid
-  // STABLE_ASSET_ISSUER before any request is processed.
-  const codes = supportedAssetCodes();
-  for (const code of codes) {
+function securityKey(request: FastifyRequest): string {
+  const authorization = request.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) {
     try {
-      validateAsset(code);
-    } catch (e: any) {
-      throw new Error(
-        `Startup asset validation failed for "${code}": ${e?.message ?? e}`
-      );
+      return `user:${verifyToken(authorization.slice("Bearer ".length).trim()).id}`;
+    } catch {
+      // Invalid credentials are deliberately grouped by client IP.
     }
   }
+  return `ip:${request.ip}`;
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -78,7 +73,7 @@ export async function buildApp(): Promise<FastifyInstance> {
               ? { target: "pino-pretty", options: { colorize: true } }
               : undefined,
         },
-    bodyLimit: 6 * 1024 * 1024,
+    bodyLimit: config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024,
   });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -135,13 +130,80 @@ export async function buildApp(): Promise<FastifyInstance> {
         },
     credentials: false,
   });
+  // Global default limit. Sensitive routes (SEP-10 auth, settlement
+  // submission, the SEP-24 callback) override this with their own,
+  // route-appropriate config — see routes/auth.ts, routes/settlements.ts,
+  // routes/anchors.ts. Keys are the authenticated user id when available,
+  // otherwise the resolved client IP — never a wallet public key.
+  //
+  // RATE_LIMIT_STORE=database shares counters across instances via Postgres
+  // (src/services/rate-limit-store.ts) and fails OPEN if that store errors
+  // (skipOnError), so a database hiccup degrades to "unlimited" rather than
+  // blocking all traffic. The default "memory" store is per-process and
+  // needs no failure handling of its own.
   await app.register(rateLimit, {
     max: 100,
-    timeWindow: "1 minute",
-    allowList: config.isTest ? () => true : undefined,
+    timeWindow: config.RATE_LIMIT_WINDOW_MS,
+    keyGenerator: securityKey,
+    addHeaders: true,
+    errorResponseBuilder: (request) => ({
+      error: "RATE_LIMITED",
+      message: "Too many requests. Please retry later.",
+      statusCode: 429,
+      requestId: request.id,
+    }),
   });
   await app.register(multipart, {
-    limits: { fileSize: 6 * 1024 * 1024, files: 1 },
+    limits: {
+      fileSize: config.MULTIPART_FILE_SIZE_BYTES,
+      files: 1,
+      parts: 10,
+    },
+  });
+
+  // Apply stricter policies only to expensive or abuse-prone endpoints.
+  app.addHook("onRoute", (routeOptions) => {
+    const url = routeOptions.url;
+    let max: number | undefined;
+    let bodyLimit: number | undefined;
+
+    if (url === "/auth/challenge" || url === "/auth/verify") {
+      max = config.AUTH_RATE_LIMIT_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/expenses/:id/settle" ||
+      url === "/groups/:id/settlements" ||
+      url === "/settlements/:id/submit"
+    ) {
+      max = config.SETTLEMENT_RATE_LIMIT_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/anchors/deposit" ||
+      url === "/anchors/withdraw" ||
+      url === "/anchors/sessions/:id/complete" ||
+      url === "/uploads/receipt"
+    ) {
+      max = config.SEP24_RATE_LIMIT_MAX;
+      bodyLimit = url === "/uploads/receipt"
+        ? config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024
+        : config.AUTH_BODY_LIMIT_BYTES;
+    }
+
+    if (max !== undefined) {
+      const options = routeOptions as typeof routeOptions & {
+        config?: Record<string, unknown>;
+        bodyLimit?: number;
+      };
+      options.config = {
+        ...(options.config ?? {}),
+        rateLimit: {
+          max,
+          timeWindow: config.RATE_LIMIT_WINDOW_MS,
+          keyGenerator: securityKey,
+        },
+      };
+      options.bodyLimit = bodyLimit;
+    }
   });
 
   await app.register(fastifyStatic, {

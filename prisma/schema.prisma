@@ -24,6 +24,7 @@ model User {
   invites          Invite[]
   anchorSessions   AnchorSession[]
   auditLogs        AuditLog[]
+  idempotencyKeys  IdempotencyKey[]
 
   @@map("users")
 }
@@ -216,12 +217,21 @@ model AnchorSession {
 }
 
 model IdempotencyKey {
-  id            String   @id @default(cuid())
-  key           String   @unique
-  requestHash   String   @map("request_hash")
-  responseJson  String   @map("response_json")
-  createdAt     DateTime @default(now()) @map("created_at")
+  id           String   @id @default(cuid())
+  userId       String   @map("user_id")
+  // Distinguishes the operation an idempotency key applies to (e.g.
+  // "settlement.create" or "settlement.confirm") so the same client-chosen
+  // key string can't be replayed across unrelated endpoints.
+  scope        String
+  key          String
+  requestHash  String   @map("request_hash")
+  responseJson String   @map("response_json")
+  createdAt    DateTime @default(now()) @map("created_at")
 
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, scope, key])
+  @@index([userId])
   @@map("idempotency_keys")
 }
 

@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
@@ -65,6 +64,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         assetIssuer: z.string().nullable().optional(),
       })
       .parse(req.body ?? {});
+    const idempotencyKey = readIdempotencyKey(req.headers);
 
     const expense = await prisma.expense.findUnique({
       where: { id: expenseId },
@@ -86,43 +86,60 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const assetIssuer =
       body.assetCode !== undefined ? body.assetIssuer ?? null : expense.assetIssuer;
 
-    const code = shortCode();
-    const settlement = await prisma.settlement.create({
-      data: {
-        shortCode: code,
-        groupId: expense.groupId,
-        fromUserId: auth.id,
-        toUserId: expense.payerUserId,
-        amount: myShare.shareAmount,
-        assetCode,
-        assetIssuer,
-        status: "pending",
-        memo: memoText(code),
-        expenseId: expense.id,
-        expenseShareId: myShare.id,
+    return runIdempotent({
+      userId: auth.id,
+      scope: "settlement.create",
+      key: idempotencyKey,
+      resourceId: expenseId,
+      payload: body,
+      operation: async (tx) => {
+        // Re-check inside the atomic unit: a concurrent request without an
+        // idempotency key (or a different one) could have already settled
+        // this share while this request was validating above.
+        const freshShare = await tx.expenseShare.findUnique({ where: { id: myShare.id } });
+        if (!freshShare || freshShare.status === "settled") {
+          throw Errors.conflict("already_settled", "Your share is already settled");
+        }
+
+        const code = shortCode();
+        const settlement = await tx.settlement.create({
+          data: {
+            shortCode: code,
+            groupId: expense.groupId,
+            fromUserId: auth.id,
+            toUserId: expense.payerUserId,
+            amount: myShare.shareAmount,
+            assetCode,
+            assetIssuer,
+            status: "pending",
+            memo: memoText(code),
+            expenseId: expense.id,
+            expenseShareId: myShare.id,
+          },
+          include: settlementInclude,
+        });
+
+        await tx.expenseShare.update({
+          where: { id: myShare.id },
+          data: { status: "settling" },
+        });
+
+        const xdr = await buildSettlementXdr({
+          fromPublicKey: auth.stellarPublicKey,
+          toPublicKey: expense.payer.stellarPublicKey,
+          assetCode,
+          assetIssuer,
+          amount: myShare.shareAmount.toString(),
+          memoCode: code,
+        });
+
+        return {
+          settlement: serializeSettlement(settlement),
+          xdr,
+          networkPassphrase: config.networkPassphrase,
+        };
       },
-      include: settlementInclude,
     });
-
-    await prisma.expenseShare.update({
-      where: { id: myShare.id },
-      data: { status: "settling" },
-    });
-
-    const xdr = await buildSettlementXdr({
-      fromPublicKey: auth.stellarPublicKey,
-      toPublicKey: expense.payer.stellarPublicKey,
-      assetCode,
-      assetIssuer,
-      amount: myShare.shareAmount.toString(),
-      memoCode: code,
-    });
-
-    return {
-      settlement: serializeSettlement(settlement),
-      xdr,
-      networkPassphrase: config.networkPassphrase,
-    };
   });
 
   // -- freeform settle-up against net balance ---------------------------------
@@ -138,6 +155,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         assetIssuer: z.string().nullable().optional(),
       })
       .parse(req.body);
+    const idempotencyKey = readIdempotencyKey(req.headers);
 
     validateAmount(body.amount);
     validateAsset(body.assetCode, body.assetIssuer ?? null);
@@ -151,36 +169,45 @@ export default async function settlementRoutes(app: FastifyInstance) {
     });
     if (!recipient) throw Errors.badRequest("invalid_recipient", "Recipient is not a member");
 
-    const code = shortCode();
-    const settlement = await prisma.settlement.create({
-      data: {
-        shortCode: code,
-        groupId,
-        fromUserId: auth.id,
-        toUserId: body.toUserId,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        status: "pending",
-        memo: memoText(code),
+    return runIdempotent({
+      userId: auth.id,
+      scope: "settlement.create",
+      key: idempotencyKey,
+      resourceId: groupId,
+      payload: body,
+      operation: async (tx) => {
+        const code = shortCode();
+        const settlement = await tx.settlement.create({
+          data: {
+            shortCode: code,
+            groupId,
+            fromUserId: auth.id,
+            toUserId: body.toUserId,
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            status: "pending",
+            memo: memoText(code),
+          },
+          include: settlementInclude,
+        });
+
+        const xdr = await buildSettlementXdr({
+          fromPublicKey: auth.stellarPublicKey,
+          toPublicKey: recipient.user.stellarPublicKey,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          amount: body.amount,
+          memoCode: code,
+        });
+
+        return {
+          settlement: serializeSettlement(settlement),
+          xdr,
+          networkPassphrase: config.networkPassphrase,
+        };
       },
-      include: settlementInclude,
     });
-
-    const xdr = await buildSettlementXdr({
-      fromPublicKey: auth.stellarPublicKey,
-      toPublicKey: recipient.user.stellarPublicKey,
-      assetCode: body.assetCode,
-      assetIssuer: body.assetIssuer ?? null,
-      amount: body.amount,
-      memoCode: code,
-    });
-
-    return {
-      settlement: serializeSettlement(settlement),
-      xdr,
-      networkPassphrase: config.networkPassphrase,
-    };
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
@@ -188,93 +215,63 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+    const idempotencyKey = readIdempotencyKey(req.headers);
 
-    const idempotencyKey = (req.headers["idempotency-key"] as string | undefined) ?? null;
-    const requestHash = idempotencyKey
-      ? crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")
-      : null;
+    return runIdempotent({
+      userId: auth.id,
+      scope: "settlement.confirm",
+      key: idempotencyKey,
+      resourceId: id,
+      payload: body,
+      operation: async (tx) => {
+        const settlement = await tx.settlement.findUnique({
+          where: { id },
+          include: settlementInclude,
+        });
+        if (!settlement) throw Errors.notFound("Settlement not found");
+        if (settlement.fromUserId !== auth.id) {
+          throw Errors.forbidden("Only the payer can confirm this settlement");
+        }
 
-    if (idempotencyKey) {
-      const existing = await prisma.idempotencyKey.findUnique({
-        where: { key: idempotencyKey },
-      });
-      if (existing) {
-        if (existing.requestHash !== requestHash) {
-          return reply.code(409).send({
-            error: "idempotency_conflict",
-            message: "Idempotency key already used with a different request body",
-            statusCode: 409,
-            requestId: req.id as string,
+        // Already confirmed, or moved past "pending" by a prior (possibly
+        // concurrent) confirm — return the current state rather than
+        // re-submitting or erroring, so retries are always safe.
+        if (settlement.status !== "pending") {
+          return { settlement: serializeSettlement(settlement) };
+        }
+
+        // Guard the transition with a conditional update rather than an
+        // unconditional one: if a concurrent confirm on the same settlement
+        // (e.g. a different idempotency key, or no key at all) already won
+        // the race and moved the status off "pending" between the read
+        // above and here, this update affects zero rows and we simply
+        // re-read the winning state instead of clobbering it.
+        const { count } = await tx.settlement.updateMany({
+          where: { id, status: "pending" },
+          data: {
+            transactionXdr: body.signedXdr,
+            status: "submitted",
+          },
+        });
+
+        const finalSettlement = await tx.settlement.findUniqueOrThrow({
+          where: { id },
+          include: settlementInclude,
+        });
+
+        if (count > 0) {
+          await audit({
+            userId: auth.id,
+            action: "settlement.confirm",
+            entityType: "settlement",
+            entityId: id,
+            metadata: { status: "submitted" },
           });
         }
-        return reply.code(200).send(JSON.parse(existing.responseJson));
-      }
-    }
 
-    const settlement = await prisma.settlement.findUnique({
-      where: { id },
-      include: { from: true, to: true },
-    });
-    if (!settlement) throw Errors.notFound("Settlement not found");
-    if (settlement.fromUserId !== auth.id) {
-      throw Errors.forbidden("Only the payer can confirm this settlement");
-    }
-    if (settlement.status === "confirmed") {
-      const response200 = { settlement: serializeSettlement(settlement) };
-      if (idempotencyKey) {
-        await prisma.idempotencyKey.create({
-          data: {
-            key: idempotencyKey,
-            requestHash: requestHash!,
-            responseJson: JSON.stringify(response200),
-          },
-        });
-      }
-      return response200;
-    }
-
-    if (settlement.status !== "pending") {
-      const response200 = { settlement: serializeSettlement(settlement) };
-      if (idempotencyKey) {
-        await prisma.idempotencyKey.create({
-          data: {
-            key: idempotencyKey,
-            requestHash: requestHash!,
-            responseJson: JSON.stringify(response200),
-          },
-        });
-      }
-      return response200;
-    }
-
-    const updated = await prisma.settlement.update({
-      where: { id },
-      data: {
-        transactionXdr: body.signedXdr,
-        status: "submitted",
+        return { settlement: serializeSettlement(finalSettlement) };
       },
-      include: settlementInclude,
     });
-
-    await audit({
-      userId: auth.id,
-      action: "settlement.confirm",
-      entityType: "settlement",
-      entityId: id,
-      metadata: { status: "submitted" },
-    });
-
-    const response200 = { settlement: serializeSettlement(updated) };
-    if (idempotencyKey) {
-      await prisma.idempotencyKey.create({
-        data: {
-          key: idempotencyKey,
-          requestHash: requestHash!,
-          responseJson: JSON.stringify(response200),
-        },
-      });
-    }
-    return response200;
   });
 
   // -- balances + suggestions -------------------------------------------------

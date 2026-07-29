@@ -18,6 +18,10 @@ const schema = z.object({
   // If not set, derived from API_PUBLIC_URL so the deployed domain is used automatically.
   SEP10_HOME_DOMAIN: z.string().optional(),
   WEB_AUTH_DOMAIN: z.string().optional(),
+  // If not set, both derived from API_PUBLIC_URL. Tokens are rejected unless
+  // they were issued for this exact issuer/audience pair.
+  JWT_ISSUER: z.string().optional(),
+  JWT_AUDIENCE: z.string().optional(),
   ANCHOR_HOME_DOMAIN: z.string().default("testanchor.stellar.org"),
   ANCHOR_NAME: z.string().default("Stellar Test Anchor"),
   ANCHOR_WEBHOOK_SECRET: z.string().default("change-me"),
@@ -42,11 +46,25 @@ function hostOf(url: string): string {
 
 const apiHost = hostOf(parsed.API_PUBLIC_URL);
 
+const isTest = process.env.NODE_ENV === "test" || process.env.VITEST === "true";
+
+// A missing signing key silently falls back to a random per-process keypair.
+// That's fine for local dev/tests, but in production it would mean every
+// instance behind a load balancer (and every restart) mints challenges under
+// a different key, breaking verification non-deterministically.
+if (parsed.NODE_ENV === "production" && !parsed.SEP10_SIGNING_SECRET && !isTest) {
+  throw new Error(
+    "SEP10_SIGNING_SECRET must be set in production (see: npm run gen:sep10key)"
+  );
+}
+
 export const config = {
   ...parsed,
   SEP10_HOME_DOMAIN: parsed.SEP10_HOME_DOMAIN ?? apiHost,
   WEB_AUTH_DOMAIN: parsed.WEB_AUTH_DOMAIN ?? apiHost,
-  isTest: process.env.NODE_ENV === "test" || process.env.VITEST === "true",
+  JWT_ISSUER: parsed.JWT_ISSUER ?? apiHost,
+  JWT_AUDIENCE: parsed.JWT_AUDIENCE ?? apiHost,
+  isTest,
   networkPassphrase:
     parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET,
   jwtExpiresIn: "12h" as const,

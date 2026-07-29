@@ -6,6 +6,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
+import { applyAnchorSessionTransition } from "../services/anchor-status";
 import { audit } from "../services/audit";
 import { serializeAnchorSession } from "../serializers";
 
@@ -111,13 +112,17 @@ export default async function anchorRoutes(app: FastifyInstance) {
         account: auth.stellarPublicKey,
       });
 
-      const updated = await prisma.anchorSession.update({
-        where: { id },
-        data: {
+      // Never store the anchor JWT alongside the transition's audit
+      // metadata — only the status change and its source are recorded.
+      const { session: updated } = await applyAnchorSessionTransition({
+        sessionId: id,
+        nextStatus: "pending_user_transfer_start",
+        source: "user",
+        ownerUserId: auth.id,
+        extraData: {
           interactiveUrl: interactive.url,
           externalTransactionId: interactive.id,
           anchorToken: token,
-          status: "pending_user_transfer_start",
         },
       });
 
@@ -156,10 +161,27 @@ export default async function anchorRoutes(app: FastifyInstance) {
     const externalId = body.transaction?.id ?? body.id;
     const status = body.transaction?.status ?? body.status;
     if (externalId && status) {
-      await prisma.anchorSession.updateMany({
+      const nextStatus = mapAnchorStatus(status);
+      // externalTransactionId is anchor-assigned per session; there is
+      // ordinarily exactly one match, but iterate defensively rather than
+      // assuming uniqueness at the database level.
+      const sessions = await prisma.anchorSession.findMany({
         where: { externalTransactionId: externalId },
-        data: { status: mapAnchorStatus(status) },
+        select: { id: true },
       });
+      for (const { id: sessionId } of sessions) {
+        // Duplicate deliveries and invalid regressions (e.g. a stale
+        // "pending_anchor" arriving after "completed") are silently ignored
+        // by applyAnchorSessionTransition rather than applied — no
+        // ownership check applies here since the anchor's shared-secret
+        // signature (checked above) is the trust boundary for this route,
+        // not a per-user JWT.
+        await applyAnchorSessionTransition({
+          sessionId,
+          nextStatus,
+          source: "webhook",
+        });
+      }
     }
     return reply.code(200).send({ ok: true });
   });

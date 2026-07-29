@@ -4,6 +4,7 @@ import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
+import { applyAnchorSessionTransition } from "../services/anchor-status";
 import { runReconciliation, startReconciliation } from "./reconciliation";
 
 interface SettlementSubmissionRecord {
@@ -62,9 +63,10 @@ export async function reconcileAnchors(): Promise<void> {
       });
 
       if (status) {
-        await prisma.anchorSession.update({
-          where: { id: session.id },
-          data: { status: mapAnchorStatus(status) },
+        await applyAnchorSessionTransition({
+          sessionId: session.id,
+          nextStatus: mapAnchorStatus(status),
+          source: "poll",
         });
       }
     } catch {

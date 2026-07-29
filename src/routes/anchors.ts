@@ -8,7 +8,9 @@ import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { applyAnchorSessionTransition } from "../services/anchor-status";
 import { audit } from "../services/audit";
+import { ipKey } from "../services/rate-limit-keys";
 import { serializeAnchorSession } from "../serializers";
+import { validateAsset } from "../services/assets";
 
 export default async function anchorRoutes(app: FastifyInstance) {
   // -- list anchors (public-ish, but behind auth for consistency) -------------
@@ -52,6 +54,9 @@ export default async function anchorRoutes(app: FastifyInstance) {
     const body = z
       .object({ assetCode: z.string().min(1), anchorName: z.string().optional() })
       .parse(req.body);
+
+    // Validate that the requested asset is supported.
+    validateAsset(body.assetCode);
 
     const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
     const challenge = await anchorService.getChallenge(
@@ -141,50 +146,48 @@ export default async function anchorRoutes(app: FastifyInstance) {
   });
 
   // -- webhook (signed) -------------------------------------------------------
-  app.post("/anchors/webhook", async (req, reply) => {
-    const secret = (req.headers["x-anchor-signature"] ??
-      req.headers["x-webhook-secret"]) as string | undefined;
-    if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
-      return reply.code(200).send({ ok: true }); // don't reveal verification result
-    }
-    const body = z
-      .object({
-        transaction: z
-          .object({ id: z.string(), status: z.string() })
-          .optional(),
-        id: z.string().optional(),
-        status: z.string().optional(),
-      })
-      .passthrough()
-      .parse(req.body ?? {});
+  // Rate limiting here is abuse protection for an unauthenticated-until-
+  // checked endpoint; it never substitutes for the shared-secret check
+  // below, which remains the actual authentication/authorization gate.
+  app.post(
+    "/anchors/webhook",
+    {
+      config: {
+        rateLimit: {
+          max: config.RATE_LIMIT_ANCHOR_WEBHOOK_MAX,
+          timeWindow: config.RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS,
+          keyGenerator: ipKey("anchor.webhook"),
+        },
+      },
+    },
+    async (req, reply) => {
+      const secret = (req.headers["x-anchor-signature"] ??
+        req.headers["x-webhook-secret"]) as string | undefined;
+      if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
+        return reply.code(200).send({ ok: true }); // don't reveal verification result
+      }
+      const body = z
+        .object({
+          transaction: z
+            .object({ id: z.string(), status: z.string() })
+            .optional(),
+          id: z.string().optional(),
+          status: z.string().optional(),
+        })
+        .passthrough()
+        .parse(req.body ?? {});
 
-    const externalId = body.transaction?.id ?? body.id;
-    const status = body.transaction?.status ?? body.status;
-    if (externalId && status) {
-      const nextStatus = mapAnchorStatus(status);
-      // externalTransactionId is anchor-assigned per session; there is
-      // ordinarily exactly one match, but iterate defensively rather than
-      // assuming uniqueness at the database level.
-      const sessions = await prisma.anchorSession.findMany({
-        where: { externalTransactionId: externalId },
-        select: { id: true },
-      });
-      for (const { id: sessionId } of sessions) {
-        // Duplicate deliveries and invalid regressions (e.g. a stale
-        // "pending_anchor" arriving after "completed") are silently ignored
-        // by applyAnchorSessionTransition rather than applied — no
-        // ownership check applies here since the anchor's shared-secret
-        // signature (checked above) is the trust boundary for this route,
-        // not a per-user JWT.
-        await applyAnchorSessionTransition({
-          sessionId,
-          nextStatus,
-          source: "webhook",
+      const externalId = body.transaction?.id ?? body.id;
+      const status = body.transaction?.status ?? body.status;
+      if (externalId && status) {
+        await prisma.anchorSession.updateMany({
+          where: { externalTransactionId: externalId },
+          data: { status: mapAnchorStatus(status) },
         });
       }
+      return reply.code(200).send({ ok: true });
     }
-    return reply.code(200).send({ ok: true });
-  });
+  );
 }
 
 function constantTimeEqual(a: string, b: string): boolean {

@@ -4,7 +4,7 @@ import { Networks } from "@stellar/stellar-sdk";
 
 const schema = z.object({
   DATABASE_URL: z.string().default("postgresql://postgres:postgres@localhost:5432/mergepay"),
-  PORT: z.coerce.number().default(4000),
+  PORT: z.coerce.number().int().positive().default(4000),
   API_PUBLIC_URL: z.string().default("http://localhost:4000"),
   // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
   WEB_URL: z.string().default("*"),
@@ -28,6 +28,29 @@ const schema = z.object({
   UPLOADS_DIR: z.string().default("./uploads"),
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
   NODE_ENV: z.string().default("development"),
+
+  // Security-sensitive endpoint policies.
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  SETTLEMENT_RATE_LIMIT_MAX: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(100000)
+    .default(20),
+  SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  AUTH_BODY_LIMIT_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(10 * 1024 * 1024)
+    .default(256 * 1024),
+  MULTIPART_FILE_SIZE_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(50 * 1024 * 1024)
+    .default(5 * 1024 * 1024),
 });
 
 const parsed = schema.parse(process.env);

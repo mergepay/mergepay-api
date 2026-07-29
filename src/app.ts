@@ -16,13 +16,43 @@ import treasuryRoutes from "./routes/treasury";
 import anchorRoutes from "./routes/anchors";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
+import { getCorrelationId } from "./lib/correlation";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
+    // Disable Fastify's unvalidated request-id header handling. The incoming
+    // values are validated by genReqId before becoming request.id.
+    requestIdHeader: false,
+    genReqId: (request) =>
+      getCorrelationId(
+        request.headers["x-correlation-id"] ?? request.headers["x-request-id"]
+      ),
     logger: config.isTest
       ? false
       : {
           level: process.env.LOG_LEVEL ?? "info",
+          redact: {
+            paths: [
+              "req.headers.authorization",
+              "req.headers.cookie",
+              "authorization",
+              "cookie",
+              "token",
+              "accessToken",
+              "refreshToken",
+              "signedXdr",
+              "transactionXdr",
+              "privateKey",
+              "secret",
+              "password",
+              "body.token",
+              "body.signedXdr",
+              "body.transactionXdr",
+              "body.privateKey",
+              "body.password",
+            ],
+            censor: "[REDACTED]",
+          },
           transport:
             config.NODE_ENV === "development"
               ? { target: "pino-pretty", options: { colorize: true } }
@@ -31,11 +61,40 @@ export async function buildApp(): Promise<FastifyInstance> {
     bodyLimit: 6 * 1024 * 1024,
   });
 
+  app.addHook("onRequest", async (request, reply) => {
+    const correlationId = getCorrelationId(request.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
+    request.log.info({ correlationId }, "request received");
+  });
+
+  app.addHook("onResponse", async (request, reply) => {
+    const correlationId = getCorrelationId(request.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
+    request.log.info(
+      {
+        correlationId,
+        statusCode: reply.statusCode,
+        method: request.method,
+        route: request.routeOptions.url,
+      },
+      "request completed"
+    );
+  });
+
+  app.addHook("onError", async (request, _reply, error) => {
+    request.log.error(
+      {
+        correlationId: getCorrelationId(request.id),
+        statusCode: (error as Error & { statusCode?: number }).statusCode ?? 500,
+        errorCode: (error as { code?: string }).code ?? "INTERNAL_ERROR",
+      },
+      "request failed"
+    );
+  });
+
   await app.register(helmet, { contentSecurityPolicy: false });
-  // CORS allowlist. "*" allows any origin; otherwise a comma-separated whitelist.
-  // Trailing slashes are stripped so "https://app.com/" still matches the
-  // browser-sent origin "https://app.com". Vercel preview deploys (*.vercel.app)
-  // are also allowed when the configured origin is itself a vercel.app domain.
   const allowAll = config.WEB_URL === "*";
   const allowed = config.WEB_URL
     .split(",")
@@ -46,7 +105,6 @@ export async function buildApp(): Promise<FastifyInstance> {
     origin: allowAll
       ? true
       : (origin, cb) => {
-          // Same-origin / server-to-server requests have no Origin header.
           if (!origin) return cb(null, true);
           const normalized = origin.replace(/\/+$/, "");
           if (allowed.includes(normalized)) return cb(null, true);
@@ -66,7 +124,6 @@ export async function buildApp(): Promise<FastifyInstance> {
     limits: { fileSize: 6 * 1024 * 1024, files: 1 },
   });
 
-  // Serve uploaded receipts.
   await app.register(fastifyStatic, {
     root: path.resolve(config.UPLOADS_DIR),
     prefix: "/uploads/",
@@ -77,22 +134,23 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(errorHandlerPlugin);
 
   app.setNotFoundHandler((req, reply) => {
+    const correlationId = getCorrelationId(req.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
       error: "NOT_FOUND",
       message: "Route not found",
       statusCode: 404,
-      requestId: req.id as string,
+      requestId: correlationId,
     });
   });
 
-  // Health check.
   app.get("/health", async () => ({
     status: "ok",
     network: config.STELLAR_NETWORK,
     time: new Date().toISOString(),
   }));
 
-  // Routes.
   await app.register(authRoutes);
   await app.register(groupRoutes);
   await app.register(expenseRoutes);

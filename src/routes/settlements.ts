@@ -14,6 +14,7 @@ import {
   serializeExpense,
   serializeTreasuryTx,
 } from "../serializers";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
@@ -290,42 +291,96 @@ export default async function settlementRoutes(app: FastifyInstance) {
   app.get("/groups/:id/ledger", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
     await requireMembership(groupId, auth.id);
+
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
+    const cursorFilter = decodedCursor
+      ? {
+          OR: [
+            { createdAt: { lt: decodedCursor.createdAt } },
+            {
+              createdAt: decodedCursor.createdAt,
+              id: { lt: decodedCursor.id },
+            },
+          ],
+        }
+      : {};
+
+    const takeCount = limit + 1;
 
     const [expenses, settlements, treasuryTxs] = await Promise.all([
       prisma.expense.findMany({
-        where: { groupId },
+        where: { groupId, ...cursorFilter },
         include: { payer: true, shares: { include: { user: true } } },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: takeCount,
       }),
       prisma.settlement.findMany({
-        where: { groupId },
+        where: { groupId, ...cursorFilter },
         include: { from: true, to: true },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: takeCount,
       }),
       prisma.treasuryTransaction.findMany({
-        where: { groupId },
+        where: { groupId, ...cursorFilter },
         include: { user: true },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: takeCount,
       }),
     ]);
 
     const entries = [
       ...expenses.map((e) => ({
         type: "expense" as const,
-        createdAt: e.createdAt.toISOString(),
+        createdAt: e.createdAt,
+        id: e.id,
         expense: serializeExpense(e),
       })),
       ...settlements.map((s) => ({
         type: "settlement" as const,
-        createdAt: s.createdAt.toISOString(),
+        createdAt: s.createdAt,
+        id: s.id,
         settlement: serializeSettlement(s),
       })),
       ...treasuryTxs.map((t) => ({
         type: "treasury" as const,
-        createdAt: t.createdAt.toISOString(),
+        createdAt: t.createdAt,
+        id: t.id,
         treasuryTransaction: serializeTreasuryTx(t),
       })),
-    ].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    ].sort((a, b) => {
+      if (a.createdAt < b.createdAt) return 1;
+      if (a.createdAt > b.createdAt) return -1;
+      return a.id < b.id ? 1 : -1;
+    });
 
-    return { entries };
+    const hasMore = entries.length > limit;
+    const results = hasMore ? entries.slice(0, limit) : entries;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
+
+    return {
+      entries: results.map((r) => {
+        const { id, ...rest } = r;
+        return {
+          ...rest,
+          createdAt: r.createdAt.toISOString(),
+        };
+      }),
+      meta: { nextCursor, hasMore },
+    };
   });
 }
 

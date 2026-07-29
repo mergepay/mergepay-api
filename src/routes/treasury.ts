@@ -95,6 +95,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       })
       .parse(req.body);
 
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
+
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
@@ -150,6 +153,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         destination: z.string(),
       })
       .parse(req.body);
+
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     if (!StrKey.isValidEd25519PublicKey(body.destination)) {
       throw Errors.badRequest("invalid_destination", "Invalid destination public key");

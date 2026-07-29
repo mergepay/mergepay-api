@@ -29,12 +29,202 @@ interface SettlementSubmissionRecord {
 
 const log = pino({ name: "worker" });
 
-const SETTLEMENT_MAX_RETRIES = 3;
-const RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+export const SETTLEMENT_MAX_RETRIES = 3;
+export const RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
 
-// ---------------------------------------------------------------------------
-// Existing tasks
-// ---------------------------------------------------------------------------
+const claimedSettlements = new Set<string>();
+const claimedAnchors = new Set<string>();
+
+class PermanentSettlementError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentSettlementError";
+  }
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function safeErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(/bearer\s+[a-z0-9._-]+/gi, "bearer [redacted]")
+    .replace(/(?:secret|token|password|private[_ -]?key)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .slice(0, 500);
+}
+
+function isPermanentSettlementFailure(error: unknown): boolean {
+  if (error instanceof PermanentSettlementError) return true;
+  if (error instanceof AppError) {
+    return error.statusCode >= 400 && error.statusCode < 500 && error.statusCode !== 429;
+  }
+
+  const message = safeErrorMessage(error).toLowerCase();
+  return (
+    message.includes("invalid") ||
+    message.includes("malformed") ||
+    message.includes("xdr_mismatch") ||
+    message.includes("unauthorized") ||
+    message.includes("forbidden") ||
+    message.includes("not authorized") ||
+    message.includes("bad request") ||
+    message.includes("signature") ||
+    message.includes("destination")
+  );
+}
+
+function isTransientSettlementFailure(error: unknown): boolean {
+  if (isPermanentSettlementFailure(error)) return false;
+  if (error instanceof AppError) {
+    return error.statusCode === 429 || error.statusCode >= 500;
+  }
+
+  const message = safeErrorMessage(error).toLowerCase();
+  return (
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("rate_limit") ||
+    message.includes("rate limit") ||
+    message.includes("stale") ||
+    message.includes("connection") ||
+    message.includes("network") ||
+    message.includes("temporar") ||
+    message.includes("unavailable") ||
+    message.includes("horizon") ||
+    message.includes("retry")
+  );
+}
+
+async function recordTransition(
+  id: string,
+  action: string,
+  metadata: Record<string, unknown> = {}
+): Promise<void> {
+  await audit({
+    action,
+    entityType: "settlement",
+    entityId: id,
+    metadata,
+  });
+}
+
+async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<boolean> {
+  if (claimedSettlements.has(settlement.id)) return false;
+
+  const model = prisma.settlement as any;
+  if (typeof model.updateMany !== "function") {
+    claimedSettlements.add(settlement.id);
+    return true;
+  }
+
+  const result = await model.updateMany({
+    where: {
+      id: settlement.id,
+      status: { in: ["pending", "submitted"] },
+      retryCount: settlement.retryCount,
+    },
+    data: { retryCount: { increment: 1 } },
+  });
+
+  if (result.count !== 1) return false;
+  claimedSettlements.add(settlement.id);
+  settlement.retryCount += 1;
+  return true;
+}
+
+async function releaseSettlementClaim(id: string): Promise<void> {
+  claimedSettlements.delete(id);
+}
+
+export async function submitSettlement(
+  settlement: SettlementSubmissionRecord,
+  retryAttempt: number
+): Promise<string> {
+  if (!settlement.transactionXdr) {
+    throw new PermanentSettlementError("settlement has no transaction XDR");
+  }
+
+  try {
+    const hash = await stellar.submitPayment(settlement.transactionXdr);
+    log.info({ id: settlement.id, hash }, "settlement submitted successfully");
+    return hash;
+  } catch (error) {
+    if (!isTransientSettlementFailure(error) || retryAttempt >= SETTLEMENT_MAX_RETRIES) {
+      throw new PermanentSettlementError(safeErrorMessage(error));
+    }
+    throw error;
+  }
+}
+
+async function markSettlementFailed(
+  settlement: SettlementSubmissionRecord,
+  message: string
+): Promise<void> {
+  await prisma.settlement.update({
+    where: { id: settlement.id },
+    data: {
+      status: "failed",
+      retryCount: settlement.retryCount,
+    },
+  });
+  await recordTransition(settlement.id, "settlement_failed", {
+    attempt: settlement.retryCount,
+    reason: message,
+  });
+  log.error(
+    { id: settlement.id, attempt: settlement.retryCount, reason: message },
+    "settlement failed"
+  );
+}
+
+async function processSettlement(settlement: SettlementSubmissionRecord): Promise<void> {
+  if (!(await claimSettlement(settlement))) return;
+
+  try {
+    const initialAttempt = Math.max(1, settlement.retryCount);
+    const remainingAttempts = Math.max(1, SETTLEMENT_MAX_RETRIES - initialAttempt + 1);
+
+    for (let offset = 0; offset < remainingAttempts; offset += 1) {
+      const attempt = initialAttempt + offset;
+      try {
+        const hash = await submitSettlement(settlement, attempt);
+        await prisma.settlement.update({
+          where: { id: settlement.id },
+          data: {
+            status: "confirmed",
+            stellarTxHash: hash,
+            retryCount: attempt,
+          },
+        });
+        await recordTransition(settlement.id, "settlement_confirmed", { attempt });
+        return;
+      } catch (error) {
+        const message = safeErrorMessage(error);
+        const permanent = isPermanentSettlementFailure(error) || attempt >= SETTLEMENT_MAX_RETRIES;
+
+        if (permanent) {
+          await markSettlementFailed(settlement, message);
+          return;
+        }
+
+        const delay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)];
+        await prisma.settlement.update({
+          where: { id: settlement.id },
+          data: { retryCount: attempt },
+        });
+        await recordTransition(settlement.id, "settlement_retry_scheduled", {
+          attempt,
+          nextDelayMs: delay,
+          reason: message,
+        });
+        await sleep(delay);
+      }
+    }
+  } finally {
+    await releaseSettlementClaim(settlement.id);
+  }
+}
 
 export async function reconcilePending(): Promise<void> {
   await runReconciliation();
@@ -97,6 +287,9 @@ export async function reconcileAnchors(): Promise<void> {
   }
 
   for (const session of sessions) {
+    if (claimedAnchors.has(session.id)) continue;
+    claimedAnchors.add(session.id);
+
     try {
       await reconcileSingleAnchor(session, toml.transferServerSep24);
     } catch (err) {
@@ -271,230 +464,65 @@ export async function expireInvites(): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Settlement submission worker
-// ---------------------------------------------------------------------------
-
-class PermanentSettlementError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "PermanentSettlementError";
-  }
-}
-
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Attempt to submit one settlement's signed XDR to the Stellar network.
- * Returns the submitted transaction hash on success, or throws on failure.
- * Transient errors are retryable; permanent errors (including exhausted
- * retries) throw PermanentSettlementError.
- */
-export async function submitSettlement(
-  settlement: SettlementSubmissionRecord,
-  retryAttempt: number
-): Promise<string> {
-  if (!settlement.transactionXdr) {
-    throw new PermanentSettlementError("settlement has no transaction XDR");
-  }
-
-  try {
-    const hash = await stellar.submitPayment(settlement.transactionXdr, {
-      sourcePublicKey: settlement.fromPublicKey,
-      destination: settlement.toPublicKey,
-      asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
-      amount: settlement.amount,
-      memoCode: settlement.shortCode,
-    });
-    log.info({ id: settlement.id, hash }, "settlement submitted successfully");
-    return hash;
-  } catch (error: any) {
-    const msg = error?.message ?? String(error);
-    const isTransient =
-      msg.includes("timeout") ||
-      msg.includes("timed out") ||
-      msg.includes("rate_limit") ||
-      msg.includes("stale") ||
-      msg.includes("connection") ||
-      msg.includes("retry");
-
-    if (isTransient && retryAttempt < SETTLEMENT_MAX_RETRIES) {
-      log.warn(
-        { id: settlement.id, attempt: retryAttempt, err: msg },
-        "transient error submitting settlement; will retry"
-      );
-      throw error;
-    }
-
-    log.error(
-      { id: settlement.id, attempt: retryAttempt, err: msg },
-      "settlement submission failed permanently"
-    );
-    throw new PermanentSettlementError(msg);
-  }
-}
-
 export async function processSubmittedSettlements(): Promise<void> {
   const settlements = await prisma.settlement.findMany({
     where: {
       status: { in: ["pending", "submitted"] },
       transactionXdr: { not: null },
     },
-    include: { from: true, to: true },
+    include: {
+      from: { select: { stellarPublicKey: true } },
+      to: { select: { stellarPublicKey: true } },
+    },
     take: 50,
-    orderBy: { createdAt: "asc" },
   });
 
-  if (settlements.length === 0) return;
-
-  log.info({ count: settlements.length }, "processing submitted settlements");
-
-  for (const settlement of settlements) {
-    try {
-      let hash: string | undefined;
-      let attempt = 0;
-
-      while (attempt <= SETTLEMENT_MAX_RETRIES) {
-        if (attempt > 0) {
-          const delay = RETRY_DELAYS_MS[attempt - 1] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1];
-          log.info(
-            { id: settlement.id, attempt, delay },
-            "retrying settlement submission"
-          );
-          await sleep(delay);
-        }
-
-        try {
-          hash = await submitSettlement(
-            {
-              id: settlement.id,
-              shortCode: settlement.shortCode,
-              fromPublicKey: settlement.from.stellarPublicKey,
-              toPublicKey: settlement.to.stellarPublicKey,
-              amount: settlement.amount.toString(),
-              assetCode: settlement.assetCode,
-              assetIssuer: settlement.assetIssuer,
-              transactionXdr: settlement.transactionXdr,
-              expenseShareId: settlement.expenseShareId,
-              retryCount: settlement.retryCount,
-              status: settlement.status,
-              createdAt: settlement.createdAt,
-            },
-            attempt
-          );
-          break;
-        } catch (error: any) {
-          if (error instanceof PermanentSettlementError || attempt >= SETTLEMENT_MAX_RETRIES) {
-            throw error;
-          }
-          attempt++;
-        }
-      }
-
-      if (hash) {
-        await prisma.$transaction(async (tx) => {
-          const updated = await tx.settlement.update({
-            where: { id: settlement.id },
-            data: { status: "confirmed", stellarTxHash: hash },
-          });
-          if (settlement.expenseShareId) {
-            await tx.expenseShare.update({
-              where: { id: settlement.expenseShareId },
-              data: { status: "settled" },
-            });
-          }
-          return updated;
-        });
-
-        log.info({ id: settlement.id, hash }, "settlement confirmed");
-
-        await audit({
-          action: "settlement.confirmed",
-          entityType: "settlement",
-          entityId: settlement.id,
-          metadata: { status: "confirmed", stellarTxHash: hash },
-        });
-      }
-    } catch (error: any) {
-      const msg = error?.message ?? String(error);
-
-      await prisma.settlement.update({
-        where: { id: settlement.id },
-        data: {
-          status: "failed",
-          failureReason: msg,
-          retryCount: { increment: 1 },
-        },
-      });
-
-      log.error(
-        { id: settlement.id, err: msg },
-        "settlement marked as failed after exhausting retries"
-      );
-
-      await audit({
-        action: "settlement.failed",
-        entityType: "settlement",
-        entityId: settlement.id,
-        metadata: { failureReason: msg },
-      });
-    }
+  for (const row of settlements) {
+    const settlement: SettlementSubmissionRecord = {
+      id: row.id,
+      shortCode: row.shortCode,
+      fromPublicKey: row.from.stellarPublicKey,
+      toPublicKey: row.to.stellarPublicKey,
+      amount: row.amount,
+      assetCode: row.assetCode,
+      assetIssuer: row.assetIssuer,
+      transactionXdr: row.transactionXdr,
+      expenseShareId: row.expenseShareId,
+      retryCount: row.retryCount,
+      status: row.status,
+      createdAt: row.createdAt,
+    };
+    await processSettlement(settlement);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Worker lifecycle
-// ---------------------------------------------------------------------------
+export async function runWorkerCycle(): Promise<void> {
+  await Promise.all([
+    reconcilePending(),
+    reconcileAnchors(),
+    processSubmittedSettlements(),
+    expireInvites(),
+  ]);
+}
 
-export function startWorker(opts?: {
-  fastMs?: number;
-  slowMs?: number;
-}): () => void {
-  const slowMs = opts?.slowMs ?? 60_000;
-  const settlementMs = config.WORKER_INTERVAL_MS;
+export function startWorker(): () => void {
+  const reconciliationStop = startReconciliation();
+  const timer = setInterval(() => {
+    void runWorkerCycle().catch((error) => {
+      log.error({ reason: safeErrorMessage(error) }, "worker cycle failed");
+    });
+  }, config.WORKER_INTERVAL_MS);
 
-  const stopReconciliation = opts?.fastMs
-    ? startReconciliation({ intervalMs: opts.fastMs })
-    : startReconciliation();
-
-  const slow = setInterval(() => {
-    reconcileAnchors().catch((error) => log.error({ err: error }, "reconcileAnchors error"));
-    expireInvites().catch((error) => log.error({ err: error }, "expireInvites error"));
-  }, slowMs);
-
-  const settlementWorker = setInterval(() => {
-    processSubmittedSettlements().catch((error) =>
-      log.error({ err: error }, "processSubmittedSettlements error")
-    );
-  }, settlementMs);
-
-  log.info(
-    {
-      reconciliation: opts?.fastMs ?? "configured",
-      slow: slowMs,
-      settlement: settlementMs,
-    },
-    "worker started"
-  );
+  void runWorkerCycle().catch((error) => {
+    log.error({ reason: safeErrorMessage(error) }, "initial worker cycle failed");
+  });
 
   return () => {
-    stopReconciliation();
-    clearInterval(slow);
-    clearInterval(settlementWorker);
+    clearInterval(timer);
+    reconciliationStop();
   };
 }
 
-if (require.main === module) {
-  const stop = startWorker();
-  const shutdown = async () => {
-    log.info("shutting down");
-    stop();
-    await prisma.$disconnect();
-    process.exit(0);
-  };
-
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+if (process.env.NODE_ENV !== "test") {
+  startWorker();
 }

@@ -27,6 +27,7 @@
  */
 
 import toml from "toml";
+import { z } from "zod";
 import { config } from "../config";
 import { Errors } from "../errors";
 
@@ -108,12 +109,29 @@ export const anchorService = {
     if (!res.ok) {
       throw Errors.upstream(`Could not load stellar.toml for ${homeDomain}`);
     }
-    const parsed = toml.parse(await res.text());
 
-    const assets = (parsed.CURRENCIES ?? []).map((c: any) => ({
-      code: c.code,
-      issuer: c.issuer ?? null,
-    }));
+    let parsed: any;
+    try {
+      parsed = toml.parse(await res.text());
+    } catch {
+      throw Errors.upstream("Anchor returned invalid stellar.toml");
+    }
+
+    const currencies = Array.isArray(parsed.CURRENCIES) ? parsed.CURRENCIES : [];
+    const assets = currencies
+      .filter((currency: any) => typeof currency?.code === "string")
+      .map((currency: any) => ({
+        code: currency.code,
+        issuer: typeof currency.issuer === "string" ? currency.issuer : null,
+      }));
+
+    if (
+      typeof parsed.WEB_AUTH_ENDPOINT !== "string" ||
+      typeof parsed.TRANSFER_SERVER_SEP0024 !== "string" ||
+      typeof parsed.SIGNING_KEY !== "string"
+    ) {
+      throw Errors.upstream("Anchor stellar.toml is missing required SEP-24 fields");
+    }
 
     const value: AnchorToml = {
       homeDomain,
@@ -134,7 +152,7 @@ export const anchorService = {
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
     const res = await fetch(url);
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 challenge request failed");
-    const data: any = await res.json();
+    const data = parseJson(challengeResponseSchema, await res.json());
     return {
       transaction: data.transaction,
       networkPassphrase: data.network_passphrase ?? config.networkPassphrase,
@@ -149,8 +167,7 @@ export const anchorService = {
       body: JSON.stringify({ transaction: signedXdr }),
     });
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 token exchange failed");
-    const data: any = await res.json();
-    return data.token;
+    return parseJson(tokenResponseSchema, await res.json()).token;
   },
 
   /** Step 3: start a SEP-24 interactive deposit/withdraw. */
@@ -175,8 +192,7 @@ export const anchorService = {
       }),
     });
     if (!res.ok) throw Errors.upstream("Anchor interactive flow request failed");
-    const data: any = await res.json();
-    return { url: data.url, id: data.id };
+    return parseJson(interactiveResponseSchema, await res.json());
   },
 
   /**
@@ -193,12 +209,149 @@ export const anchorService = {
     const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
       params.id
     )}`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${params.token}` },
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { Authorization: `Bearer ${params.token}` },
+      });
+    } catch {
+      return null;
+    }
+
     if (!res.ok) return null;
-    const data: any = await res.json();
-    return data?.transaction?.status ?? null;
+
+    try {
+      const data = parseJson(sep24TransactionResponseSchema, await res.json());
+      const rawStatus = data.transaction?.status;
+      return rawStatus ? rawStatus.trim().toLowerCase() : null;
+    } catch {
+      return null;
+    }
+  },
+
+  /**
+   * Full SEP-24 poll with timeout, error normalization, and rich result.
+   *
+   * This is the primary method the worker should call. It wraps
+   * getTransactionStatus with a timeout, parses the full transaction
+   * response, and returns a normalised PollResult.
+   */
+  async pollTransaction(params: {
+    transferServer: string;
+    token: string;
+    id: string;
+    timeoutMs?: number;
+  }): Promise<PollResult> {
+    const timeoutMs = params.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+    const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
+      params.id
+    )}`;
+
+    let response: Response;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        response = await fetch(url, {
+          headers: { Authorization: `Bearer ${params.token}` },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        rawStatus: null,
+        status: "pending_anchor",
+        message: `Anchor poll failed: ${message}`,
+        isError: true,
+      };
+    }
+
+    if (!response.ok) {
+      return {
+        rawStatus: null,
+        status: "pending_anchor",
+        message: `Anchor returned HTTP ${response.status}`,
+        isError: true,
+      };
+    }
+
+    let json: Record<string, unknown>;
+    try {
+      json = (await response.json()) as Record<string, unknown>;
+    } catch {
+      return {
+        rawStatus: null,
+        status: "pending_anchor",
+        message: "Anchor returned malformed (non-JSON) response",
+        isError: true,
+      };
+    }
+
+    const tx = json.transaction as Record<string, unknown> | undefined;
+    if (!tx) {
+      return {
+        rawStatus: null,
+        status: "pending_anchor",
+        message: "Anchor response missing 'transaction' field",
+        isError: true,
+      };
+    }
+
+    const rawStatus =
+      typeof tx.status === "string" ? tx.status : (json.status as string | undefined) ?? null;
+    if (!rawStatus) {
+      return {
+        rawStatus: null,
+        status: "pending_anchor",
+        message: "Anchor response missing transaction status",
+        isError: true,
+      };
+    }
+
+    // Sanitise — only carry forward benign fields for debugging
+    const sanitizedTx: Record<string, unknown> = {
+      id: tx.id,
+      status: rawStatus,
+      kind: tx.kind,
+      amount_in: tx.amount_in,
+      amount_out: tx.amount_out,
+      amount_fee: tx.amount_fee,
+      started_at: tx.started_at,
+      completed_at: tx.completed_at,
+      stellar_transaction_hash: tx.stellar_transaction_hash,
+      external_transaction_id: tx.external_transaction_id,
+      message: tx.message,
+      refunds: tx.refunds,
+    };
+
+    const mappedStatus = mapAnchorStatus(rawStatus);
+
+    return {
+      rawStatus,
+      status: mappedStatus,
+      message: `SEP-24 status: ${rawStatus} → ${mappedStatus}`,
+      isError: false,
+      transaction: sanitizedTx,
+      amountIn:
+        typeof tx.amount_in === "string" || typeof tx.amount_in === "number"
+          ? String(tx.amount_in)
+          : undefined,
+      amountOut:
+        typeof tx.amount_out === "string" || typeof tx.amount_out === "number"
+          ? String(tx.amount_out)
+          : undefined,
+      amountFee:
+        typeof tx.amount_fee === "string" || typeof tx.amount_fee === "number"
+          ? String(tx.amount_fee)
+          : undefined,
+      stellarTransactionHash:
+        typeof tx.stellar_transaction_hash === "string"
+          ? tx.stellar_transaction_hash
+          : undefined,
+    };
   },
 
   /**
@@ -388,4 +541,9 @@ export function mapAnchorStatus(raw: string): string {
     default:
       return "pending_anchor";
   }
+}
+
+/** Whether a normalized status is terminal and no longer needs polling. */
+export function isTerminalAnchorStatus(status: string): boolean {
+  return status === "completed" || status === "error" || status === "refunded";
 }

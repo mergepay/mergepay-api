@@ -9,6 +9,7 @@ import {
   Asset,
   BASE_FEE,
   Horizon,
+  Keypair,
   Memo,
   Operation,
   Transaction,
@@ -16,6 +17,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { Errors } from "../errors";
+import { validateAssetSpec, assetConfigToSpec } from "./assets";
 
 let _server: Horizon.Server | null = null;
 function server(): Horizon.Server {
@@ -29,8 +31,10 @@ export interface AssetSpec {
 }
 
 export function toAsset(spec: AssetSpec): Asset {
-  if (!spec.issuer || spec.code === "XLM") return Asset.native();
-  return new Asset(spec.code, spec.issuer);
+  // Validate the asset is supported before constructing the SDK object.
+  const config = validateAssetSpec(spec);
+  if (config.type === "native") return Asset.native();
+  return new Asset(config.code, config.issuer!);
 }
 
 export function memoText(code: string): string {
@@ -207,6 +211,17 @@ export function validatePaymentTx(
       : "";
   if (gotMemo !== wantMemo) {
     throw Errors.badRequest("xdr_mismatch", "Memo does not match the expense reference");
+  }
+
+  // Verify at least one signature matches the expected source account.
+  // This implicitly validates the network passphrase, as the signature hash includes it.
+  const sourceKeypair = Keypair.fromPublicKey(expected.sourcePublicKey);
+  const txHash = tx.hash();
+  const hasValidSignature = tx.signatures.some((sig) =>
+    sourceKeypair.verify(txHash, sig.signature())
+  );
+  if (!hasValidSignature) {
+    throw Errors.badRequest("xdr_mismatch", "Transaction signature is invalid or for the wrong network");
   }
 }
 

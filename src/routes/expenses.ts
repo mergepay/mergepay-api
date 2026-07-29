@@ -8,7 +8,9 @@ import { computeShares, type SplitType } from "../services/settlement";
 import { isPositive } from "../services/money";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 
 const shareInput = z.object({
   userId: z.string(),
@@ -44,9 +46,8 @@ export default async function expenseRoutes(app: FastifyInstance) {
     await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
-    if (!isPositive(body.amount)) {
-      throw Errors.badRequest("invalid_amount", "Amount must be greater than zero");
-    }
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
 
@@ -119,14 +120,48 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
     await requireMembership(groupId, auth.id);
 
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
     const expenses = await prisma.expense.findMany({
-      where: { groupId },
+      where: {
+        groupId,
+        ...(decodedCursor && {
+          OR: [
+            { createdAt: { lt: decodedCursor.createdAt } },
+            {
+              createdAt: decodedCursor.createdAt,
+              id: { lt: decodedCursor.id },
+            },
+          ],
+        }),
+      },
       include: expenseInclude,
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
     });
-    return { expenses: expenses.map(serializeExpense) };
+
+    const hasMore = expenses.length > limit;
+    const results = hasMore ? expenses.slice(0, limit) : expenses;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
+
+    return {
+      expenses: results.map(serializeExpense),
+      meta: { nextCursor, hasMore },
+    };
   });
 
   // -- get one ----------------------------------------------------------------

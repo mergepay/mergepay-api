@@ -246,6 +246,7 @@ const ANCHOR_POLL_TERMINAL = new Set([
   "incomplete", // before we have an external id
 ]);
 
+// This function was updated during the upstream merge
 /**
  * Poll pending SEP-24 anchor sessions and reconcile remote status with
  * local records.

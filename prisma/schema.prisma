@@ -201,6 +201,9 @@ model AnchorSession {
   externalTransactionId String?  @map("external_transaction_id")
   anchorToken           String?  @map("anchor_token")
   status                String   @default("incomplete")
+  failureReason         String?  @map("failure_reason")
+  retryCount            Int      @default(0) @map("retry_count")
+  lastPolledAt          DateTime? @map("last_polled_at")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
 
@@ -208,6 +211,7 @@ model AnchorSession {
 
   @@index([userId])
   @@index([externalTransactionId])
+  @@index([status])
   @@map("anchor_sessions")
 }
 

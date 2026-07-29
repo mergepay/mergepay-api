@@ -230,20 +230,47 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       ttx.direction === "deposit"
         ? group.treasuryAccountPublicKey
         : ttx.destination!;
+    const intent = {
+      sourcePublicKey: source,
+      destination,
+      asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
+      amount: ttx.amount.toString(),
+      memoCode: ttx.shortCode,
+    };
 
     let hash: string;
     try {
-      hash = await stellar.submitPayment(body.signedXdr, {
-        sourcePublicKey: source,
-        destination,
-        asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
-        amount: ttx.amount.toString(),
-        memoCode: ttx.shortCode,
-      });
+      if (ttx.direction === "deposit") {
+        hash = await stellar.submitPayment(body.signedXdr, intent);
+      } else {
+        // Withdrawals move funds out of the shared treasury account, so the
+        // signed envelope must carry signatures from the treasury's own
+        // on-chain signer set meeting the group's configured threshold —
+        // not just any valid signature — before it ever reaches Horizon.
+        const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
+        if (!snapshot.exists) {
+          throw Errors.badRequest("treasury_unfunded", "Treasury account is not funded");
+        }
+        hash = await stellar.submitMultisigPayment(body.signedXdr, intent, {
+          signers: snapshot.signers.map((s) => s.key),
+          threshold: group.treasuryRequiredSigners ?? 1,
+        });
+      }
     } catch (e) {
       await prisma.treasuryTransaction.update({
         where: { id },
         data: { status: "failed" },
+      });
+      await audit({
+        userId: auth.id,
+        action: "treasury.confirm_failed",
+        entityType: "treasury_transaction",
+        entityId: id,
+        metadata: {
+          groupId: ttx.groupId,
+          direction: ttx.direction,
+          reason: e instanceof Error ? e.message : "unknown error",
+        },
       });
       throw e;
     }

@@ -9,6 +9,7 @@ import {
   Asset,
   BASE_FEE,
   Horizon,
+  Keypair,
   Memo,
   Operation,
   Transaction,
@@ -45,6 +46,21 @@ export interface AccountSnapshot {
   balances: { assetCode: string; assetIssuer: string | null; balance: string }[];
   signers: { key: string; weight: number }[];
   thresholds: { low: number; med: number; high: number };
+}
+
+export interface PaymentIntent {
+  sourcePublicKey: string;
+  destination: string;
+  asset: AssetSpec;
+  amount: string;
+  memoCode: string;
+}
+
+export interface MultisigRequirement {
+  /** Public keys of the accounts authorized to sign for this treasury. */
+  signers: string[];
+  /** Minimum number of distinct authorized signers required. */
+  threshold: number;
 }
 
 export const stellar = {
@@ -115,28 +131,29 @@ export const stellar = {
    * Validate a signed payment XDR matches an expected intent, then submit it.
    * Throws AppError on mismatch or Horizon failure. Returns the tx hash.
    */
-  async submitPayment(
-    signedXdr: string,
-    expected: {
-      sourcePublicKey: string;
-      destination: string;
-      asset: AssetSpec;
-      amount: string;
-      memoCode: string;
-    }
-  ): Promise<string> {
-    const tx = new Transaction(signedXdr, config.networkPassphrase);
+  async submitPayment(signedXdr: string, expected: PaymentIntent): Promise<string> {
+    const tx = parseSignedTransaction(signedXdr);
     validatePaymentTx(tx, expected);
-    try {
-      const res = await server().submitTransaction(tx);
-      return res.hash;
-    } catch (e: any) {
-      const codes =
-        e?.response?.data?.extras?.result_codes ??
-        e?.response?.data?.result_codes;
-      const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
-      throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
-    }
+    return submitToHorizon(tx);
+  },
+
+  /**
+   * Same as `submitPayment`, but additionally requires the envelope to carry
+   * signatures from at least `threshold` distinct accounts in
+   * `multisig.signers`. Every signature on the envelope must be attributable
+   * to a configured signer — an envelope carrying any signature outside that
+   * set is rejected outright rather than having the extra signature ignored.
+   * All checks happen before any Horizon submission is attempted.
+   */
+  async submitMultisigPayment(
+    signedXdr: string,
+    expected: PaymentIntent,
+    multisig: MultisigRequirement
+  ): Promise<string> {
+    const tx = parseSignedTransaction(signedXdr);
+    validatePaymentTx(tx, expected);
+    verifyMultisig(tx, multisig);
+    return submitToHorizon(tx);
   },
 
   /** Look up a transaction by hash. Returns null if not yet visible. */
@@ -153,20 +170,76 @@ export const stellar = {
   },
 };
 
+/** Parse a signed XDR envelope, rejecting malformed input as a client error. */
+function parseSignedTransaction(signedXdr: string): Transaction {
+  try {
+    return new Transaction(signedXdr, config.networkPassphrase);
+  } catch {
+    throw Errors.badRequest("xdr_mismatch", "Malformed transaction envelope");
+  }
+}
+
+async function submitToHorizon(tx: Transaction): Promise<string> {
+  try {
+    const res = await server().submitTransaction(tx);
+    return res.hash;
+  } catch (e: any) {
+    const codes =
+      e?.response?.data?.extras?.result_codes ??
+      e?.response?.data?.result_codes;
+    const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
+    throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+  }
+}
+
+/**
+ * Verify the envelope carries valid signatures from at least `threshold`
+ * distinct accounts in `signers`, and no signature from outside that set.
+ * Independent of Horizon — this is enforced before any network submission.
+ */
+export function verifyMultisig(tx: Transaction, requirement: MultisigRequirement): void {
+  if (requirement.signers.length === 0) {
+    throw Errors.badRequest(
+      "treasury_misconfigured",
+      "No signers are configured for this treasury account"
+    );
+  }
+  if (tx.signatures.length === 0) {
+    throw Errors.unauthorized("Transaction has no signatures");
+  }
+
+  const txHash = tx.hash();
+  const matchedSigners = new Set<string>();
+
+  for (const decorated of tx.signatures) {
+    const signature = decorated.signature();
+    const matched = requirement.signers.find((signer) => {
+      try {
+        return Keypair.fromPublicKey(signer).verify(txHash, signature);
+      } catch {
+        return false;
+      }
+    });
+    if (!matched) {
+      throw Errors.unauthorized(
+        "Transaction contains a signature from an unauthorized signer"
+      );
+    }
+    matchedSigners.add(matched);
+  }
+
+  if (matchedSigners.size < requirement.threshold) {
+    throw Errors.unauthorized(
+      `At least ${requirement.threshold} authorized signer(s) must sign this transaction`
+    );
+  }
+}
+
 /**
  * Strict validation that a transaction is exactly the payment we authorized.
  * This is the guardrail that stops a wallet returning a different transaction.
  */
-export function validatePaymentTx(
-  tx: Transaction,
-  expected: {
-    sourcePublicKey: string;
-    destination: string;
-    asset: AssetSpec;
-    amount: string;
-    memoCode: string;
-  }
-): void {
+export function validatePaymentTx(tx: Transaction, expected: PaymentIntent): void {
   if (tx.source !== expected.sourcePublicKey) {
     throw Errors.badRequest("xdr_mismatch", "Transaction source does not match");
   }

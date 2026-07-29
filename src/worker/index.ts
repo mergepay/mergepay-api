@@ -4,6 +4,7 @@ import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit, AuditAction } from "../services/audit";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
+import { cleanupExpiredIdempotencyKeys } from "../lib/idempotency";
 import { runReconciliation, startReconciliation } from "./reconciliation";
 
 interface SettlementSubmissionRecord {
@@ -86,6 +87,18 @@ export async function reconcileAnchors(): Promise<void> {
   }
 }
 
+export async function cleanupIdempotencyKeys(): Promise<void> {
+  const removed = await cleanupExpiredIdempotencyKeys();
+  if (removed === 0) return;
+  await audit({
+    actor: { type: "system", worker: "idempotency-cleanup" },
+    action: AuditAction.IdempotencyKeyCleanup,
+    entityType: "idempotency_key",
+    entityId: "batch",
+    metadata: { removed },
+  });
+}
+
 export async function expireInvites(): Promise<void> {
   const expired = await prisma.invite.findMany({
     where: { expiresAt: { not: null, lt: new Date() } },
@@ -148,6 +161,29 @@ export async function submitSettlement(
     return hash;
   } catch (error: any) {
     const msg = error?.message ?? String(error);
+
+    // A 400 here is our own pre-submission validation (verifySignedPaymentXdr)
+    // rejecting the envelope — it never reached Horizon, so there is nothing
+    // ambiguous to reconcile.
+    if (error?.status !== 400) {
+      // Ambiguous outcome: submission failed, but Stellar may have still
+      // applied the transaction (e.g. our response was lost to a timeout).
+      // The hash is deterministic from the signed envelope, so check before
+      // ever deciding to retry — resubmitting an applied payment would pay
+      // the recipient twice.
+      const intendedHash = safeHashOf(settlement.transactionXdr);
+      if (intendedHash) {
+        const onChain = await stellar.getTransaction(intendedHash).catch(() => null);
+        if (onChain?.successful) {
+          log.warn(
+            { id: settlement.id, hash: intendedHash, err: msg },
+            "submission response was lost but the transaction already succeeded on-chain; treating as confirmed"
+          );
+          return intendedHash;
+        }
+      }
+    }
+
     const isTransient =
       msg.includes("timeout") ||
       msg.includes("timed out") ||
@@ -169,6 +205,14 @@ export async function submitSettlement(
       "settlement submission failed permanently"
     );
     throw new PermanentSettlementError(msg);
+  }
+}
+
+function safeHashOf(signedXdr: string): string | null {
+  try {
+    return stellar.hashOf(signedXdr);
+  } catch {
+    return null;
   }
 }
 
@@ -307,6 +351,9 @@ export function startWorker(opts?: {
   const slow = setInterval(() => {
     reconcileAnchors().catch((error) => log.error({ err: error }, "reconcileAnchors error"));
     expireInvites().catch((error) => log.error({ err: error }, "expireInvites error"));
+    cleanupIdempotencyKeys().catch((error) =>
+      log.error({ err: error }, "cleanupIdempotencyKeys error")
+    );
   }, slowMs);
 
   const settlementWorker = setInterval(() => {

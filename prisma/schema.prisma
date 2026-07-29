@@ -212,12 +212,18 @@ model AnchorSession {
 }
 
 model IdempotencyKey {
-  id            String   @id @default(cuid())
-  key           String   @unique
-  requestHash   String   @map("request_hash")
-  responseJson  String   @map("response_json")
-  createdAt     DateTime @default(now()) @map("created_at")
+  id           String    @id @default(cuid())
+  key          String    @unique
+  userId       String?   @map("user_id")
+  requestHash  String    @map("request_hash")
+  status       String    @default("in_progress")
+  statusCode   Int?      @map("status_code")
+  responseJson String?   @map("response_json")
+  expiresAt    DateTime  @map("expires_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at")
 
+  @@index([expiresAt])
   @@map("idempotency_keys")
 }
 

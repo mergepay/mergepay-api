@@ -151,6 +151,17 @@ export const stellar = {
       throw e;
     }
   },
+
+  /**
+   * Compute the hash a signed XDR will submit under, without submitting it.
+   * Used to check Horizon for an already-applied transaction when a prior
+   * submission attempt's response was lost (network timeout, worker crash)
+   * — the hash is deterministic from the envelope, so it's known before we
+   * ever call Horizon again.
+   */
+  hashOf(signedXdr: string): string {
+    return new Transaction(signedXdr, config.networkPassphrase).hash().toString("hex");
+  },
 };
 
 /**

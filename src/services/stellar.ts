@@ -9,6 +9,7 @@ import {
   Asset,
   BASE_FEE,
   Horizon,
+  Keypair,
   Memo,
   Operation,
   Transaction,
@@ -207,6 +208,17 @@ export function validatePaymentTx(
       : "";
   if (gotMemo !== wantMemo) {
     throw Errors.badRequest("xdr_mismatch", "Memo does not match the expense reference");
+  }
+
+  // Verify at least one signature matches the expected source account.
+  // This implicitly validates the network passphrase, as the signature hash includes it.
+  const sourceKeypair = Keypair.fromPublicKey(expected.sourcePublicKey);
+  const txHash = tx.hash();
+  const hasValidSignature = tx.signatures.some((sig) =>
+    sourceKeypair.verify(txHash, sig.signature())
+  );
+  if (!hasValidSignature) {
+    throw Errors.badRequest("xdr_mismatch", "Transaction signature is invalid or for the wrong network");
   }
 }
 

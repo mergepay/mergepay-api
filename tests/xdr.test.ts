@@ -73,11 +73,13 @@ function buildCustomXdr({
 describe("payment XDR validation", () => {
   it("accepts a transaction that matches the intent", () => {
     const tx = new Transaction(buildXdr(), config.networkPassphrase);
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).not.toThrow();
   });
 
   it("rejects a mismatched amount", () => {
     const tx = new Transaction(buildXdr({ amount: "99" }), config.networkPassphrase);
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/amount/i);
   });
 
@@ -87,6 +89,7 @@ describe("payment XDR validation", () => {
       buildXdr({ destination: other }),
       config.networkPassphrase
     );
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/destination/i);
   });
 
@@ -96,6 +99,9 @@ describe("payment XDR validation", () => {
       buildXdr({ sourcePublicKey: other }),
       config.networkPassphrase
     );
+    // Sign with 'from' to simulate a stolen intent but the signature will fail
+    // for the 'other' account, or if we sign with 'other', it fails the source check.
+    tx.sign(Keypair.fromSecret(from.secret())); 
     expect(() => validatePaymentTx(tx, intent)).toThrow(/source/i);
   });
 
@@ -104,11 +110,13 @@ describe("payment XDR validation", () => {
       buildCustomXdr({ operationSource: Keypair.random().publicKey() }),
       config.networkPassphrase
     );
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/operation source/i);
   });
 
   it("rejects an altered transaction fee", () => {
     const tx = new Transaction(buildCustomXdr({ fee: "999" }), config.networkPassphrase);
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/fee/i);
   });
 
@@ -117,6 +125,7 @@ describe("payment XDR validation", () => {
       buildCustomXdr({ extraOperation: true, fee: String(BASE_FEE) }),
       config.networkPassphrase
     );
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/one operation/i);
   });
 
@@ -125,7 +134,24 @@ describe("payment XDR validation", () => {
       buildXdr({ memoCode: "DIFFERENT" }),
       config.networkPassphrase
     );
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/memo/i);
+  });
+
+  it("rejects a transaction signed for the wrong network", () => {
+    // Build an XDR and sign it for a DIFFERENT network passphrase
+    const txWithWrongNetwork = new Transaction(buildXdr(), "Test SDF Network ; September 2015");
+    txWithWrongNetwork.sign(from);
+    const signedXdr = txWithWrongNetwork.toXDR();
+
+    // Now parse it using our APP'S network passphrase
+    const tx = new Transaction(signedXdr, config.networkPassphrase);
+    expect(() => validatePaymentTx(tx, intent)).toThrow(/network/i);
+  });
+
+  it("rejects an unsigned transaction", () => {
+    const tx = new Transaction(buildXdr(), config.networkPassphrase);
+    expect(() => validatePaymentTx(tx, intent)).toThrow(/signature is invalid/i);
   });
 
   it("validates USDC issuer details", () => {
@@ -134,6 +160,7 @@ describe("payment XDR validation", () => {
       buildCustomXdr({ asset: { code: "USDC", issuer: usdcIssuer } }),
       config.networkPassphrase
     );
+    tx.sign(from);
 
     expect(() =>
       validatePaymentTx(tx, {
@@ -141,6 +168,7 @@ describe("payment XDR validation", () => {
         asset: { code: "USDC", issuer: usdcIssuer },
       })
     ).not.toThrow();
+    
     expect(() =>
       validatePaymentTx(tx, {
         ...intent,
@@ -163,3 +191,4 @@ describe("payment XDR validation", () => {
     expect(Buffer.byteLength(memo)).toBeLessThanOrEqual(28);
   });
 });
+

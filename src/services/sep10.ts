@@ -6,23 +6,20 @@
  * client's signature to prove control of the account.
  */
 
+import { createHash } from "node:crypto";
+import { Prisma } from "@prisma/client";
 import { Keypair, WebAuth, Transaction } from "@stellar/stellar-sdk";
 import { config } from "../config";
+import { prisma } from "../db";
 import { Errors } from "../errors";
 import { stellar } from "./stellar";
 
-const CHALLENGE_TTL_SECONDS = 300;
+const CHALLENGE_VALIDITY_SECONDS = 300;
+const MIN_NONCE_BYTES = 32;
 
-interface IssuedChallenge {
-  account: string;
-  expiresAt: number;
-}
-
-// Challenge transactions are deliberately short-lived and single-use. Keeping
-// these records in memory avoids persisting transaction contents or signatures.
-// The record is only an issuance/replay marker; no private key material is kept.
-const issuedChallenges = new Map<string, IssuedChallenge>();
-const consumedChallenges = new Map<string, number>();
+// Fallback used only by lightweight unit-test database mocks that do not expose
+// Prisma raw-query methods. Production replay state is stored in the database.
+const testConsumedChallenges = new Map<string, number>();
 
 let _serverKeypair: Keypair | null = null;
 
@@ -31,7 +28,6 @@ export function serverKeypair(): Keypair {
   if (config.SEP10_SIGNING_SECRET) {
     _serverKeypair = Keypair.fromSecret(config.SEP10_SIGNING_SECRET);
   } else {
-    // Deterministic-enough ephemeral key for dev/test when none is configured.
     _serverKeypair = Keypair.random();
   }
   return _serverKeypair;
@@ -78,7 +74,7 @@ export function buildChallenge(account: string): {
     serverKeypair(),
     account,
     config.SEP10_HOME_DOMAIN,
-    CHALLENGE_TTL_SECONDS,
+    CHALLENGE_VALIDITY_SECONDS,
     config.networkPassphrase,
     config.WEB_AUTH_DOMAIN
   );
@@ -94,57 +90,90 @@ export function buildChallenge(account: string): {
   return { transaction, networkPassphrase: config.networkPassphrase };
 }
 
+function invalidChallenge(): never {
+  throw Errors.unauthorized("Invalid or expired authentication challenge");
+}
+
+function challengeId(tx: Transaction): string {
+  return createHash("sha256").update(tx.hash()).digest("hex");
+}
+
+function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): void {
+  const transaction = tx as Transaction & {
+    timeBounds?: { minTime: number; maxTime: number } | null;
+    operations: Array<{
+      type?: string;
+      source?: string;
+      name?: string;
+      value?: Uint8Array;
+    }>;
+  };
+
+  if (transaction.source !== serverKeypair().publicKey()) invalidChallenge();
+
+  const bounds = transaction.timeBounds;
+  const now = Math.floor(Date.now() / 1000);
+  if (!bounds || !Number.isFinite(bounds.minTime) || !Number.isFinite(bounds.maxTime)) {
+    invalidChallenge();
+  }
+
+  // Stellar's TransactionBuilder.setTimeout() normally sets minTime to 0.
+  // Validate the effective expiration rather than requiring maxTime - minTime
+  // to be bounded, which would reject valid SEP-10 challenges.
+  if (
+    bounds.minTime > now ||
+    bounds.maxTime <= now ||
+    bounds.maxTime > now + CHALLENGE_VALIDITY_SECONDS
+  ) {
+    invalidChallenge();
+  }
+
+  if (transaction.operations.length !== 1) invalidChallenge();
+  const operation = transaction.operations[0];
+  if (
+    operation.type !== "manageData" ||
+    operation.source !== clientAccountId ||
+    operation.name !== `${config.WEB_AUTH_DOMAIN} auth` ||
+    !operation.value ||
+    operation.value.length < MIN_NONCE_BYTES
+  ) {
+    invalidChallenge();
+  }
+}
+
+async function consumeChallenge(id: string, expiresAt: Date): Promise<void> {
+  if (typeof prisma.$executeRaw !== "function") {
+    const now = Date.now();
+    for (const [key, expiry] of testConsumedChallenges) {
+      if (expiry <= now) testConsumedChallenges.delete(key);
+    }
+    if (testConsumedChallenges.has(id)) invalidChallenge();
+    testConsumedChallenges.set(id, expiresAt.getTime());
+    return;
+  }
+
+  const inserted = await prisma.$executeRaw(
+    Prisma.sql`INSERT INTO "Sep10ConsumedChallenge" ("id", "expiresAt")
+      VALUES (${id}, ${expiresAt})
+      ON CONFLICT ("id") DO NOTHING`
+  );
+  if (Number(inserted) !== 1) invalidChallenge();
+
+  await prisma.$executeRaw(
+    Prisma.sql`DELETE FROM "Sep10ConsumedChallenge" WHERE "expiresAt" <= CURRENT_TIMESTAMP`
+  );
+}
+
 /**
  * Verify a signed challenge. Returns the authenticated client public key.
  * Handles unfunded accounts by verifying against the account's master key.
  */
 export async function verifyChallenge(signedXdr: string): Promise<string> {
-  const now = Date.now();
-  cleanupChallenges(now);
-
   let tx: Transaction;
   let clientAccountId: string;
-  let challengeHash: string;
 
   try {
     tx = new Transaction(signedXdr, config.networkPassphrase);
-    challengeHash = tx.hash().toString("hex");
-
-    const issued = issuedChallenges.get(challengeHash);
-    if (!issued || issued.expiresAt <= now || consumedChallenges.has(challengeHash)) {
-      genericChallengeError();
-    }
-
-    const currentTime = Math.floor(now / 1000);
-    const timeBounds = tx.timeBounds;
-    if (
-      !timeBounds ||
-      !Number.isFinite(timeBounds.minTime) ||
-      !Number.isFinite(timeBounds.maxTime) ||
-      timeBounds.minTime > currentTime ||
-      timeBounds.maxTime < currentTime ||
-      timeBounds.maxTime <= timeBounds.minTime
-    ) {
-      genericChallengeError();
-    }
-
-    if (tx.source !== serverKeypair().publicKey()) genericChallengeError();
-    if (tx.sequence !== "0") genericChallengeError();
-    if (tx.memo.type !== "none") genericChallengeError();
-    if (tx.operations.length !== 2) genericChallengeError();
-
-    const [homeOperation, webAuthOperation] = tx.operations;
-    if (
-      homeOperation.type !== "manageData" ||
-      webAuthOperation.type !== "manageData" ||
-      homeOperation.name !== config.SEP10_HOME_DOMAIN ||
-      webAuthOperation.name !== config.WEB_AUTH_DOMAIN ||
-      operationValue(homeOperation.value) === null ||
-      operationValue(webAuthOperation.value) === null
-    ) {
-      genericChallengeError();
-    }
-
     const read = WebAuth.readChallengeTx(
       signedXdr,
       serverKeypair().publicKey(),
@@ -153,32 +182,20 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
       config.WEB_AUTH_DOMAIN
     );
     clientAccountId = read.clientAccountID;
-
-    if (
-      homeOperation.source !== clientAccountId ||
-      webAuthOperation.source !== clientAccountId ||
-      operationValue(webAuthOperation.value) !== clientAccountId
-    ) {
-      genericChallengeError();
-    }
-
-    const issuedAfterRead = issuedChallenges.get(challengeHash);
-    if (
-      !issuedAfterRead ||
-      issuedAfterRead.account !== clientAccountId ||
-      !validAccount(clientAccountId)
-    ) {
-      genericChallengeError();
-    }
+    validateChallengeEnvelope(tx, clientAccountId);
   } catch {
-    throw Errors.badRequest("invalid_challenge", "Invalid or expired authentication challenge");
+    invalidChallenge();
   }
 
-  const snapshot = await stellar.loadAccount(clientAccountId);
+  let snapshot;
+  try {
+    snapshot = await stellar.loadAccount(clientAccountId);
+  } catch {
+    invalidChallenge();
+  }
 
   try {
     if (!snapshot.exists) {
-      // Unfunded account: verify the master-key signature directly.
       WebAuth.verifyChallengeTxSigners(
         signedXdr,
         serverKeypair().publicKey(),
@@ -204,7 +221,20 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
       );
     }
   } catch {
-    throw Errors.unauthorized("Challenge authentication failed");
+    invalidChallenge();
+  }
+
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    await consumeChallenge(
+      challengeId(tx),
+      new Date((now + CHALLENGE_VALIDITY_SECONDS) * 1000)
+    );
+  } catch (error) {
+    if (error instanceof Error && error.message === "Invalid or expired authentication challenge") {
+      throw error;
+    }
+    invalidChallenge();
   }
 
   // Mark only after all validation and signature checks pass. JavaScript's

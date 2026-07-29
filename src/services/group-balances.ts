@@ -6,8 +6,13 @@ import {
   type BalanceSettlementRow,
   type NetBalance,
 } from "./settlement";
+import { getAssetConfig } from "./assets";
 
-/** The asset a group settles in: derived from its expenses, default XLM. */
+/**
+ * The asset a group settles in: derived from its expenses, default XLM.
+ * Uses the centralized asset configuration to ensure the returned code+issuer
+ * pair is valid.
+ */
 export async function groupPrimaryAsset(
   groupId: string
 ): Promise<{ assetCode: string; assetIssuer: string | null }> {
@@ -16,9 +21,13 @@ export async function groupPrimaryAsset(
     orderBy: { createdAt: "desc" },
     select: { assetCode: true, assetIssuer: true },
   });
+  const code = latest?.assetCode ?? "XLM";
+  const issuer = latest?.assetIssuer ?? null;
+  // Validate via the central registry (throws if misconfigured at startup).
+  const asset = getAssetConfig(code, issuer ?? undefined);
   return {
-    assetCode: latest?.assetCode ?? "XLM",
-    assetIssuer: latest?.assetIssuer ?? null,
+    assetCode: asset.code,
+    assetIssuer: asset.issuer,
   };
 }
 

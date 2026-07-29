@@ -1,12 +1,13 @@
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db";
+import { config } from "../config";
 import { requireUser } from "../plugins/auth";
 import { serializeExpense, serializeSettlement } from "../serializers";
 
 export default async function historyRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-  app.get("/history", async (req) => {
+  app.get("/history", { config: { rateLimit: { max: config.RATE_LIMIT_HISTORY, timeWindow: "1 minute" } } }, async (req) => {
     const auth = requireUser(req);
 
     const [expenses, settlements] = await Promise.all([

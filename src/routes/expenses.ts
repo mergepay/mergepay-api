@@ -7,7 +7,7 @@ import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
 import { isPositive } from "../services/money";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, AuditAction } from "../services/audit";
 import { serializeExpense } from "../serializers";
 
 const shareInput = z.object({
@@ -80,36 +80,43 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
-    const expense = await prisma.expense.create({
-      data: {
-        groupId,
-        payerUserId,
-        title: body.title,
-        description: body.description,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        splitType: body.splitType,
-        memo,
-        receiptUrl: body.receiptUrl ?? null,
-        shares: {
-          create: computed.map((c) => ({
-            userId: c.userId,
-            shareAmount: c.shareAmount,
-            // The payer's own share is already covered — mark it settled.
-            status: c.userId === payerUserId ? "settled" : "pending",
-          })),
+    const expense = await prisma.$transaction(async (tx) => {
+      const created = await tx.expense.create({
+        data: {
+          groupId,
+          payerUserId,
+          title: body.title,
+          description: body.description,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          splitType: body.splitType,
+          memo,
+          receiptUrl: body.receiptUrl ?? null,
+          shares: {
+            create: computed.map((c) => ({
+              userId: c.userId,
+              shareAmount: c.shareAmount,
+              // The payer's own share is already covered — mark it settled.
+              status: c.userId === payerUserId ? "settled" : "pending",
+            })),
+          },
         },
-      },
-      include: expenseInclude,
-    });
+        include: expenseInclude,
+      });
 
-    await audit({
-      userId: auth.id,
-      action: "expense.create",
-      entityType: "expense",
-      entityId: expense.id,
-      metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.ExpenseCreate,
+          entityType: "expense",
+          entityId: created.id,
+          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+        },
+        tx
+      );
+
+      return created;
     });
 
     return { expense: serializeExpense(expense) };
@@ -162,15 +169,28 @@ export default async function expenseRoutes(app: FastifyInstance) {
       throw Errors.forbidden("Only the payer or an admin can edit this expense");
     }
 
-    const updated = await prisma.expense.update({
-      where: { id },
-      data: {
-        ...(body.title !== undefined && { title: body.title }),
-        ...(body.description !== undefined && { description: body.description }),
-        ...(body.memo !== undefined && { memo: body.memo }),
-        ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
-      },
-      include: expenseInclude,
+    const updated = await prisma.$transaction(async (tx) => {
+      const saved = await tx.expense.update({
+        where: { id },
+        data: {
+          ...(body.title !== undefined && { title: body.title }),
+          ...(body.description !== undefined && { description: body.description }),
+          ...(body.memo !== undefined && { memo: body.memo }),
+          ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
+        },
+        include: expenseInclude,
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.ExpenseUpdate,
+          entityType: "expense",
+          entityId: id,
+          metadata: { fields: Object.keys(body) },
+        },
+        tx
+      );
+      return saved;
     });
     return { expense: serializeExpense(updated) };
   });
@@ -199,12 +219,18 @@ export default async function expenseRoutes(app: FastifyInstance) {
       );
     }
 
-    await prisma.expense.delete({ where: { id } });
-    await audit({
-      userId: auth.id,
-      action: "expense.delete",
-      entityType: "expense",
-      entityId: id,
+    await prisma.$transaction(async (tx) => {
+      await tx.expense.delete({ where: { id } });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.ExpenseDelete,
+          entityType: "expense",
+          entityId: id,
+          metadata: { groupId: expense.groupId },
+        },
+        tx
+      );
     });
     return { ok: true };
   });

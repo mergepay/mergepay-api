@@ -6,7 +6,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
-import { audit } from "../services/audit";
+import { audit, AuditAction } from "../services/audit";
 import { serializeAnchorSession } from "../serializers";
 
 export default async function anchorRoutes(app: FastifyInstance) {
@@ -58,20 +58,27 @@ export default async function anchorRoutes(app: FastifyInstance) {
       auth.stellarPublicKey
     );
 
-    const session = await prisma.anchorSession.create({
-      data: {
-        userId: auth.id,
-        anchorName: body.anchorName ?? config.ANCHOR_NAME,
-        kind,
-        assetCode: body.assetCode,
-        status: "incomplete",
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: `anchor.${kind}.start`,
-      entityType: "anchor_session",
-      entityId: session.id,
+    const session = await prisma.$transaction(async (tx) => {
+      const created = await tx.anchorSession.create({
+        data: {
+          userId: auth.id,
+          anchorName: body.anchorName ?? config.ANCHOR_NAME,
+          kind,
+          assetCode: body.assetCode,
+          status: "incomplete",
+        },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.AnchorSessionStart,
+          entityType: "anchor_session",
+          entityId: created.id,
+          metadata: { kind, assetCode: body.assetCode },
+        },
+        tx
+      );
+      return created;
     });
 
     return {
@@ -111,14 +118,28 @@ export default async function anchorRoutes(app: FastifyInstance) {
         account: auth.stellarPublicKey,
       });
 
-      const updated = await prisma.anchorSession.update({
-        where: { id },
-        data: {
-          interactiveUrl: interactive.url,
-          externalTransactionId: interactive.id,
-          anchorToken: token,
-          status: "pending_user_transfer_start",
-        },
+      const updated = await prisma.$transaction(async (tx) => {
+        const saved = await tx.anchorSession.update({
+          where: { id },
+          data: {
+            interactiveUrl: interactive.url,
+            externalTransactionId: interactive.id,
+            anchorToken: token,
+            status: "pending_user_transfer_start",
+          },
+        });
+        // anchorToken/signedXdr are bearer credentials — never written to audit metadata.
+        await audit(
+          {
+            actor: { type: "user", userId: auth.id },
+            action: AuditAction.AnchorSessionComplete,
+            entityType: "anchor_session",
+            entityId: id,
+            metadata: { externalTransactionId: interactive.id, status: "pending_user_transfer_start" },
+          },
+          tx
+        );
+        return saved;
       });
 
       return { session: serializeAnchorSession(updated) };
@@ -156,10 +177,34 @@ export default async function anchorRoutes(app: FastifyInstance) {
     const externalId = body.transaction?.id ?? body.id;
     const status = body.transaction?.status ?? body.status;
     if (externalId && status) {
-      await prisma.anchorSession.updateMany({
+      const nextStatus = mapAnchorStatus(status);
+      const sessions = await prisma.anchorSession.findMany({
         where: { externalTransactionId: externalId },
-        data: { status: mapAnchorStatus(status) },
+        select: { id: true, status: true },
       });
+      for (const session of sessions) {
+        if (session.status === nextStatus) continue; // redelivered webhook — no state change to audit
+        await prisma.$transaction(async (tx) => {
+          await tx.anchorSession.update({
+            where: { id: session.id },
+            data: { status: nextStatus },
+          });
+          await audit(
+            {
+              actor: { type: "system", worker: "anchor-webhook" },
+              action: AuditAction.AnchorWebhookStatusChange,
+              entityType: "anchor_session",
+              entityId: session.id,
+              metadata: {
+                previousStatus: session.status,
+                status: nextStatus,
+                externalTransactionId: externalId,
+              },
+            },
+            tx
+          );
+        });
+      }
     }
     return reply.code(200).send({ ok: true });
   });

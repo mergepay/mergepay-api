@@ -6,7 +6,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { inviteCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, AuditAction } from "../services/audit";
 import {
   serializeGroup,
   serializeInvitation,
@@ -31,19 +31,25 @@ export default async function groupRoutes(app: FastifyInstance) {
       })
       .parse(req.body);
 
-    const group = await prisma.group.create({
-      data: {
-        name: body.name,
-        description: body.description,
-        createdByUserId: auth.id,
-        members: { create: { userId: auth.id, role: "admin" } },
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: "group.create",
-      entityType: "group",
-      entityId: group.id,
+    const group = await prisma.$transaction(async (tx) => {
+      const created = await tx.group.create({
+        data: {
+          name: body.name,
+          description: body.description,
+          createdByUserId: auth.id,
+          members: { create: { userId: auth.id, role: "admin" } },
+        },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.GroupCreate,
+          entityType: "group",
+          entityId: created.id,
+        },
+        tx
+      );
+      return created;
     });
     return { group: serializeGroup(group) };
   });
@@ -147,20 +153,25 @@ export default async function groupRoutes(app: FastifyInstance) {
         );
       }
 
-      const invitation = await prisma.invitation.create({
-        data: {
-          groupId: id,
-          inviteePublicKey: body.publicKey,
-          status: "PENDING",
-        },
-      });
-
-      await audit({
-        userId: auth.id,
-        action: "group.invite",
-        entityType: "invitation",
-        entityId: invitation.id,
-        metadata: { groupId: id, inviteePublicKey: body.publicKey },
+      const invitation = await prisma.$transaction(async (tx) => {
+        const created = await tx.invitation.create({
+          data: {
+            groupId: id,
+            inviteePublicKey: body.publicKey,
+            status: "PENDING",
+          },
+        });
+        await audit(
+          {
+            actor: { type: "user", userId: auth.id },
+            action: AuditAction.GroupInviteDirect,
+            entityType: "invitation",
+            entityId: created.id,
+            metadata: { groupId: id, inviteePublicKey: body.publicKey },
+          },
+          tx
+        );
+        return created;
       });
 
       return reply.status(201).send({ invitation: serializeInvitation(invitation) });
@@ -178,14 +189,27 @@ export default async function groupRoutes(app: FastifyInstance) {
       ? new Date(Date.now() + body.expiresInHours * 3600_000)
       : null;
 
-    const invite = await prisma.invite.create({
-      data: {
-        groupId: id,
-        code: inviteCode(),
-        createdByUserId: auth.id,
-        maxUses: body.maxUses ?? null,
-        expiresAt,
-      },
+    const invite = await prisma.$transaction(async (tx) => {
+      const created = await tx.invite.create({
+        data: {
+          groupId: id,
+          code: inviteCode(),
+          createdByUserId: auth.id,
+          maxUses: body.maxUses ?? null,
+          expiresAt,
+        },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.GroupInviteCodeCreate,
+          entityType: "invite",
+          entityId: created.id,
+          metadata: { groupId: id, maxUses: body.maxUses ?? null, expiresAt },
+        },
+        tx
+      );
+      return created;
     });
     return { invite: serializeInvite(invite, config.WEB_URL) };
   });
@@ -211,20 +235,24 @@ export default async function groupRoutes(app: FastifyInstance) {
     });
 
     if (!existing) {
-      await prisma.$transaction([
-        prisma.groupMember.create({
+      await prisma.$transaction(async (tx) => {
+        await tx.groupMember.create({
           data: { groupId: invite.groupId, userId: auth.id, role: "member" },
-        }),
-        prisma.invite.update({
+        });
+        await tx.invite.update({
           where: { id: invite.id },
           data: { uses: { increment: 1 } },
-        }),
-      ]);
-      await audit({
-        userId: auth.id,
-        action: "group.join",
-        entityType: "group",
-        entityId: invite.groupId,
+        });
+        await audit(
+          {
+            actor: { type: "user", userId: auth.id },
+            action: AuditAction.GroupJoin,
+            entityType: "group",
+            entityId: invite.groupId,
+            metadata: { inviteId: invite.id },
+          },
+          tx
+        );
       });
     }
 
@@ -253,14 +281,19 @@ export default async function groupRoutes(app: FastifyInstance) {
       }
     }
 
-    await prisma.groupMember.delete({
-      where: { groupId_userId: { groupId: id, userId: auth.id } },
-    });
-    await audit({
-      userId: auth.id,
-      action: "group.leave",
-      entityType: "group",
-      entityId: id,
+    await prisma.$transaction(async (tx) => {
+      await tx.groupMember.delete({
+        where: { groupId_userId: { groupId: id, userId: auth.id } },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.GroupLeave,
+          entityType: "group",
+          entityId: id,
+        },
+        tx
+      );
     });
     return { ok: true };
   });
@@ -270,15 +303,21 @@ export default async function groupRoutes(app: FastifyInstance) {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireAdmin(id, auth.id);
-    const group = await prisma.group.update({
-      where: { id },
-      data: { archived: true },
-    });
-    await audit({
-      userId: auth.id,
-      action: "group.archive",
-      entityType: "group",
-      entityId: id,
+    const group = await prisma.$transaction(async (tx) => {
+      const updated = await tx.group.update({
+        where: { id },
+        data: { archived: true },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.GroupArchive,
+          entityType: "group",
+          entityId: id,
+        },
+        tx
+      );
+      return updated;
     });
     return { group: serializeGroup(group) };
   });

@@ -8,7 +8,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
 import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, AuditAction } from "../services/audit";
 import {
   serializeSettlement,
   serializeExpense,
@@ -57,26 +57,46 @@ export default async function settlementRoutes(app: FastifyInstance) {
       body.assetCode !== undefined ? body.assetIssuer ?? null : expense.assetIssuer;
 
     const code = shortCode();
-    const settlement = await prisma.settlement.create({
-      data: {
-        shortCode: code,
-        groupId: expense.groupId,
-        fromUserId: auth.id,
-        toUserId: expense.payerUserId,
-        amount: myShare.shareAmount,
-        assetCode,
-        assetIssuer,
-        status: "pending",
-        memo: memoText(code),
-        expenseId: expense.id,
-        expenseShareId: myShare.id,
-      },
-      include: settlementInclude,
-    });
+    const settlement = await prisma.$transaction(async (tx) => {
+      const created = await tx.settlement.create({
+        data: {
+          shortCode: code,
+          groupId: expense.groupId,
+          fromUserId: auth.id,
+          toUserId: expense.payerUserId,
+          amount: myShare.shareAmount,
+          assetCode,
+          assetIssuer,
+          status: "pending",
+          memo: memoText(code),
+          expenseId: expense.id,
+          expenseShareId: myShare.id,
+        },
+        include: settlementInclude,
+      });
 
-    await prisma.expenseShare.update({
-      where: { id: myShare.id },
-      data: { status: "settling" },
+      await tx.expenseShare.update({
+        where: { id: myShare.id },
+        data: { status: "settling" },
+      });
+
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.SettlementCreate,
+          entityType: "settlement",
+          entityId: created.id,
+          metadata: {
+            groupId: expense.groupId,
+            expenseId: expense.id,
+            amount: myShare.shareAmount.toString(),
+            assetCode,
+          },
+        },
+        tx
+      );
+
+      return created;
     });
 
     const xdr = await buildSettlementXdr({
@@ -119,19 +139,32 @@ export default async function settlementRoutes(app: FastifyInstance) {
     if (!recipient) throw Errors.badRequest("invalid_recipient", "Recipient is not a member");
 
     const code = shortCode();
-    const settlement = await prisma.settlement.create({
-      data: {
-        shortCode: code,
-        groupId,
-        fromUserId: auth.id,
-        toUserId: body.toUserId,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        status: "pending",
-        memo: memoText(code),
-      },
-      include: settlementInclude,
+    const settlement = await prisma.$transaction(async (tx) => {
+      const created = await tx.settlement.create({
+        data: {
+          shortCode: code,
+          groupId,
+          fromUserId: auth.id,
+          toUserId: body.toUserId,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          status: "pending",
+          memo: memoText(code),
+        },
+        include: settlementInclude,
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.SettlementCreate,
+          entityType: "settlement",
+          entityId: created.id,
+          metadata: { groupId, toUserId: body.toUserId, amount: body.amount, assetCode: body.assetCode },
+        },
+        tx
+      );
+      return created;
     });
 
     const xdr = await buildSettlementXdr({
@@ -214,21 +247,26 @@ export default async function settlementRoutes(app: FastifyInstance) {
       return response200;
     }
 
-    const updated = await prisma.settlement.update({
-      where: { id },
-      data: {
-        transactionXdr: body.signedXdr,
-        status: "submitted",
-      },
-      include: settlementInclude,
-    });
-
-    await audit({
-      userId: auth.id,
-      action: "settlement.confirm",
-      entityType: "settlement",
-      entityId: id,
-      metadata: { status: "submitted" },
+    const updated = await prisma.$transaction(async (tx) => {
+      const saved = await tx.settlement.update({
+        where: { id },
+        data: {
+          transactionXdr: body.signedXdr,
+          status: "submitted",
+        },
+        include: settlementInclude,
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.SettlementConfirm,
+          entityType: "settlement",
+          entityId: id,
+          metadata: { status: "submitted" },
+        },
+        tx
+      );
+      return saved;
     });
 
     const response200 = { settlement: serializeSettlement(updated) };

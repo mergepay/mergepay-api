@@ -8,7 +8,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, AuditAction } from "../services/audit";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
 
 export default async function treasuryRoutes(app: FastifyInstance) {
@@ -41,19 +41,26 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       }
     }
 
-    const group = await prisma.group.update({
-      where: { id },
-      data: {
-        treasuryEnabled: true,
-        treasuryAccountPublicKey: body.publicKey,
-        treasuryRequiredSigners: body.requiredSigners ?? 1,
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: "treasury.enable",
-      entityType: "group",
-      entityId: id,
+    const group = await prisma.$transaction(async (tx) => {
+      const updated = await tx.group.update({
+        where: { id },
+        data: {
+          treasuryEnabled: true,
+          treasuryAccountPublicKey: body.publicKey,
+          treasuryRequiredSigners: body.requiredSigners ?? 1,
+        },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.TreasuryEnable,
+          entityType: "group",
+          entityId: id,
+          metadata: { publicKey: body.publicKey, requiredSigners: body.requiredSigners ?? 1 },
+        },
+        tx
+      );
+      return updated;
     });
     return { group: serializeGroup(group) };
   });
@@ -100,20 +107,33 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     }
 
     const code = shortCode();
-    const ttx = await prisma.treasuryTransaction.create({
-      data: {
-        shortCode: code,
-        groupId: id,
-        userId: auth.id,
-        direction: "deposit",
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        destination: group.treasuryAccountPublicKey,
-        status: "pending",
-        memo: memoText(code),
-      },
-      include: { user: true },
+    const ttx = await prisma.$transaction(async (tx) => {
+      const created = await tx.treasuryTransaction.create({
+        data: {
+          shortCode: code,
+          groupId: id,
+          userId: auth.id,
+          direction: "deposit",
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          destination: group.treasuryAccountPublicKey,
+          status: "pending",
+          memo: memoText(code),
+        },
+        include: { user: true },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.TreasuryDepositCreate,
+          entityType: "treasury_transaction",
+          entityId: created.id,
+          metadata: { groupId: id, amount: body.amount, assetCode: body.assetCode },
+        },
+        tx
+      );
+      return created;
     });
 
     const account = await stellar.loadAccount(auth.stellarPublicKey);
@@ -161,20 +181,38 @@ export default async function treasuryRoutes(app: FastifyInstance) {
 
     const requiresMulti = (group.treasuryRequiredSigners ?? 1) > 1;
     const code = shortCode();
-    const ttx = await prisma.treasuryTransaction.create({
-      data: {
-        shortCode: code,
-        groupId: id,
-        userId: auth.id,
-        direction: "withdrawal",
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        destination: body.destination,
-        status: requiresMulti ? "awaiting_signatures" : "pending",
-        memo: memoText(code),
-      },
-      include: { user: true },
+    const ttx = await prisma.$transaction(async (tx) => {
+      const created = await tx.treasuryTransaction.create({
+        data: {
+          shortCode: code,
+          groupId: id,
+          userId: auth.id,
+          direction: "withdrawal",
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          destination: body.destination,
+          status: requiresMulti ? "awaiting_signatures" : "pending",
+          memo: memoText(code),
+        },
+        include: { user: true },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.TreasuryWithdrawCreate,
+          entityType: "treasury_transaction",
+          entityId: created.id,
+          metadata: {
+            groupId: id,
+            amount: body.amount,
+            assetCode: body.assetCode,
+            destination: body.destination,
+          },
+        },
+        tx
+      );
+      return created;
     });
 
     const account = await stellar.loadAccount(group.treasuryAccountPublicKey);
@@ -240,25 +278,44 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         amount: ttx.amount.toString(),
         memoCode: ttx.shortCode,
       });
-    } catch (e) {
-      await prisma.treasuryTransaction.update({
-        where: { id },
-        data: { status: "failed" },
+    } catch (e: any) {
+      await prisma.$transaction(async (tx) => {
+        await tx.treasuryTransaction.update({
+          where: { id },
+          data: { status: "failed" },
+        });
+        await audit(
+          {
+            actor: { type: "user", userId: auth.id },
+            action: AuditAction.TreasuryConfirmFailed,
+            entityType: "treasury_transaction",
+            entityId: id,
+            outcome: "failure",
+            metadata: { direction: ttx.direction, reason: e?.message ?? String(e) },
+          },
+          tx
+        );
       });
       throw e;
     }
 
-    const updated = await prisma.treasuryTransaction.update({
-      where: { id },
-      data: { status: "confirmed", stellarTxHash: hash },
-      include: { user: true },
-    });
-    await audit({
-      userId: auth.id,
-      action: "treasury.confirm",
-      entityType: "treasury_transaction",
-      entityId: id,
-      metadata: { hash, direction: ttx.direction },
+    const updated = await prisma.$transaction(async (tx) => {
+      const saved = await tx.treasuryTransaction.update({
+        where: { id },
+        data: { status: "confirmed", stellarTxHash: hash },
+        include: { user: true },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.TreasuryConfirm,
+          entityType: "treasury_transaction",
+          entityId: id,
+          metadata: { hash, direction: ttx.direction },
+        },
+        tx
+      );
+      return saved;
     });
     return { treasuryTransaction: serializeTreasuryTx(updated) };
   });

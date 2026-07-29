@@ -2,7 +2,7 @@ import pino from "pino";
 import { config } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
-import { audit } from "../services/audit";
+import { audit, AuditAction } from "../services/audit";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { runReconciliation, startReconciliation } from "./reconciliation";
 
@@ -61,10 +61,23 @@ export async function reconcileAnchors(): Promise<void> {
         id: session.externalTransactionId!,
       });
 
-      if (status) {
-        await prisma.anchorSession.update({
-          where: { id: session.id },
-          data: { status: mapAnchorStatus(status) },
+      const nextStatus = status ? mapAnchorStatus(status) : null;
+      if (nextStatus && nextStatus !== session.status) {
+        await prisma.$transaction(async (tx) => {
+          await tx.anchorSession.update({
+            where: { id: session.id },
+            data: { status: nextStatus },
+          });
+          await audit(
+            {
+              actor: { type: "system", worker: "anchor-reconciliation" },
+              action: AuditAction.AnchorReconcileStatusChange,
+              entityType: "anchor_session",
+              entityId: session.id,
+              metadata: { previousStatus: session.status, status: nextStatus },
+            },
+            tx
+          );
         });
       }
     } catch {
@@ -74,9 +87,24 @@ export async function reconcileAnchors(): Promise<void> {
 }
 
 export async function expireInvites(): Promise<void> {
-  await prisma.invite.deleteMany({
+  const expired = await prisma.invite.findMany({
     where: { expiresAt: { not: null, lt: new Date() } },
+    select: { id: true, groupId: true },
   });
+  if (expired.length === 0) return;
+
+  await prisma.invite.deleteMany({
+    where: { id: { in: expired.map((i) => i.id) } },
+  });
+  for (const invite of expired) {
+    await audit({
+      actor: { type: "system", worker: "invite-expiry" },
+      action: AuditAction.InviteExpired,
+      entityType: "invite",
+      entityId: invite.id,
+      metadata: { groupId: invite.groupId },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,41 +241,50 @@ export async function processSubmittedSettlements(): Promise<void> {
               data: { status: "settled" },
             });
           }
+          await audit(
+            {
+              actor: { type: "system", worker: "settlement-submission" },
+              action: AuditAction.SettlementSubmitted,
+              entityType: "settlement",
+              entityId: settlement.id,
+              metadata: { status: "confirmed", stellarTxHash: hash },
+            },
+            tx
+          );
           return updated;
         });
 
         log.info({ id: settlement.id, hash }, "settlement confirmed");
-
-        await audit({
-          action: "settlement.confirmed",
-          entityType: "settlement",
-          entityId: settlement.id,
-          metadata: { status: "confirmed", stellarTxHash: hash },
-        });
       }
     } catch (error: any) {
       const msg = error?.message ?? String(error);
 
-      await prisma.settlement.update({
-        where: { id: settlement.id },
-        data: {
-          status: "failed",
-          failureReason: msg,
-          retryCount: { increment: 1 },
-        },
+      await prisma.$transaction(async (tx) => {
+        await tx.settlement.update({
+          where: { id: settlement.id },
+          data: {
+            status: "failed",
+            failureReason: msg,
+            retryCount: { increment: 1 },
+          },
+        });
+        await audit(
+          {
+            actor: { type: "system", worker: "settlement-submission" },
+            action: AuditAction.SettlementFailed,
+            entityType: "settlement",
+            entityId: settlement.id,
+            outcome: "failure",
+            metadata: { failureReason: msg },
+          },
+          tx
+        );
       });
 
       log.error(
         { id: settlement.id, err: msg },
         "settlement marked as failed after exhausting retries"
       );
-
-      await audit({
-        action: "settlement.failed",
-        entityType: "settlement",
-        entityId: settlement.id,
-        metadata: { failureReason: msg },
-      });
     }
   }
 }

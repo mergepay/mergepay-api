@@ -8,16 +8,18 @@ import { requireMembership } from "../services/access";
 import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
-import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
+import { userOrIpKey } from "../services/rate-limit-keys";
 import {
   serializeSettlement,
   serializeExpense,
   serializeTreasuryTx,
 } from "../serializers";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
+import { validateAsset, validateAmount } from "../services/assets";
 import { memoText } from "../services/stellar";
 
 const settlementInclude = { from: true, to: true } as const;
@@ -25,8 +27,35 @@ const settlementInclude = { from: true, to: true } as const;
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
+  // Settlement submission builds a real Stellar payment XDR (create) or
+  // hands a signed one off for submission (confirm) — both are the kind of
+  // expensive, state-changing operation that needs its own explicit budget
+  // rather than sharing the blanket global limit. Rate-limiting runs as a
+  // preHandler (after the app.authenticate hook above sets req.user) so the
+  // key can be the authenticated user rather than falling back to IP.
+  const createLimit = {
+    config: {
+      rateLimit: {
+        max: config.RATE_LIMIT_SETTLEMENT_CREATE_MAX,
+        timeWindow: config.RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS,
+        hook: "preHandler" as const,
+        keyGenerator: userOrIpKey("settlement.create"),
+      },
+    },
+  };
+  const confirmLimit = {
+    config: {
+      rateLimit: {
+        max: config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX,
+        timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
+        hook: "preHandler" as const,
+        keyGenerator: userOrIpKey("settlement.confirm"),
+      },
+    },
+  };
+
   // -- settle a specific expense share ----------------------------------------
-  app.post("/expenses/:id/settle", async (req) => {
+  app.post("/expenses/:id/settle", createLimit, async (req) => {
     const auth = requireUser(req);
     const { id: expenseId } = z.object({ id: z.string() }).parse(req.params);
     const body = z
@@ -114,7 +143,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- freeform settle-up against net balance ---------------------------------
-  app.post("/groups/:id/settlements", async (req) => {
+  app.post("/groups/:id/settlements", createLimit, async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(groupId, auth.id);
@@ -127,6 +156,9 @@ export default async function settlementRoutes(app: FastifyInstance) {
       })
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
+
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     if (body.toUserId === auth.id) {
       throw Errors.badRequest("self_settle", "You cannot settle with yourself");
@@ -179,7 +211,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
-  app.post("/settlements/:id/confirm", async (req) => {
+  app.post("/settlements/:id/confirm", confirmLimit, async (req, reply) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
@@ -288,42 +320,96 @@ export default async function settlementRoutes(app: FastifyInstance) {
   app.get("/groups/:id/ledger", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
     await requireMembership(groupId, auth.id);
+
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
+    const cursorFilter = decodedCursor
+      ? {
+          OR: [
+            { createdAt: { lt: decodedCursor.createdAt } },
+            {
+              createdAt: decodedCursor.createdAt,
+              id: { lt: decodedCursor.id },
+            },
+          ],
+        }
+      : {};
+
+    const takeCount = limit + 1;
 
     const [expenses, settlements, treasuryTxs] = await Promise.all([
       prisma.expense.findMany({
-        where: { groupId },
+        where: { groupId, ...cursorFilter },
         include: { payer: true, shares: { include: { user: true } } },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: takeCount,
       }),
       prisma.settlement.findMany({
-        where: { groupId },
+        where: { groupId, ...cursorFilter },
         include: { from: true, to: true },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: takeCount,
       }),
       prisma.treasuryTransaction.findMany({
-        where: { groupId },
+        where: { groupId, ...cursorFilter },
         include: { user: true },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: takeCount,
       }),
     ]);
 
     const entries = [
       ...expenses.map((e) => ({
         type: "expense" as const,
-        createdAt: e.createdAt.toISOString(),
+        createdAt: e.createdAt,
+        id: e.id,
         expense: serializeExpense(e),
       })),
       ...settlements.map((s) => ({
         type: "settlement" as const,
-        createdAt: s.createdAt.toISOString(),
+        createdAt: s.createdAt,
+        id: s.id,
         settlement: serializeSettlement(s),
       })),
       ...treasuryTxs.map((t) => ({
         type: "treasury" as const,
-        createdAt: t.createdAt.toISOString(),
+        createdAt: t.createdAt,
+        id: t.id,
         treasuryTransaction: serializeTreasuryTx(t),
       })),
-    ].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    ].sort((a, b) => {
+      if (a.createdAt < b.createdAt) return 1;
+      if (a.createdAt > b.createdAt) return -1;
+      return a.id < b.id ? 1 : -1;
+    });
 
-    return { entries };
+    const hasMore = entries.length > limit;
+    const results = hasMore ? entries.slice(0, limit) : entries;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
+
+    return {
+      entries: results.map((r) => {
+        const { id, ...rest } = r;
+        return {
+          ...rest,
+          createdAt: r.createdAt.toISOString(),
+        };
+      }),
+      meta: { nextCursor, hasMore },
+    };
   });
 }
 

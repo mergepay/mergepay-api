@@ -17,6 +17,7 @@ import treasuryRoutes from "./routes/treasury";
 import anchorRoutes from "./routes/anchors";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
+import { getCorrelationId } from "./lib/correlation";
 
 function securityKey(request: FastifyRequest): string {
   const authorization = request.headers.authorization;
@@ -32,10 +33,39 @@ function securityKey(request: FastifyRequest): string {
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
+    // Disable Fastify's unvalidated request-id header handling. The incoming
+    // values are validated by genReqId before becoming request.id.
+    requestIdHeader: false,
+    genReqId: (request) =>
+      getCorrelationId(
+        request.headers["x-correlation-id"] ?? request.headers["x-request-id"]
+      ),
     logger: config.isTest
       ? false
       : {
           level: process.env.LOG_LEVEL ?? "info",
+          redact: {
+            paths: [
+              "req.headers.authorization",
+              "req.headers.cookie",
+              "authorization",
+              "cookie",
+              "token",
+              "accessToken",
+              "refreshToken",
+              "signedXdr",
+              "transactionXdr",
+              "privateKey",
+              "secret",
+              "password",
+              "body.token",
+              "body.signedXdr",
+              "body.transactionXdr",
+              "body.privateKey",
+              "body.password",
+            ],
+            censor: "[REDACTED]",
+          },
           transport:
             config.NODE_ENV === "development"
               ? { target: "pino-pretty", options: { colorize: true } }
@@ -44,8 +74,40 @@ export async function buildApp(): Promise<FastifyInstance> {
     bodyLimit: config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024,
   });
 
+  app.addHook("onRequest", async (request, reply) => {
+    const correlationId = getCorrelationId(request.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
+    request.log.info({ correlationId }, "request received");
+  });
+
+  app.addHook("onResponse", async (request, reply) => {
+    const correlationId = getCorrelationId(request.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
+    request.log.info(
+      {
+        correlationId,
+        statusCode: reply.statusCode,
+        method: request.method,
+        route: request.routeOptions.url,
+      },
+      "request completed"
+    );
+  });
+
+  app.addHook("onError", async (request, _reply, error) => {
+    request.log.error(
+      {
+        correlationId: getCorrelationId(request.id),
+        statusCode: (error as Error & { statusCode?: number }).statusCode ?? 500,
+        errorCode: (error as { code?: string }).code ?? "INTERNAL_ERROR",
+      },
+      "request failed"
+    );
+  });
+
   await app.register(helmet, { contentSecurityPolicy: false });
-  // CORS allowlist. "*" allows any origin; otherwise a comma-separated whitelist.
   const allowAll = config.WEB_URL === "*";
   const allowed = config.WEB_URL
     .split(",")
@@ -141,11 +203,14 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(errorHandlerPlugin);
 
   app.setNotFoundHandler((req, reply) => {
+    const correlationId = getCorrelationId(req.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
       error: "NOT_FOUND",
       message: "Route not found",
       statusCode: 404,
-      requestId: req.id as string,
+      requestId: correlationId,
     });
   });
 

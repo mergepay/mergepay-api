@@ -124,6 +124,43 @@ See [.env.example](.env.example). Key ones:
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
 
+### Rate limiting
+
+Every route is covered by a global default limit
+(`RATE_LIMIT_GLOBAL_MAX` / `RATE_LIMIT_GLOBAL_WINDOW_MS`, default 100 per
+minute), plus route-appropriate overrides for endpoints with different
+traffic patterns or trust boundaries:
+
+| Route(s) | Variables | Default |
+| --- | --- | --- |
+| `POST /auth/challenge` | `RATE_LIMIT_AUTH_CHALLENGE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /auth/verify` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /expenses/:id/settle`, `POST /groups/:id/settlements` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /settlements/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 60 / 1 min |
+
+Limit keys are the authenticated user's internal id when available
+(never a Stellar public key), or the resolved client IP otherwise —
+`req.ip` does not trust `X-Forwarded-For` unless Fastify's `trustProxy`
+option is explicitly enabled, which this app does not do by default. If
+you deploy behind a reverse proxy or load balancer and want per-client
+(rather than per-proxy) limiting, enable `trustProxy` in `src/app.ts` and
+make sure only your proxy can reach the app directly.
+
+The anchor webhook's rate limit is abuse protection only — it never
+replaces the shared-secret (`ANCHOR_WEBHOOK_SECRET`) check, which remains
+the actual authentication gate for that route.
+
+By default (`RATE_LIMIT_STORE=memory`) counters live in each API process's
+memory, which is fine for a single instance. Set `RATE_LIMIT_STORE=database`
+to share counters across multiple instances via a small Postgres-backed
+store (`rate_limit_buckets` table, see
+`src/services/rate-limit-store.ts`). That store fails **open**: if a count
+query errors (e.g. a transient database outage), the request is allowed
+through rather than the whole API returning 500s — a degraded rate limiter
+is preferable to a full outage. Every 429 response includes standard
+`Retry-After` / `X-RateLimit-*` headers.
+
 ## How it works
 
 ### SEP-10 login

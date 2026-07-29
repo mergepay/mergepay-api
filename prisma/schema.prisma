@@ -252,6 +252,24 @@ model AuditLog {
   @@map("audit_logs")
 }
 
+// Replay-protection ledger for SEP-10 authentication (see
+// src/services/sep10.ts). Each row is the fingerprint of a challenge
+// transaction that has already been exchanged for a session; consumeChallenge()
+// claims a row with an atomic INSERT ... ON CONFLICT DO NOTHING so the same
+// challenge can never be consumed twice, even under concurrent requests
+// across multiple API instances. Rows past `expiresAt` are opportunistically
+// deleted by consumeChallenge() itself, so this table never grows unbounded.
+//
+// Table/column names intentionally match Prisma's default (unmapped) casing
+// because src/services/sep10.ts writes to this table via raw SQL rather than
+// the generated client.
+model Sep10ConsumedChallenge {
+  id        String   @id
+  expiresAt DateTime
+
+  @@index([expiresAt])
+}
+
 // Backing store for the optional database-backed rate limiter (see
 // src/services/rate-limit-store.ts). Only used when RATE_LIMIT_STORE=database;
 // the default in-memory store never touches this table. Rows are

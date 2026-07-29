@@ -11,7 +11,7 @@ import { Prisma } from "@prisma/client";
 import { Keypair, WebAuth, Transaction } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { prisma } from "../db";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { stellar } from "./stellar";
 
 const CHALLENGE_VALIDITY_SECONDS = 300;
@@ -33,15 +33,6 @@ export function serverKeypair(): Keypair {
   return _serverKeypair;
 }
 
-function cleanupChallenges(now: number): void {
-  for (const [hash, challenge] of issuedChallenges) {
-    if (challenge.expiresAt <= now) issuedChallenges.delete(hash);
-  }
-  for (const [hash, expiresAt] of consumedChallenges) {
-    if (expiresAt <= now) consumedChallenges.delete(hash);
-  }
-}
-
 function validAccount(account: string): boolean {
   try {
     Keypair.fromPublicKey(account);
@@ -49,10 +40,6 @@ function validAccount(account: string): boolean {
   } catch {
     return false;
   }
-}
-
-function genericChallengeError(): never {
-  throw Errors.badRequest("invalid_challenge", "Invalid or expired authentication challenge");
 }
 
 function operationValue(value: unknown): string | null {
@@ -79,14 +66,6 @@ export function buildChallenge(account: string): {
     config.WEB_AUTH_DOMAIN
   );
 
-  const parsed = new Transaction(transaction, config.networkPassphrase);
-  const now = Date.now();
-  cleanupChallenges(now);
-  issuedChallenges.set(parsed.hash().toString("hex"), {
-    account,
-    expiresAt: now + CHALLENGE_TTL_SECONDS * 1000,
-  });
-
   return { transaction, networkPassphrase: config.networkPassphrase };
 }
 
@@ -100,7 +79,9 @@ function challengeId(tx: Transaction): string {
 
 function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): void {
   const transaction = tx as Transaction & {
-    timeBounds?: { minTime: number; maxTime: number } | null;
+    // stellar-sdk represents time bounds as decimal-string unix timestamps,
+    // not numbers.
+    timeBounds?: { minTime: string; maxTime: string } | null;
     operations: Array<{
       type?: string;
       source?: string;
@@ -113,31 +94,51 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): vo
 
   const bounds = transaction.timeBounds;
   const now = Math.floor(Date.now() / 1000);
-  if (!bounds || !Number.isFinite(bounds.minTime) || !Number.isFinite(bounds.maxTime)) {
+  const minTime = bounds ? Number(bounds.minTime) : NaN;
+  const maxTime = bounds ? Number(bounds.maxTime) : NaN;
+  if (!bounds || !Number.isFinite(minTime) || !Number.isFinite(maxTime)) {
     invalidChallenge();
   }
 
   // Stellar's TransactionBuilder.setTimeout() normally sets minTime to 0.
   // Validate the effective expiration rather than requiring maxTime - minTime
   // to be bounded, which would reject valid SEP-10 challenges.
+  if (minTime > now || maxTime <= now || maxTime > now + CHALLENGE_VALIDITY_SECONDS) {
+    invalidChallenge();
+  }
+
+  // A SEP-10 challenge always has a manageData operation binding the
+  // challenge to the client account under the home domain; when the server
+  // is configured with a distinct WEB_AUTH_DOMAIN (the common case), the SDK
+  // adds a second manageData operation binding the challenge to that
+  // web_auth_domain too, to prevent it being replayed against a different
+  // web-auth endpoint sharing the same signing key. Both are validated when
+  // present; anything else is rejected.
+  const operations = transaction.operations;
+  if (operations.length < 1 || operations.length > 2) invalidChallenge();
+
+  const clientOp = operations[0];
   if (
-    bounds.minTime > now ||
-    bounds.maxTime <= now ||
-    bounds.maxTime > now + CHALLENGE_VALIDITY_SECONDS
+    clientOp.type !== "manageData" ||
+    clientOp.source !== clientAccountId ||
+    clientOp.name !== `${config.SEP10_HOME_DOMAIN} auth` ||
+    !clientOp.value ||
+    clientOp.value.length < MIN_NONCE_BYTES
   ) {
     invalidChallenge();
   }
 
-  if (transaction.operations.length !== 1) invalidChallenge();
-  const operation = transaction.operations[0];
-  if (
-    operation.type !== "manageData" ||
-    operation.source !== clientAccountId ||
-    operation.name !== `${config.WEB_AUTH_DOMAIN} auth` ||
-    !operation.value ||
-    operation.value.length < MIN_NONCE_BYTES
-  ) {
-    invalidChallenge();
+  if (operations.length === 2) {
+    const domainOp = operations[1];
+    const domainValue = operationValue(domainOp.value);
+    if (
+      domainOp.type !== "manageData" ||
+      domainOp.source !== serverKeypair().publicKey() ||
+      domainOp.name !== "web_auth_domain" ||
+      domainValue !== config.WEB_AUTH_DOMAIN
+    ) {
+      invalidChallenge();
+    }
   }
 }
 
@@ -224,6 +225,14 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
     invalidChallenge();
   }
 
+  // Claim the challenge only after every structural, time-bound, and
+  // signature check has passed. consumeChallenge() atomically inserts the
+  // challenge's fingerprint and rejects if it has already been claimed —
+  // by this request or a concurrent one — so a signed challenge can never
+  // be exchanged for a session more than once. Any failure here (a replay,
+  // or an unexpected database error) surfaces as the same generic,
+  // client-safe "invalid or expired challenge" response as every other
+  // validation step above, rather than leaking why the exchange failed.
   try {
     const now = Math.floor(Date.now() / 1000);
     await consumeChallenge(
@@ -231,17 +240,9 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
       new Date((now + CHALLENGE_VALIDITY_SECONDS) * 1000)
     );
   } catch (error) {
-    if (error instanceof Error && error.message === "Invalid or expired authentication challenge") {
-      throw error;
-    }
+    if (error instanceof AppError) throw error;
     invalidChallenge();
   }
-
-  // Mark only after all validation and signature checks pass. JavaScript's
-  // synchronous map update makes subsequent requests unable to reuse it.
-  const expiresAt = issuedChallenges.get(challengeHash)?.expiresAt ?? now;
-  issuedChallenges.delete(challengeHash);
-  consumedChallenges.set(challengeHash, expiresAt);
 
   return clientAccountId;
 }

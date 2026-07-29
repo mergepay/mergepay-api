@@ -74,7 +74,7 @@ export async function buildApp(): Promise<FastifyInstance> {
               ? { target: "pino-pretty", options: { colorize: true } }
               : undefined,
         },
-    bodyLimit: config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024,
+    bodyLimit: config.JSON_BODY_LIMIT_BYTES,
   });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -143,8 +143,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   // blocking all traffic. The default "memory" store is per-process and
   // needs no failure handling of its own.
   await app.register(rateLimit, {
-    max: 100,
-    timeWindow: config.RATE_LIMIT_WINDOW_MS,
+    max: config.RATE_LIMIT_GLOBAL_MAX,
+    timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: securityKey,
     addHeaders: true,
     errorResponseBuilder: (request) => ({
@@ -157,40 +157,75 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(multipart, {
     limits: {
       fileSize: config.MULTIPART_FILE_SIZE_BYTES,
-      files: 1,
-      parts: 10,
+      files: config.MULTIPART_MAX_FILES,
+      parts: config.MULTIPART_MAX_FIELDS,
     },
   });
 
   // Apply stricter policies only to expensive or abuse-prone endpoints.
   app.addHook("onRoute", (routeOptions) => {
     const url = routeOptions.url;
-    let max: number | undefined;
+    let rateLimit: { max: number; timeWindow: number } | undefined;
     let bodyLimit: number | undefined;
 
-    if (url === "/auth/challenge" || url === "/auth/verify") {
-      max = config.AUTH_RATE_LIMIT_MAX;
-      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
-    } else if (
-      url === "/expenses/:id/settle" ||
-      url === "/groups/:id/settlements" ||
-      url === "/settlements/:id/submit"
-    ) {
-      max = config.SETTLEMENT_RATE_LIMIT_MAX;
-      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
-    } else if (
-      url === "/anchors/deposit" ||
-      url === "/anchors/withdraw" ||
-      url === "/anchors/sessions/:id/complete" ||
-      url === "/uploads/receipt"
-    ) {
-      max = config.SEP24_RATE_LIMIT_MAX;
-      bodyLimit = url === "/uploads/receipt"
-        ? config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024
-        : config.AUTH_BODY_LIMIT_BYTES;
+    // Auth endpoints: challenge is more forgiving (wallet polling), verify is strict
+    if (url === "/auth/challenge") {
+      rateLimit = {
+        max: config.RATE_LIMIT_AUTH_CHALLENGE_MAX,
+        timeWindow: config.RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS,
+      };
+      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
+    } else if (url === "/auth/verify") {
+      rateLimit = {
+        max: config.RATE_LIMIT_AUTH_VERIFY_MAX,
+        timeWindow: config.RATE_LIMIT_AUTH_VERIFY_WINDOW_MS,
+      };
+      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
+    }
+    // Settlement endpoints: create/initiate is more restricted than confirm
+    else if (url === "/expenses/:id/settle" || url === "/groups/:id/settlements") {
+      rateLimit = {
+        max: config.RATE_LIMIT_SETTLEMENT_CREATE_MAX,
+        timeWindow: config.RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS,
+      };
+      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
+    } else if (url === "/settlements/:id/confirm" || url === "/settlements/:id/submit") {
+      rateLimit = {
+        max: config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX,
+        timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
+      };
+      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
+    }
+    // SEP-24 anchor endpoints: initiate/status distinction
+    else if (url === "/anchors/deposit" || url === "/anchors/withdraw") {
+      rateLimit = {
+        max: config.RATE_LIMIT_ANCHOR_INITIATE_MAX,
+        timeWindow: config.RATE_LIMIT_ANCHOR_INITIATE_WINDOW_MS,
+      };
+      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
+    } else if (url === "/anchors/sessions/:id/complete" || url === "/anchors/sessions") {
+      rateLimit = {
+        max: config.RATE_LIMIT_ANCHOR_STATUS_MAX,
+        timeWindow: config.RATE_LIMIT_ANCHOR_STATUS_WINDOW_MS,
+      };
+      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
+    } else if (url === "/anchors/webhook") {
+      rateLimit = {
+        max: config.RATE_LIMIT_ANCHOR_WEBHOOK_MAX,
+        timeWindow: config.RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS,
+      };
+      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
+    }
+    // File uploads: large multipart bodies allowed
+    else if (url === "/uploads/receipt") {
+      rateLimit = {
+        max: config.RATE_LIMIT_ANCHOR_INITIATE_MAX,
+        timeWindow: config.RATE_LIMIT_ANCHOR_INITIATE_WINDOW_MS,
+      };
+      bodyLimit = config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024;
     }
 
-    if (max !== undefined) {
+    if (rateLimit !== undefined) {
       const options = routeOptions as typeof routeOptions & {
         config?: Record<string, unknown>;
         bodyLimit?: number;
@@ -198,8 +233,8 @@ export async function buildApp(): Promise<FastifyInstance> {
       options.config = {
         ...(options.config ?? {}),
         rateLimit: {
-          max,
-          timeWindow: config.RATE_LIMIT_WINDOW_MS,
+          max: rateLimit.max,
+          timeWindow: rateLimit.timeWindow,
           keyGenerator: securityKey,
         },
       };

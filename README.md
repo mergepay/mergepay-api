@@ -136,8 +136,11 @@ traffic patterns or trust boundaries:
 | `POST /auth/challenge` | `RATE_LIMIT_AUTH_CHALLENGE_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /auth/verify` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
 | `POST /expenses/:id/settle`, `POST /groups/:id/settlements` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
-| `POST /settlements/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /settlements/:id/confirm`, `POST /settlements/:id/submit` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /anchors/deposit`, `POST /anchors/withdraw` | `RATE_LIMIT_ANCHOR_INITIATE_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /anchors/sessions/:id/complete`, `GET /anchors/sessions` | `RATE_LIMIT_ANCHOR_STATUS_MAX` / `_WINDOW_MS` | 30 / 1 min |
 | `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 60 / 1 min |
+| `POST /uploads/receipt` | `RATE_LIMIT_ANCHOR_INITIATE_MAX` / `_WINDOW_MS` | 10 / 1 min |
 
 Limit keys are the authenticated user's internal id when available
 (never a Stellar public key), or the resolved client IP otherwise —
@@ -160,6 +163,39 @@ query errors (e.g. a transient database outage), the request is allowed
 through rather than the whole API returning 500s — a degraded rate limiter
 is preferable to a full outage. Every 429 response includes standard
 `Retry-After` / `X-RateLimit-*` headers.
+
+### Request size limits
+
+The API enforces explicit limits on JSON bodies and multipart uploads to prevent
+memory exhaustion and DoS attacks:
+
+| Type | Variable | Default | Description |
+| --- | --- | --- | --- |
+| JSON body | `JSON_BODY_LIMIT_BYTES` | 256 KB | All JSON request bodies (auth, settlements, anchors) |
+| Multipart file | `MULTIPART_FILE_SIZE_BYTES` | 5 MB | Max file size in multipart uploads (e.g. receipts) |
+| Multipart files | `MULTIPART_MAX_FILES` | 1 | Maximum number of files per multipart request |
+| Multipart fields | `MULTIPART_MAX_FIELDS` | 10 | Maximum number of form fields per multipart request |
+
+Oversized requests are rejected with a `413 Payload Too Large` or `400 Bad Request`
+response before expensive business logic or external Stellar calls run. Request
+bodies are fully validated with Zod before use; the size limits ensure the
+validator runs efficiently.
+
+### Worker job tracking and recovery
+
+The background worker tracks job claims and retry attempts for settlement
+submissions and anchor polling. In the event of a worker crash or deployment
+interruption, stale jobs (claimed for longer than 15 minutes) are automatically
+recovered and re-eligible for processing. Job state is tracked via:
+
+- `jobAttemptCount`: Number of times the job has been claimed for processing
+- `jobClaimedAt`: Timestamp when the job was last claimed (null if released)
+- `jobEligibleAt`: Earliest time the job is eligible for the next retry attempt
+- `jobErrorSummary`: Truncated error message from the last attempt (for operator review)
+
+Terminal failures (exhausted retries, permanent errors) are marked with status
+`failed` and retain an error summary for support investigation. Each job has
+a maximum of 5 attempts with exponential backoff (5s, 30s, 5m, 30m, 60m).
 
 ## How it works
 

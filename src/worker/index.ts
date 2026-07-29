@@ -32,6 +32,13 @@ const log = pino({ name: "worker" });
 export const SETTLEMENT_MAX_RETRIES = 3;
 export const RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
 
+// Job claim lease duration in milliseconds (15 minutes)
+const JOB_CLAIM_LEASE_MS = 15 * 60 * 1000;
+// Maximum job attempts before marking as terminal failure
+const JOB_MAX_ATTEMPTS = 5;
+// Exponential backoff delays for job recovery (in milliseconds)
+const JOB_RETRY_DELAYS_MS = [5_000, 30_000, 300_000, 1_800_000, 3_600_000] as const;
+
 const claimedSettlements = new Set<string>();
 const claimedAnchors = new Set<string>();
 
@@ -112,19 +119,27 @@ async function recordTransition(
 async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<boolean> {
   if (claimedSettlements.has(settlement.id)) return false;
 
+  const now = new Date();
   const model = prisma.settlement as any;
   if (typeof model.updateMany !== "function") {
     claimedSettlements.add(settlement.id);
     return true;
   }
 
+  // Atomically claim the job: only succeed if not already claimed and eligible for retry
   const result = await model.updateMany({
     where: {
       id: settlement.id,
       status: { in: ["pending", "submitted"] },
-      retryCount: settlement.retryCount,
+      jobClaimedAt: null, // Not currently claimed
+      jobEligibleAt: { lte: now }, // Eligible for retry
+      jobAttemptCount: { lt: JOB_MAX_ATTEMPTS },
     },
-    data: { retryCount: { increment: 1 } },
+    data: {
+      jobClaimedAt: now,
+      jobAttemptCount: { increment: 1 },
+      retryCount: { increment: 1 },
+    },
   });
 
   if (result.count !== 1) return false;
@@ -133,8 +148,23 @@ async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<
   return true;
 }
 
-async function releaseSettlementClaim(id: string): Promise<void> {
+async function releaseSettlementClaim(
+  id: string,
+  nextRetryDelayMs?: number
+): Promise<void> {
   claimedSettlements.delete(id);
+  if (nextRetryDelayMs !== undefined) {
+    const nextEligible = new Date(Date.now() + nextRetryDelayMs);
+    await prisma.settlement.update({
+      where: { id },
+      data: {
+        jobClaimedAt: null, // Release the claim
+        jobEligibleAt: nextEligible,
+      },
+    }).catch(() => {
+      // Ignore errors releasing the claim; the lease timeout will recover it
+    });
+  }
 }
 
 export async function submitSettlement(
@@ -166,6 +196,8 @@ async function markSettlementFailed(
     data: {
       status: "failed",
       retryCount: settlement.retryCount,
+      jobErrorSummary: message,
+      jobClaimedAt: null,
     },
   });
   await recordTransition(settlement.id, "settlement_failed", {
@@ -195,6 +227,8 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
             status: "confirmed",
             stellarTxHash: hash,
             retryCount: attempt,
+            jobClaimedAt: null,
+            jobErrorSummary: null,
           },
         });
         await recordTransition(settlement.id, "settlement_confirmed", { attempt });
@@ -211,7 +245,10 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
         const delay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)];
         await prisma.settlement.update({
           where: { id: settlement.id },
-          data: { retryCount: attempt },
+          data: {
+            retryCount: attempt,
+            jobErrorSummary: message,
+          },
         });
         await recordTransition(settlement.id, "settlement_retry_scheduled", {
           attempt,
@@ -222,7 +259,68 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
       }
     }
   } finally {
-    await releaseSettlementClaim(settlement.id);
+    const delay = JOB_RETRY_DELAYS_MS[Math.min(settlement.retryCount, JOB_RETRY_DELAYS_MS.length - 1)];
+    await releaseSettlementClaim(settlement.id, delay);
+  }
+}
+
+/**
+ * Recover stale/abandoned settlement jobs that were claimed but not completed
+ * (e.g. worker crashed, deployment interrupted). Jobs older than the claim
+ * lease are eligible for re-processing.
+ */
+async function recoverStaleSettlements(): Promise<void> {
+  const leaseExpiry = new Date(Date.now() - JOB_CLAIM_LEASE_MS);
+
+  const stale = await prisma.settlement.findMany({
+    where: {
+      jobClaimedAt: { lt: leaseExpiry },
+      status: { in: ["pending", "submitted"] },
+      jobAttemptCount: { lt: JOB_MAX_ATTEMPTS },
+    },
+    select: { id: true },
+    take: 10,
+  });
+
+  for (const row of stale) {
+    log.info({ settlementId: row.id }, "recovering stale settlement job");
+    await prisma.settlement.update({
+      where: { id: row.id },
+      data: {
+        jobClaimedAt: null,
+        jobEligibleAt: new Date(),
+      },
+    });
+  }
+}
+
+/**
+ * Recover stale/abandoned anchor jobs that were claimed but not completed
+ * (e.g. worker crashed, deployment interrupted). Jobs older than the claim
+ * lease are eligible for re-processing.
+ */
+async function recoverStaleAnchorSessions(): Promise<void> {
+  const leaseExpiry = new Date(Date.now() - JOB_CLAIM_LEASE_MS);
+
+  const stale = await prisma.anchorSession.findMany({
+    where: {
+      jobClaimedAt: { lt: leaseExpiry },
+      status: { notIn: [...TERMINAL_ANCHOR_STATUSES, "completed", "failed"] },
+      jobAttemptCount: { lt: JOB_MAX_ATTEMPTS },
+    },
+    select: { id: true },
+    take: 10,
+  });
+
+  for (const row of stale) {
+    log.info({ anchorSessionId: row.id }, "recovering stale anchor job");
+    await prisma.anchorSession.update({
+      where: { id: row.id },
+      data: {
+        jobClaimedAt: null,
+        jobEligibleAt: new Date(),
+      },
+    });
   }
 }
 
@@ -351,7 +449,11 @@ async function reconcileSingleAnchor(
 
     await prisma.anchorSession.update({
       where: { id: session.id },
-      data: data as any,
+      data: {
+        ...data,
+        jobErrorSummary: result.message,
+        jobClaimedAt: null,
+      } as any,
     });
 
     if (!shouldBackoff) {
@@ -426,7 +528,11 @@ async function reconcileSingleAnchor(
 
   await prisma.anchorSession.update({
     where: { id: session.id },
-    data: updateData as any,
+    data: {
+      ...updateData,
+      jobErrorSummary: null,
+      jobClaimedAt: null,
+    } as any,
   });
 
   log.info(
@@ -497,6 +603,13 @@ export async function processSubmittedSettlements(): Promise<void> {
 }
 
 export async function runWorkerCycle(): Promise<void> {
+  // Recover stale jobs first (crashed workers, deployment interruptions)
+  await Promise.all([
+    recoverStaleSettlements(),
+    recoverStaleAnchorSessions(),
+  ]);
+
+  // Then process normal work
   await Promise.all([
     reconcilePending(),
     reconcileAnchors(),

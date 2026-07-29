@@ -126,6 +126,10 @@ model Settlement {
   expenseShareId String?  @map("expense_share_id")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
+  jobAttemptCount Int     @default(0) @map("job_attempt_count")
+  jobClaimedAt   DateTime? @map("job_claimed_at")
+  jobEligibleAt  DateTime @default(now()) @map("job_eligible_at")
+  jobErrorSummary String?  @map("job_error_summary")
 
   group        Group         @relation(fields: [groupId], references: [id], onDelete: Cascade)
   from         User          @relation("SettlementFrom", fields: [fromUserId], references: [id])
@@ -136,6 +140,8 @@ model Settlement {
   @@index([fromUserId])
   @@index([toUserId])
   @@index([status])
+  @@index([jobClaimedAt])
+  @@index([jobEligibleAt])
   @@map("settlements")
 }
 
@@ -209,12 +215,18 @@ model AnchorSession {
   lastPolledAt          DateTime? @map("last_polled_at")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
+  jobAttemptCount       Int      @default(0) @map("job_attempt_count")
+  jobClaimedAt          DateTime? @map("job_claimed_at")
+  jobEligibleAt         DateTime @default(now()) @map("job_eligible_at")
+  jobErrorSummary       String?  @map("job_error_summary")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([externalTransactionId])
   @@index([status])
+  @@index([jobClaimedAt])
+  @@index([jobEligibleAt])
   @@map("anchor_sessions")
 }
 

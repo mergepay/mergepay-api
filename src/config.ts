@@ -30,16 +30,24 @@ const schema = z.object({
   NODE_ENV: z.string().default("development"),
 
   // Security-sensitive endpoint policies.
-  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
-  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
-  SETTLEMENT_RATE_LIMIT_MAX: z.coerce
-    .number()
-    .int()
-    .positive()
-    .max(100000)
-    .default(20),
-  SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
-  AUTH_BODY_LIMIT_BYTES: z.coerce
+  RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().max(100000).default(100),
+  RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_CREATE_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_ANCHOR_INITIATE_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_ANCHOR_INITIATE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_ANCHOR_STATUS_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_ANCHOR_STATUS_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().max(100000).default(60),
+  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  // Request body and multipart size limits
+  JSON_BODY_LIMIT_BYTES: z.coerce
     .number()
     .int()
     .positive()
@@ -51,6 +59,14 @@ const schema = z.object({
     .positive()
     .max(50 * 1024 * 1024)
     .default(5 * 1024 * 1024),
+  MULTIPART_MAX_FILES: z.coerce.number().int().positive().max(100).default(1),
+  MULTIPART_MAX_FIELDS: z.coerce.number().int().positive().max(100).default(10),
+  // Deprecated config keys for backwards compatibility
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).optional(),
+  SETTLEMENT_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).optional(),
+  SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).optional(),
+  AUTH_BODY_LIMIT_BYTES: z.coerce.number().int().positive().max(10 * 1024 * 1024).optional(),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().optional(),
 });
 
 const parsed = schema.parse(process.env);

@@ -1,11 +1,12 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { Transaction } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
-import { stellar } from "../services/stellar";
+import { stellar, validatePaymentTx } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import { userOrIpKey } from "../services/rate-limit-keys";
@@ -21,6 +22,7 @@ import {
 } from "../services/group-balances";
 import { validateAsset, validateAmount } from "../services/assets";
 import { memoText } from "../services/stellar";
+import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 
 const settlementInclude = { from: true, to: true } as const;
 
@@ -239,6 +241,27 @@ export default async function settlementRoutes(app: FastifyInstance) {
         if (settlement.status !== "pending") {
           return { settlement: serializeSettlement(settlement) };
         }
+
+        // Validate the signed XDR against the settlement's own recorded
+        // intent before it is ever persisted. Actual Horizon submission is
+        // deferred to the worker (so it can be retried), which re-validates
+        // independently before submitting — this check exists so a
+        // mismatched XDR is rejected immediately with a client-safe error
+        // instead of being silently accepted here and only failing later in
+        // the background.
+        let signedTx: Transaction;
+        try {
+          signedTx = new Transaction(body.signedXdr, config.networkPassphrase);
+        } catch {
+          throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
+        }
+        validatePaymentTx(signedTx, {
+          sourcePublicKey: settlement.from.stellarPublicKey,
+          destination: settlement.to.stellarPublicKey,
+          asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
+          amount: settlement.amount.toString(),
+          memoCode: settlement.shortCode,
+        });
 
         // Guard the transition with a conditional update rather than an
         // unconditional one: if a concurrent confirm on the same settlement

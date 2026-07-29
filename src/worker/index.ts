@@ -3,6 +3,7 @@ import { config } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { AppError } from "../errors";
 import {
   anchorService,
   mapAnchorStatus,
@@ -146,7 +147,19 @@ export async function submitSettlement(
   }
 
   try {
-    const hash = await stellar.submitPayment(settlement.transactionXdr);
+    // Re-validate the signed XDR against the settlement's own recorded
+    // intent immediately before submission — this is the only place the
+    // stored signedXdr is ever checked against what the server actually
+    // authorized, since /settlements/:id/confirm persists it directly
+    // without validating it (submission is deferred to this worker so it
+    // can be retried).
+    const hash = await stellar.submitPayment(settlement.transactionXdr, {
+      sourcePublicKey: settlement.fromPublicKey,
+      destination: settlement.toPublicKey,
+      asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
+      amount: settlement.amount,
+      memoCode: settlement.shortCode,
+    });
     log.info({ id: settlement.id, hash }, "settlement submitted successfully");
     return hash;
   } catch (error) {
@@ -483,7 +496,7 @@ export async function processSubmittedSettlements(): Promise<void> {
       shortCode: row.shortCode,
       fromPublicKey: row.from.stellarPublicKey,
       toPublicKey: row.to.stellarPublicKey,
-      amount: row.amount,
+      amount: row.amount.toString(),
       assetCode: row.assetCode,
       assetIssuer: row.assetIssuer,
       transactionXdr: row.transactionXdr,

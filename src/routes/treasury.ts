@@ -10,6 +10,7 @@ import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 
 export default async function treasuryRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -266,13 +267,48 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   // -- history ----------------------------------------------------------------
   app.get("/groups/:id/treasury/history", async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
+    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    await requireMembership(groupId, auth.id);
+
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
     const transactions = await prisma.treasuryTransaction.findMany({
-      where: { groupId: id },
+      where: {
+        groupId,
+        ...(decodedCursor && {
+          OR: [
+            { createdAt: { lt: decodedCursor.createdAt } },
+            {
+              createdAt: decodedCursor.createdAt,
+              id: { lt: decodedCursor.id },
+            },
+          ],
+        }),
+      },
       include: { user: true },
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
     });
-    return { transactions: transactions.map(serializeTreasuryTx) };
+
+    const hasMore = transactions.length > limit;
+    const results = hasMore ? transactions.slice(0, limit) : transactions;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
+
+    return {
+      transactions: results.map(serializeTreasuryTx),
+      meta: { nextCursor, hasMore },
+    };
   });
 }

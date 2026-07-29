@@ -15,6 +15,7 @@ import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
 import anchorRoutes from "./routes/anchors";
+import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import { getCorrelationId } from "./lib/correlation";
@@ -211,7 +212,6 @@ export async function buildApp(): Promise<FastifyInstance> {
     prefix: "/uploads/",
     decorateReply: false,
   });
-
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
 
@@ -239,6 +239,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
   await app.register(anchorRoutes);
+  await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
 

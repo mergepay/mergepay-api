@@ -6,8 +6,6 @@
  * client's signature to prove control of the account.
  */
 
-import { createHash } from "node:crypto";
-import { Prisma } from "@prisma/client";
 import { Keypair, WebAuth, Transaction } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { prisma } from "../db";
@@ -15,11 +13,6 @@ import { Errors } from "../errors";
 import { stellar } from "./stellar";
 
 const CHALLENGE_VALIDITY_SECONDS = 300;
-const MIN_NONCE_BYTES = 32;
-
-// Fallback used only by lightweight unit-test database mocks that do not expose
-// Prisma raw-query methods. Production replay state is stored in the database.
-const testConsumedChallenges = new Map<string, number>();
 
 let _serverKeypair: Keypair | null = null;
 
@@ -33,15 +26,6 @@ export function serverKeypair(): Keypair {
   return _serverKeypair;
 }
 
-function cleanupChallenges(now: number): void {
-  for (const [hash, challenge] of issuedChallenges) {
-    if (challenge.expiresAt <= now) issuedChallenges.delete(hash);
-  }
-  for (const [hash, expiresAt] of consumedChallenges) {
-    if (expiresAt <= now) consumedChallenges.delete(hash);
-  }
-}
-
 function validAccount(account: string): boolean {
   try {
     Keypair.fromPublicKey(account);
@@ -49,17 +33,6 @@ function validAccount(account: string): boolean {
   } catch {
     return false;
   }
-}
-
-function genericChallengeError(): never {
-  throw Errors.badRequest("invalid_challenge", "Invalid or expired authentication challenge");
-}
-
-function operationValue(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "string") return value;
-  if (Buffer.isBuffer(value)) return value.toString("utf8");
-  return String(value);
 }
 
 export function buildChallenge(account: string): {
@@ -79,90 +52,9 @@ export function buildChallenge(account: string): {
     config.WEB_AUTH_DOMAIN
   );
 
-  const parsed = new Transaction(transaction, config.networkPassphrase);
-  const now = Date.now();
-  cleanupChallenges(now);
-  issuedChallenges.set(parsed.hash().toString("hex"), {
-    account,
-    expiresAt: now + CHALLENGE_TTL_SECONDS * 1000,
-  });
-
   return { transaction, networkPassphrase: config.networkPassphrase };
 }
 
-function invalidChallenge(): never {
-  throw Errors.unauthorized("Invalid or expired authentication challenge");
-}
-
-function challengeId(tx: Transaction): string {
-  return createHash("sha256").update(tx.hash()).digest("hex");
-}
-
-function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): void {
-  const transaction = tx as Transaction & {
-    timeBounds?: { minTime: number; maxTime: number } | null;
-    operations: Array<{
-      type?: string;
-      source?: string;
-      name?: string;
-      value?: Uint8Array;
-    }>;
-  };
-
-  if (transaction.source !== serverKeypair().publicKey()) invalidChallenge();
-
-  const bounds = transaction.timeBounds;
-  const now = Math.floor(Date.now() / 1000);
-  if (!bounds || !Number.isFinite(bounds.minTime) || !Number.isFinite(bounds.maxTime)) {
-    invalidChallenge();
-  }
-
-  // Stellar's TransactionBuilder.setTimeout() normally sets minTime to 0.
-  // Validate the effective expiration rather than requiring maxTime - minTime
-  // to be bounded, which would reject valid SEP-10 challenges.
-  if (
-    bounds.minTime > now ||
-    bounds.maxTime <= now ||
-    bounds.maxTime > now + CHALLENGE_VALIDITY_SECONDS
-  ) {
-    invalidChallenge();
-  }
-
-  if (transaction.operations.length !== 1) invalidChallenge();
-  const operation = transaction.operations[0];
-  if (
-    operation.type !== "manageData" ||
-    operation.source !== clientAccountId ||
-    operation.name !== `${config.WEB_AUTH_DOMAIN} auth` ||
-    !operation.value ||
-    operation.value.length < MIN_NONCE_BYTES
-  ) {
-    invalidChallenge();
-  }
-}
-
-async function consumeChallenge(id: string, expiresAt: Date): Promise<void> {
-  if (typeof prisma.$executeRaw !== "function") {
-    const now = Date.now();
-    for (const [key, expiry] of testConsumedChallenges) {
-      if (expiry <= now) testConsumedChallenges.delete(key);
-    }
-    if (testConsumedChallenges.has(id)) invalidChallenge();
-    testConsumedChallenges.set(id, expiresAt.getTime());
-    return;
-  }
-
-  const inserted = await prisma.$executeRaw(
-    Prisma.sql`INSERT INTO "Sep10ConsumedChallenge" ("id", "expiresAt")
-      VALUES (${id}, ${expiresAt})
-      ON CONFLICT ("id") DO NOTHING`
-  );
-  if (Number(inserted) !== 1) invalidChallenge();
-
-  await prisma.$executeRaw(
-    Prisma.sql`DELETE FROM "Sep10ConsumedChallenge" WHERE "expiresAt" <= CURRENT_TIMESTAMP`
-  );
-}
 
 /**
  * Verify a signed challenge. Returns the authenticated client public key.
@@ -182,16 +74,26 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
       config.WEB_AUTH_DOMAIN
     );
     clientAccountId = read.clientAccountID;
-    validateChallengeEnvelope(tx, clientAccountId);
-  } catch {
-    invalidChallenge();
+  } catch (e: any) {
+    if (e?.code || e?.status) throw e;
+    throw Errors.badRequest("invalid_challenge", e?.message ?? "Invalid challenge");
   }
 
+  // 1. Verify Time Bounds (Expiration)
+  const nowSec = Math.floor(Date.now() / 1000);
+  const minTime = parseInt(tx.timeBounds?.minTime ?? "0", 10);
+  const maxTime = parseInt(tx.timeBounds?.maxTime ?? "0", 10);
+
+  if ((minTime > 0 && nowSec < minTime) || (maxTime > 0 && nowSec > maxTime)) {
+    throw Errors.badRequest("challenge_expired", "Challenge transaction has expired");
+  }
+
+  // 2. Verify Signatures & Account Thresholds FIRST (prevents invalid signatures from consuming challenges)
   let snapshot;
   try {
     snapshot = await stellar.loadAccount(clientAccountId);
-  } catch {
-    invalidChallenge();
+  } catch (e: any) {
+    throw Errors.badRequest("invalid_challenge", e?.message ?? "Invalid challenge");
   }
 
   try {
@@ -220,30 +122,44 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
         config.WEB_AUTH_DOMAIN
       );
     }
-  } catch {
-    invalidChallenge();
+  } catch (e: any) {
+    throw Errors.unauthorized(
+      `Challenge signature verification failed: ${e?.message ?? "unknown"}`
+    );
   }
+
+  // 3. Atomically Record & Claim Challenge (Replay Protection) after signature verification succeeds
+  const fingerprint = tx.hash().toString("hex");
+  const expiresAt = maxTime > 0 ? new Date(maxTime * 1000) : new Date(Date.now() + 300 * 1000);
 
   try {
-    const now = Math.floor(Date.now() / 1000);
-    await consumeChallenge(
-      challengeId(tx),
-      new Date((now + CHALLENGE_VALIDITY_SECONDS) * 1000)
-    );
-  } catch (error) {
-    if (error instanceof Error && error.message === "Invalid or expired authentication challenge") {
-      throw error;
+    await prisma.sep10Challenge.create({
+      data: {
+        fingerprint,
+        clientAccount: clientAccountId,
+        expiresAt,
+      },
+    });
+  } catch (e: any) {
+    if (e?.code === "P2002") {
+      throw Errors.badRequest("challenge_replayed", "Challenge transaction has already been used");
     }
-    invalidChallenge();
+    throw e;
   }
 
-  // Mark only after all validation and signature checks pass. JavaScript's
-  // synchronous map update makes subsequent requests unable to reuse it.
-  const expiresAt = issuedChallenges.get(challengeHash)?.expiresAt ?? now;
-  issuedChallenges.delete(challengeHash);
-  consumedChallenges.set(challengeHash, expiresAt);
-
   return clientAccountId;
+}
+
+/** Delete expired challenge records from the database. */
+export async function cleanupExpiredChallenges(): Promise<number> {
+  const result = await prisma.sep10Challenge.deleteMany({
+    where: {
+      expiresAt: {
+        lt: new Date(),
+      },
+    },
+  });
+  return result.count;
 }
 
 /** Validate the structure of a transaction XDR string (used in tests). */

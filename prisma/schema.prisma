@@ -264,3 +264,14 @@ model RateLimitBucket {
 
   @@map("rate_limit_buckets")
 }
+
+model Sep10Challenge {
+  id            String   @id @default(cuid())
+  fingerprint   String   @unique
+  clientAccount String   @map("client_account")
+  expiresAt     DateTime @map("expires_at")
+  consumedAt    DateTime @default(now()) @map("consumed_at")
+
+  @@index([expiresAt])
+  @@map("sep10_challenges")
+}

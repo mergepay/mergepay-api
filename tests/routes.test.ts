@@ -28,6 +28,8 @@ const h = vi.hoisted(() => {
     anchorSession: model(),
     auditLog: model(),
     idempotencyKey: model(),
+    sep10Challenge: model(),
+
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),

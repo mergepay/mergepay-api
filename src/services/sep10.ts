@@ -4,6 +4,9 @@
  * The server holds one signing keypair (SEP10_SIGNING_SECRET). It builds a
  * challenge transaction the client signs with their wallet; we then verify the
  * client's signature to prove control of the account.
+ *
+ * TODO(#115): Add configurable challenge time-to-live (CHALLENGE_TTL_SECONDS)
+ * support so different client tiers can get different validity windows.
  */
 
 import { createHash } from "node:crypto";

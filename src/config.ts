@@ -4,7 +4,7 @@ import { Networks } from "@stellar/stellar-sdk";
 
 const schema = z.object({
   DATABASE_URL: z.string().default("postgresql://postgres:postgres@localhost:5432/mergepay"),
-  PORT: z.coerce.number().default(4000),
+  PORT: z.coerce.number().int().positive().default(4000),
   API_PUBLIC_URL: z.string().default("http://localhost:4000"),
   // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
   WEB_URL: z.string().default("*"),
@@ -29,26 +29,28 @@ const schema = z.object({
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
   NODE_ENV: z.string().default("development"),
 
-  // -- rate limiting ----------------------------------------------------------
-  // "memory" (default) keeps per-instance counters and is fine for a single
-  // API process. "database" persists counters in Postgres so limits are
-  // shared across multiple instances behind a load balancer; it adds a query
-  // per rate-limited request and fails OPEN (requests are allowed through)
-  // if that query errors, so a database outage degrades to "unlimited" rather
-  // than "everything blocked".
-  RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
-  RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().default(100),
-  RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
-  RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().default(20),
-  RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
-  RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().default(10),
-  RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
-  RATE_LIMIT_SETTLEMENT_CREATE_MAX: z.coerce.number().int().positive().default(20),
-  RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
-  RATE_LIMIT_SETTLEMENT_CONFIRM_MAX: z.coerce.number().int().positive().default(30),
-  RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
-  RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().default(60),
-  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  // Security-sensitive endpoint policies.
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  SETTLEMENT_RATE_LIMIT_MAX: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(100000)
+    .default(20),
+  SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  AUTH_BODY_LIMIT_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(10 * 1024 * 1024)
+    .default(256 * 1024),
+  MULTIPART_FILE_SIZE_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(50 * 1024 * 1024)
+    .default(5 * 1024 * 1024),
 });
 
 const parsed = schema.parse(process.env);

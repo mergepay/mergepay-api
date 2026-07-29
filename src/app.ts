@@ -16,6 +16,7 @@ import treasuryRoutes from "./routes/treasury";
 import anchorRoutes from "./routes/anchors";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
+import { getReadiness } from "./services/health";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -85,12 +86,19 @@ export async function buildApp(): Promise<FastifyInstance> {
     });
   });
 
-  // Health check.
-  app.get("/health", async () => ({
-    status: "ok",
-    network: config.STELLAR_NETWORK,
-    time: new Date().toISOString(),
-  }));
+  // Liveness never contacts external dependencies and is safe for process probes.
+  const liveness = async () => ({
+    status: "ok" as const,
+    timestamp: new Date().toISOString(),
+  });
+  app.get("/health", liveness);
+  app.get("/health/live", liveness);
+
+  // Readiness is intentionally unauthenticated for deployment automation.
+  app.get("/health/ready", async (_req, reply) => {
+    const result = await getReadiness();
+    return reply.code(result.status === "ok" ? 200 : 503).send(result);
+  });
 
   // Routes.
   await app.register(authRoutes);

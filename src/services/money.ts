@@ -29,7 +29,7 @@ export function fromStroops(stroops: bigint): string {
   const abs = negative ? -stroops : stroops;
   const whole = abs / SCALE_FACTOR;
   const frac = abs % SCALE_FACTOR;
-  let fracStr = frac.toString().padStart(7, "0").replace(/0+$/, "");
+  const fracStr = frac.toString().padStart(7, "0").replace(/0+$/, "");
   const sign = negative ? "-" : "";
   return fracStr.length > 0 ? `${sign}${whole}.${fracStr}` : `${sign}${whole}`;
 }

@@ -8,6 +8,7 @@ import {
   Account,
   Asset,
   BASE_FEE,
+  FeeBumpTransaction,
   Horizon,
   Memo,
   Operation,
@@ -125,8 +126,7 @@ export const stellar = {
       memoCode: string;
     }
   ): Promise<string> {
-    const tx = new Transaction(signedXdr, config.networkPassphrase);
-    validatePaymentTx(tx, expected);
+    const tx = validateSignedPaymentXdr(signedXdr, expected);
     try {
       const res = await server().submitTransaction(tx);
       return res.hash;
@@ -202,4 +202,76 @@ function normalizeAmount(a: string): string {
   // Compare at 7dp precision regardless of trailing zeros.
   const [w, f = ""] = a.split(".");
   return `${w}.${(f + "0000000").slice(0, 7)}`;
+}
+
+/**
+ * Parse a base64 signed XDR envelope against the expected network, rejecting
+ * anything that isn't a single-signature-family payment transaction envelope
+ * (e.g. fee-bump transactions) or that fails to decode at all. Never throws a
+ * raw SDK exception — always surfaces a client-safe AppError instead.
+ */
+export function parseSignedPaymentXdr(
+  signedXdr: string,
+  networkPassphrase: string = config.networkPassphrase
+): Transaction {
+  let envelope: Transaction | FeeBumpTransaction;
+  try {
+    envelope = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
+  } catch {
+    throw Errors.badRequest(
+      "xdr_mismatch",
+      "The provided transaction could not be parsed"
+    );
+  }
+  if (envelope instanceof FeeBumpTransaction) {
+    throw Errors.badRequest(
+      "xdr_mismatch",
+      "Fee-bump transaction envelopes are not supported"
+    );
+  }
+  return envelope;
+}
+
+/** Reject a transaction whose time bounds have already expired. */
+export function assertTimeBoundsValid(tx: Transaction): void {
+  const timeBounds = tx.timeBounds;
+  if (!timeBounds) return;
+  const maxTime = Number(timeBounds.maxTime);
+  if (maxTime > 0 && Date.now() > maxTime * 1000) {
+    throw Errors.badRequest(
+      "xdr_mismatch",
+      "Transaction time bounds have expired"
+    );
+  }
+  const minTime = Number(timeBounds.minTime);
+  if (minTime > 0 && Date.now() < minTime * 1000) {
+    throw Errors.badRequest(
+      "xdr_mismatch",
+      "Transaction is not yet valid (minTime in the future)"
+    );
+  }
+}
+
+/**
+ * Parse and fully validate a signed payment XDR against the expected
+ * settlement intent: network, envelope type, time bounds, source,
+ * destination, asset, amount, and memo. Throws AppError (400) on any
+ * mismatch or malformed input — callers must not submit to Horizon unless
+ * this returns successfully.
+ */
+export function validateSignedPaymentXdr(
+  signedXdr: string,
+  expected: {
+    sourcePublicKey: string;
+    destination: string;
+    asset: AssetSpec;
+    amount: string;
+    memoCode: string;
+  },
+  networkPassphrase: string = config.networkPassphrase
+): Transaction {
+  const tx = parseSignedPaymentXdr(signedXdr, networkPassphrase);
+  assertTimeBoundsValid(tx);
+  validatePaymentTx(tx, expected);
+  return tx;
 }

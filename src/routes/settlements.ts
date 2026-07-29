@@ -6,7 +6,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
-import { stellar } from "../services/stellar";
+import { stellar, validateSignedPaymentXdr } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import {
@@ -213,6 +213,18 @@ export default async function settlementRoutes(app: FastifyInstance) {
       }
       return response200;
     }
+
+    // Validate the signed XDR against the original settlement intent before
+    // ever persisting it or handing it to the worker for submission. This
+    // stops a wallet or client from swapping the destination, asset, amount,
+    // memo, source account, or network between XDR creation and signing.
+    validateSignedPaymentXdr(body.signedXdr, {
+      sourcePublicKey: settlement.from.stellarPublicKey,
+      destination: settlement.to.stellarPublicKey,
+      asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
+      amount: settlement.amount.toString(),
+      memoCode: settlement.shortCode,
+    });
 
     const updated = await prisma.settlement.update({
       where: { id },

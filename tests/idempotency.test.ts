@@ -33,6 +33,7 @@ vi.mock("../src/services/stellar", () => ({
     submitPayment: vi.fn(),
   },
   memoText: vi.fn((code: string) => `MP:${code}`),
+  validateSignedPaymentXdr: vi.fn(),
 }));
 
 import { buildApp } from "../src/app";

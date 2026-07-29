@@ -7,7 +7,7 @@ import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
 import { isPositive } from "../services/money";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
 import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
@@ -43,34 +43,12 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.post("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
     validateAmount(body.amount);
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
-
-    // All participants (and payer) must be members of the group.
-    const memberIds = new Set(
-      (
-        await prisma.groupMember.findMany({
-          where: { groupId },
-          select: { userId: true },
-        })
-      ).map((m) => m.userId)
-    );
-    if (!memberIds.has(payerUserId)) {
-      throw Errors.badRequest("invalid_payer", "Payer must be a group member");
-    }
-    for (const s of body.shares) {
-      if (!memberIds.has(s.userId)) {
-        throw Errors.badRequest(
-          "invalid_participant",
-          "All participants must be group members"
-        );
-      }
-    }
 
     let computed;
     try {
@@ -81,36 +59,66 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
-    const expense = await prisma.expense.create({
-      data: {
-        groupId,
-        payerUserId,
-        title: body.title,
-        description: body.description,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        splitType: body.splitType,
-        memo,
-        receiptUrl: body.receiptUrl ?? null,
-        shares: {
-          create: computed.map((c) => ({
-            userId: c.userId,
-            shareAmount: c.shareAmount,
-            // The payer's own share is already covered — mark it settled.
-            status: c.userId === payerUserId ? "settled" : "pending",
-          })),
-        },
-      },
-      include: expenseInclude,
-    });
+    // Membership check and creation happen in one transaction so a
+    // concurrent removal of `auth.id` between the check and the write
+    // cannot let a former member create expenses against the group.
+    const expense = await prisma.$transaction(async (tx) => {
+      await requireMembership(groupId, auth.id, tx);
 
-    await audit({
-      userId: auth.id,
-      action: "expense.create",
-      entityType: "expense",
-      entityId: expense.id,
-      metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+      // All participants (and payer) must be members of the group.
+      const memberIds = new Set(
+        (
+          await tx.groupMember.findMany({
+            where: { groupId },
+            select: { userId: true },
+          })
+        ).map((m) => m.userId)
+      );
+      if (!memberIds.has(payerUserId)) {
+        throw Errors.badRequest("invalid_payer", "Payer must be a group member");
+      }
+      for (const s of body.shares) {
+        if (!memberIds.has(s.userId)) {
+          throw Errors.badRequest(
+            "invalid_participant",
+            "All participants must be group members"
+          );
+        }
+      }
+
+      const created = await tx.expense.create({
+        data: {
+          groupId,
+          payerUserId,
+          title: body.title,
+          description: body.description,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          splitType: body.splitType,
+          memo,
+          receiptUrl: body.receiptUrl ?? null,
+          shares: {
+            create: computed.map((c) => ({
+              userId: c.userId,
+              shareAmount: c.shareAmount,
+              // The payer's own share is already covered — mark it settled.
+              status: c.userId === payerUserId ? "settled" : "pending",
+            })),
+          },
+        },
+        include: expenseInclude,
+      });
+
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "expense.create",
+        entityType: "expense",
+        entityId: created.id,
+        metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+      });
+
+      return created;
     });
 
     return { expense: serializeExpense(expense) };
@@ -190,22 +198,27 @@ export default async function expenseRoutes(app: FastifyInstance) {
       })
       .parse(req.body);
 
-    const expense = await prisma.expense.findUnique({ where: { id } });
-    if (!expense) throw Errors.notFound("Expense not found");
-    const ctx = await requireMembership(expense.groupId, auth.id);
-    if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
-      throw Errors.forbidden("Only the payer or an admin can edit this expense");
-    }
+    // The membership/role check and the update run in one transaction: a
+    // concurrent removal or demotion of `auth.id` between the check and the
+    // write cannot slip an unauthorized edit through.
+    const updated = await prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.findUnique({ where: { id } });
+      if (!expense) throw Errors.notFound("Expense not found");
+      const ctx = await requireMembership(expense.groupId, auth.id, tx);
+      if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
+        throw Errors.forbidden("Only the payer or an admin can edit this expense");
+      }
 
-    const updated = await prisma.expense.update({
-      where: { id },
-      data: {
-        ...(body.title !== undefined && { title: body.title }),
-        ...(body.description !== undefined && { description: body.description }),
-        ...(body.memo !== undefined && { memo: body.memo }),
-        ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
-      },
-      include: expenseInclude,
+      return tx.expense.update({
+        where: { id },
+        data: {
+          ...(body.title !== undefined && { title: body.title }),
+          ...(body.description !== undefined && { description: body.description }),
+          ...(body.memo !== undefined && { memo: body.memo }),
+          ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
+        },
+        include: expenseInclude,
+      });
     });
     return { expense: serializeExpense(updated) };
   });
@@ -215,31 +228,35 @@ export default async function expenseRoutes(app: FastifyInstance) {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
 
-    const expense = await prisma.expense.findUnique({
-      where: { id },
-      include: { shares: true },
-    });
-    if (!expense) throw Errors.notFound("Expense not found");
-    const ctx = await requireMembership(expense.groupId, auth.id);
-    if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
-      throw Errors.forbidden("Only the payer or an admin can delete this expense");
-    }
-    const hasSettled = expense.shares.some(
-      (s) => s.status === "settled" && s.userId !== expense.payerUserId
-    );
-    if (hasSettled) {
-      throw Errors.conflict(
-        "expense_settled",
-        "Cannot delete an expense that already has settled shares"
+    // Same atomicity concern as the update route above: check and delete
+    // happen in one transaction.
+    await prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.findUnique({
+        where: { id },
+        include: { shares: true },
+      });
+      if (!expense) throw Errors.notFound("Expense not found");
+      const ctx = await requireMembership(expense.groupId, auth.id, tx);
+      if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
+        throw Errors.forbidden("Only the payer or an admin can delete this expense");
+      }
+      const hasSettled = expense.shares.some(
+        (s) => s.status === "settled" && s.userId !== expense.payerUserId
       );
-    }
+      if (hasSettled) {
+        throw Errors.conflict(
+          "expense_settled",
+          "Cannot delete an expense that already has settled shares"
+        );
+      }
 
-    await prisma.expense.delete({ where: { id } });
-    await audit({
-      userId: auth.id,
-      action: "expense.delete",
-      entityType: "expense",
-      entityId: id,
+      await tx.expense.delete({ where: { id } });
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "expense.delete",
+        entityType: "expense",
+        entityId: id,
+      });
     });
     return { ok: true };
   });

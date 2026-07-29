@@ -6,7 +6,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { inviteCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, auditTx } from "../services/audit";
 import {
   serializeGroup,
   serializeInvitation,
@@ -100,7 +100,6 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post("/groups/:id/invite", async (req, reply) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
 
     // Direct invitation by Stellar public key
     if (
@@ -114,53 +113,63 @@ export default async function groupRoutes(app: FastifyInstance) {
         })
         .parse(req.body);
 
-      // Check if invitee is already a member
-      const inviteeUser = await prisma.user.findUnique({
-        where: { stellarPublicKey: body.publicKey },
-      });
-      if (inviteeUser) {
-        const existingMember = await prisma.groupMember.findUnique({
+      // The admin check and the invitation write happen inside one
+      // transaction so a concurrent demotion/removal of `auth.id` between
+      // the check and the write cannot let a former admin sneak an
+      // invitation through.
+      const invitation = await prisma.$transaction(async (tx) => {
+        await requireAdmin(id, auth.id, tx);
+
+        // Check if invitee is already a member
+        const inviteeUser = await tx.user.findUnique({
+          where: { stellarPublicKey: body.publicKey },
+        });
+        if (inviteeUser) {
+          const existingMember = await tx.groupMember.findUnique({
+            where: {
+              groupId_userId: { groupId: id, userId: inviteeUser.id },
+            },
+          });
+          if (existingMember) {
+            throw Errors.conflict(
+              "ALREADY_MEMBER",
+              "This user is already a member of the group"
+            );
+          }
+        }
+
+        // Check for existing pending invitation
+        const existingInvitation = await tx.invitation.findFirst({
           where: {
-            groupId_userId: { groupId: id, userId: inviteeUser.id },
+            groupId: id,
+            inviteePublicKey: body.publicKey,
+            status: "PENDING",
           },
         });
-        if (existingMember) {
+        if (existingInvitation) {
           throw Errors.conflict(
-            "ALREADY_MEMBER",
-            "This user is already a member of the group"
+            "INVITATION_PENDING",
+            "An invitation for this user is already pending"
           );
         }
-      }
 
-      // Check for existing pending invitation
-      const existingInvitation = await prisma.invitation.findFirst({
-        where: {
-          groupId: id,
-          inviteePublicKey: body.publicKey,
-          status: "PENDING",
-        },
-      });
-      if (existingInvitation) {
-        throw Errors.conflict(
-          "INVITATION_PENDING",
-          "An invitation for this user is already pending"
-        );
-      }
+        const created = await tx.invitation.create({
+          data: {
+            groupId: id,
+            inviteePublicKey: body.publicKey,
+            status: "PENDING",
+          },
+        });
 
-      const invitation = await prisma.invitation.create({
-        data: {
-          groupId: id,
-          inviteePublicKey: body.publicKey,
-          status: "PENDING",
-        },
-      });
+        await auditTx(tx, {
+          userId: auth.id,
+          action: "group.invite",
+          entityType: "invitation",
+          entityId: created.id,
+          metadata: { groupId: id, inviteePublicKey: body.publicKey },
+        });
 
-      await audit({
-        userId: auth.id,
-        action: "group.invite",
-        entityType: "invitation",
-        entityId: invitation.id,
-        metadata: { groupId: id, inviteePublicKey: body.publicKey },
+        return created;
       });
 
       return reply.status(201).send({ invitation: serializeInvitation(invitation) });
@@ -178,14 +187,17 @@ export default async function groupRoutes(app: FastifyInstance) {
       ? new Date(Date.now() + body.expiresInHours * 3600_000)
       : null;
 
-    const invite = await prisma.invite.create({
-      data: {
-        groupId: id,
-        code: inviteCode(),
-        createdByUserId: auth.id,
-        maxUses: body.maxUses ?? null,
-        expiresAt,
-      },
+    const invite = await prisma.$transaction(async (tx) => {
+      await requireAdmin(id, auth.id, tx);
+      return tx.invite.create({
+        data: {
+          groupId: id,
+          code: inviteCode(),
+          createdByUserId: auth.id,
+          maxUses: body.maxUses ?? null,
+          expiresAt,
+        },
+      });
     });
     return { invite: serializeInvite(invite, config.WEB_URL) };
   });
@@ -238,29 +250,35 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post("/groups/:id/leave", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const ctx = await requireMembership(id, auth.id);
 
-    if (ctx.role === "admin") {
-      const [adminCount, totalCount] = await Promise.all([
-        prisma.groupMember.count({ where: { groupId: id, role: "admin" } }),
-        prisma.groupMember.count({ where: { groupId: id } }),
-      ]);
-      if (adminCount === 1 && totalCount > 1) {
-        throw Errors.conflict(
-          "last_admin",
-          "Promote another member to admin before leaving"
-        );
+    // The membership check, the last-admin guard, and the removal all run
+    // inside one transaction so a concurrent leave/removal by another admin
+    // can't race past the last-admin check and leave the group ownerless.
+    await prisma.$transaction(async (tx) => {
+      const ctx = await requireMembership(id, auth.id, tx);
+
+      if (ctx.role === "admin") {
+        const [adminCount, totalCount] = await Promise.all([
+          tx.groupMember.count({ where: { groupId: id, role: "admin" } }),
+          tx.groupMember.count({ where: { groupId: id } }),
+        ]);
+        if (adminCount === 1 && totalCount > 1) {
+          throw Errors.conflict(
+            "last_admin",
+            "Promote another member to admin before leaving"
+          );
+        }
       }
-    }
 
-    await prisma.groupMember.delete({
-      where: { groupId_userId: { groupId: id, userId: auth.id } },
-    });
-    await audit({
-      userId: auth.id,
-      action: "group.leave",
-      entityType: "group",
-      entityId: id,
+      await tx.groupMember.delete({
+        where: { groupId_userId: { groupId: id, userId: auth.id } },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "group.leave",
+        entityType: "group",
+        entityId: id,
+      });
     });
     return { ok: true };
   });
@@ -269,16 +287,20 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post("/groups/:id/archive", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
-    const group = await prisma.group.update({
-      where: { id },
-      data: { archived: true },
-    });
-    await audit({
-      userId: auth.id,
-      action: "group.archive",
-      entityType: "group",
-      entityId: id,
+
+    const group = await prisma.$transaction(async (tx) => {
+      await requireAdmin(id, auth.id, tx);
+      const updated = await tx.group.update({
+        where: { id },
+        data: { archived: true },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "group.archive",
+        entityType: "group",
+        entityId: id,
+      });
+      return updated;
     });
     return { group: serializeGroup(group) };
   });

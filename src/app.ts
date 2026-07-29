@@ -16,6 +16,7 @@ import treasuryRoutes from "./routes/treasury";
 import anchorRoutes from "./routes/anchors";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
+import healthRoutes from "./routes/health";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -85,14 +86,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     });
   });
 
-  // Health check.
-  app.get("/health", async () => ({
-    status: "ok",
-    network: config.STELLAR_NETWORK,
-    time: new Date().toISOString(),
-  }));
-
   // Routes.
+  await app.register(healthRoutes);
   await app.register(authRoutes);
   await app.register(groupRoutes);
   await app.register(expenseRoutes);

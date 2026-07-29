@@ -32,6 +32,7 @@ const schema = z.object({
   RATE_LIMIT_GROUP: z.coerce.number().int().positive().default(20),
   RATE_LIMIT_SETTLEMENT: z.coerce.number().int().positive().default(20),
   RATE_LIMIT_HISTORY: z.coerce.number().int().positive().default(100),
+  RATE_LIMIT_HEALTH: z.coerce.number().int().positive().default(200),
 });
 
 const parsed = schema.parse(process.env);

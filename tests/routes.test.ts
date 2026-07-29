@@ -31,9 +31,11 @@ const h = vi.hoisted(() => {
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
+    $queryRaw: vi.fn(),
     $disconnect: vi.fn(),
   };
-  return { prisma };
+  const mockFetchBaseFee = vi.fn();
+  return { prisma, mockFetchBaseFee };
 });
 
 vi.mock("../src/db", () => ({ prisma: h.prisma }));
@@ -50,6 +52,18 @@ vi.mock("../src/services/stellar", async (importActual) => {
         balances: [],
         signers: [],
         thresholds: { low: 0, med: 0, high: 0 },
+      })),
+    },
+  };
+});
+
+vi.mock("@stellar/stellar-sdk", async (importActual) => {
+  const actual = await importActual<typeof import("@stellar/stellar-sdk")>();
+  return {
+    ...actual,
+    Horizon: {
+      Server: vi.fn().mockImplementation(() => ({
+        fetchBaseFee: h.mockFetchBaseFee,
       })),
     },
   };
@@ -83,6 +97,8 @@ function authHeader(user = fakeUser()) {
 
 describe("auth routes", () => {
   it("GET /health is open", async () => {
+    h.prisma.$queryRaw.mockResolvedValueOnce([{ 1: 1 }]);
+    h.mockFetchBaseFee.mockResolvedValueOnce(100);
     const res = await app.inject({ method: "GET", url: "/health" });
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("ok");

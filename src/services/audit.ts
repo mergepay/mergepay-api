@@ -3,6 +3,7 @@ import { prisma } from "../db";
 /** Best-effort audit log write. Never throws into the request path. */
 export async function audit(params: {
   userId?: string | null;
+  groupId?: string | null;
   action: string;
   entityType: string;
   entityId: string;
@@ -12,6 +13,7 @@ export async function audit(params: {
     await prisma.auditLog.create({
       data: {
         userId: params.userId ?? null,
+        groupId: params.groupId ?? null,
         action: params.action,
         entityType: params.entityType,
         entityId: params.entityId,

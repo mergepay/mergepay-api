@@ -51,6 +51,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     });
     await audit({
       userId: auth.id,
+      groupId: id,
       action: "treasury.enable",
       entityType: "group",
       entityId: id,
@@ -255,6 +256,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     });
     await audit({
       userId: auth.id,
+      groupId: ttx.groupId,
       action: "treasury.confirm",
       entityType: "treasury_transaction",
       entityId: id,

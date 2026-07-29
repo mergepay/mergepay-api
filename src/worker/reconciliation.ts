@@ -182,6 +182,7 @@ async function writeStatus(
   }
 
   await audit({
+    groupId: hasField(record, "groupId") ? (record as any).groupId : undefined,
     action: `stellar_transaction_${status}`,
     entityType: table,
     entityId: record.id,

@@ -41,6 +41,7 @@ export default async function groupRoutes(app: FastifyInstance) {
     });
     await audit({
       userId: auth.id,
+      groupId: group.id,
       action: "group.create",
       entityType: "group",
       entityId: group.id,
@@ -157,6 +158,7 @@ export default async function groupRoutes(app: FastifyInstance) {
 
       await audit({
         userId: auth.id,
+        groupId: id,
         action: "group.invite",
         entityType: "invitation",
         entityId: invitation.id,
@@ -222,6 +224,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       ]);
       await audit({
         userId: auth.id,
+        groupId: invite.groupId,
         action: "group.join",
         entityType: "group",
         entityId: invite.groupId,
@@ -258,6 +261,7 @@ export default async function groupRoutes(app: FastifyInstance) {
     });
     await audit({
       userId: auth.id,
+      groupId: id,
       action: "group.leave",
       entityType: "group",
       entityId: id,
@@ -276,6 +280,7 @@ export default async function groupRoutes(app: FastifyInstance) {
     });
     await audit({
       userId: auth.id,
+      groupId: id,
       action: "group.archive",
       entityType: "group",
       entityId: id,

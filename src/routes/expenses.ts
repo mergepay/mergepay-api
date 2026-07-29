@@ -106,6 +106,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     await audit({
       userId: auth.id,
+      groupId,
       action: "expense.create",
       entityType: "expense",
       entityId: expense.id,
@@ -202,6 +203,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
     await prisma.expense.delete({ where: { id } });
     await audit({
       userId: auth.id,
+      groupId: expense.groupId,
       action: "expense.delete",
       entityType: "expense",
       entityId: id,

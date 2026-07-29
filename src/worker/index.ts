@@ -219,6 +219,7 @@ export async function processSubmittedSettlements(): Promise<void> {
         log.info({ id: settlement.id, hash }, "settlement confirmed");
 
         await audit({
+          groupId: settlement.groupId,
           action: "settlement.confirmed",
           entityType: "settlement",
           entityId: settlement.id,
@@ -243,6 +244,7 @@ export async function processSubmittedSettlements(): Promise<void> {
       );
 
       await audit({
+        groupId: settlement.groupId,
         action: "settlement.failed",
         entityType: "settlement",
         entityId: settlement.id,

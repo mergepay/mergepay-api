@@ -30,15 +30,30 @@ const schema = z.object({
   NODE_ENV: z.string().default("development"),
 
   // Security-sensitive endpoint policies.
+  RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
-  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
-  SETTLEMENT_RATE_LIMIT_MAX: z.coerce
-    .number()
-    .int()
-    .positive()
-    .max(100000)
-    .default(20),
+  RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().max(100000).default(100),
+  RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().max(100000).default(50),
+  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_CREATE_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  SEP24_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_GROUP: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_HISTORY: z.coerce.number().int().positive().max(100000).default(30),
+  // trusted proxies: only trust X-Forwarded-For if the direct peer is in this
+  // comma-separated list; otherwise Fastify falls back to req.ip = socket remote.
+  TRUSTED_PROXY_IPS: z.string().default(""),
+  // Anchor circuit breaker: open after this many consecutive failures.
+  ANCHOR_CIRCUIT_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(5),
+  // Anchor circuit breaker cooldown before transitioning to half-open (ms).
+  ANCHOR_CIRCUIT_COOLDOWN_MS: z.coerce.number().int().positive().default(30000),
   AUTH_BODY_LIMIT_BYTES: z.coerce
     .number()
     .int()
@@ -65,13 +80,26 @@ function hostOf(url: string): string {
 
 const apiHost = hostOf(parsed.API_PUBLIC_URL);
 
+export function validateAssetConfig() {
+  if (
+    !parsed.STABLE_ASSET_ISSUER ||
+    parsed.STABLE_ASSET_ISSUER === "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+  ) {
+    throw new Error(
+      "STABLE_ASSET_ISSUER is not configured. Set it in the environment to a real issuer public key."
+    );
+  }
+}
+
+const networkPassphrase =
+  parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET;
+
 export const config = {
   ...parsed,
   SEP10_HOME_DOMAIN: parsed.SEP10_HOME_DOMAIN ?? apiHost,
   WEB_AUTH_DOMAIN: parsed.WEB_AUTH_DOMAIN ?? apiHost,
   isTest: process.env.NODE_ENV === "test" || process.env.VITEST === "true",
-  networkPassphrase:
-    parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET,
+  networkPassphrase,
   jwtExpiresIn: "12h" as const,
 };
 

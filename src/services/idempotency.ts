@@ -8,7 +8,12 @@ import { Errors } from "../errors";
  * Idempotency keys are scoped per (user, operation, key) so a client-chosen
  * key string can never collide across users or across unrelated endpoints.
  */
-export type IdempotencyScope = "settlement.create" | "settlement.confirm";
+export type IdempotencyScope =
+  | "settlement.create"
+  | "settlement.confirm"
+  | "treasury.deposit"
+  | "treasury.withdraw"
+  | "treasury.confirm";
 
 export const idempotencyKeySchema = z
   .string()

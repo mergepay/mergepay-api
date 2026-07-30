@@ -5,7 +5,7 @@ import rateLimit from "@fastify/rate-limit";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
-import { config } from "./config";
+import { config, validateAssetConfig } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
@@ -146,7 +146,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     max: 100,
     timeWindow: config.RATE_LIMIT_WINDOW_MS,
     keyGenerator: securityKey,
-    addHeaders: true,
+    addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: (request) => ({
       error: "RATE_LIMITED",
       message: "Too many requests. Please retry later.",
@@ -169,14 +169,14 @@ export async function buildApp(): Promise<FastifyInstance> {
     let bodyLimit: number | undefined;
 
     if (url === "/auth/challenge" || url === "/auth/verify") {
-      max = config.AUTH_RATE_LIMIT_MAX;
+      max = config.RATE_LIMIT_AUTH_CHALLENGE_MAX;
       bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
     } else if (
       url === "/expenses/:id/settle" ||
       url === "/groups/:id/settlements" ||
-      url === "/settlements/:id/submit"
+      url === "/settlements/:id/confirm"
     ) {
-      max = config.SETTLEMENT_RATE_LIMIT_MAX;
+      max = config.RATE_LIMIT_SETTLEMENT_CREATE_MAX;
       bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
     } else if (
       url === "/anchors/deposit" ||

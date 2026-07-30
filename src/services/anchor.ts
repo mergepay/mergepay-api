@@ -30,6 +30,52 @@ import toml from "toml";
 import { z } from "zod";
 import { config } from "../config";
 import { Errors } from "../errors";
+import { anchorCircuit } from "./anchor-circuit";
+
+// ─── Zod schemas for anchor API responses ──────────────────────────────────
+
+const challengeResponseSchema = z.object({
+  transaction: z.string(),
+  network_passphrase: z.string().optional(),
+});
+
+const tokenResponseSchema = z.object({
+  token: z.string(),
+});
+
+const interactiveResponseSchema = z.object({
+  url: z.string(),
+  id: z.string(),
+});
+
+const sep24TransactionResponseSchema = z.object({
+  transaction: z
+    .object({
+      id: z.string().optional(),
+      status: z.string().optional(),
+      kind: z.string().optional(),
+      amount_in: z.string().optional(),
+      amount_out: z.string().optional(),
+      amount_fee: z.string().optional(),
+      started_at: z.string().optional(),
+      completed_at: z.string().optional(),
+      stellar_transaction_hash: z.string().optional(),
+      external_transaction_id: z.string().optional(),
+      message: z.string().optional(),
+      refunds: z.any().optional(),
+    })
+    .passthrough()
+    .optional(),
+  status: z.string().optional(),
+}).passthrough();
+
+function parseJson<T>(schema: z.ZodSchema<T>, data: unknown): T {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    throw Errors.upstream("Anchor returned an unexpected response format");
+  }
+  return result.data;
+}
 
 export interface AnchorToml {
   homeDomain: string;
@@ -44,6 +90,28 @@ const TOML_TTL = 5 * 60 * 1000;
 
 /** Timeout for a single SEP-24 poll request (ms). */
 const DEFAULT_POLL_TIMEOUT_MS = 10_000;
+
+export type RetryableErrorCode = "ANCHOR_TIMEOUT" | "ANCHOR_UPSTREAM" | "ANCHOR_MALFORMED" | "ANCHOR_CIRCUIT_OPEN";
+
+export class RetryableError extends Error {
+  constructor(
+    message: string,
+    public readonly code: RetryableErrorCode,
+    public readonly retryAfterMs?: number
+  ) {
+    super(message);
+    Object.setPrototypeOf(this, RetryableError.prototype);
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new RetryableError("Anchor request timed out", "ANCHOR_TIMEOUT", ms)), ms)
+    ),
+  ]);
+}
 
 // ─── SEP-24 status mapping ─────────────────────────────────────────────────
 
@@ -104,17 +172,34 @@ export const anchorService = {
     const cached = tomlCache.get(homeDomain);
     if (cached && Date.now() - cached.at < TOML_TTL) return cached.value;
 
-    const url = `https://${homeDomain}/.well-known/stellar.toml`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      throw Errors.upstream(`Could not load stellar.toml for ${homeDomain}`);
+    const provider = `toml:${homeDomain}`;
+    if (anchorCircuit.isOpen(provider)) {
+      throw new RetryableError(`Circuit open for anchor ${homeDomain}`, "ANCHOR_CIRCUIT_OPEN", config.ANCHOR_CIRCUIT_COOLDOWN_MS);
     }
 
+    const url = `https://${homeDomain}/.well-known/stellar.toml`;
+    let res: Response;
+    try {
+      res = await withTimeout(fetch(url), 10_000);
+      anchorCircuit.recordSuccess(provider);
+    } catch (err) {
+      const opened = anchorCircuit.recordFailure(provider);
+      if (err instanceof RetryableError) {
+        if (opened) {
+          throw new RetryableError(err.message, err.code, config.ANCHOR_CIRCUIT_COOLDOWN_MS);
+        }
+        throw err;
+      }
+      throw new RetryableError(`Failed to load toml for ${homeDomain}: ${err instanceof Error ? err.message : err}`, "ANCHOR_UPSTREAM");
+    }
+    if (!res.ok) {
+      throw new RetryableError(`Could not load stellar.toml for ${homeDomain}`, "ANCHOR_UPSTREAM");
+    }
     let parsed: any;
     try {
       parsed = toml.parse(await res.text());
     } catch {
-      throw Errors.upstream("Anchor returned invalid stellar.toml");
+      throw new RetryableError("Anchor returned invalid stellar.toml", "ANCHOR_MALFORMED");
     }
 
     const currencies = Array.isArray(parsed.CURRENCIES) ? parsed.CURRENCIES : [];
@@ -130,7 +215,7 @@ export const anchorService = {
       typeof parsed.TRANSFER_SERVER_SEP0024 !== "string" ||
       typeof parsed.SIGNING_KEY !== "string"
     ) {
-      throw Errors.upstream("Anchor stellar.toml is missing required SEP-24 fields");
+      throw new RetryableError("Anchor stellar.toml is missing required SEP-24 fields", "ANCHOR_MALFORMED");
     }
 
     const value: AnchorToml = {
@@ -150,7 +235,13 @@ export const anchorService = {
     account: string
   ): Promise<{ transaction: string; networkPassphrase: string }> {
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
-    const res = await fetch(url);
+    let res: Response;
+    try {
+      res = await withTimeout(fetch(url), 10_000);
+    } catch (err) {
+      if (err instanceof RetryableError) throw err;
+      throw new RetryableError(`Anchor SEP-10 challenge failed: ${err instanceof Error ? err.message : err}`, "ANCHOR_UPSTREAM");
+    }
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 challenge request failed");
     const data = parseJson(challengeResponseSchema, await res.json());
     return {
@@ -161,11 +252,17 @@ export const anchorService = {
 
   /** Step 2: exchange the signed challenge for an anchor JWT. */
   async getToken(webAuthEndpoint: string, signedXdr: string): Promise<string> {
-    const res = await fetch(webAuthEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ transaction: signedXdr }),
-    });
+    let res: Response;
+    try {
+      res = await withTimeout(fetch(webAuthEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transaction: signedXdr }),
+      }), 10_000);
+    } catch (err) {
+      if (err instanceof RetryableError) throw err;
+      throw new RetryableError(`Anchor SEP-10 token exchange failed: ${err instanceof Error ? err.message : err}`, "ANCHOR_UPSTREAM");
+    }
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 token exchange failed");
     return parseJson(tokenResponseSchema, await res.json()).token;
   },
@@ -178,19 +275,25 @@ export const anchorService = {
     assetCode: string;
     account: string;
   }): Promise<{ url: string; id: string }> {
-    const path = params.kind === "deposit" ? "deposit" : "withdraw";
-    const url = `${params.transferServer}/transactions/${path}/interactive`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${params.token}`,
-      },
-      body: JSON.stringify({
-        asset_code: params.assetCode,
-        account: params.account,
-      }),
-    });
+    const kind = params.kind === "deposit" ? "deposit" : "withdraw";
+    const url = `${params.transferServer}/transactions/${kind}/interactive`;
+    let res: Response;
+    try {
+      res = await withTimeout(fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${params.token}`,
+        },
+        body: JSON.stringify({
+          asset_code: params.assetCode,
+          account: params.account,
+        }),
+      }), 10_000);
+    } catch (err) {
+      if (err instanceof RetryableError) throw err;
+      throw new RetryableError(`Anchor interactive flow failed: ${err instanceof Error ? err.message : err}`, "ANCHOR_UPSTREAM");
+    }
     if (!res.ok) throw Errors.upstream("Anchor interactive flow request failed");
     return parseJson(interactiveResponseSchema, await res.json());
   },
@@ -206,25 +309,36 @@ export const anchorService = {
     token: string;
     id: string;
   }): Promise<string | null> {
+    const provider = `tx:${params.transferServer}`;
+    if (anchorCircuit.isOpen(provider)) {
+      return null;
+    }
+
     const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
       params.id
     )}`;
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await withTimeout(fetch(url, {
         headers: { Authorization: `Bearer ${params.token}` },
-      });
+      }), 10_000);
+      anchorCircuit.recordSuccess(provider);
     } catch {
+      anchorCircuit.recordFailure(provider);
       return null;
     }
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      anchorCircuit.recordFailure(provider);
+      return null;
+    }
 
     try {
       const data = parseJson(sep24TransactionResponseSchema, await res.json());
       const rawStatus = data.transaction?.status;
       return rawStatus ? rawStatus.trim().toLowerCase() : null;
     } catch {
+      anchorCircuit.recordFailure(provider);
       return null;
     }
   },
@@ -243,6 +357,16 @@ export const anchorService = {
     timeoutMs?: number;
   }): Promise<PollResult> {
     const timeoutMs = params.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+    const provider = `tx:${params.transferServer}`;
+    if (anchorCircuit.isOpen(provider)) {
+      return {
+        rawStatus: null,
+        status: "pending_anchor",
+        message: "Anchor circuit is open",
+        isError: true,
+      };
+    }
+
     const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
       params.id
     )}`;
@@ -251,139 +375,13 @@ export const anchorService = {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        response = await fetch(url, {
-          headers: { Authorization: `Bearer ${params.token}` },
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: `Anchor poll failed: ${message}`,
-        isError: true,
-      };
-    }
 
-    if (!response.ok) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: `Anchor returned HTTP ${response.status}`,
-        isError: true,
-      };
-    }
-
-    let json: Record<string, unknown>;
-    try {
-      json = (await response.json()) as Record<string, unknown>;
-    } catch {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor returned malformed (non-JSON) response",
-        isError: true,
-      };
-    }
-
-    const tx = json.transaction as Record<string, unknown> | undefined;
-    if (!tx) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor response missing 'transaction' field",
-        isError: true,
-      };
-    }
-
-    const rawStatus =
-      typeof tx.status === "string" ? tx.status : (json.status as string | undefined) ?? null;
-    if (!rawStatus) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor response missing transaction status",
-        isError: true,
-      };
-    }
-
-    // Sanitise — only carry forward benign fields for debugging
-    const sanitizedTx: Record<string, unknown> = {
-      id: tx.id,
-      status: rawStatus,
-      kind: tx.kind,
-      amount_in: tx.amount_in,
-      amount_out: tx.amount_out,
-      amount_fee: tx.amount_fee,
-      started_at: tx.started_at,
-      completed_at: tx.completed_at,
-      stellar_transaction_hash: tx.stellar_transaction_hash,
-      external_transaction_id: tx.external_transaction_id,
-      message: tx.message,
-      refunds: tx.refunds,
-    };
-
-    const mappedStatus = mapAnchorStatus(rawStatus);
-
-    return {
-      rawStatus,
-      status: mappedStatus,
-      message: `SEP-24 status: ${rawStatus} → ${mappedStatus}`,
-      isError: false,
-      transaction: sanitizedTx,
-      amountIn:
-        typeof tx.amount_in === "string" || typeof tx.amount_in === "number"
-          ? String(tx.amount_in)
-          : undefined,
-      amountOut:
-        typeof tx.amount_out === "string" || typeof tx.amount_out === "number"
-          ? String(tx.amount_out)
-          : undefined,
-      amountFee:
-        typeof tx.amount_fee === "string" || typeof tx.amount_fee === "number"
-          ? String(tx.amount_fee)
-          : undefined,
-      stellarTransactionHash:
-        typeof tx.stellar_transaction_hash === "string"
-          ? tx.stellar_transaction_hash
-          : undefined,
-    };
-  },
-
-  /**
-   * Full SEP-24 poll with timeout, error normalization, and rich result.
-   *
-   * This is the primary method the worker should call. It wraps
-   * getTransactionStatus with a timeout, parses the full transaction
-   * response, and returns a normalised PollResult.
-   */
-  async pollTransaction(params: {
-    transferServer: string;
-    token: string;
-    id: string;
-    timeoutMs?: number;
-  }): Promise<PollResult> {
-    const timeoutMs = params.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
-    const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
-      params.id
-    )}`;
-
-    let response: Response;
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        response = await fetch(url, {
-          headers: { Authorization: `Bearer ${params.token}` },
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
+      response = await withTimeout(fetch(url, {
+        headers: { Authorization: `Bearer ${params.token}` },
+        signal: controller.signal,
+      }), timeoutMs);
+      clearTimeout(timer);
+      anchorCircuit.recordSuccess(provider);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return {

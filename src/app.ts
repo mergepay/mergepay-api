@@ -1,4 +1,4 @@
-import Fastify, { FastifyInstance } from "fastify";
+import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -6,6 +6,7 @@ import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
 import { config } from "./config";
+import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
 import authRoutes from "./routes/auth";
@@ -14,29 +15,102 @@ import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
 import anchorRoutes from "./routes/anchors";
+import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
-import userGroupsRoutes from "./routes/user-groups";
+import { getCorrelationId } from "./lib/correlation";
+
+function securityKey(request: FastifyRequest): string {
+  const authorization = request.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) {
+    try {
+      return `user:${verifyToken(authorization.slice("Bearer ".length).trim()).id}`;
+    } catch {
+      // Invalid credentials are deliberately grouped by client IP.
+    }
+  }
+  return `ip:${request.ip}`;
+}
 
 export async function buildApp(): Promise<FastifyInstance> {
+  validateAssetConfig();
+
   const app = Fastify({
+    // Disable Fastify's unvalidated request-id header handling. The incoming
+    // values are validated by genReqId before becoming request.id.
+    requestIdHeader: false,
+    genReqId: (request) =>
+      getCorrelationId(
+        request.headers["x-correlation-id"] ?? request.headers["x-request-id"]
+      ),
     logger: config.isTest
       ? false
       : {
           level: process.env.LOG_LEVEL ?? "info",
+          redact: {
+            paths: [
+              "req.headers.authorization",
+              "req.headers.cookie",
+              "authorization",
+              "cookie",
+              "token",
+              "accessToken",
+              "refreshToken",
+              "signedXdr",
+              "transactionXdr",
+              "privateKey",
+              "secret",
+              "password",
+              "body.token",
+              "body.signedXdr",
+              "body.transactionXdr",
+              "body.privateKey",
+              "body.password",
+            ],
+            censor: "[REDACTED]",
+          },
           transport:
             config.NODE_ENV === "development"
               ? { target: "pino-pretty", options: { colorize: true } }
               : undefined,
         },
-    bodyLimit: 6 * 1024 * 1024,
+    bodyLimit: config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024,
+  });
+
+  app.addHook("onRequest", async (request, reply) => {
+    const correlationId = getCorrelationId(request.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
+    request.log.info({ correlationId }, "request received");
+  });
+
+  app.addHook("onResponse", async (request, reply) => {
+    const correlationId = getCorrelationId(request.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
+    request.log.info(
+      {
+        correlationId,
+        statusCode: reply.statusCode,
+        method: request.method,
+        route: request.routeOptions.url,
+      },
+      "request completed"
+    );
+  });
+
+  app.addHook("onError", async (request, _reply, error) => {
+    request.log.error(
+      {
+        correlationId: getCorrelationId(request.id),
+        statusCode: (error as Error & { statusCode?: number }).statusCode ?? 500,
+        errorCode: (error as { code?: string }).code ?? "INTERNAL_ERROR",
+      },
+      "request failed"
+    );
   });
 
   await app.register(helmet, { contentSecurityPolicy: false });
-  // CORS allowlist. "*" allows any origin; otherwise a comma-separated whitelist.
-  // Trailing slashes are stripped so "https://app.com/" still matches the
-  // browser-sent origin "https://app.com". Vercel preview deploys (*.vercel.app)
-  // are also allowed when the configured origin is itself a vercel.app domain.
   const allowAll = config.WEB_URL === "*";
   const allowed = config.WEB_URL
     .split(",")
@@ -47,7 +121,6 @@ export async function buildApp(): Promise<FastifyInstance> {
     origin: allowAll
       ? true
       : (origin, cb) => {
-          // Same-origin / server-to-server requests have no Origin header.
           if (!origin) return cb(null, true);
           const normalized = origin.replace(/\/+$/, "");
           if (allowed.includes(normalized)) return cb(null, true);
@@ -58,48 +131,115 @@ export async function buildApp(): Promise<FastifyInstance> {
         },
     credentials: false,
   });
+  // Global default limit. Sensitive routes (SEP-10 auth, settlement
+  // submission, the SEP-24 callback) override this with their own,
+  // route-appropriate config — see routes/auth.ts, routes/settlements.ts,
+  // routes/anchors.ts. Keys are the authenticated user id when available,
+  // otherwise the resolved client IP — never a wallet public key.
+  //
+  // RATE_LIMIT_STORE=database shares counters across instances via Postgres
+  // (src/services/rate-limit-store.ts) and fails OPEN if that store errors
+  // (skipOnError), so a database hiccup degrades to "unlimited" rather than
+  // blocking all traffic. The default "memory" store is per-process and
+  // needs no failure handling of its own.
   await app.register(rateLimit, {
     max: 100,
-    timeWindow: "1 minute",
-    allowList: config.isTest ? () => true : undefined,
+    timeWindow: config.RATE_LIMIT_WINDOW_MS,
+    keyGenerator: securityKey,
+    addHeaders: true,
+    errorResponseBuilder: (request) => ({
+      error: "RATE_LIMITED",
+      message: "Too many requests. Please retry later.",
+      statusCode: 429,
+      requestId: request.id,
+    }),
   });
   await app.register(multipart, {
-    limits: { fileSize: 6 * 1024 * 1024, files: 1 },
+    limits: {
+      fileSize: config.MULTIPART_FILE_SIZE_BYTES,
+      files: 1,
+      parts: 10,
+    },
   });
 
-  // Serve uploaded receipts.
+  // Apply stricter policies only to expensive or abuse-prone endpoints.
+  app.addHook("onRoute", (routeOptions) => {
+    const url = routeOptions.url;
+    let max: number | undefined;
+    let bodyLimit: number | undefined;
+
+    if (url === "/auth/challenge" || url === "/auth/verify") {
+      max = config.AUTH_RATE_LIMIT_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/expenses/:id/settle" ||
+      url === "/groups/:id/settlements" ||
+      url === "/settlements/:id/submit"
+    ) {
+      max = config.SETTLEMENT_RATE_LIMIT_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/anchors/deposit" ||
+      url === "/anchors/withdraw" ||
+      url === "/anchors/sessions/:id/complete" ||
+      url === "/uploads/receipt"
+    ) {
+      max = config.SEP24_RATE_LIMIT_MAX;
+      bodyLimit = url === "/uploads/receipt"
+        ? config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024
+        : config.AUTH_BODY_LIMIT_BYTES;
+    }
+
+    if (max !== undefined) {
+      const options = routeOptions as typeof routeOptions & {
+        config?: Record<string, unknown>;
+        bodyLimit?: number;
+      };
+      options.config = {
+        ...(options.config ?? {}),
+        rateLimit: {
+          max,
+          timeWindow: config.RATE_LIMIT_WINDOW_MS,
+          keyGenerator: securityKey,
+        },
+      };
+      options.bodyLimit = bodyLimit;
+    }
+  });
+
   await app.register(fastifyStatic, {
     root: path.resolve(config.UPLOADS_DIR),
     prefix: "/uploads/",
     decorateReply: false,
   });
-
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
 
   app.setNotFoundHandler((req, reply) => {
+    const correlationId = getCorrelationId(req.id);
+    reply.header("x-request-id", correlationId);
+    reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
       error: "NOT_FOUND",
       message: "Route not found",
       statusCode: 404,
-      requestId: req.id as string,
+      requestId: correlationId,
     });
   });
 
-  // Health check.
   app.get("/health", async () => ({
     status: "ok",
     network: config.STELLAR_NETWORK,
     time: new Date().toISOString(),
   }));
 
-  // Routes.
   await app.register(authRoutes);
   await app.register(groupRoutes);
   await app.register(expenseRoutes);
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
   await app.register(anchorRoutes);
+  await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
   await app.register(userGroupsRoutes);

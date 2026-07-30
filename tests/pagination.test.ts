@@ -133,7 +133,7 @@ describe("Pagination routes", () => {
       headers: authHeader(),
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INVALID_CURSOR");
+    expect(res.json().code).toBe("INVALID_CURSOR");
   });
 
   it("enforces maximum limits and returns 400 for invalid limits", async () => {
@@ -143,7 +143,7 @@ describe("Pagination routes", () => {
       headers: authHeader(),
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("VALIDATION_ERROR");
+    expect(res.json().code).toBe("VALIDATION_ERROR");
   });
 
   it("handles empty results gracefully", async () => {

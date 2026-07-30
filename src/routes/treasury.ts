@@ -3,7 +3,7 @@ import { z } from "zod";
 import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
@@ -252,7 +252,8 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         where: { id },
         data: { status: "failed" },
       });
-      throw e;
+      if (e instanceof AppError) throw e;
+      throw Errors.upstream("Transaction submission failed");
     }
 
     const updated = await prisma.treasuryTransaction.update({

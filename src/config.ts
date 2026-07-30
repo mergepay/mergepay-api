@@ -48,6 +48,8 @@ const schema = z.object({
   
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
+  CONFIRM_POLL_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
+  CONFIRM_POLL_DELAY_MS: z.coerce.number().int().positive().default(1500),
   NODE_ENV: z.string().default("development"),
 
   // Security-sensitive endpoint policies.

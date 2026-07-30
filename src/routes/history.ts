@@ -7,34 +7,16 @@ import { requireUser } from "../plugins/auth";
 import { serializeExpense, serializeSettlement } from "../serializers";
 import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 
+const historyQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+});
+
 export default async function historyRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   app.get("/history", { config: { rateLimit: { max: config.AUTH_RATE_LIMIT_MAX, timeWindow: "1 minute" } } }, async (req) => {
     const auth = requireUser(req);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
-
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
-
-    const cursorFilter = decodedCursor
-      ? {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }
-      : {};
-
-    const takeCount = limit + 1;
+    historyQuerySchema.parse(req.query ?? {});
 
     const [expenses, settlements] = await Promise.all([
       prisma.expense.findMany({

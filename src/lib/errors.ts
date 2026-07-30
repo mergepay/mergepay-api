@@ -6,12 +6,15 @@
  * fields to build the standard JSON response:
  *
  *   {
- *     error: string,          // machine-readable code (e.g. "NOT_FOUND")
+ *     code: string,           // machine-readable code (e.g. "NOT_FOUND")
  *     message: string,        // human-readable description
- *     statusCode: number,     // mirrors the HTTP status (e.g. 404)
- *     details?: unknown,      // optional structured detail (e.g. Zod issues)
- *     requestId?: string      // Fastify request.id for correlation / tracing
+ *     requestId: string,      // Fastify request.id for correlation / tracing
+ *     details?: unknown[],    // optional structured detail (e.g. Zod issues)
  *   }
+ *
+ * The HTTP status code is conveyed via the response status — it is not
+ * duplicated in the body. Stack traces, SQL, credentials, signed XDRs, and
+ * upstream response bodies are never included in the response.
  */
 
 /** All first-class error codes used across the API. */
@@ -27,6 +30,7 @@ export const ErrorCode = {
   INVALID_PUBLIC_KEY: "INVALID_PUBLIC_KEY",
   INVALID_RECIPIENT: "INVALID_RECIPIENT",
   INVALID_DESTINATION: "INVALID_DESTINATION",
+  INVALID_IDEMPOTENCY_KEY: "INVALID_IDEMPOTENCY_KEY",
   NO_SHARE: "NO_SHARE",
   PAYER_SHARE: "PAYER_SHARE",
   SELF_SETTLE: "SELF_SETTLE",
@@ -47,6 +51,7 @@ export const ErrorCode = {
   NOT_FOUND: "NOT_FOUND",
   // 409
   CONFLICT: "CONFLICT",
+  IDEMPOTENCY_CONFLICT: "IDEMPOTENCY_CONFLICT",
   ALREADY_SETTLED: "ALREADY_SETTLED",
   EXPENSE_SETTLED: "EXPENSE_SETTLED",
   LAST_ADMIN: "LAST_ADMIN",

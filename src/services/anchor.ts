@@ -367,62 +367,6 @@ export const anchorService = {
       };
     }
 
-    const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
-      params.id
-    )}`;
-
-    let response: Response;
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-      response = await withTimeout(fetch(url, {
-        headers: { Authorization: `Bearer ${params.token}` },
-        signal: controller.signal,
-      }), timeoutMs);
-      clearTimeout(timer);
-      anchorCircuit.recordSuccess(provider);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: `Anchor poll failed: ${message}`,
-        isError: true,
-      };
-    }
-
-    if (!response.ok) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: `Anchor returned HTTP ${response.status}`,
-        isError: true,
-      };
-    }
-
-    let json: Record<string, unknown>;
-    try {
-      json = (await response.json()) as Record<string, unknown>;
-    } catch {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor returned malformed (non-JSON) response",
-        isError: true,
-      };
-    }
-
-    const tx = json.transaction as Record<string, unknown> | undefined;
-    if (!tx) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor response missing 'transaction' field",
-        isError: true,
-      };
-    }
-
     const rawStatus =
       typeof tx.status === "string" ? tx.status : (json.status as string | undefined) ?? null;
     if (!rawStatus) {
@@ -476,6 +420,7 @@ export const anchorService = {
           : undefined,
     };
   },
+
 };
 
 // ─── Status mapping ─────────────────────────────────────────────────────────

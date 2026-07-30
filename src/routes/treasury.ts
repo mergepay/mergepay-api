@@ -3,7 +3,7 @@ import { z } from "zod";
 import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
@@ -235,7 +235,58 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
-    return runIdempotent({
+    const ttx = await prisma.treasuryTransaction.findUnique({ where: { id } });
+    if (!ttx) throw Errors.notFound("Treasury transaction not found");
+
+    const group = await prisma.group.findUnique({ where: { id: ttx.groupId } });
+    if (!group?.treasuryAccountPublicKey) {
+      throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
+    }
+
+    if (ttx.direction === "deposit") {
+      if (ttx.userId !== auth.id) {
+        throw Errors.forbidden("Only the depositor can confirm this deposit");
+      }
+    } else {
+      await requireAdmin(ttx.groupId, auth.id);
+    }
+    if (ttx.status === "confirmed") {
+      return { treasuryTransaction: serializeTreasuryTx(ttx) };
+    }
+
+    const source =
+      ttx.direction === "deposit"
+        ? auth.stellarPublicKey
+        : group.treasuryAccountPublicKey;
+    const destination =
+      ttx.direction === "deposit"
+        ? group.treasuryAccountPublicKey
+        : ttx.destination!;
+
+    let hash: string;
+    try {
+      hash = await stellar.submitPayment(body.signedXdr, {
+        sourcePublicKey: source,
+        destination,
+        asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
+        amount: ttx.amount.toString(),
+        memoCode: ttx.shortCode,
+      });
+    } catch (e) {
+      await prisma.treasuryTransaction.update({
+        where: { id },
+        data: { status: "failed" },
+      });
+      if (e instanceof AppError) throw e;
+      throw Errors.upstream("Transaction submission failed");
+    }
+
+    const updated = await prisma.treasuryTransaction.update({
+      where: { id },
+      data: { status: "confirmed", stellarTxHash: hash },
+      include: { user: true },
+    });
+    await audit({
       userId: auth.id,
       scope: "treasury.confirm",
       key: idempotencyKey,

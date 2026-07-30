@@ -9,6 +9,12 @@ import { inviteCode } from "../services/codes";
 import { audit } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
 import {
+  buildPage,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
+import {
   serializeGroup,
   serializeInvitation,
   serializeInvite,
@@ -50,16 +56,43 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- list (with summaries) -------------------------------------------------
+  //
+  // Paginated because each row costs a balance computation, so an unbounded
+  // list would scale that work with a user's group count. Membership rows are
+  // ordered by `joinedAt`, which is this resource's creation timestamp, so the
+  // shared cursor helpers are given that field as `createdAt`.
   app.get("/groups", async (req) => {
     const auth = requireUser(req);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const position = requireCursor(cursor);
+
+    const cursorScope = position
+      ? {
+          OR: [
+            { joinedAt: { [order === "desc" ? "lt" : "gt"]: position.createdAt } },
+            {
+              joinedAt: position.createdAt,
+              id: { [order === "desc" ? "lt" : "gt"]: position.id },
+            },
+          ],
+        }
+      : {};
+
     const memberships = await prisma.groupMember.findMany({
-      where: { userId: auth.id },
+      where: { userId: auth.id, ...cursorScope },
       include: { group: { include: { _count: { select: { members: true } } } } },
-      orderBy: { joinedAt: "desc" },
+      orderBy: [{ joinedAt: order }, { id: order }],
+      take: takeForPage(limit),
     });
 
+    const { items, meta } = buildPage(
+      memberships.map((m) => ({ ...m, createdAt: m.joinedAt })),
+      limit,
+      order
+    );
+
     const groups = await Promise.all(
-      memberships.map(async (m) => {
+      items.map(async (m) => {
         const balances = await loadGroupBalances(m.groupId);
         const asset = await groupPrimaryAsset(m.groupId);
         const yourNet =
@@ -73,7 +106,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       })
     );
 
-    return { groups };
+    return { groups, meta };
   });
 
   // -- detail -----------------------------------------------------------------

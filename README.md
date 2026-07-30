@@ -229,6 +229,37 @@ exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signe
 All request bodies are validated with Zod; every group action checks membership
 (and admin rights where required). Errors are returned as `{ error: { code, message } }`.
 
+### Pagination
+
+Every list endpoint uses one cursor convention, defined and documented in
+[src/lib/pagination.ts](src/lib/pagination.ts) and mirrored in
+[docs/api-contract.md](docs/api-contract.md).
+
+| Parameter | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `limit` | integer 1–100 | 50 | Outside the range → `VALIDATION_ERROR`, never a silent clamp |
+| `cursor` | opaque string | — | From a previous response's `meta.nextCursor`; malformed → `INVALID_CURSOR` |
+| `order` | `desc` \| `asc` | `desc` | Applies to the `(createdAt, id)` ordering |
+
+Every list response carries the same metadata:
+
+```json
+{ "meta": { "nextCursor": "MTc2…", "hasMore": true, "limit": 50, "order": "desc" } }
+```
+
+Ordering is always the pair `(createdAt, id)`, so rows sharing a timestamp have
+a defined order and can never appear on two pages or be skipped between them.
+Queries fetch `limit + 1` rows — the page plus one lookahead row to compute
+`hasMore` — so no endpoint ever loads a full result set. Cursors carry only
+ordering coordinates, never a group or user id: access is decided by each
+query's own scope plus its membership check, so a cursor from one resource
+replayed against another cannot widen what the caller can read.
+
+Covers `GET /groups`, `/groups/:id/expenses`, `/groups/:id/ledger`,
+`/groups/:id/treasury/history`, `/anchors/sessions`, and `/history` (which
+paginates its expense and settlement streams independently, via `cursor` and
+`settlementCursor`).
+
 ## Testing
 
 ```bash

@@ -10,7 +10,17 @@ import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
+
+/** Every route in this file takes a single opaque resource id. */
+const idParamSchema = z.object({ id: z.string().min(1).max(64) });
 
 const shareInput = z.object({
   userId: z.string(),
@@ -42,7 +52,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   // -- create -----------------------------------------------------------------
   app.post("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
@@ -119,55 +129,29 @@ export default async function expenseRoutes(app: FastifyInstance) {
   // -- list -------------------------------------------------------------------
   app.get("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    const { id: groupId } = idParamSchema.parse(req.params);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    // Membership is checked before any row is read, and the `groupId` filter
+    // below is what scopes the page — never the cursor.
     await requireMembership(groupId, auth.id);
 
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
+    const position = requireCursor(cursor);
 
     const expenses = await prisma.expense.findMany({
-      where: {
-        groupId,
-        ...(decodedCursor && {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }),
-      },
+      where: { groupId, ...cursorFilter(position, order) },
       include: expenseInclude,
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
     });
 
-    const hasMore = expenses.length > limit;
-    const results = hasMore ? expenses.slice(0, limit) : expenses;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
-
-    return {
-      expenses: results.map(serializeExpense),
-      meta: { nextCursor, hasMore },
-    };
+    const { items, meta } = buildPage(expenses, limit, order);
+    return { expenses: items.map(serializeExpense), meta };
   });
 
   // -- get one ----------------------------------------------------------------
   app.get("/expenses/:id", async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
     const expense = await prisma.expense.findUnique({
       where: { id },
       include: expenseInclude,
@@ -180,7 +164,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   // -- update (metadata only) -------------------------------------------------
   app.patch("/expenses/:id", async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
     const body = z
       .object({
         title: z.string().min(1).max(80).optional(),
@@ -213,7 +197,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   // -- delete -----------------------------------------------------------------
   app.delete("/expenses/:id", async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
 
     const expense = await prisma.expense.findUnique({
       where: { id },

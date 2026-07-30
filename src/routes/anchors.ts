@@ -9,6 +9,14 @@ import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { applyAnchorSessionTransition } from "../services/anchor-status";
 import { audit } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 
@@ -159,12 +167,20 @@ export default async function anchorRoutes(app: FastifyInstance) {
     "/anchors/sessions",
     { preHandler: [app.authenticate], ...pollLimit },
     async (req) => {
-    const auth = requireUser(req);
-    const sessions = await prisma.anchorSession.findMany({
-      where: { userId: auth.id },
-      orderBy: { createdAt: "desc" },
-    });
-      return { sessions: sessions.map(serializeAnchorSession) };
+      const auth = requireUser(req);
+      const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+      const position = requireCursor(cursor);
+
+      // Scoped to the caller's own sessions; the cursor only moves the page
+      // boundary inside that scope.
+      const sessions = await prisma.anchorSession.findMany({
+        where: { userId: auth.id, ...cursorFilter(position, order) },
+        orderBy: cursorOrderBy(order),
+        take: takeForPage(limit),
+      });
+
+      const { items, meta } = buildPage(sessions, limit, order);
+      return { sessions: items.map(serializeAnchorSession), meta };
     }
   );
 

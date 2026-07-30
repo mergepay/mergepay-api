@@ -15,7 +15,14 @@ import {
   serializeExpense,
   serializeTreasuryTx,
 } from "../serializers";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
@@ -24,6 +31,9 @@ import { validateAsset, validateAmount } from "../services/assets";
 import { memoText } from "../services/stellar";
 
 const settlementInclude = { from: true, to: true } as const;
+
+/** Every route in this file takes a single opaque resource id. */
+const idParamSchema = z.object({ id: z.string().min(1).max(64) });
 
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -41,7 +51,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // -- settle a specific expense share ----------------------------------------
   app.post("/expenses/:id/settle", createLimit, async (req) => {
     const auth = requireUser(req);
-    const { id: expenseId } = z.object({ id: z.string() }).parse(req.params);
+    const { id: expenseId } = idParamSchema.parse(req.params);
     const body = z
       .object({
         assetCode: z.string().optional(),
@@ -129,7 +139,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // -- freeform settle-up against net balance ---------------------------------
   app.post("/groups/:id/settlements", createLimit, async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
     const body = z
       .object({
@@ -197,7 +207,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // -- confirm (submit signed xdr) --------------------------------------------
   app.post("/settlements/:id/confirm", confirmLimit, async (req, reply) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
@@ -261,7 +271,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // -- balances + suggestions -------------------------------------------------
   app.get("/groups/:id/balances", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
 
     const { balances, suggestions } = await loadGroupBalancesWithSuggestions(groupId);
@@ -301,55 +311,45 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- ledger -----------------------------------------------------------------
+  //
+  // The ledger interleaves three tables. Each is read with the same bounded
+  // `limit + 1` window and the same `(createdAt, id)` ordering, then merged
+  // using that identical total order, so the merged page obeys the shared
+  // pagination contract: a cursor from any page resumes exactly where the last
+  // one stopped, whichever table the boundary row came from.
   app.get("/groups/:id/ledger", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    const { id: groupId } = idParamSchema.parse(req.params);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
     await requireMembership(groupId, auth.id);
 
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
-
-    const cursorFilter = decodedCursor
-      ? {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }
-      : {};
-
-    const takeCount = limit + 1;
+    const position = requireCursor(cursor);
+    const where = { groupId, ...cursorFilter(position, order) };
+    const orderBy = cursorOrderBy(order);
+    const take = takeForPage(limit);
 
     const [expenses, settlements, treasuryTxs] = await Promise.all([
       prisma.expense.findMany({
-        where: { groupId, ...cursorFilter },
+        where,
         include: { payer: true, shares: { include: { user: true } } },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-        take: takeCount,
+        orderBy,
+        take,
       }),
       prisma.settlement.findMany({
-        where: { groupId, ...cursorFilter },
-        include: { from: true, to: true },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-        take: takeCount,
+        where,
+        include: settlementInclude,
+        orderBy,
+        take,
       }),
       prisma.treasuryTransaction.findMany({
-        where: { groupId, ...cursorFilter },
+        where,
         include: { user: true },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-        take: takeCount,
+        orderBy,
+        take,
       }),
     ]);
 
+    const direction = order === "desc" ? -1 : 1;
     const entries = [
       ...expenses.map((e) => ({
         type: "expense" as const,
@@ -370,29 +370,24 @@ export default async function settlementRoutes(app: FastifyInstance) {
         treasuryTransaction: serializeTreasuryTx(t),
       })),
     ].sort((a, b) => {
-      if (a.createdAt < b.createdAt) return 1;
-      if (a.createdAt > b.createdAt) return -1;
-      return a.id < b.id ? 1 : -1;
+      if (a.createdAt.getTime() !== b.createdAt.getTime()) {
+        return a.createdAt < b.createdAt ? -direction : direction;
+      }
+      // Ids from different tables can collide in sort position only by string
+      // comparison, which is still a total order — the same one the per-table
+      // queries used, so the merge stays consistent with the cursor.
+      if (a.id === b.id) return 0;
+      return a.id < b.id ? -direction : direction;
     });
 
-    const hasMore = entries.length > limit;
-    const results = hasMore ? entries.slice(0, limit) : entries;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
+    const { items, meta } = buildPage(entries, limit, order);
 
     return {
-      entries: results.map((r) => {
-        const { id, ...rest } = r;
-        return {
-          ...rest,
-          createdAt: r.createdAt.toISOString(),
-        };
-      }),
-      meta: { nextCursor, hasMore },
+      entries: items.map(({ id: _id, createdAt, ...rest }) => ({
+        ...rest,
+        createdAt: createdAt.toISOString(),
+      })),
+      meta,
     };
   });
 }

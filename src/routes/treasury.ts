@@ -12,7 +12,14 @@ import { audit } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { rateLimited } from "../lib/rate-limit";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 
 export default async function treasuryRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -278,48 +285,20 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   // -- history ----------------------------------------------------------------
   app.get("/groups/:id/treasury/history", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    const { id: groupId } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
     await requireMembership(groupId, auth.id);
 
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
+    const position = requireCursor(cursor);
 
     const transactions = await prisma.treasuryTransaction.findMany({
-      where: {
-        groupId,
-        ...(decodedCursor && {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }),
-      },
+      where: { groupId, ...cursorFilter(position, order) },
       include: { user: true },
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
     });
 
-    const hasMore = transactions.length > limit;
-    const results = hasMore ? transactions.slice(0, limit) : transactions;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
-
-    return {
-      transactions: results.map(serializeTreasuryTx),
-      meta: { nextCursor, hasMore },
-    };
+    const { items, meta } = buildPage(transactions, limit, order);
+    return { transactions: items.map(serializeTreasuryTx), meta };
   });
 }

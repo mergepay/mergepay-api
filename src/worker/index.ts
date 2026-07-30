@@ -3,6 +3,7 @@ import { config } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { AppError } from "../errors";
 import {
   anchorService,
   mapAnchorStatus,
@@ -11,6 +12,7 @@ import {
 } from "../services/anchor";
 import type { PollResult } from "../services/anchor";
 import { runReconciliation, startReconciliation } from "./reconciliation";
+import { recordStatusTransitionInTransaction } from "../services/status-history";
 
 interface SettlementSubmissionRecord {
   id: string;
@@ -146,7 +148,13 @@ export async function submitSettlement(
   }
 
   try {
-    const hash = await stellar.submitPayment(settlement.transactionXdr);
+    const hash = await stellar.submitPayment(settlement.transactionXdr, {
+      sourcePublicKey: settlement.fromPublicKey,
+      destination: settlement.toPublicKey,
+      asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
+      amount: settlement.amount,
+      memoCode: settlement.shortCode,
+    });
     log.info({ id: settlement.id, hash }, "settlement submitted successfully");
     return hash;
   } catch (error) {
@@ -161,12 +169,22 @@ async function markSettlementFailed(
   settlement: SettlementSubmissionRecord,
   message: string
 ): Promise<void> {
-  await prisma.settlement.update({
-    where: { id: settlement.id },
-    data: {
-      status: "failed",
-      retryCount: settlement.retryCount,
-    },
+  await prisma.$transaction(async (tx) => {
+    await tx.settlement.update({
+      where: { id: settlement.id },
+      data: {
+        status: "failed",
+        failureReason: message,
+        retryCount: settlement.retryCount,
+      },
+    });
+    await recordStatusTransitionInTransaction(tx, {
+      entityType: "settlement",
+      entityId: settlement.id,
+      newStatus: "failed",
+      reason: message,
+      source: "worker",
+    });
   });
   await recordTransition(settlement.id, "settlement_failed", {
     attempt: settlement.retryCount,
@@ -189,13 +207,21 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
       const attempt = initialAttempt + offset;
       try {
         const hash = await submitSettlement(settlement, attempt);
-        await prisma.settlement.update({
-          where: { id: settlement.id },
-          data: {
-            status: "confirmed",
-            stellarTxHash: hash,
-            retryCount: attempt,
-          },
+        await prisma.$transaction(async (tx) => {
+          await tx.settlement.update({
+            where: { id: settlement.id },
+            data: {
+              status: "confirmed",
+              stellarTxHash: hash,
+              retryCount: attempt,
+            },
+          });
+          await recordStatusTransitionInTransaction(tx, {
+            entityType: "settlement",
+            entityId: settlement.id,
+            newStatus: "confirmed",
+            source: "worker",
+          });
         });
         await recordTransition(settlement.id, "settlement_confirmed", { attempt });
         return;
@@ -349,9 +375,18 @@ async function reconcileSingleAnchor(
       data.status = "error";
     }
 
-    await prisma.anchorSession.update({
-      where: { id: session.id },
-      data: data as any,
+    await prisma.$transaction(async (tx) => {
+      await tx.anchorSession.update({
+        where: { id: session.id },
+        data: data as any,
+      });
+      await recordStatusTransitionInTransaction(tx, {
+        entityType: "anchor_session",
+        entityId: session.id,
+        newStatus: "error",
+        reason: result.message,
+        source: "worker",
+      });
     });
 
     if (!shouldBackoff) {
@@ -424,9 +459,18 @@ async function reconcileSingleAnchor(
     );
   }
 
-  await prisma.anchorSession.update({
-    where: { id: session.id },
-    data: updateData as any,
+  await prisma.$transaction(async (tx) => {
+    await tx.anchorSession.update({
+      where: { id: session.id },
+      data: updateData as any,
+    });
+    await recordStatusTransitionInTransaction(tx, {
+      entityType: "anchor_session",
+      entityId: session.id,
+      newStatus: result.status,
+      reason: result.status === "error" ? (result.message ?? null) : undefined,
+      source: "worker",
+    });
   });
 
   log.info(
@@ -483,7 +527,7 @@ export async function processSubmittedSettlements(): Promise<void> {
       shortCode: row.shortCode,
       fromPublicKey: row.from.stellarPublicKey,
       toPublicKey: row.to.stellarPublicKey,
-      amount: row.amount,
+      amount: row.amount.toString(),
       assetCode: row.assetCode,
       assetIssuer: row.assetIssuer,
       transactionXdr: row.transactionXdr,
@@ -524,5 +568,11 @@ export function startWorker(): () => void {
 }
 
 if (process.env.NODE_ENV !== "test") {
+  // Config validation already happened at module load time in config.ts
+  // This explicit check ensures we fail before starting the worker if config is invalid
+  if (!config.DATABASE_URL || !config.HORIZON_URL || !config.ANCHOR_HOME_DOMAIN) {
+    console.error("❌ Critical configuration missing for worker. Exiting.");
+    process.exit(1);
+  }
   startWorker();
 }

@@ -13,6 +13,18 @@ function iso(d: Date): string {
   return d.toISOString();
 }
 
+export function serializeStatusHistory(h: any) {
+  return {
+    id: h.id,
+    entityType: h.entityType,
+    entityId: h.entityId,
+    status: h.status,
+    reason: h.reason ?? null,
+    source: h.source ?? null,
+    createdAt: iso(h.createdAt),
+  };
+}
+
 export function serializeUser(u: any) {
   return {
     id: u.id,
@@ -94,6 +106,7 @@ export function serializeSettlement(s: any) {
     memo: s.memo ?? null,
     expenseId: s.expenseId ?? null,
     createdAt: iso(s.createdAt),
+    statusHistory: (s.statusHistory ?? []).map(serializeStatusHistory),
   };
 }
 
@@ -149,6 +162,7 @@ export function serializeAnchorSession(s: any) {
     interactiveUrl: s.interactiveUrl ?? null,
     externalTransactionId: s.externalTransactionId ?? null,
     status: s.status,
+    statusHistory: (s.statusHistory ?? []).map(serializeStatusHistory),
     failureReason: s.failureReason ?? null,
     retryCount: s.retryCount ?? 0,
     lastPolledAt: s.lastPolledAt ? iso(s.lastPolledAt) : null,

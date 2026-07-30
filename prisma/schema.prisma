@@ -136,6 +136,7 @@ model Settlement {
   @@index([fromUserId])
   @@index([toUserId])
   @@index([status])
+  @@index([status, updatedAt]) // For worker reconciliation queries
   @@map("settlements")
 }
 
@@ -215,6 +216,8 @@ model AnchorSession {
   @@index([userId])
   @@index([externalTransactionId])
   @@index([status])
+  @@index([anchorToken, externalTransactionId]) // For worker polling queries
+  @@index([status, lastPolledAt]) // For worker polling with time-based filtering
   @@map("anchor_sessions")
 }
 
@@ -250,6 +253,20 @@ model AuditLog {
 
   @@index([userId])
   @@map("audit_logs")
+}
+
+model StatusHistory {
+  id              String   @id @default(cuid())
+  entityType      String   @map("entity_type") // "settlement" or "anchor_session"
+  entityId        String   @map("entity_id")
+  status          String
+  reason          String?  // Safe, displayable reason for the status change
+  source          String?  // Source of the status change (e.g., "worker", "api", "anchor")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([entityType, entityId, createdAt])
+  @@map("status_history")
 }
 
 // Backing store for the optional database-backed rate limiter (see

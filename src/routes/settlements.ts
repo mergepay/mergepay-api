@@ -21,8 +21,9 @@ import {
 } from "../services/group-balances";
 import { validateAsset, validateAmount } from "../services/assets";
 import { memoText } from "../services/stellar";
+import { recordStatusTransitionInTransaction } from "../services/status-history";
 
-const settlementInclude = { from: true, to: true } as const;
+const settlementInclude = { from: true, to: true, statusHistory: true } as const;
 
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -119,6 +120,13 @@ export default async function settlementRoutes(app: FastifyInstance) {
           include: settlementInclude,
         });
 
+        await recordStatusTransitionInTransaction(tx, {
+          entityType: "settlement",
+          entityId: settlement.id,
+          newStatus: "pending",
+          source: "api",
+        });
+
         await tx.expenseShare.update({
           where: { id: myShare.id },
           data: { status: "settling" },
@@ -192,6 +200,13 @@ export default async function settlementRoutes(app: FastifyInstance) {
           include: settlementInclude,
         });
 
+        await recordStatusTransitionInTransaction(tx, {
+          entityType: "settlement",
+          entityId: settlement.id,
+          newStatus: "pending",
+          source: "api",
+        });
+
         const xdr = await buildSettlementXdr({
           fromPublicKey: auth.stellarPublicKey,
           toPublicKey: recipient.user.stellarPublicKey,
@@ -253,6 +268,15 @@ export default async function settlementRoutes(app: FastifyInstance) {
             status: "submitted",
           },
         });
+
+        if (count > 0) {
+          await recordStatusTransitionInTransaction(tx, {
+            entityType: "settlement",
+            entityId: id,
+            newStatus: "submitted",
+            source: "api",
+          });
+        }
 
         const finalSettlement = await tx.settlement.findUniqueOrThrow({
           where: { id },

@@ -129,13 +129,7 @@ export const stellar = {
       memoCode: string;
     }
   ): Promise<string> {
-    let tx: Transaction;
-    try {
-      tx = new Transaction(signedXdr, config.networkPassphrase);
-    } catch {
-      throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
-    }
-    validatePaymentTx(tx, expected);
+    const { tx } = validateSignedXdr(signedXdr, expected);
     try {
       const res = await server().submitTransaction(tx);
       return res.hash;
@@ -229,4 +223,38 @@ function normalizeAmount(a: string): string {
   // Compare at 7dp precision regardless of trailing zeros.
   const [w, f = ""] = a.split(".");
   return `${w}.${(f + "0000000").slice(0, 7)}`;
+}
+
+/**
+ * Parse and validate a signed XDR against the expected payment intent
+ * without submitting it to Horizon. Returns the parsed transaction and its
+ * hash on success. Throws AppError (400 XDR_MISMATCH) on any mismatch.
+ *
+ * Callers use this in API routes to reject invalid signed XDRs *before*
+ * persisting them, so Horizon is never called for transactions that fail
+ * structural validation.
+ */
+export interface SignedXdrValidation {
+  tx: Transaction;
+  hash: string;
+}
+
+export function validateSignedXdr(
+  signedXdr: string,
+  expected: {
+    sourcePublicKey: string;
+    destination: string;
+    asset: AssetSpec;
+    amount: string;
+    memoCode: string;
+  }
+): SignedXdrValidation {
+  let tx: Transaction;
+  try {
+    tx = new Transaction(signedXdr, config.networkPassphrase);
+  } catch {
+    throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
+  }
+  validatePaymentTx(tx, expected);
+  return { tx, hash: tx.hash().toString("hex") };
 }

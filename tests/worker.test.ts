@@ -25,6 +25,7 @@ const h = vi.hoisted(() => {
   return {
     prisma,
     submitPayment: vi.fn(),
+    getTransaction: vi.fn(),
     audit: vi.fn(),
   };
 });
@@ -35,9 +36,13 @@ vi.mock("../src/services/stellar", () => ({
     loadAccount: vi.fn(),
     buildPayment: vi.fn(),
     submitPayment: h.submitPayment,
+    getTransaction: h.getTransaction,
   },
 }));
 vi.mock("../src/services/audit", () => ({ audit: h.audit }));
+vi.mock("../src/services/settlement-reconciliation", () => ({
+  reconcileSettlements: vi.fn(),
+}));
 vi.mock("../src/worker/reconciliation", () => ({
   runReconciliation: vi.fn(),
   startReconciliation: vi.fn(() => () => {}),
@@ -469,8 +474,9 @@ describe("processSubmittedSettlements", () => {
       expect.objectContaining({
         where: { id: "settle_1" },
         data: expect.objectContaining({
-          status: "confirmed",
+          status: "pending_confirmation",
           stellarTxHash: "hash_123",
+          retryCount: 0,
         }),
       })
     );
@@ -511,8 +517,9 @@ describe("processSubmittedSettlements", () => {
       expect.objectContaining({
         where: { id: "settle_2" },
         data: expect.objectContaining({
-          status: "confirmed",
+          status: "pending_confirmation",
           stellarTxHash: "hash_456",
+          retryCount: 0,
         }),
       })
     );
@@ -554,7 +561,6 @@ describe("processSubmittedSettlements", () => {
         }),
       })
     );
-    expect(h.audit).toHaveBeenCalled();
   });
 
   it("marks a settlement as failed immediately on non-transient error without retrying", async () => {

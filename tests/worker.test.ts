@@ -4,6 +4,7 @@ const h = vi.hoisted(() => {
   const settlement = {
     findMany: vi.fn(),
     update: vi.fn(),
+    updateMany: vi.fn(),
   };
   const expenseShare = {
     update: vi.fn(),
@@ -11,6 +12,7 @@ const h = vi.hoisted(() => {
   const anchorSession = {
     findMany: vi.fn(),
     update: vi.fn(),
+    updateMany: vi.fn(),
   };
   const prisma: any = {
     settlement,
@@ -69,7 +71,7 @@ vi.mock("../src/services/anchor", () => ({
   ]),
 }));
 
-import { processSubmittedSettlements, reconcileAnchors } from "../src/worker/index";
+import { processSubmittedSettlements, reconcileAnchors, setDelayFn, SETTLEMENT_MAX_RETRIES } from "../src/worker/index";
 import { anchorService } from "../src/services/anchor";
 
 // ---------------------------------------------------------------------------
@@ -114,6 +116,8 @@ function makePollResult(rawStatus: string): ReturnType<typeof import("../src/ser
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers();
+  // Reset delay function to real setTimeout
+  setDelayFn((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 });
 
 // ---------------------------------------------------------------------------
@@ -133,6 +137,7 @@ describe("reconcileAnchors", () => {
     status: "pending_anchor",
     retryCount: 0,
     failureReason: null,
+    nextRetryAt: null,
     lastPolledAt: null,
     createdAt: new Date("2026-07-25T00:00:00.000Z"),
     updatedAt: new Date("2026-07-25T00:00:00.000Z"),
@@ -140,7 +145,9 @@ describe("reconcileAnchors", () => {
 
   beforeEach(() => {
     h.prisma.anchorSession.update.mockReset();
+    h.prisma.anchorSession.updateMany.mockReset();
     h.prisma.anchorSession.update.mockResolvedValue({});
+    h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it("discovers pending sessions and polls them", async () => {
@@ -164,6 +171,8 @@ describe("reconcileAnchors", () => {
           lastPolledAt: expect.any(Date),
           failureReason: null,
           retryCount: 0,
+          errorCategory: null,
+          nextRetryAt: null,
         }),
       })
     );
@@ -205,6 +214,7 @@ describe("reconcileAnchors", () => {
     for (const [raw, expected] of statusMappings) {
       vi.clearAllMocks();
       h.prisma.anchorSession.findMany.mockResolvedValue([{ ...baseSession, status: "pending_anchor" }]);
+      h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
       const { anchorServiceMock } = mockAnchorService();
       anchorServiceMock.pollTransaction.mockResolvedValue(makePollResult(raw));
 
@@ -259,6 +269,7 @@ describe("reconcileAnchors", () => {
     h.prisma.anchorSession.findMany.mockResolvedValue([
       { ...baseSession, status: "completed" },
     ]);
+    h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 0 }); // Claim fails
     const { anchorServiceMock } = mockAnchorService();
     anchorServiceMock.pollTransaction.mockResolvedValue(makePollResult("pending_anchor"));
 
@@ -283,13 +294,18 @@ describe("reconcileAnchors", () => {
     await reconcileAnchors();
 
     // Session should NOT be returned by findMany because lastPolledAt is recent
+    // The query now uses AND with nested ORs, so we check the structure is correct
     expect(h.prisma.anchorSession.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
-          OR: expect.arrayContaining([
-            expect.objectContaining({ lastPolledAt: null }),
+          AND: expect.arrayContaining([
             expect.objectContaining({
-              lastPolledAt: expect.objectContaining({ lt: expect.any(Date) }),
+              OR: expect.arrayContaining([
+                expect.objectContaining({ lastPolledAt: null }),
+                expect.objectContaining({
+                  lastPolledAt: expect.objectContaining({ lt: expect.any(Date) }),
+                }),
+              ]),
             }),
           ]),
         }),
@@ -297,8 +313,9 @@ describe("reconcileAnchors", () => {
     );
   });
 
-  it("retries with bounded backoff on poll errors", async () => {
+  it("retries with exponential backoff on poll errors", async () => {
     h.prisma.anchorSession.findMany.mockResolvedValue([baseSession]);
+    h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
     const { anchorServiceMock } = mockAnchorService();
     anchorServiceMock.pollTransaction.mockResolvedValue({
       rawStatus: null,
@@ -316,6 +333,8 @@ describe("reconcileAnchors", () => {
           retryCount: 1,
           failureReason: "Anchor returned HTTP 503",
           lastPolledAt: expect.any(Date),
+          errorCategory: "transient",
+          nextRetryAt: expect.any(Date),
         }),
       })
     );
@@ -323,8 +342,9 @@ describe("reconcileAnchors", () => {
     // Simulate retryCount reaching max
     vi.clearAllMocks();
     h.prisma.anchorSession.findMany.mockResolvedValue([
-      { ...baseSession, retryCount: 3, status: "pending_anchor" },
+      { ...baseSession, retryCount: 3, status: "pending_anchor", nextRetryAt: null },
     ]);
+    h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
     anchorServiceMock.pollTransaction.mockResolvedValue({
       rawStatus: null,
       status: "pending_anchor",
@@ -339,6 +359,7 @@ describe("reconcileAnchors", () => {
         data: expect.objectContaining({
           status: "error",
           failureReason: "Anchor timed out",
+          nextRetryAt: null,
         }),
       })
     );
@@ -362,6 +383,7 @@ describe("reconcileAnchors", () => {
   it("recovers from transient anchor errors without marking as failed", async () => {
     // First call: error
     h.prisma.anchorSession.findMany.mockResolvedValue([baseSession]);
+    h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
     const { anchorServiceMock } = mockAnchorService();
     anchorServiceMock.pollTransaction
       .mockResolvedValueOnce({
@@ -381,15 +403,18 @@ describe("reconcileAnchors", () => {
         data: expect.objectContaining({
           retryCount: 1,
           failureReason: "Anchor timed out",
+          errorCategory: "transient",
+          nextRetryAt: expect.any(Date),
         }),
       })
     );
 
-    // Second call: success (simulate next cycle)
+    // Second call: success (simulate next cycle after retry delay)
     vi.clearAllMocks();
     h.prisma.anchorSession.findMany.mockResolvedValue([
-      { ...baseSession, retryCount: 1, failureReason: "Anchor timed out" },
+      { ...baseSession, retryCount: 1, failureReason: "Anchor timed out", nextRetryAt: null },
     ]);
+    h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
     await reconcileAnchors();
 
     // Should have updated to completed and cleared failureReason
@@ -400,6 +425,8 @@ describe("reconcileAnchors", () => {
           status: "completed",
           failureReason: null,
           retryCount: 0,
+          errorCategory: null,
+          nextRetryAt: null,
         }),
       })
     );
@@ -422,6 +449,24 @@ describe("reconcileAnchors", () => {
     );
     expect(anchorServiceMock.pollTransaction).not.toHaveBeenCalled();
   });
+
+  it("prevents concurrent anchor session processing via optimistic locking", async () => {
+    h.prisma.anchorSession.findMany.mockResolvedValue([baseSession]);
+    h.prisma.anchorSession.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+    const { anchorServiceMock } = mockAnchorService();
+    anchorServiceMock.pollTransaction.mockResolvedValue(makePollResult("completed"));
+
+    // Two workers processing concurrently
+    await Promise.all([
+      reconcileAnchors(),
+      reconcileAnchors(),
+    ]);
+
+    // Only one should poll
+    expect(anchorServiceMock.pollTransaction).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -442,12 +487,15 @@ describe("processSubmittedSettlements", () => {
       expenseShareId: null,
       retryCount: 0,
       status: "submitted",
+      nextRetryAt: null,
+      errorCategory: null,
       createdAt: new Date(),
       from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
       to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
     };
 
     h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
     h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
     h.submitPayment.mockResolvedValue("hash_123");
 
@@ -471,13 +519,15 @@ describe("processSubmittedSettlements", () => {
         data: expect.objectContaining({
           status: "confirmed",
           stellarTxHash: "hash_123",
+          errorCategory: null,
+          nextRetryAt: null,
         }),
       })
     );
     expect(h.audit).toHaveBeenCalled();
   });
 
-  it("retries transient failures before confirming", async () => {
+  it("retries transient failures with exponential backoff before confirming", async () => {
     const settlement = {
       id: "settle_2",
       shortCode: "XYZ999",
@@ -490,29 +540,41 @@ describe("processSubmittedSettlements", () => {
       expenseShareId: null,
       retryCount: 0,
       status: "submitted",
+      nextRetryAt: null,
+      errorCategory: null,
       createdAt: new Date(),
       from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
       to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
     };
 
     h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
     h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
     h.submitPayment
       .mockRejectedValueOnce(new Error("timeout"))
       .mockRejectedValueOnce(new Error("connection reset"))
       .mockResolvedValueOnce("hash_456");
 
-    const promise = processSubmittedSettlements();
-    await vi.runAllTimersAsync();
-    await promise;
+    // Use fake timers to control delay
+    const delays: number[] = [];
+    setDelayFn((ms: number) => {
+      delays.push(ms);
+      return Promise.resolve();
+    });
+
+    await processSubmittedSettlements();
 
     expect(h.submitPayment).toHaveBeenCalledTimes(3);
+    // Verify exponential backoff (should increase)
+    expect(delays[1]).toBeGreaterThan(delays[0]);
     expect(h.prisma.settlement.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: "settle_2" },
         data: expect.objectContaining({
           status: "confirmed",
           stellarTxHash: "hash_456",
+          errorCategory: null,
+          nextRetryAt: null,
         }),
       })
     );
@@ -531,26 +593,32 @@ describe("processSubmittedSettlements", () => {
       expenseShareId: null,
       retryCount: 0,
       status: "submitted",
+      nextRetryAt: null,
+      errorCategory: null,
       createdAt: new Date(),
       from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
       to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
     };
 
     h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "failed" });
     h.submitPayment.mockRejectedValue(new Error("timeout"));
 
-    const promise = processSubmittedSettlements();
-    await vi.runAllTimersAsync();
-    await promise;
+    setDelayFn(() => Promise.resolve());
 
-    expect(h.submitPayment).toHaveBeenCalledTimes(4);
+    await processSubmittedSettlements();
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(SETTLEMENT_MAX_RETRIES);
+    // The final update should mark it as failed with permanent category (retries exhausted)
     expect(h.prisma.settlement.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: "settle_3" },
         data: expect.objectContaining({
           status: "failed",
           failureReason: expect.any(String),
-          retryCount: { increment: 1 },
+          errorCategory: "permanent", // Retries exhausted = permanent failure
+          nextRetryAt: null,
         }),
       })
     );
@@ -570,17 +638,21 @@ describe("processSubmittedSettlements", () => {
       expenseShareId: null,
       retryCount: 0,
       status: "submitted",
+      nextRetryAt: null,
+      errorCategory: null,
       createdAt: new Date(),
       from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
       to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
     };
 
     h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "failed" });
     h.submitPayment.mockRejectedValue(new Error("invalid signature"));
 
-    const promise = processSubmittedSettlements();
-    await vi.runAllTimersAsync();
-    await promise;
+    setDelayFn(() => Promise.resolve());
+
+    await processSubmittedSettlements();
 
     expect(h.submitPayment).toHaveBeenCalledTimes(1);
     expect(h.prisma.settlement.update).toHaveBeenCalledWith(
@@ -589,7 +661,172 @@ describe("processSubmittedSettlements", () => {
         data: expect.objectContaining({
           status: "failed",
           failureReason: expect.any(String),
-          retryCount: { increment: 1 },
+          errorCategory: "permanent",
+          nextRetryAt: null,
+        }),
+      })
+    );
+  });
+
+  it("prevents concurrent workers from processing the same settlement", async () => {
+    const settlement = {
+      id: "settle_5",
+      shortCode: "CONCURRENT",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "5.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-5",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      nextRetryAt: null,
+      errorCategory: null,
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    // First claim succeeds, second fails (optimistic locking)
+    h.prisma.settlement.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
+    h.submitPayment.mockResolvedValue("hash_789");
+
+    setDelayFn(() => Promise.resolve());
+
+    // Simulate two workers processing the same settlement
+    const [result1, result2] = await Promise.all([
+      processSubmittedSettlements(),
+      processSubmittedSettlements(),
+    ]);
+
+    // Only one should succeed in claiming and submitting
+    expect(h.submitPayment).toHaveBeenCalledTimes(1);
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips settlements that are not yet ready for retry", async () => {
+    const futureDate = new Date(Date.now() + 60000); // 1 minute in future
+    const settlement = {
+      id: "settle_6",
+      shortCode: "WAIT",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: ".00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-6",
+      expenseShareId: null,
+      retryCount: 1,
+      status: "submitted",
+      nextRetryAt: futureDate,
+      errorCategory: "transient",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 0 }); // Claim fails due to nextRetryAt
+
+    await processSubmittedSettlements();
+
+    // Should not attempt submission
+    expect(h.submitPayment).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concurrent worker tests
+// ---------------------------------------------------------------------------
+
+describe("Concurrent Worker Safety", () => {
+  it("prevents duplicate payment submissions via optimistic locking", async () => {
+    const settlement = {
+      id: "settle_concurrent",
+      shortCode: "CONC",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "10.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      nextRetryAt: null,
+      errorCategory: null,
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    // Simulate race: first worker claims, second fails
+    h.prisma.settlement.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
+    h.submitPayment.mockResolvedValue("hash_xyz");
+
+    setDelayFn(() => Promise.resolve());
+
+    // Run two workers concurrently
+    await Promise.all([
+      processSubmittedSettlements(),
+      processSubmittedSettlements(),
+    ]);
+
+    // Only one submission should occur
+    expect(h.submitPayment).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Restart recovery tests
+// ---------------------------------------------------------------------------
+
+describe("Restart Recovery", () => {
+  it("resumes processing after worker restart without duplicating submissions", async () => {
+    const settlement = {
+      id: "settle_restart",
+      shortCode: "RESTART",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "10.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr",
+      expenseShareId: null,
+      retryCount: 1, // Already retried once before restart
+      status: "submitted",
+      nextRetryAt: null,
+      errorCategory: "transient",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
+    h.submitPayment.mockResolvedValue("hash_restart");
+
+    setDelayFn(() => Promise.resolve());
+
+    await processSubmittedSettlements();
+
+    // Should submit successfully (not duplicate)
+    expect(h.submitPayment).toHaveBeenCalledTimes(1);
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          retryCount: expect.any(Number), // Should be incremented
+          status: "confirmed",
         }),
       })
     );

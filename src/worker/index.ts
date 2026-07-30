@@ -3,6 +3,7 @@ import { config } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { AppError } from "../lib/errors";
 import {
   anchorService,
   mapAnchorStatus,
@@ -24,16 +25,37 @@ interface SettlementSubmissionRecord {
   expenseShareId: string | null;
   retryCount: number;
   status: string;
+  nextRetryAt: Date | null;
+  errorCategory: string | null;
   createdAt: Date;
 }
 
 const log = pino({ name: "worker" });
 
 export const SETTLEMENT_MAX_RETRIES = 3;
-export const RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
+export const ANCHOR_MAX_RETRIES = 3;
+const ANCHOR_POLL_BATCH_SIZE = 50;
+const ANCHOR_MIN_POLL_INTERVAL_SEC = 30;
 
-const claimedSettlements = new Set<string>();
-const claimedAnchors = new Set<string>();
+/** Base retry delay in milliseconds */
+const BASE_RETRY_DELAY_MS = 1_000;
+/** Maximum retry delay in milliseconds (capped exponential backoff) */
+const MAX_RETRY_DELAY_MS = 60_000;
+
+/** Error categories for classification */
+enum ErrorCategory {
+  TRANSIENT = "transient",
+  PERMANENT = "permanent",
+  RATE_LIMIT = "rate_limit",
+}
+
+/** Injectable delay function for testing */
+let delayFn: (ms: number) => Promise<void> = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export function setDelayFn(fn: (ms: number) => Promise<void>): void {
+  delayFn = fn;
+}
 
 class PermanentSettlementError extends Error {
   constructor(message: string) {
@@ -42,8 +64,15 @@ class PermanentSettlementError extends Error {
   }
 }
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** Calculate exponential backoff delay with jitter */
+function calculateBackoff(attempt: number): number {
+  const exponentialDelay = Math.min(
+    BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1),
+    MAX_RETRY_DELAY_MS
+  );
+  // Add jitter: ±25% of the delay
+  const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
+  return Math.max(BASE_RETRY_DELAY_MS, exponentialDelay + jitter);
 }
 
 function safeErrorMessage(error: unknown): string {
@@ -54,14 +83,20 @@ function safeErrorMessage(error: unknown): string {
     .slice(0, 500);
 }
 
-function isPermanentSettlementFailure(error: unknown): boolean {
-  if (error instanceof PermanentSettlementError) return true;
+function classifyError(error: unknown): ErrorCategory {
+  if (error instanceof PermanentSettlementError) {
+    return ErrorCategory.PERMANENT;
+  }
   if (error instanceof AppError) {
-    return error.statusCode >= 400 && error.statusCode < 500 && error.statusCode !== 429;
+    if (error.statusCode === 429) return ErrorCategory.RATE_LIMIT;
+    if (error.statusCode >= 500) return ErrorCategory.TRANSIENT;
+    if (error.statusCode >= 400 && error.statusCode < 500) return ErrorCategory.PERMANENT;
   }
 
   const message = safeErrorMessage(error).toLowerCase();
-  return (
+  
+  // Permanent errors
+  if (
     message.includes("invalid") ||
     message.includes("malformed") ||
     message.includes("xdr_mismatch") ||
@@ -71,21 +106,22 @@ function isPermanentSettlementFailure(error: unknown): boolean {
     message.includes("bad request") ||
     message.includes("signature") ||
     message.includes("destination")
-  );
-}
-
-function isTransientSettlementFailure(error: unknown): boolean {
-  if (isPermanentSettlementFailure(error)) return false;
-  if (error instanceof AppError) {
-    return error.statusCode === 429 || error.statusCode >= 500;
+  ) {
+    return ErrorCategory.PERMANENT;
   }
 
-  const message = safeErrorMessage(error).toLowerCase();
-  return (
+  // Rate limit errors
+  if (
+    message.includes("rate_limit") ||
+    message.includes("rate limit")
+  ) {
+    return ErrorCategory.RATE_LIMIT;
+  }
+
+  // Transient errors
+  if (
     message.includes("timeout") ||
     message.includes("timed out") ||
-    message.includes("rate_limit") ||
-    message.includes("rate limit") ||
     message.includes("stale") ||
     message.includes("connection") ||
     message.includes("network") ||
@@ -93,7 +129,16 @@ function isTransientSettlementFailure(error: unknown): boolean {
     message.includes("unavailable") ||
     message.includes("horizon") ||
     message.includes("retry")
-  );
+  ) {
+    return ErrorCategory.TRANSIENT;
+  }
+
+  // Default to permanent for unknown errors
+  return ErrorCategory.PERMANENT;
+}
+
+function isRetryableError(category: ErrorCategory): boolean {
+  return category === ErrorCategory.TRANSIENT || category === ErrorCategory.RATE_LIMIT;
 }
 
 async function recordTransition(
@@ -109,32 +154,39 @@ async function recordTransition(
   });
 }
 
-async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<boolean> {
-  if (claimedSettlements.has(settlement.id)) return false;
-
-  const model = prisma.settlement as any;
-  if (typeof model.updateMany !== "function") {
-    claimedSettlements.add(settlement.id);
-    return true;
+/**
+ * Claim a settlement using optimistic locking via database update.
+ * Returns true if the claim was successful, false if another worker claimed it.
+ */
+async function claimSettlement(
+  settlement: SettlementSubmissionRecord
+): Promise<boolean> {
+  const now = new Date();
+  const nextRetryAt = settlement.nextRetryAt;
+  
+  // Skip if not yet ready for retry
+  if (nextRetryAt && nextRetryAt > now) {
+    return false;
   }
 
-  const result = await model.updateMany({
+  const result = await prisma.settlement.updateMany({
     where: {
       id: settlement.id,
       status: { in: ["pending", "submitted"] },
       retryCount: settlement.retryCount,
+      OR: [
+        { nextRetryAt: null },
+        { nextRetryAt: { lte: now } },
+      ],
     },
-    data: { retryCount: { increment: 1 } },
+    data: {
+      retryCount: { increment: 1 },
+      nextRetryAt: null,
+      errorCategory: null,
+    },
   });
 
-  if (result.count !== 1) return false;
-  claimedSettlements.add(settlement.id);
-  settlement.retryCount += 1;
-  return true;
-}
-
-async function releaseSettlementClaim(id: string): Promise<void> {
-  claimedSettlements.delete(id);
+  return result.count === 1;
 }
 
 export async function submitSettlement(
@@ -146,11 +198,18 @@ export async function submitSettlement(
   }
 
   try {
-    const hash = await stellar.submitPayment(settlement.transactionXdr);
+    const hash = await stellar.submitPayment(settlement.transactionXdr, {
+      sourcePublicKey: settlement.fromPublicKey,
+      destination: settlement.toPublicKey,
+      asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
+      amount: settlement.amount,
+      memoCode: settlement.shortCode,
+    });
     log.info({ id: settlement.id, hash }, "settlement submitted successfully");
     return hash;
   } catch (error) {
-    if (!isTransientSettlementFailure(error) || retryAttempt >= SETTLEMENT_MAX_RETRIES) {
+    const category = classifyError(error);
+    if (!isRetryableError(category) || retryAttempt >= SETTLEMENT_MAX_RETRIES) {
       throw new PermanentSettlementError(safeErrorMessage(error));
     }
     throw error;
@@ -159,21 +218,26 @@ export async function submitSettlement(
 
 async function markSettlementFailed(
   settlement: SettlementSubmissionRecord,
-  message: string
+  message: string,
+  category: ErrorCategory
 ): Promise<void> {
   await prisma.settlement.update({
     where: { id: settlement.id },
     data: {
       status: "failed",
       retryCount: settlement.retryCount,
+      failureReason: message,
+      errorCategory: category,
+      nextRetryAt: null,
     },
   });
   await recordTransition(settlement.id, "settlement_failed", {
     attempt: settlement.retryCount,
     reason: message,
+    errorCategory: category,
   });
   log.error(
-    { id: settlement.id, attempt: settlement.retryCount, reason: message },
+    { id: settlement.id, attempt: settlement.retryCount, reason: message, category },
     "settlement failed"
   );
 }
@@ -195,50 +259,56 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
             status: "confirmed",
             stellarTxHash: hash,
             retryCount: attempt,
+            failureReason: null,
+            errorCategory: null,
+            nextRetryAt: null,
           },
         });
         await recordTransition(settlement.id, "settlement_confirmed", { attempt });
         return;
       } catch (error) {
         const message = safeErrorMessage(error);
-        const permanent = isPermanentSettlementFailure(error) || attempt >= SETTLEMENT_MAX_RETRIES;
+        const category = classifyError(error);
+        const permanent = !isRetryableError(category) || attempt >= SETTLEMENT_MAX_RETRIES;
 
         if (permanent) {
-          await markSettlementFailed(settlement, message);
+          await markSettlementFailed(settlement, message, category);
           return;
         }
 
-        const delay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)];
+        const delayMs = calculateBackoff(attempt);
+        const nextRetryAt = new Date(Date.now() + delayMs);
+        
         await prisma.settlement.update({
           where: { id: settlement.id },
-          data: { retryCount: attempt },
+          data: {
+            retryCount: attempt,
+            failureReason: message,
+            errorCategory: category,
+            nextRetryAt,
+          },
         });
         await recordTransition(settlement.id, "settlement_retry_scheduled", {
           attempt,
-          nextDelayMs: delay,
+          nextDelayMs: delayMs,
+          nextRetryAt: nextRetryAt.toISOString(),
           reason: message,
+          errorCategory: category,
         });
-        await sleep(delay);
+        await delayFn(delayMs);
       }
     }
-  } finally {
-    await releaseSettlementClaim(settlement.id);
+  } catch (error) {
+    // Unexpected error in processing logic - mark as failed
+    const message = safeErrorMessage(error);
+    const category = classifyError(error);
+    await markSettlementFailed(settlement, message, category);
   }
 }
 
 export async function reconcilePending(): Promise<void> {
   await runReconciliation();
 }
-
-/** Maximum number of failed poll attempts before marking a session as error. */
-const ANCHOR_MAX_RETRIES = 3;
-const ANCHOR_POLL_BATCH_SIZE = 50;
-
-/**
- * Minimum interval between polls for the same session (seconds).
- * Sessions polled more recently than this are skipped.
- */
-const ANCHOR_MIN_POLL_INTERVAL_SEC = 30;
 
 /** Normalised SEP-24 terminal states that stop further polling. */
 const ANCHOR_POLL_TERMINAL = new Set([
@@ -256,20 +326,32 @@ const ANCHOR_POLL_TERMINAL = new Set([
  * - Retry failures with bounded exponential backoff tracked via retryCount.
  * - Store error details in failureReason for support.
  * - Emit audit log events when a terminal status is reached via polling.
+ * - Use optimistic locking for concurrent worker safety.
  */
 export async function reconcileAnchors(): Promise<void> {
   const cutoff = new Date(
     Date.now() - ANCHOR_MIN_POLL_INTERVAL_SEC * 1000
   );
+  const now = new Date();
 
   const sessions = await prisma.anchorSession.findMany({
     where: {
       anchorToken: { not: null },
       externalTransactionId: { not: null },
       status: { notIn: [...ANCHOR_POLL_TERMINAL] },
-      OR: [
-        { lastPolledAt: null },
-        { lastPolledAt: { lt: cutoff } },
+      AND: [
+        {
+          OR: [
+            { lastPolledAt: null },
+            { lastPolledAt: { lt: cutoff } },
+          ],
+        },
+        {
+          OR: [
+            { nextRetryAt: null },
+            { nextRetryAt: { lte: now } },
+          ],
+        },
       ],
     },
     take: ANCHOR_POLL_BATCH_SIZE,
@@ -287,9 +369,6 @@ export async function reconcileAnchors(): Promise<void> {
   }
 
   for (const session of sessions) {
-    if (claimedAnchors.has(session.id)) continue;
-    claimedAnchors.add(session.id);
-
     try {
       await reconcileSingleAnchor(session, toml.transferServerSep24);
     } catch (err) {
@@ -304,6 +383,38 @@ export async function reconcileAnchors(): Promise<void> {
 }
 
 /**
+ * Claim an anchor session using optimistic locking.
+ */
+async function claimAnchorSession(
+  session: { id: string; retryCount: number; nextRetryAt: Date | null }
+): Promise<boolean> {
+  const now = new Date();
+  
+  // Skip if not yet ready for retry
+  if (session.nextRetryAt && session.nextRetryAt > now) {
+    return false;
+  }
+
+  const result = await prisma.anchorSession.updateMany({
+    where: {
+      id: session.id,
+      retryCount: session.retryCount,
+      OR: [
+        { nextRetryAt: null },
+        { nextRetryAt: { lte: now } },
+      ],
+    },
+    data: {
+      retryCount: { increment: 1 },
+      nextRetryAt: null,
+      errorCategory: null,
+    },
+  });
+
+  return result.count === 1;
+}
+
+/**
  * Poll a single anchor session and advance its status.
  */
 async function reconcileSingleAnchor(
@@ -314,6 +425,7 @@ async function reconcileSingleAnchor(
     status: string;
     retryCount: number;
     failureReason: string | null;
+    nextRetryAt: Date | null;
   },
   transferServer: string
 ): Promise<void> {
@@ -325,6 +437,12 @@ async function reconcileSingleAnchor(
     );
     return;
   }
+
+  // Try to claim the session
+  if (!(await claimAnchorSession(session))) {
+    return; // Another worker claimed it or not ready for retry
+  }
+
   const result: PollResult = await anchorService.pollTransaction({
     transferServer,
     token: session.anchorToken!,
@@ -332,21 +450,26 @@ async function reconcileSingleAnchor(
   });
 
   const now = new Date();
+  const currentRetryCount = session.retryCount + 1;
 
   // ── Handle poll errors (timeout, network, malformed) ─────────────────
   if (result.isError) {
-    const nextRetryCount = session.retryCount + 1;
-    const shouldBackoff = nextRetryCount <= ANCHOR_MAX_RETRIES;
+    const shouldBackoff = currentRetryCount <= ANCHOR_MAX_RETRIES;
+    const category = ErrorCategory.TRANSIENT; // Poll errors are typically transient
 
     const data: Record<string, unknown> = {
       lastPolledAt: now,
-      retryCount: shouldBackoff ? nextRetryCount : session.retryCount,
+      retryCount: currentRetryCount,
       failureReason: result.message,
+      errorCategory: category,
     };
 
-    // If we've exhausted retries, mark as error.
-    if (!shouldBackoff) {
+    if (shouldBackoff) {
+      const delayMs = calculateBackoff(currentRetryCount);
+      data.nextRetryAt = new Date(Date.now() + delayMs);
+    } else {
       data.status = "error";
+      data.nextRetryAt = null;
     }
 
     await prisma.anchorSession.update({
@@ -359,7 +482,7 @@ async function reconcileSingleAnchor(
         {
           sessionId: session.id,
           externalId: session.externalTransactionId,
-          retryCount: session.retryCount,
+          retryCount: currentRetryCount,
           reason: result.message,
         },
         "anchor session marked as error after exhausting retries"
@@ -373,7 +496,8 @@ async function reconcileSingleAnchor(
           previousStatus: session.status,
           status: "error",
           failureReason: result.message,
-          retryCount: nextRetryCount,
+          retryCount: currentRetryCount,
+          errorCategory: category,
         },
       });
     }
@@ -388,6 +512,9 @@ async function reconcileSingleAnchor(
       data: {
         lastPolledAt: now,
         failureReason: null, // clear transient errors if poll succeeds
+        errorCategory: null,
+        nextRetryAt: null,
+        retryCount: 0, // reset on successful poll
       },
     });
     return;
@@ -415,6 +542,8 @@ async function reconcileSingleAnchor(
     lastPolledAt: now,
     failureReason: result.status === "error" ? (result.message ?? null) : null,
     retryCount: 0, // reset on successful poll
+    errorCategory: null,
+    nextRetryAt: null,
   };
 
   if (result.stellarTransactionHash) {
@@ -465,16 +594,23 @@ export async function expireInvites(): Promise<void> {
 }
 
 export async function processSubmittedSettlements(): Promise<void> {
+  const now = new Date();
   const settlements = await prisma.settlement.findMany({
     where: {
       status: { in: ["pending", "submitted"] },
       transactionXdr: { not: null },
+      // Only process settlements that are ready for retry
+      OR: [
+        { nextRetryAt: null },
+        { nextRetryAt: { lte: now } },
+      ],
     },
     include: {
       from: { select: { stellarPublicKey: true } },
       to: { select: { stellarPublicKey: true } },
     },
     take: 50,
+    orderBy: { nextRetryAt: "asc" as const },
   });
 
   for (const row of settlements) {
@@ -483,13 +619,15 @@ export async function processSubmittedSettlements(): Promise<void> {
       shortCode: row.shortCode,
       fromPublicKey: row.from.stellarPublicKey,
       toPublicKey: row.to.stellarPublicKey,
-      amount: row.amount,
+      amount: row.amount.toString(),
       assetCode: row.assetCode,
       assetIssuer: row.assetIssuer,
       transactionXdr: row.transactionXdr,
       expenseShareId: row.expenseShareId,
       retryCount: row.retryCount,
       status: row.status,
+      nextRetryAt: row.nextRetryAt,
+      errorCategory: row.errorCategory,
       createdAt: row.createdAt,
     };
     await processSettlement(settlement);

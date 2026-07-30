@@ -47,7 +47,10 @@ vi.mock("../src/services/stellar", () => ({
     getTransaction: h.getTransaction,
   },
 }));
-vi.mock("../src/services/audit", () => ({ audit: h.audit, auditTx: vi.fn(async (_tx: any, p: any) => h.audit(p)) }));
+vi.mock("../src/services/audit", () => ({ audit: h.audit }));
+vi.mock("../src/services/settlement-reconciliation", () => ({
+  reconcileSettlements: vi.fn(),
+}));
 vi.mock("../src/worker/reconciliation", () => ({
   runReconciliation: vi.fn(),
   startReconciliation: vi.fn(() => () => {}),
@@ -288,8 +291,27 @@ describe("processSubmittedSettlements", () => {
     await vi.runAllTimersAsync();
     await promise;
 
-    expect(currentSettlementState?.status).toBe("confirmed");
-    expect(currentSettlementState?.stellarTxHash).toBe("hash_recovered");
+    expect(h.submitPayment).toHaveBeenCalledWith(
+      "signed-xdr",
+      expect.objectContaining({
+        sourcePublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        destination: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        asset: { code: "USDC", issuer: null },
+        amount: "10.00",
+        memoCode: "ABC123",
+      })
+    );
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_1" },
+        data: expect.objectContaining({
+          status: "pending_confirmation",
+          stellarTxHash: "hash_123",
+          retryCount: 0,
+        }),
+      })
+    );
+    expect(h.audit).toHaveBeenCalled();
   });
 
   it("retries transient failures before confirming", async () => {
@@ -305,8 +327,16 @@ describe("processSubmittedSettlements", () => {
     await promise;
 
     expect(h.submitPayment).toHaveBeenCalledTimes(3);
-    expect(currentSettlementState?.status).toBe("confirmed");
-    expect(currentSettlementState?.stellarTxHash).toBe("hash_456");
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_2" },
+        data: expect.objectContaining({
+          status: "pending_confirmation",
+          stellarTxHash: "hash_456",
+          retryCount: 0,
+        }),
+      })
+    );
   });
 
   it("marks as failed when all retries are exhausted", async () => {
@@ -317,8 +347,17 @@ describe("processSubmittedSettlements", () => {
     await vi.runAllTimersAsync();
     await promise;
 
-    expect(h.submitPayment).toHaveBeenCalledTimes(3);
-    expect(currentSettlementState?.status).toBe("failed");
+    expect(h.submitPayment).toHaveBeenCalledTimes(4);
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_3" },
+        data: expect.objectContaining({
+          status: "failed",
+          failureReason: expect.any(String),
+          retryCount: { increment: 1 },
+        }),
+      })
+    );
   });
 
   it("marks as failed immediately on non-transient error without retrying", async () => {

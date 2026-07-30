@@ -25,6 +25,10 @@ function server(): Horizon.Server {
   return _server;
 }
 
+function logUpstreamError(e: unknown, codes: unknown): void {
+  console.error("[stellar] Upstream error:", e instanceof Error ? e.message : String(e), codes ? JSON.stringify(codes) : "");
+}
+
 export interface AssetSpec {
   code: string;
   issuer?: string | null;
@@ -143,8 +147,8 @@ export const stellar = {
       const codes =
         e?.response?.data?.extras?.result_codes ??
         e?.response?.data?.result_codes;
-      const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
-      throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+      logUpstreamError(e, codes);
+      throw Errors.upstream("Stellar rejected the transaction");
     }
   },
 

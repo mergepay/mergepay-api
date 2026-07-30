@@ -91,8 +91,13 @@ export function serializeSettlement(s: any) {
     assetIssuer: s.assetIssuer ?? null,
     stellarTxHash: s.stellarTxHash ?? null,
     status: s.status,
+    failureReason: s.failureReason ?? null,
+    retryCount: s.retryCount,
+    submittedAt: s.submittedAt ? iso(s.submittedAt) : null,
+    confirmedAt: s.confirmedAt ? iso(s.confirmedAt) : null,
     memo: s.memo ?? null,
     expenseId: s.expenseId ?? null,
+    expenseShareId: s.expenseShareId ?? null,
     createdAt: iso(s.createdAt),
   };
 }

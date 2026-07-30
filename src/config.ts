@@ -27,6 +27,8 @@ const schema = z.object({
     .default("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
   UPLOADS_DIR: z.string().default("./uploads"),
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
+  CONFIRM_POLL_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
+  CONFIRM_POLL_DELAY_MS: z.coerce.number().int().positive().default(1500),
   NODE_ENV: z.string().default("development"),
 
   // Security-sensitive endpoint policies.

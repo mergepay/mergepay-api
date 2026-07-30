@@ -4,6 +4,11 @@ import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import {
+  applySettlementTransition,
+  classifySettlementError,
+} from "../services/settlement-machine";
+import { pollForConfirmation } from "../services/horizon-confirm";
+import {
   anchorService,
   mapAnchorStatus,
   TERMINAL_ANCHOR_STATUSES,
@@ -54,61 +59,6 @@ function safeErrorMessage(error: unknown): string {
     .slice(0, 500);
 }
 
-function isPermanentSettlementFailure(error: unknown): boolean {
-  if (error instanceof PermanentSettlementError) return true;
-  if (error instanceof AppError) {
-    return error.statusCode >= 400 && error.statusCode < 500 && error.statusCode !== 429;
-  }
-
-  const message = safeErrorMessage(error).toLowerCase();
-  return (
-    message.includes("invalid") ||
-    message.includes("malformed") ||
-    message.includes("xdr_mismatch") ||
-    message.includes("unauthorized") ||
-    message.includes("forbidden") ||
-    message.includes("not authorized") ||
-    message.includes("bad request") ||
-    message.includes("signature") ||
-    message.includes("destination")
-  );
-}
-
-function isTransientSettlementFailure(error: unknown): boolean {
-  if (isPermanentSettlementFailure(error)) return false;
-  if (error instanceof AppError) {
-    return error.statusCode === 429 || error.statusCode >= 500;
-  }
-
-  const message = safeErrorMessage(error).toLowerCase();
-  return (
-    message.includes("timeout") ||
-    message.includes("timed out") ||
-    message.includes("rate_limit") ||
-    message.includes("rate limit") ||
-    message.includes("stale") ||
-    message.includes("connection") ||
-    message.includes("network") ||
-    message.includes("temporar") ||
-    message.includes("unavailable") ||
-    message.includes("horizon") ||
-    message.includes("retry")
-  );
-}
-
-async function recordTransition(
-  id: string,
-  action: string,
-  metadata: Record<string, unknown> = {}
-): Promise<void> {
-  await audit({
-    action,
-    entityType: "settlement",
-    entityId: id,
-    metadata,
-  });
-}
-
 async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<boolean> {
   if (claimedSettlements.has(settlement.id)) return false;
 
@@ -121,7 +71,7 @@ async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<
   const result = await model.updateMany({
     where: {
       id: settlement.id,
-      status: { in: ["pending", "submitted"] },
+      status: { in: ["submitted", "verifying"] },
       retryCount: settlement.retryCount,
     },
     data: { retryCount: { increment: 1 } },
@@ -137,6 +87,24 @@ async function releaseSettlementClaim(id: string): Promise<void> {
   claimedSettlements.delete(id);
 }
 
+async function markSettlementFailed(
+  settlement: SettlementSubmissionRecord,
+  message: string
+): Promise<void> {
+  await applySettlementTransition({
+    settlementId: settlement.id,
+    nextStatus: "failed",
+    source: "worker",
+    extraData: {
+      failureReason: message,
+    },
+  });
+  log.error(
+    { id: settlement.id, attempt: settlement.retryCount, reason: message },
+    "settlement failed"
+  );
+}
+
 export async function submitSettlement(
   settlement: SettlementSubmissionRecord,
   retryAttempt: number
@@ -147,41 +115,29 @@ export async function submitSettlement(
 
   try {
     const hash = await stellar.submitPayment(settlement.transactionXdr);
-    log.info({ id: settlement.id, hash }, "settlement submitted successfully");
+    log.info({ id: settlement.id, hash }, "settlement submitted to Horizon");
     return hash;
   } catch (error) {
-    if (!isTransientSettlementFailure(error) || retryAttempt >= SETTLEMENT_MAX_RETRIES) {
+    const classification = classifySettlementError(error);
+    if (classification === "permanent" || retryAttempt >= SETTLEMENT_MAX_RETRIES) {
       throw new PermanentSettlementError(safeErrorMessage(error));
     }
     throw error;
   }
 }
 
-async function markSettlementFailed(
-  settlement: SettlementSubmissionRecord,
-  message: string
-): Promise<void> {
-  await prisma.settlement.update({
-    where: { id: settlement.id },
-    data: {
-      status: "failed",
-      retryCount: settlement.retryCount,
-    },
-  });
-  await recordTransition(settlement.id, "settlement_failed", {
-    attempt: settlement.retryCount,
-    reason: message,
-  });
-  log.error(
-    { id: settlement.id, attempt: settlement.retryCount, reason: message },
-    "settlement failed"
-  );
-}
-
 async function processSettlement(settlement: SettlementSubmissionRecord): Promise<void> {
   if (!(await claimSettlement(settlement))) return;
 
   try {
+    if (settlement.status === "submitted") {
+      await applySettlementTransition({
+        settlementId: settlement.id,
+        nextStatus: "verifying",
+        source: "worker",
+      });
+    }
+
     const initialAttempt = Math.max(1, settlement.retryCount);
     const remainingAttempts = Math.max(1, SETTLEMENT_MAX_RETRIES - initialAttempt + 1);
 
@@ -189,19 +145,51 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
       const attempt = initialAttempt + offset;
       try {
         const hash = await submitSettlement(settlement, attempt);
-        await prisma.settlement.update({
-          where: { id: settlement.id },
-          data: {
-            status: "confirmed",
+
+        const result = await pollForConfirmation(hash);
+
+        if (result.status === "confirmed") {
+          await applySettlementTransition({
+            settlementId: settlement.id,
+            nextStatus: "confirmed",
+            source: "worker",
+            extraData: { stellarTxHash: hash, retryCount: attempt },
+          });
+          log.info({ id: settlement.id, hash }, "settlement confirmed");
+          return;
+        }
+
+        if (result.status === "failed") {
+          await applySettlementTransition({
+            settlementId: settlement.id,
+            nextStatus: "failed",
+            source: "worker",
+            extraData: {
+              stellarTxHash: hash,
+              failureReason: "Horizon reported transaction failed",
+              retryCount: attempt,
+            },
+          });
+          return;
+        }
+
+        await applySettlementTransition({
+          settlementId: settlement.id,
+          nextStatus: "needs_review",
+          source: "worker",
+          extraData: {
             stellarTxHash: hash,
+            failureReason: "Transaction submitted but not confirmed after verification retries",
             retryCount: attempt,
           },
         });
-        await recordTransition(settlement.id, "settlement_confirmed", { attempt });
         return;
       } catch (error) {
         const message = safeErrorMessage(error);
-        const permanent = isPermanentSettlementFailure(error) || attempt >= SETTLEMENT_MAX_RETRIES;
+        const permanent =
+          error instanceof PermanentSettlementError ||
+          classifySettlementError(error) === "permanent" ||
+          attempt >= SETTLEMENT_MAX_RETRIES;
 
         if (permanent) {
           await markSettlementFailed(settlement, message);
@@ -209,15 +197,6 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
         }
 
         const delay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)];
-        await prisma.settlement.update({
-          where: { id: settlement.id },
-          data: { retryCount: attempt },
-        });
-        await recordTransition(settlement.id, "settlement_retry_scheduled", {
-          attempt,
-          nextDelayMs: delay,
-          reason: message,
-        });
         await sleep(delay);
       }
     }
@@ -467,7 +446,7 @@ export async function expireInvites(): Promise<void> {
 export async function processSubmittedSettlements(): Promise<void> {
   const settlements = await prisma.settlement.findMany({
     where: {
-      status: { in: ["pending", "submitted"] },
+      status: { in: ["submitted", "verifying"] },
       transactionXdr: { not: null },
     },
     include: {

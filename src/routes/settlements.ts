@@ -21,6 +21,8 @@ import {
 } from "../services/group-balances";
 import { validateAsset, validateAmount } from "../services/assets";
 import { memoText } from "../services/stellar";
+import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
+import { applySettlementTransition } from "../services/settlement-machine";
 
 const settlementInclude = { from: true, to: true } as const;
 
@@ -233,43 +235,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.forbidden("Only the payer can confirm this settlement");
         }
 
-        // Already confirmed, or moved past "pending" by a prior (possibly
-        // concurrent) confirm — return the current state rather than
-        // re-submitting or erroring, so retries are always safe.
         if (settlement.status !== "pending") {
           return { settlement: serializeSettlement(settlement) };
         }
 
-        // Guard the transition with a conditional update rather than an
-        // unconditional one: if a concurrent confirm on the same settlement
-        // (e.g. a different idempotency key, or no key at all) already won
-        // the race and moved the status off "pending" between the read
-        // above and here, this update affects zero rows and we simply
-        // re-read the winning state instead of clobbering it.
-        const { count } = await tx.settlement.updateMany({
-          where: { id, status: "pending" },
-          data: {
-            transactionXdr: body.signedXdr,
-            status: "submitted",
-          },
+        const result = await applySettlementTransition({
+          settlementId: id,
+          nextStatus: "submitted",
+          source: "user",
+          ownerUserId: auth.id,
+          extraData: { transactionXdr: body.signedXdr },
+          tx,
         });
 
-        const finalSettlement = await tx.settlement.findUniqueOrThrow({
-          where: { id },
-          include: settlementInclude,
-        });
-
-        if (count > 0) {
-          await audit({
-            userId: auth.id,
-            action: "settlement.confirm",
-            entityType: "settlement",
-            entityId: id,
-            metadata: { status: "submitted" },
-          });
-        }
-
-        return { settlement: serializeSettlement(finalSettlement) };
+        return { settlement: serializeSettlement(result.settlement) };
       },
     });
   });

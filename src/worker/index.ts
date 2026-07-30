@@ -14,6 +14,7 @@ import {
 import type { PollResult } from "../services/anchor";
 import { runReconciliation, startReconciliation } from "./reconciliation";
 import { classifyJobFailure, retryDelayMs, SETTLEMENT_RETRY_POLICY } from "../services/job-retry";
+import { TimeoutError, TransportError } from "../services/timeout";
 
 interface SettlementSubmissionRecord {
   id: string;

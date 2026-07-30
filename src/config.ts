@@ -52,6 +52,26 @@ const schema = z.object({
     .positive()
     .max(50 * 1024 * 1024)
     .default(5 * 1024 * 1024),
+
+  // ── Timeout configuration for external calls ──────────────────────────
+  // Horizon account lookup timeout (ms). Account lookups are fast reads.
+  HORIZON_ACCOUNT_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  // Horizon transaction submission timeout (ms). Submissions may take longer.
+  HORIZON_SUBMIT_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  // Horizon transaction status lookup timeout (ms).
+  HORIZON_STATUS_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  // Horizon fee stats timeout (ms).
+  HORIZON_FEE_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  // Anchor SEP-10 challenge request timeout (ms).
+  ANCHOR_CHALLENGE_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  // Anchor SEP-10 token exchange timeout (ms).
+  ANCHOR_TOKEN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  // Anchor SEP-24 interactive flow start timeout (ms).
+  ANCHOR_INTERACTIVE_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  // Anchor SEP-24 transaction status poll timeout (ms).
+  ANCHOR_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  // Anchor stellar.toml fetch timeout (ms).
+  ANCHOR_TOML_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
 });
 
 const parsed = schema.parse(process.env);

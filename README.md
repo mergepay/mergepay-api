@@ -135,9 +135,29 @@ traffic patterns or trust boundaries:
 | --- | --- | --- |
 | `POST /auth/challenge` | `RATE_LIMIT_AUTH_CHALLENGE_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /auth/verify` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
-| `POST /expenses/:id/settle`, `POST /groups/:id/settlements` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /expenses/:id/settle`, `POST /groups/:id/settlements`, `POST /groups/:id/treasury/deposit`, `POST /groups/:id/treasury/withdraw` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /settlements/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /treasury-transactions/:id/confirm` | `RATE_LIMIT_TREASURY_SUBMIT_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /anchors/deposit`, `POST /anchors/withdraw`, `POST /anchors/sessions/:id/complete` | `RATE_LIMIT_ANCHOR_INIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `GET /anchors`, `GET /anchors/sessions` | `RATE_LIMIT_ANCHOR_POLL_MAX` / `_WINDOW_MS` | 60 / 1 min |
 | `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 60 / 1 min |
+| `POST /groups` | `RATE_LIMIT_GROUP` | 30 / 1 min |
+| `GET /history` | `RATE_LIMIT_HISTORY` | 60 / 1 min |
+
+**Tuning a deployment.** Every value above is an environment variable with a
+safe default, so a deployment overrides only what it needs — for example a
+wallet integration that legitimately retries submissions can raise
+`RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` without loosening SEP-10 or anchor
+budgets. Windows are milliseconds and capped at one hour; maximums must be
+positive integers, so a typo cannot silently disable limiting. The single
+source of truth for which route gets which policy is the table in
+[src/lib/rate-limit.ts](src/lib/rate-limit.ts); routes name a policy rather
+than repeating numbers, and each policy has its own key prefix, which is what
+makes the buckets independent.
+
+Every route above has a bucket separate from ordinary authenticated reads, so
+exhausting a submission or anchor budget never blocks a client from reading its
+own groups, expenses, or settlement status.
 
 Limit keys are the authenticated user's internal id when available
 (never a Stellar public key), or the resolved client IP otherwise —

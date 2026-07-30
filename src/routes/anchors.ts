@@ -8,13 +8,31 @@ import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { applyAnchorSessionTransition } from "../services/anchor-status";
 import { audit } from "../services/audit";
-import { ipKey } from "../services/rate-limit-keys";
+import { rateLimited } from "../lib/rate-limit";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 
 export default async function anchorRoutes(app: FastifyInstance) {
+  // Every anchor route that reaches an anchor gets an explicit budget so a
+  // client cannot amplify one Mergepay request into unbounded upstream ones.
+  //
+  //  - anchorInit  — deposit/withdraw start and interactive completion. Each
+  //    call fans out to stellar.toml + SEP-10 + SEP-24, so it is the tightest
+  //    policy in the API.
+  //  - anchorPoll  — status reads. Cheaper, but still upstream-amplifying (or,
+  //    for the DB-backed session list, the endpoint clients poll in a loop).
+  //
+  // Both are keyed by the authenticated user, so one caller can never exhaust
+  // another's budget. The webhook is keyed by IP because it is authenticated
+  // by shared secret rather than a session.
+  const initLimit = rateLimited("anchorInit");
+  const pollLimit = rateLimited("anchorPoll");
+
   // -- list anchors (public-ish, but behind auth for consistency) -------------
-  app.get("/anchors", { preHandler: [app.authenticate] }, async () => {
+  app.get(
+    "/anchors",
+    { preHandler: [app.authenticate], ...pollLimit },
+    async () => {
     try {
       const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
       return {
@@ -46,7 +64,8 @@ export default async function anchorRoutes(app: FastifyInstance) {
         ],
       };
     }
-  });
+  }
+  );
 
   // -- start deposit / withdraw -----------------------------------------------
   async function start(kind: "deposit" | "withdrawal", req: any) {
@@ -86,17 +105,17 @@ export default async function anchorRoutes(app: FastifyInstance) {
     };
   }
 
-  app.post("/anchors/deposit", { preHandler: [app.authenticate] }, (req) =>
+  app.post("/anchors/deposit", { preHandler: [app.authenticate], ...initLimit }, (req) =>
     start("deposit", req)
   );
-  app.post("/anchors/withdraw", { preHandler: [app.authenticate] }, (req) =>
+  app.post("/anchors/withdraw", { preHandler: [app.authenticate], ...initLimit }, (req) =>
     start("withdrawal", req)
   );
 
   // -- complete (exchange signed challenge for interactive url) ---------------
   app.post(
     "/anchors/sessions/:id/complete",
-    { preHandler: [app.authenticate] },
+    { preHandler: [app.authenticate], ...initLimit },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string() }).parse(req.params);
@@ -136,14 +155,18 @@ export default async function anchorRoutes(app: FastifyInstance) {
   );
 
   // -- sessions ---------------------------------------------------------------
-  app.get("/anchors/sessions", { preHandler: [app.authenticate] }, async (req) => {
+  app.get(
+    "/anchors/sessions",
+    { preHandler: [app.authenticate], ...pollLimit },
+    async (req) => {
     const auth = requireUser(req);
     const sessions = await prisma.anchorSession.findMany({
       where: { userId: auth.id },
       orderBy: { createdAt: "desc" },
     });
-    return { sessions: sessions.map(serializeAnchorSession) };
-  });
+      return { sessions: sessions.map(serializeAnchorSession) };
+    }
+  );
 
   // -- webhook (signed) -------------------------------------------------------
   // Rate limiting here is abuse protection for an unauthenticated-until-
@@ -151,15 +174,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // below, which remains the actual authentication/authorization gate.
   app.post(
     "/anchors/webhook",
-    {
-      config: {
-        rateLimit: {
-          max: config.RATE_LIMIT_ANCHOR_WEBHOOK_MAX,
-          timeWindow: config.RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS,
-          keyGenerator: ipKey("anchor.webhook"),
-        },
-      },
-    },
+    rateLimited("anchorWebhook"),
     async (req, reply) => {
       const secret = (req.headers["x-anchor-signature"] ??
         req.headers["x-webhook-secret"]) as string | undefined;
@@ -180,10 +195,22 @@ export default async function anchorRoutes(app: FastifyInstance) {
       const externalId = body.transaction?.id ?? body.id;
       const status = body.transaction?.status ?? body.status;
       if (externalId && status) {
-        await prisma.anchorSession.updateMany({
+        // Route every status change through the transition model rather than
+        // a blanket updateMany: anchor callbacks are untrusted, can arrive
+        // twice, and can arrive out of order. That module ignores regressions
+        // from a terminal state and audits only transitions it actually
+        // applies.
+        const sessions = await prisma.anchorSession.findMany({
           where: { externalTransactionId: externalId },
-          data: { status: mapAnchorStatus(status) },
+          select: { id: true },
         });
+        for (const session of sessions) {
+          await applyAnchorSessionTransition({
+            sessionId: session.id,
+            nextStatus: mapAnchorStatus(status),
+            source: "webhook",
+          });
+        }
       }
       return reply.code(200).send({ ok: true });
     }

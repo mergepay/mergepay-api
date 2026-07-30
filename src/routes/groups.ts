@@ -7,6 +7,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { inviteCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { rateLimited } from "../lib/rate-limit";
 import {
   serializeGroup,
   serializeInvitation,
@@ -22,7 +23,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- create -----------------------------------------------------------------
-  app.post("/groups", { config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } } }, async (req) => {
+  app.post("/groups", rateLimited("groupCreate"), async (req) => {
     const auth = requireUser(req);
     const body = z
       .object({

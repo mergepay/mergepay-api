@@ -9,6 +9,8 @@ import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { validateAsset, validateAmount } from "../services/assets";
+import { rateLimited } from "../lib/rate-limit";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
 import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 
@@ -83,7 +85,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- deposit ----------------------------------------------------------------
-  app.post("/groups/:id/treasury/deposit", async (req) => {
+  app.post("/groups/:id/treasury/deposit", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(id, auth.id);
@@ -141,7 +143,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- withdraw ---------------------------------------------------------------
-  app.post("/groups/:id/treasury/withdraw", async (req) => {
+  app.post("/groups/:id/treasury/withdraw", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireAdmin(id, auth.id);
@@ -205,7 +207,10 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- confirm treasury tx ----------------------------------------------------
-  app.post("/treasury-transactions/:id/confirm", async (req) => {
+  // Submitting a signed treasury envelope validates it and pushes it to
+  // Horizon, so it gets its own budget rather than sharing one with the
+  // treasury read routes — or with settlement submission.
+  app.post("/treasury-transactions/:id/confirm", rateLimited("treasurySubmit"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);

@@ -8,7 +8,8 @@ import { requireMembership } from "../services/access";
 import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
-import { userOrIpKey } from "../services/rate-limit-keys";
+import { rateLimited } from "../lib/rate-limit";
+import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 import {
   serializeSettlement,
   serializeExpense,
@@ -30,29 +31,12 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // Settlement submission builds a real Stellar payment XDR (create) or
   // hands a signed one off for submission (confirm) — both are the kind of
   // expensive, state-changing operation that needs its own explicit budget
-  // rather than sharing the blanket global limit. Rate-limiting runs as a
-  // preHandler (after the app.authenticate hook above sets req.user) so the
-  // key can be the authenticated user rather than falling back to IP.
-  const createLimit = {
-    config: {
-      rateLimit: {
-        max: config.RATE_LIMIT_SETTLEMENT_CREATE_MAX,
-        timeWindow: config.RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS,
-        hook: "preHandler" as const,
-        keyGenerator: userOrIpKey("settlement.create"),
-      },
-    },
-  };
-  const confirmLimit = {
-    config: {
-      rateLimit: {
-        max: config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX,
-        timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
-        hook: "preHandler" as const,
-        keyGenerator: userOrIpKey("settlement.confirm"),
-      },
-    },
-  };
+  // rather than sharing the blanket global limit, and neither shares a bucket
+  // with the read routes below. Both policies run as a preHandler (after the
+  // app.authenticate hook above sets req.user) so the key is the authenticated
+  // user rather than falling back to IP.
+  const createLimit = rateLimited("settlementCreate");
+  const confirmLimit = rateLimited("settlementConfirm");
 
   // -- settle a specific expense share ----------------------------------------
   app.post("/expenses/:id/settle", createLimit, async (req) => {

@@ -39,6 +39,15 @@ export const ErrorCode = {
   BAD_FILE_TYPE: "BAD_FILE_TYPE",
   FILE_TOO_LARGE: "FILE_TOO_LARGE",
   XDR_MISMATCH: "XDR_MISMATCH",
+  /**
+   * An unsigned transaction intent was signed or submitted after its
+   * server-controlled validity window. Distinct from XDR_MISMATCH (the
+   * envelope is wrong) and from UNAUTHORIZED/FORBIDDEN (the caller is wrong):
+   * the correct client response is to request a fresh transaction and sign it
+   * promptly. See src/lib/time-bounds.ts.
+   */
+  INTENT_EXPIRED: "INTENT_EXPIRED",
+  INVALID_CURSOR: "INVALID_CURSOR",
   // 401
   UNAUTHORIZED: "UNAUTHORIZED",
   // 403

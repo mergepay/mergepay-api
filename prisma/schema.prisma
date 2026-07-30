@@ -252,6 +252,18 @@ model AuditLog {
   @@map("audit_logs")
 }
 
+// SEP-10 replay protection: the id of every challenge that has been redeemed,
+// kept until the challenge would have expired anyway. Written by
+// src/services/sep10.ts via a conditional INSERT, which is what makes
+// redemption single-use. Declared here so `prisma db push` does not drop the
+// table created by 20260729000000_add_sep10_consumed_challenges.
+model Sep10ConsumedChallenge {
+  id        String   @id
+  expiresAt DateTime
+
+  @@index([expiresAt])
+}
+
 // Backing store for the optional database-backed rate limiter (see
 // src/services/rate-limit-store.ts). Only used when RATE_LIMIT_STORE=database;
 // the default in-memory store never touches this table. Rows are

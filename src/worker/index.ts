@@ -1,6 +1,7 @@
 import pino from "pino";
 import { config } from "../config";
 import { prisma } from "../db";
+import { AppError } from "../errors";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import {
@@ -146,11 +147,21 @@ export async function submitSettlement(
   }
 
   try {
-    const hash = await stellar.submitPayment(settlement.transactionXdr);
+    // Re-validate the stored signed XDR against the persisted intent on every
+    // submission attempt — the worker never trusts a stored envelope blindly.
+    const hash = await stellar.submitPayment(settlement.transactionXdr, {
+      sourcePublicKey: settlement.fromPublicKey,
+      destination: settlement.toPublicKey,
+      asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
+      amount: settlement.amount,
+      memoCode: settlement.shortCode,
+    });
     log.info({ id: settlement.id, hash }, "settlement submitted successfully");
     return hash;
   } catch (error) {
-    if (!isTransientSettlementFailure(error) || retryAttempt >= SETTLEMENT_MAX_RETRIES) {
+    // SETTLEMENT_MAX_RETRIES counts *retries*, so the first attempt plus its
+    // retries is SETTLEMENT_MAX_RETRIES + 1 submissions in total.
+    if (!isTransientSettlementFailure(error) || retryAttempt > SETTLEMENT_MAX_RETRIES) {
       throw new PermanentSettlementError(safeErrorMessage(error));
     }
     throw error;
@@ -165,7 +176,10 @@ async function markSettlementFailed(
     where: { id: settlement.id },
     data: {
       status: "failed",
-      retryCount: settlement.retryCount,
+      // The reason is already scrubbed of bearer tokens and secrets by
+      // safeErrorMessage, so it is safe to persist and surface to the payer.
+      failureReason: message,
+      retryCount: { increment: 1 },
     },
   });
   await recordTransition(settlement.id, "settlement_failed", {
@@ -183,7 +197,8 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
 
   try {
     const initialAttempt = Math.max(1, settlement.retryCount);
-    const remainingAttempts = Math.max(1, SETTLEMENT_MAX_RETRIES - initialAttempt + 1);
+    const maxAttempts = SETTLEMENT_MAX_RETRIES + 1;
+    const remainingAttempts = Math.max(1, maxAttempts - initialAttempt + 1);
 
     for (let offset = 0; offset < remainingAttempts; offset += 1) {
       const attempt = initialAttempt + offset;
@@ -201,7 +216,7 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
         return;
       } catch (error) {
         const message = safeErrorMessage(error);
-        const permanent = isPermanentSettlementFailure(error) || attempt >= SETTLEMENT_MAX_RETRIES;
+        const permanent = isPermanentSettlementFailure(error) || attempt >= maxAttempts;
 
         if (permanent) {
           await markSettlementFailed(settlement, message);
@@ -299,6 +314,11 @@ export async function reconcileAnchors(): Promise<void> {
         { sessionId: session.id, externalId: session.externalTransactionId, err: message },
         "unexpected error reconciling anchor session"
       );
+    } finally {
+      // The claim guards against two overlapping cycles polling the same
+      // session; it must be released once this cycle is done with it, or the
+      // session would never be polled again in this process.
+      claimedAnchors.delete(session.id);
     }
   }
 }
@@ -483,7 +503,7 @@ export async function processSubmittedSettlements(): Promise<void> {
       shortCode: row.shortCode,
       fromPublicKey: row.from.stellarPublicKey,
       toPublicKey: row.to.stellarPublicKey,
-      amount: row.amount,
+      amount: row.amount.toString(),
       assetCode: row.assetCode,
       assetIssuer: row.assetIssuer,
       transactionXdr: row.transactionXdr,

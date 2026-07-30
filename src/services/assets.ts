@@ -268,6 +268,36 @@ export function supportedAssetCodes(): string[] {
   return [..._byCode.keys()];
 }
 
+/**
+ * Startup validation of the asset-related configuration, called once by
+ * `buildApp()`. Failing here surfaces a misconfigured deployment at boot
+ * rather than as a confusing 400 on the first settlement attempt.
+ */
+export function validateAssetConfig(): void {
+  const stableCode = config.STABLE_ASSET_CODE?.trim();
+  if (!stableCode) {
+    throw new Error("STABLE_ASSET_CODE must be set");
+  }
+
+  const stable = _byCode.get(stableCode.toUpperCase());
+  if (!stable) {
+    throw new Error(
+      `STABLE_ASSET_CODE "${stableCode}" is not one of the supported assets ` +
+        `(${supportedAssetCodes().join(", ")})`
+    );
+  }
+
+  if (stable.type === "issued") {
+    const issuer = config.STABLE_ASSET_ISSUER?.trim();
+    if (!issuer) {
+      throw new Error(`STABLE_ASSET_ISSUER must be set for issued asset "${stableCode}"`);
+    }
+    if (!StrKey.isValidEd25519PublicKey(issuer)) {
+      throw new Error("STABLE_ASSET_ISSUER is not a valid Stellar public key");
+    }
+  }
+}
+
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
 function assertNetwork(asset: SupportedAsset): void {

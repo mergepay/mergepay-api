@@ -195,8 +195,15 @@ unfunded accounts via the master key), upserts the user, and returns a JWT.
 2. The wallet signs the XDR.
 3. `POST /settlements/:id/confirm` re-parses the signed XDR, **validates it
    matches the stored intent exactly** (source, single payment op, destination,
-   asset, amount, memo) and rejects mismatches with `xdr_mismatch`, then submits
-   to Horizon, stores the tx hash, and marks the expense share `settled`.
+   asset, amount, memo, time bounds) and rejects mismatches with `xdr_mismatch`,
+   then submits to Horizon, stores the tx hash, and marks the expense share
+   `settled`.
+4. `GET /settlements/:id/status` is the single source of truth from then on. It
+   combines persisted state with a bounded Horizon lookup and reports one of
+   `awaiting_signature`, `submitted`, `confirmed`, `failed`, or `expired`. A
+   transaction Horizon has not indexed yet is reported as `submitted` with
+   `onChain.found: false` — never as a confirmed payment. See
+   [docs/api-contract.md](docs/api-contract.md#get-settlementsidstatus).
 
 ### Transaction intent expiration
 
@@ -248,6 +255,7 @@ exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signe
 | POST | `/groups/:id/invite` · `/groups/join` · `/groups/:id/leave` · `/groups/:id/archive` | Membership |
 | POST/GET/PATCH/DELETE | `/groups/:id/expenses` · `/expenses/:id` | Expenses |
 | POST | `/expenses/:id/settle` · `/groups/:id/settlements` · `/settlements/:id/confirm` | Settlement |
+| GET | `/settlements/:id/status` | Settlement state (see [docs/api-contract.md](docs/api-contract.md#get-settlementsidstatus)) |
 | GET | `/groups/:id/balances` · `/groups/:id/ledger` | Balances & ledger |
 | POST/GET | `/groups/:id/treasury/*` · `/treasury-transactions/:id/confirm` | Treasury |
 | GET/POST | `/anchors` · `/anchors/deposit` · `/anchors/withdraw` · `/anchors/sessions/:id/complete` · `/anchors/sessions` · `/anchors/webhook` | Anchors |
@@ -255,7 +263,10 @@ exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signe
 | POST/GET | `/uploads/receipt` · `/uploads/:file` | Receipts |
 
 All request bodies are validated with Zod; every group action checks membership
-(and admin rights where required). Errors are returned as `{ error: { code, message } }`.
+(and admin rights where required). The full contract — error envelope and codes,
+pagination, intent expiration, and the settlement status endpoint — is documented
+in [docs/api-contract.md](docs/api-contract.md) and mirrored in
+`mergepay-web/src/lib/types.ts`.
 
 ### Pagination
 

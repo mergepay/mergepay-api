@@ -2,7 +2,6 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
-import { config } from "../config";
 import { Errors } from "../errors";
 import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";

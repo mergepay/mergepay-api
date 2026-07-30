@@ -17,6 +17,11 @@ import {
 } from "../lib/time-bounds";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 import {
+  isTerminalSettlementStatus,
+  resolveSettlementStatus,
+  toPublicStatus,
+} from "../services/settlement-status";
+import {
   serializeSettlement,
   serializeExpense,
   serializeTreasuryTx,
@@ -40,6 +45,31 @@ const settlementInclude = { from: true, to: true } as const;
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });
+
+/**
+ * A settlement's public identifier: either its cuid or its short code. Both are
+ * unique. Constrained to the characters those identifiers actually use, so a
+ * malformed path is a validation error before it reaches the database.
+ */
+const settlementIdParamSchema = z.object({
+  id: z
+    .string()
+    .min(4)
+    .max(64)
+    .regex(/^[A-Za-z0-9_-]+$/, "Not a valid settlement identifier"),
+});
+
+const settlementStatusQuerySchema = z.object({
+  /**
+   * Whether to consult Horizon for on-chain confirmation. On by default —
+   * confirming a payment is the point of the endpoint — but a client rendering
+   * a list can pass `refresh=false` to read only persisted state.
+   */
+  refresh: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+});
 
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -295,6 +325,75 @@ export default async function settlementRoutes(app: FastifyInstance) {
         return { settlement: serializeSettlement(finalSettlement) };
       },
     });
+  });
+
+  // -- status -----------------------------------------------------------------
+  //
+  // The single source of truth a client polls after creating or signing a
+  // settlement, so it never has to infer progress from an unrelated group or
+  // expense response.
+  //
+  // Access: any member of the settlement's group may read it, enforced through
+  // the same `requireMembership` helper every mutating route uses — there is no
+  // second authorization path here. A settlement that does not exist is a 404;
+  // one the caller may not inspect is a 403. That distinction is deliberate
+  // (clients need to tell "gone" from "not yours") and leaks only the existence
+  // of an opaque identifier, never any amount, party, group, or on-chain detail.
+  //
+  // The response never includes a signed or unsigned XDR, a token, provider
+  // credentials, or upstream error text — see src/services/settlement-status.ts.
+  app.get("/settlements/:id/status", async (req) => {
+    const auth = requireUser(req);
+    const { id } = settlementIdParamSchema.parse(req.params);
+    const { refresh } = settlementStatusQuerySchema.parse(req.query ?? {});
+
+    // `id` accepts either the cuid or the human-facing short code, both of
+    // which are unique and already public (the short code appears in the
+    // payment memo, so a user reading their wallet history can look it up).
+    const settlement = await prisma.settlement.findFirst({
+      where: { OR: [{ id }, { shortCode: id }] },
+      include: settlementInclude,
+    });
+    if (!settlement) throw Errors.notFound("Settlement not found");
+
+    await requireMembership(settlement.groupId, auth.id);
+
+    // Skipping the provider lookup is opt-in via `refresh=false`, for a client
+    // that wants only the persisted state (e.g. rendering a list).
+    const resolved = refresh
+      ? await resolveSettlementStatus(settlement)
+      : {
+          status: toPublicStatus(settlement),
+          onChain: {
+            checked: false,
+            found: false,
+            successful: null,
+            transactionHash: settlement.stellarTxHash ?? null,
+          },
+          failure: settlement.failureReason
+            ? { reason: settlement.failureReason }
+            : null,
+          expiresAt: settlement.expiresAt
+            ? settlement.expiresAt.toISOString()
+            : null,
+          expiresInSeconds: settlement.expiresAt
+            ? secondsUntilExpiry(settlement.expiresAt)
+            : null,
+          checkedAt: new Date().toISOString(),
+        };
+
+    return {
+      settlement: serializeSettlement(settlement),
+      status: resolved.status,
+      terminal: isTerminalSettlementStatus(resolved.status),
+      onChain: resolved.onChain,
+      failure: resolved.failure,
+      expiresAt: resolved.expiresAt,
+      expiresInSeconds: resolved.expiresInSeconds,
+      createdAt: settlement.createdAt.toISOString(),
+      updatedAt: settlement.updatedAt.toISOString(),
+      checkedAt: resolved.checkedAt,
+    };
   });
 
   // -- balances + suggestions -------------------------------------------------

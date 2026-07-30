@@ -19,7 +19,7 @@ import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import { getCorrelationId } from "./lib/correlation";
-import { policyKeyGenerator, rateLimitPolicies } from "./lib/rate-limit";
+import { rateLimitPolicies } from "./lib/rate-limit";
 import { validateAssetConfig } from "./services/assets";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";

@@ -24,6 +24,7 @@ model User {
   invites          Invite[]
   anchorSessions   AnchorSession[]
   auditLogs        AuditLog[]
+  idempotencyKeys  IdempotencyKey[]
 
   @@map("users")
 }
@@ -63,6 +64,7 @@ model GroupMember {
 
   @@unique([groupId, userId])
   @@index([userId])
+  @@index([groupId])
   @@map("group_members")
 }
 
@@ -85,6 +87,7 @@ model Expense {
   shares ExpenseShare[]
 
   @@index([groupId])
+  @@index([payerUserId])
   @@map("expenses")
 }
 
@@ -201,6 +204,9 @@ model AnchorSession {
   externalTransactionId String?  @map("external_transaction_id")
   anchorToken           String?  @map("anchor_token")
   status                String   @default("incomplete")
+  failureReason         String?  @map("failure_reason")
+  retryCount            Int      @default(0) @map("retry_count")
+  lastPolledAt          DateTime? @map("last_polled_at")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
 
@@ -208,16 +214,26 @@ model AnchorSession {
 
   @@index([userId])
   @@index([externalTransactionId])
+  @@index([status])
   @@map("anchor_sessions")
 }
 
 model IdempotencyKey {
-  id            String   @id @default(cuid())
-  key           String   @unique
-  requestHash   String   @map("request_hash")
-  responseJson  String   @map("response_json")
-  createdAt     DateTime @default(now()) @map("created_at")
+  id           String   @id @default(cuid())
+  userId       String   @map("user_id")
+  // Distinguishes the operation an idempotency key applies to (e.g.
+  // "settlement.create" or "settlement.confirm") so the same client-chosen
+  // key string can't be replayed across unrelated endpoints.
+  scope        String
+  key          String
+  requestHash  String   @map("request_hash")
+  responseJson String   @map("response_json")
+  createdAt    DateTime @default(now()) @map("created_at")
 
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, scope, key])
+  @@index([userId])
   @@map("idempotency_keys")
 }
 
@@ -234,4 +250,17 @@ model AuditLog {
 
   @@index([userId])
   @@map("audit_logs")
+}
+
+// Backing store for the optional database-backed rate limiter (see
+// src/services/rate-limit-store.ts). Only used when RATE_LIMIT_STORE=database;
+// the default in-memory store never touches this table. Rows are
+// short-lived counters, not business records — safe to truncate at any time.
+model RateLimitBucket {
+  key       String   @id
+  count     Int      @default(0)
+  resetAt   DateTime @map("reset_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("rate_limit_buckets")
 }

@@ -124,6 +124,12 @@ model Settlement {
   memo           String?
   expenseId      String?  @map("expense_id")
   expenseShareId String?  @map("expense_share_id")
+  // Server-controlled deadline for signing and submitting the unsigned XDR this
+  // settlement was created with. Derived from the server clock, never from
+  // client input, and re-checked before a signed envelope is accepted or
+  // submitted. Null on rows created before expiration tracking existed.
+  // See src/lib/time-bounds.ts.
+  expiresAt      DateTime? @map("expires_at")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
 
@@ -136,6 +142,7 @@ model Settlement {
   @@index([fromUserId])
   @@index([toUserId])
   @@index([status])
+  @@index([expiresAt])
   @@map("settlements")
 }
 
@@ -152,6 +159,9 @@ model TreasuryTransaction {
   stellarTxHash String?  @map("stellar_tx_hash")
   status        String   @default("pending")
   memo          String?
+  // Server-controlled signing deadline for the unsigned XDR — same contract as
+  // Settlement.expiresAt. See src/lib/time-bounds.ts.
+  expiresAt     DateTime? @map("expires_at")
   createdAt     DateTime @default(now()) @map("created_at")
 
   group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
@@ -159,6 +169,7 @@ model TreasuryTransaction {
 
   @@index([groupId])
   @@index([status])
+  @@index([expiresAt])
   @@map("treasury_transactions")
 }
 

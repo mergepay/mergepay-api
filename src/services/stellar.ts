@@ -17,7 +17,12 @@ import {
 } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { Errors } from "../errors";
-import { validateAssetSpec, assetConfigToSpec } from "./assets";
+import {
+  INTENT_VALIDITY_SECONDS,
+  assertTimeBoundsMatchIntent,
+  readTimeBounds,
+} from "../lib/time-bounds";
+import { validateAssetSpec } from "./assets";
 
 let _server: Horizon.Server | null = null;
 function server(): Horizon.Server {
@@ -96,6 +101,13 @@ export const stellar = {
     asset: AssetSpec;
     amount: string;
     memoCode: string;
+    /**
+     * Seconds the built envelope stays valid. Defaults to the shared intent
+     * window so the transaction's own `maxTime` and the intent expiry the
+     * caller records describe the same deadline. Callers pass the value they
+     * persisted, never a client-supplied one.
+     */
+    validitySeconds?: number;
   }): string {
     const source = new Account(params.sourcePublicKey, params.sourceSequence);
     const tx = new TransactionBuilder(source, {
@@ -110,7 +122,10 @@ export const stellar = {
         })
       )
       .addMemo(Memo.text(memoText(params.memoCode)))
-      .setTimeout(300)
+      // An unbounded envelope could be submitted indefinitely, so the timeout
+      // is what puts the intent's deadline on-chain: past it, Horizon itself
+      // rejects the transaction as tx_too_late.
+      .setTimeout(params.validitySeconds ?? INTENT_VALIDITY_SECONDS)
       .build();
     return tx.toXDR();
   },
@@ -127,6 +142,14 @@ export const stellar = {
       asset: AssetSpec;
       amount: string;
       memoCode: string;
+      /**
+       * The intent's recorded expiry. When present, the envelope's own time
+       * bounds are validated against it and an expired intent is rejected
+       * *before* anything is sent to Horizon.
+       */
+      expiresAt?: Date | null;
+      /** Names the resource in the expiration error, e.g. "settlement". */
+      resource?: string;
     }
   ): Promise<string> {
     let tx: Transaction;
@@ -174,8 +197,22 @@ export function validatePaymentTx(
     asset: AssetSpec;
     amount: string;
     memoCode: string;
+    /** Recorded intent expiry; when present, the envelope's bounds must agree. */
+    expiresAt?: Date | null;
+    /** Names the resource in the expiration error, e.g. "settlement". */
+    resource?: string;
   }
 ): void {
+  // Checked first: a stale envelope should be reported as expired, not as some
+  // incidental mismatch further down, and an expired intent must never reach
+  // Horizon or an anchor. `assertTimeBoundsMatchIntent` also rejects an
+  // unbounded envelope, which would otherwise be submittable forever.
+  assertTimeBoundsMatchIntent(
+    readTimeBounds(tx as unknown as { timeBounds?: { minTime: number | string; maxTime: number | string } | null }),
+    expected.expiresAt ?? null,
+    expected.resource ?? "transaction"
+  );
+
   if (tx.source !== expected.sourcePublicKey) {
     throw Errors.badRequest("xdr_mismatch", "Transaction source does not match");
   }

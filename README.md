@@ -198,6 +198,34 @@ unfunded accounts via the master key), upserts the user, and returns a JWT.
    asset, amount, memo) and rejects mismatches with `xdr_mismatch`, then submits
    to Horizon, stores the tx hash, and marks the expense share `settled`.
 
+### Transaction intent expiration
+
+Every unsigned XDR the API builds carries a **server-controlled** deadline,
+recorded on the row as `expiresAt` and set as the transaction's own `maxTime` so
+the stored intent and the on-chain envelope describe the same moment. Creation
+responses include `expiresAt` and `expiresInSeconds`.
+
+- The deadline comes from the server clock. A client may request a *shorter*
+  window via `validitySeconds` (30–300s); it can never extend one, and it never
+  supplies an absolute timestamp. An out-of-range request is a
+  `VALIDATION_ERROR`.
+- Signing and submission re-check the deadline. `POST /settlements/:id/confirm`
+  and `POST /treasury-transactions/:id/confirm` reject a stale intent with
+  `INTENT_EXPIRED` (400) — deliberately distinct from `XDR_MISMATCH` (the
+  envelope is wrong) and `UNAUTHORIZED`/`FORBIDDEN` (the caller is wrong), so a
+  client knows to request a fresh transaction rather than to debug.
+- Submission also validates the signed envelope's own time bounds against the
+  stored intent: an unbounded envelope, or one valid longer than the intent it
+  was built for, is an `XDR_MISMATCH`. No expired transaction is ever sent to
+  Horizon or an anchor — the worker marks such a settlement `expired` and
+  releases its expense share instead of retrying.
+- Comparisons allow a bounded **30-second** clock-skew tolerance
+  (`CLOCK_SKEW_TOLERANCE_SECONDS` in
+  [src/lib/time-bounds.ts](src/lib/time-bounds.ts)), so a wallet whose clock is a
+  few seconds off still works while a genuinely stale envelope is still
+  rejected. It is a constant rather than a config knob because widening it
+  weakens replay protection proportionally.
+
 ### Treasury (multisig)
 A group registers a Stellar account it created in a wallet (the API never holds
 the key). Deposits are signed by the depositor; withdrawals are signed from the

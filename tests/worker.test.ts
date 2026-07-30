@@ -4,6 +4,7 @@ const h = vi.hoisted(() => {
   const settlement = {
     findMany: vi.fn(),
     update: vi.fn(),
+    updateMany: vi.fn(),
   };
   const expenseShare = {
     update: vi.fn(),
@@ -114,6 +115,9 @@ function makePollResult(rawStatus: string): ReturnType<typeof import("../src/ser
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers();
+  // The worker claims a settlement with a conditional updateMany before
+  // submitting, and marks an expired one the same way.
+  h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
 });
 
 // ---------------------------------------------------------------------------
@@ -555,6 +559,89 @@ describe("processSubmittedSettlements", () => {
       })
     );
     expect(h.audit).toHaveBeenCalled();
+  });
+
+  it("never submits a settlement whose signing window has expired", async () => {
+    const settlement = {
+      id: "settle_expired",
+      shortCode: "STALE1",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "5.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-stale",
+      expenseShareId: "share_1",
+      retryCount: 0,
+      status: "submitted",
+      // Well past the deadline and the whole clock-skew tolerance.
+      expiresAt: new Date(Date.now() - 3_600_000),
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    // Retrying an expired envelope can only ever produce tx_too_late, so it is
+    // never sent to Horizon.
+    expect(h.submitPayment).not.toHaveBeenCalled();
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_expired", status: { in: ["pending", "submitted"] } },
+        data: expect.objectContaining({ status: "expired" }),
+      })
+    );
+    // The share is released so the payer can settle it again.
+    expect(h.prisma.expenseShare.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "share_1" },
+        data: { status: "pending" },
+      })
+    );
+  });
+
+  it("submits a settlement that is still inside its signing window", async () => {
+    const settlement = {
+      id: "settle_live",
+      shortCode: "LIVE01",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "5.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-live",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      expiresAt: new Date(Date.now() + 300_000),
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
+    h.submitPayment.mockResolvedValue("hash_live");
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    // The recorded deadline travels with the submission, so the service can
+    // re-validate the envelope's own time bounds against it.
+    expect(h.submitPayment).toHaveBeenCalledWith(
+      "signed-xdr-live",
+      expect.objectContaining({
+        expiresAt: settlement.expiresAt,
+        resource: "settlement",
+      })
+    );
   });
 
   it("marks a settlement as failed immediately on non-transient error without retrying", async () => {

@@ -93,6 +93,9 @@ export function serializeSettlement(s: any) {
     status: s.status,
     memo: s.memo ?? null,
     expenseId: s.expenseId ?? null,
+    // Server-controlled signing deadline for the unsigned XDR. Null on rows
+    // created before expiration tracking existed. See src/lib/time-bounds.ts.
+    expiresAt: s.expiresAt ? iso(s.expiresAt) : null,
     createdAt: iso(s.createdAt),
   };
 }
@@ -111,6 +114,7 @@ export function serializeTreasuryTx(t: any) {
     stellarTxHash: t.stellarTxHash ?? null,
     status: t.status,
     memo: t.memo ?? null,
+    expiresAt: t.expiresAt ? iso(t.expiresAt) : null,
     createdAt: iso(t.createdAt),
   };
 }

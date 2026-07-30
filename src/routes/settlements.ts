@@ -9,6 +9,12 @@ import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
+import {
+  assertIntentNotExpired,
+  intentExpiry,
+  intentValiditySchema,
+  secondsUntilExpiry,
+} from "../lib/time-bounds";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 import {
   serializeSettlement,
@@ -56,6 +62,9 @@ export default async function settlementRoutes(app: FastifyInstance) {
       .object({
         assetCode: z.string().optional(),
         assetIssuer: z.string().nullable().optional(),
+        // A client may ask for a *shorter* signing window than the default; the
+        // schema bounds the request and the server clock decides the deadline.
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body ?? {});
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -96,6 +105,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         }
 
         const code = shortCode();
+        const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({
           data: {
             shortCode: code,
@@ -109,6 +119,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
             memo: memoText(code),
             expenseId: expense.id,
             expenseShareId: myShare.id,
+            expiresAt,
           },
           include: settlementInclude,
         });
@@ -125,12 +136,15 @@ export default async function settlementRoutes(app: FastifyInstance) {
           assetIssuer,
           amount: myShare.shareAmount.toString(),
           memoCode: code,
+          validitySeconds,
         });
 
         return {
           settlement: serializeSettlement(settlement),
           xdr,
           networkPassphrase: config.networkPassphrase,
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: secondsUntilExpiry(expiresAt),
         };
       },
     });
@@ -147,6 +161,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         amount: z.string().min(1),
         assetCode: z.string().min(1),
         assetIssuer: z.string().nullable().optional(),
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -171,6 +186,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       payload: body,
       operation: async (tx) => {
         const code = shortCode();
+        const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({
           data: {
             shortCode: code,
@@ -182,6 +198,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
             assetIssuer: body.assetIssuer ?? null,
             status: "pending",
             memo: memoText(code),
+            expiresAt,
           },
           include: settlementInclude,
         });
@@ -193,12 +210,15 @@ export default async function settlementRoutes(app: FastifyInstance) {
           assetIssuer: body.assetIssuer ?? null,
           amount: body.amount,
           memoCode: code,
+          validitySeconds,
         });
 
         return {
           settlement: serializeSettlement(settlement),
           xdr,
           networkPassphrase: config.networkPassphrase,
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: secondsUntilExpiry(expiresAt),
         };
       },
     });
@@ -233,6 +253,15 @@ export default async function settlementRoutes(app: FastifyInstance) {
         if (settlement.status !== "pending") {
           return { settlement: serializeSettlement(settlement) };
         }
+
+        // Expiration is checked after ownership — so a stranger learns nothing
+        // from the difference between 403 and an expiry error — but before the
+        // envelope is stored, so an expired intent never becomes a `submitted`
+        // row the worker would later push to Horizon. The signed envelope's own
+        // time bounds are re-validated against this same intent at submission
+        // (stellar.submitPayment -> validatePaymentTx), which is where the XDR
+        // is parsed.
+        assertIntentNotExpired(settlement.expiresAt, "settlement");
 
         // Guard the transition with a conditional update rather than an
         // unconditional one: if a concurrent confirm on the same settlement
@@ -403,6 +432,7 @@ async function buildSettlementXdr(params: {
   assetIssuer: string | null;
   amount: string;
   memoCode: string;
+  validitySeconds: number;
 }): Promise<string> {
   const account = await stellar.loadAccount(params.fromPublicKey);
   if (!account.exists) {
@@ -418,6 +448,10 @@ async function buildSettlementXdr(params: {
     asset: { code: params.assetCode, issuer: params.assetIssuer },
     amount: params.amount,
     memoCode: params.memoCode,
+    // The envelope's own maxTime and the persisted expiresAt describe the same
+    // deadline, so a wallet cannot return something valid longer than the
+    // intent it was issued for.
+    validitySeconds: params.validitySeconds,
   });
 }
 

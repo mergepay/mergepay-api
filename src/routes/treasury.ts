@@ -11,6 +11,12 @@ import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { rateLimited } from "../lib/rate-limit";
+import {
+  assertIntentNotExpired,
+  intentExpiry,
+  intentValiditySchema,
+  secondsUntilExpiry,
+} from "../lib/time-bounds";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
 import {
   buildPage,
@@ -101,6 +107,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         amount: z.string().min(1),
         assetCode: z.string().min(1),
         assetIssuer: z.string().nullable().optional(),
+        // A client may ask for a shorter signing window; the server clock still
+        // decides the deadline.
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body);
 
@@ -113,6 +122,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     }
 
     const code = shortCode();
+    const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
     const ttx = await prisma.treasuryTransaction.create({
       data: {
         shortCode: code,
@@ -125,6 +135,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         destination: group.treasuryAccountPublicKey,
         status: "pending",
         memo: memoText(code),
+        expiresAt,
       },
       include: { user: true },
     });
@@ -140,12 +151,15 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
       amount: body.amount,
       memoCode: code,
+      validitySeconds,
     });
 
     return {
       treasuryTransaction: serializeTreasuryTx(ttx),
       xdr,
       networkPassphrase: config.networkPassphrase,
+      expiresAt: expiresAt.toISOString(),
+      expiresInSeconds: secondsUntilExpiry(expiresAt),
     };
   });
 
@@ -160,6 +174,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         assetCode: z.string().min(1),
         assetIssuer: z.string().nullable().optional(),
         destination: z.string(),
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body);
 
@@ -177,6 +192,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
 
     const requiresMulti = (group.treasuryRequiredSigners ?? 1) > 1;
     const code = shortCode();
+    // A multisig withdrawal has to be routed to additional signers, so it gets
+    // the full window; the deadline is still server-controlled and enforced.
+    const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
     const ttx = await prisma.treasuryTransaction.create({
       data: {
         shortCode: code,
@@ -189,6 +207,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         destination: body.destination,
         status: requiresMulti ? "awaiting_signatures" : "pending",
         memo: memoText(code),
+        expiresAt,
       },
       include: { user: true },
     });
@@ -204,12 +223,15 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
       amount: body.amount,
       memoCode: code,
+      validitySeconds,
     });
 
     return {
       treasuryTransaction: serializeTreasuryTx(ttx),
       xdr,
       networkPassphrase: config.networkPassphrase,
+      expiresAt: expiresAt.toISOString(),
+      expiresInSeconds: secondsUntilExpiry(expiresAt),
     };
   });
 
@@ -241,6 +263,11 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       return { treasuryTransaction: serializeTreasuryTx(ttx) };
     }
 
+    // Checked after authorization (so a stranger learns nothing from the
+    // difference) but before anything is sent upstream: an expired intent must
+    // never be submitted to Horizon.
+    assertIntentNotExpired(ttx.expiresAt, "treasury transaction");
+
     const source =
       ttx.direction === "deposit"
         ? auth.stellarPublicKey
@@ -258,6 +285,11 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
         amount: ttx.amount.toString(),
         memoCode: ttx.shortCode,
+        // submitPayment re-validates the envelope's own time bounds against the
+        // stored intent, so a stale signature is rejected locally rather than
+        // by Horizon.
+        expiresAt: ttx.expiresAt,
+        resource: "treasury transaction",
       });
     } catch (e) {
       await prisma.treasuryTransaction.update({

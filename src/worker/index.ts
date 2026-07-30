@@ -2,6 +2,7 @@ import pino from "pino";
 import { config } from "../config";
 import { prisma } from "../db";
 import { AppError } from "../errors";
+import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import {
@@ -25,6 +26,7 @@ interface SettlementSubmissionRecord {
   expenseShareId: string | null;
   retryCount: number;
   status: string;
+  expiresAt: Date | null;
   createdAt: Date;
 }
 
@@ -155,6 +157,8 @@ export async function submitSettlement(
       asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
       amount: settlement.amount,
       memoCode: settlement.shortCode,
+      expiresAt: settlement.expiresAt,
+      resource: "settlement",
     });
     log.info({ id: settlement.id, hash }, "settlement submitted successfully");
     return hash;
@@ -192,7 +196,49 @@ async function markSettlementFailed(
   );
 }
 
+/**
+ * Mark a settlement whose signing window has passed. Distinct from `failed`:
+ * nothing was rejected on-chain, the envelope simply became unusable, and the
+ * payer's remedy is to create a new settlement rather than to investigate.
+ */
+async function markSettlementExpired(
+  settlement: SettlementSubmissionRecord
+): Promise<void> {
+  const { count } = await prisma.settlement.updateMany({
+    where: { id: settlement.id, status: { in: ["pending", "submitted"] } },
+    data: {
+      status: "expired",
+      failureReason: "The signing window for this settlement expired before it was submitted.",
+    },
+  });
+  if (count === 0) return;
+
+  // Release the expense share so the payer can settle it again.
+  if (settlement.expenseShareId) {
+    await prisma.expenseShare.update({
+      where: { id: settlement.expenseShareId },
+      data: { status: "pending" },
+    });
+  }
+
+  await recordTransition(settlement.id, "settlement_expired", {
+    expiresAt: settlement.expiresAt?.toISOString() ?? null,
+  });
+  log.warn(
+    { id: settlement.id, expiresAt: settlement.expiresAt },
+    "settlement expired before submission"
+  );
+}
+
 async function processSettlement(settlement: SettlementSubmissionRecord): Promise<void> {
+  // An intent past its server-controlled deadline is terminal: retrying it can
+  // only ever produce a Horizon tx_too_late, so it is marked expired and never
+  // submitted. Checked before the claim so an expired row is not held.
+  if (isIntentExpired(settlement.expiresAt)) {
+    await markSettlementExpired(settlement);
+    return;
+  }
+
   if (!(await claimSettlement(settlement))) return;
 
   try {
@@ -510,6 +556,7 @@ export async function processSubmittedSettlements(): Promise<void> {
       expenseShareId: row.expenseShareId,
       retryCount: row.retryCount,
       status: row.status,
+      expiresAt: row.expiresAt,
       createdAt: row.createdAt,
     };
     await processSettlement(settlement);

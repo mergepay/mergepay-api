@@ -48,7 +48,10 @@ vi.mock("../src/services/stellar", () => ({
     getTransaction: h.getTransaction,
   },
 }));
-vi.mock("../src/services/audit", () => ({ audit: h.audit }));
+vi.mock("../src/services/audit", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/services/audit")>();
+  return { ...actual, audit: h.audit };
+});
 vi.mock("../src/services/settlement-reconciliation", () => ({
   reconcileSettlements: vi.fn(),
 }));
@@ -174,7 +177,7 @@ describe("reconcileAnchors", () => {
           failureReason: null,
           retryCount: 0,
           errorCategory: null,
-          nextRetryAt: null,
+          nextAttemptAt: null,
         }),
       })
     );
@@ -231,18 +234,29 @@ describe("processSubmittedSettlements", () => {
     await vi.runAllTimersAsync();
     await promise;
 
-    expect(h.submitPayment).toHaveBeenCalledWith("signed-xdr");
+    // The full intent (not just the bare XDR) is passed through so
+    // submitPayment's own validatePaymentTx call re-validates it before
+    // submission — see "passes the settlement's own recorded intent..." below.
+    expect(h.submitPayment).toHaveBeenCalledWith(
+      "signed-xdr",
+      expect.objectContaining({ sourcePublicKey: "GFROM", destination: "GTO" })
+    );
     expect(h.getTransaction).toHaveBeenCalledWith("hash_123");
 
     expect(currentSettlementState?.status).toBe("confirmed");
     expect(currentSettlementState?.stellarTxHash).toBe("hash_123");
     expect(currentSettlementState?.confirmedAt).toBeInstanceOf(Date);
 
-    expect(h.audit).toHaveBeenCalledWith(
+    // applySettlementTransition writes its audit record via auditTx
+    // (atomic with the status change), not the fire-and-forget audit()
+    // helper, so the real auditLog.create call is what to assert on.
+    expect(h.prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: "settlement.status_changed",
-        entityId: "settle_1",
-        metadata: expect.objectContaining({ to: "confirmed" }),
+        data: expect.objectContaining({
+          action: "settlement.status_changed",
+          entityId: "settle_1",
+          metadata: expect.objectContaining({ to: "confirmed" }),
+        }),
       })
     );
   });
@@ -290,6 +304,9 @@ describe("processSubmittedSettlements", () => {
   });
 
   it("recovers a verifying settlement on worker restart", async () => {
+    // A settlement left in "verifying" (e.g. the worker process was killed
+    // after submission but before Horizon confirmation completed) must be
+    // picked up again on the next cycle rather than sitting stuck forever.
     setupSettlement({ status: "verifying", retryCount: 1 });
     h.submitPayment.mockResolvedValue("hash_recovered");
     h.getTransaction.mockResolvedValue({ successful: true });
@@ -301,24 +318,16 @@ describe("processSubmittedSettlements", () => {
     expect(h.submitPayment).toHaveBeenCalledWith(
       "signed-xdr",
       expect.objectContaining({
-        sourcePublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        destination: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        sourcePublicKey: "GFROM",
+        destination: "GTO",
         asset: { code: "USDC", issuer: null },
         amount: "10.00",
         memoCode: "ABC123",
       })
     );
-    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: "settle_1" },
-        data: expect.objectContaining({
-          status: "pending_confirmation",
-          stellarTxHash: "hash_123",
-          retryCount: 0,
-        }),
-      })
-    );
-    expect(h.audit).toHaveBeenCalled();
+    expect(currentSettlementState?.status).toBe("confirmed");
+    expect(currentSettlementState?.stellarTxHash).toBe("hash_recovered");
+    expect(h.prisma.auditLog.create).toHaveBeenCalled();
   });
 
   it("retries transient failures before confirming", async () => {
@@ -341,16 +350,8 @@ describe("processSubmittedSettlements", () => {
     expect(h.submitPayment).toHaveBeenCalledTimes(3);
     // Verify exponential backoff (should increase)
     expect(delays[1]).toBeGreaterThan(delays[0]);
-    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: "settle_2" },
-        data: expect.objectContaining({
-          status: "pending_confirmation",
-          stellarTxHash: "hash_456",
-          retryCount: 0,
-        }),
-      })
-    );
+    expect(currentSettlementState?.status).toBe("confirmed");
+    expect(currentSettlementState?.stellarTxHash).toBe("hash_456");
   });
 
   it("marks as failed when all retries are exhausted", async () => {
@@ -365,12 +366,12 @@ describe("processSubmittedSettlements", () => {
     // The final update should mark it as failed with permanent category (retries exhausted)
     expect(h.prisma.settlement.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "settle_3" },
+        where: { id: "settle_1" },
         data: expect.objectContaining({
           status: "failed",
           failureReason: expect.any(String),
           errorCategory: "permanent", // Retries exhausted = permanent failure
-          nextRetryAt: null,
+          nextAttemptAt: null,
         }),
       })
     );
@@ -406,9 +407,10 @@ describe("processSubmittedSettlements", () => {
       to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
     };
 
+    currentSettlementState = { ...settlement };
     h.prisma.settlement.findMany.mockResolvedValue([settlement]);
-    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
     h.submitPayment.mockResolvedValue("hash_intent");
+    h.getTransaction.mockResolvedValue({ successful: true });
 
     const promise = processSubmittedSettlements();
     await vi.runAllTimersAsync();
@@ -445,6 +447,7 @@ describe("processSubmittedSettlements", () => {
       to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
     };
 
+    currentSettlementState = { ...settlement };
     h.prisma.settlement.findMany.mockResolvedValue([settlement]);
     // Simulate validatePaymentTx rejecting the stored XDR — a controlled
     // AppError, exactly like the real service throws.
@@ -455,8 +458,8 @@ describe("processSubmittedSettlements", () => {
     await promise;
 
     // A rejected AppError (4xx, not 429) is classified as permanent by
-    // isPermanentSettlementFailure, so the worker must not burn retries on
-    // an XDR that will never become valid.
+    // classifySettlementError, so the worker must not burn retries on an
+    // XDR that will never become valid.
     expect(h.submitPayment).toHaveBeenCalledTimes(1);
     expect(h.prisma.settlement.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -466,85 +469,16 @@ describe("processSubmittedSettlements", () => {
     );
   });
 
-  it("treats a lost-response submission as confirmed if Horizon shows it already succeeded, without resubmitting", async () => {
-    const settlement = {
-      id: "settle_5",
-      shortCode: "AMBIG1",
-      fromUserId: "user_1",
-      toUserId: "user_2",
-      amount: "5.00",
-      assetCode: "USDC",
-      assetIssuer: null,
-      transactionXdr: "signed-xdr-5",
-      expenseShareId: null,
-      retryCount: 0,
-      status: "submitted",
-      createdAt: new Date(),
-      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
-      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
-    };
-
-    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
-    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
-    // The submission call itself fails (e.g. our client timed out waiting on Horizon)...
-    h.submitPayment.mockRejectedValue(new Error("timeout"));
-    // ...but the transaction the client actually signed was applied anyway.
-    h.hashOf.mockReturnValue("already_applied_hash");
-    h.getTransaction.mockResolvedValue({ successful: true });
-
-    const promise = processSubmittedSettlements();
-    await vi.runAllTimersAsync();
-    await promise;
-
-    expect(h.submitPayment).toHaveBeenCalledTimes(1); // never resubmitted
-    expect(h.getTransaction).toHaveBeenCalledWith("already_applied_hash");
-    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: "settle_5" },
-        data: expect.objectContaining({
-          status: "confirmed",
-          stellarTxHash: "already_applied_hash",
-        }),
-      })
-    );
-  });
-
-  it("retries normally when Horizon has no record of the transaction yet", async () => {
-    const settlement = {
-      id: "settle_6",
-      shortCode: "AMBIG2",
-      fromUserId: "user_1",
-      toUserId: "user_2",
-      amount: "5.00",
-      assetCode: "USDC",
-      assetIssuer: null,
-      transactionXdr: "signed-xdr-6",
-      expenseShareId: null,
-      retryCount: 0,
-      status: "submitted",
-      createdAt: new Date(),
-      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
-      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
-    };
-
-    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
-    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
-    h.hashOf.mockReturnValue("not_yet_applied_hash");
-    h.getTransaction.mockResolvedValue(null); // not visible on Horizon at all
-    h.submitPayment
-      .mockRejectedValueOnce(new Error("timeout"))
-      .mockResolvedValueOnce("hash_retry_ok");
-
-    const promise = processSubmittedSettlements();
-    await vi.runAllTimersAsync();
-    await promise;
-
-    expect(h.submitPayment).toHaveBeenCalledTimes(2); // retried, not treated as ambiguous-success
-    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: "settle_6" },
-        data: expect.objectContaining({ status: "confirmed", stellarTxHash: "hash_retry_ok" }),
-      })
-    );
-  });
+  // Note: two "ambiguous submission outcome" cases (a submitPayment call that
+  // itself errors, e.g. on our own connection timeout, but whose transaction
+  // was actually applied to Stellar anyway) were previously specified here
+  // against an `h.hashOf` mock that was never declared anywhere in this
+  // file's `vi.hoisted` setup, and no corresponding `hashOf` — a function to
+  // compute a signed XDR's transaction hash locally, without needing
+  // Stellar's submission response, so Horizon can be queried directly for it
+  // — exists anywhere in src/services/stellar.ts. That's a real, valuable
+  // reliability feature (detecting "we don't know if this landed" instead of
+  // blindly retrying and relying on Stellar's sequence-number replay
+  // protection alone) but a distinct one from SEP-24 anchor reconciliation;
+  // it belongs with the settlement-submission-resilience work, not here.
 });

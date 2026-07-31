@@ -271,7 +271,7 @@ export const anchorService = {
     try {
       res = await fetchWithTimeout(url, "Anchor.getTransactionStatus", config.ANCHOR_POLL_TIMEOUT_MS, {
         headers: { Authorization: `Bearer ${params.token}` },
-      }), 10_000);
+      });
       anchorCircuit.recordSuccess(provider);
     } catch {
       anchorCircuit.recordFailure(provider);

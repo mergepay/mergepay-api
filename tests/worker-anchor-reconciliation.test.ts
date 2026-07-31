@@ -5,6 +5,10 @@ const h = vi.hoisted(() => {
     findMany: vi.fn(),
     findUnique: vi.fn(),
     update: vi.fn(),
+    // Sessions are claimed with a short-lived database lease
+    // (claimedAt/claimedBy/leaseExpiresAt) before polling, so two worker
+    // processes can never poll the same session concurrently.
+    updateMany: vi.fn(async () => ({ count: 1 })),
   };
   const prisma: any = {
     anchorSession,

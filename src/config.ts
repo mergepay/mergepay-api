@@ -48,6 +48,24 @@ const schema = z.object({
   
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
+  // How long a worker holds an exclusive claim on a settlement or anchor
+  // session before another worker instance is allowed to reclaim it (e.g.
+  // after a crash mid-job). Must comfortably exceed a single job's worst-case
+  // duration (Horizon calls, retries) to avoid two workers processing the
+  // same row concurrently.
+  WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
+  // Per-call network timeouts (ms) — every outbound Horizon/anchor request
+  // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
+  // a slow or hung upstream can't block a worker cycle indefinitely.
+  HORIZON_ACCOUNT_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  HORIZON_SUBMIT_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  HORIZON_STATUS_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  HORIZON_FEE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_TOML_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_CHALLENGE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_TOKEN_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_INTERACTIVE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   CONFIRM_POLL_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
   CONFIRM_POLL_DELAY_MS: z.coerce.number().int().positive().default(1500),
   NODE_ENV: z.string().default("development"),

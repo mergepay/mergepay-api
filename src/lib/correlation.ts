@@ -44,6 +44,15 @@ export interface CorrelationContext {
 }
 
 /**
+ * Deterministic correlation ID for a background job — same jobType/jobId
+ * always produces the same ID, so retries across worker cycles for the same
+ * job share one correlation ID in logs and audit metadata.
+ */
+function jobCorrelationId(jobType: string, jobId: string): string {
+  return `job_${jobType}_${jobId}`;
+}
+
+/**
  * Derive a correlation context for a background job. When an originating
  * correlation ID from an API request is not available, the context is
  * derived deterministically from the job type and ID so that retries

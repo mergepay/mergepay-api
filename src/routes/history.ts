@@ -1,66 +1,119 @@
 import { FastifyInstance } from "fastify";
+import { z } from "zod";
 import { prisma } from "../db";
+import { config } from "../config";
+import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { rateLimited } from "../lib/rate-limit";
 import { serializeExpense, serializeSettlement } from "../serializers";
-import {
-  buildPage,
-  cursorFilter,
-  cursorOrderBy,
-  paginationQuerySchema,
-  requireCursor,
-  takeForPage,
-} from "../lib/pagination";
+import { paginationQuerySchema, decodeCursor, buildPaginatedResponse } from "../services/pagination";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+
+const historyQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+});
 
 export default async function historyRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-  // Cross-group history for the authenticated user.
-  //
-  // Expenses and settlements are separate resources with separate cursors, so
-  // a client can page each independently — merging them into one stream would
-  // make a single cursor ambiguous. Both use the shared pagination contract,
-  // and both are scoped to rows the caller is a party to; the cursor only ever
-  // moves the page boundary inside that scope.
-  app.get("/history", rateLimited("history"), async (req) => {
+  app.get("/history", { config: { rateLimit: { max: config.AUTH_RATE_LIMIT_MAX, timeWindow: "1 minute" } } }, async (req) => {
     const auth = requireUser(req);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    const { cursor: settlementCursor } = paginationQuerySchema
-      .pick({ cursor: true })
-      .parse({ cursor: (req.query as Record<string, unknown> | undefined)?.settlementCursor });
+    const query = paginationQuerySchema.parse(req.query);
 
-    const expensePosition = requireCursor(cursor);
-    const settlementPosition = requireCursor(settlementCursor);
+    let cursorCondition: any = {};
+    if (query.cursor) {
+      const cursor = decodeCursor(query.cursor);
+      cursorCondition = {
+        OR: [
+          { createdAt: { lt: cursor.createdAt } },
+          { createdAt: { equals: cursor.createdAt }, id: { lt: cursor.id } },
+        ],
+      };
+    }
+
+    const statusFilter = query.status
+      ? { status: query.status }
+      : undefined;
+
+    const assetFilter = query.assetCode
+      ? { assetCode: query.assetCode }
+      : undefined;
+
+    const dateFilter: any = {};
+    if (query.fromDate) {
+      dateFilter.createdAt = { ...(dateFilter.createdAt || {}), gte: new Date(query.fromDate) };
+    }
+    if (query.toDate) {
+      dateFilter.createdAt = { ...(dateFilter.createdAt || {}), lte: new Date(query.toDate) };
+    }
+    historyQuerySchema.parse(req.query ?? {});
 
     const [expenses, settlements] = await Promise.all([
       prisma.expense.findMany({
         where: {
-          OR: [{ payerUserId: auth.id }, { shares: { some: { userId: auth.id } } }],
-          ...cursorFilter(expensePosition, order),
+          AND: [
+            {
+              OR: [
+                { payerUserId: auth.id },
+                { shares: { some: { userId: auth.id } } },
+              ],
+            },
+            cursorCondition,
+            assetFilter,
+            dateFilter,
+          ],
+          ...cursorFilter,
         },
         include: { payer: true, shares: { include: { user: true } } },
-        orderBy: cursorOrderBy(order),
-        take: takeForPage(limit),
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: takeCount,
       }),
       prisma.settlement.findMany({
-        where: {
+        where: { 
           OR: [{ fromUserId: auth.id }, { toUserId: auth.id }],
-          ...cursorFilter(settlementPosition, order),
+          ...cursorFilter,
         },
         include: { from: true, to: true },
-        orderBy: cursorOrderBy(order),
-        take: takeForPage(limit),
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: takeCount,
       }),
     ]);
 
-    const expensePage = buildPage(expenses, limit, order);
-    const settlementPage = buildPage(settlements, limit, order);
+    // Merge and sort by createdAt desc, then id desc
+    const entries = [
+      ...expenses.map((e) => ({
+        type: "expense" as const,
+        createdAt: e.createdAt,
+        id: e.id,
+        data: serializeExpense(e),
+      })),
+      ...settlements.map((s) => ({
+        type: "settlement" as const,
+        createdAt: s.createdAt,
+        id: s.id,
+        data: serializeSettlement(s),
+      })),
+    ].sort((a, b) => {
+      if (a.createdAt < b.createdAt) return 1;
+      if (a.createdAt > b.createdAt) return -1;
+      return a.id < b.id ? 1 : -1;
+    });
+
+    const hasMore = entries.length > limit;
+    const results = hasMore ? entries.slice(0, limit) : entries;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
 
     return {
-      expenses: expensePage.items.map(serializeExpense),
-      settlements: settlementPage.items.map(serializeSettlement),
-      meta: expensePage.meta,
-      settlementMeta: settlementPage.meta,
+      entries: results.map((r) => ({
+        type: r.type,
+        ...r.data,
+      })),
+      meta: { nextCursor, hasMore },
     };
   });
 }

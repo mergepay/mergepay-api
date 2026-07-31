@@ -2,97 +2,81 @@ import "dotenv/config";
 import { z } from "zod";
 import { Networks } from "@stellar/stellar-sdk";
 
-/** A rate-limit ceiling: a positive integer, bounded so a typo can't disable limiting. */
-function rateLimitMax(fallback: number) {
-  return z.coerce.number().int().positive().max(100000).default(fallback);
-}
+// URL validation helper
+const urlSchema = z.string().url("Invalid URL format");
 
-/** A rate-limit window in milliseconds; capped at one hour. */
-function rateLimitWindow(fallback = 60000) {
-  return z.coerce.number().int().positive().max(3600000).default(fallback);
-}
+// Stellar public key validation (G followed by 56 base32 characters)
+const stellarPublicKeySchema = z.string().regex(/^G[A-Z0-9]{55}$/, "Invalid Stellar public key format");
 
 const schema = z.object({
-  DATABASE_URL: z.string().default("postgresql://postgres:postgres@localhost:5432/mergepay"),
+  // Required core configuration
+  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   PORT: z.coerce.number().int().positive().default(4000),
-  API_PUBLIC_URL: z.string().default("http://localhost:4000"),
+  API_PUBLIC_URL: urlSchema,
   // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
   WEB_URL: z.string().default("*"),
-  JWT_SECRET: z.string().default("change-me-in-production"),
-  STELLAR_NETWORK: z.enum(["testnet", "public"]).default("public"),
-  HORIZON_URL: z.string().default("https://horizon.stellar.org"),
+  JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
+  
+  // Stellar configuration - required
+  STELLAR_NETWORK: z.enum(["testnet", "public"], {
+    errorMap: () => ({ message: "STELLAR_NETWORK must be either 'testnet' or 'public'" }),
+  }),
+  HORIZON_URL: urlSchema,
+  
+  // Fee configuration with sensible defaults
   FEE_CACHE_TTL: z.coerce.number().positive().default(30),
   MAX_FEE_STROOPS: z.coerce.number().int().positive().default(1000),
   DEFAULT_FEE_STROOPS: z.coerce.number().int().positive().default(100),
+  
+  // SEP-10 configuration - optional but validated if provided
   SEP10_SIGNING_SECRET: z.string().optional(),
   // If not set, derived from API_PUBLIC_URL so the deployed domain is used automatically.
   SEP10_HOME_DOMAIN: z.string().optional(),
   WEB_AUTH_DOMAIN: z.string().optional(),
-  ANCHOR_HOME_DOMAIN: z.string().default("testanchor.stellar.org"),
-  ANCHOR_NAME: z.string().default("Stellar Test Anchor"),
-  ANCHOR_WEBHOOK_SECRET: z.string().default("change-me"),
-  STABLE_ASSET_CODE: z.string().default("USDC"),
-  STABLE_ASSET_ISSUER: z
-    .string()
-    .default("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
+  
+  // Anchor configuration
+  ANCHOR_HOME_DOMAIN: z.string().min(1, "ANCHOR_HOME_DOMAIN is required"),
+  ANCHOR_NAME: z.string().min(1, "ANCHOR_NAME is required"),
+  ANCHOR_WEBHOOK_SECRET: z.string().min(1, "ANCHOR_WEBHOOK_SECRET is required"),
+  
+  // Stable asset configuration
+  STABLE_ASSET_CODE: z.string().min(1, "STABLE_ASSET_CODE is required"),
+  STABLE_ASSET_ISSUER: stellarPublicKeySchema,
+  
+  // File storage
   UPLOADS_DIR: z.string().default("./uploads"),
+  
+  // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
+  CONFIRM_POLL_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
+  CONFIRM_POLL_DELAY_MS: z.coerce.number().int().positive().default(1500),
   NODE_ENV: z.string().default("development"),
 
-  // ── Rate limiting ────────────────────────────────────────────────────────
-  //
-  // Every route is covered by the global policy; routes that do expensive
-  // cryptographic work, submit to Horizon, or fan out to an anchor get their
-  // own bucket so they never share a budget with ordinary authenticated
-  // reads. Each value is independently overridable per deployment — see
-  // .env.example and README.md#rate-limiting.
-  //
-  // "memory" keeps counters per API process (correct for a single instance);
-  // "database" shares them across instances via the rate_limit_buckets table
-  // and fails open if that store errors (src/services/rate-limit-store.ts).
+  // Security-sensitive endpoint policies.
   RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
-
-  RATE_LIMIT_GLOBAL_MAX: rateLimitMax(100),
-  RATE_LIMIT_GLOBAL_WINDOW_MS: rateLimitWindow(),
-
-  // SEP-10: a challenge is cheap and legitimately retried while a wallet
-  // prompt is open; verify is the actual authentication step and is kept
-  // tighter to slow brute-force attempts against it.
-  RATE_LIMIT_AUTH_CHALLENGE_MAX: rateLimitMax(20),
-  RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: rateLimitWindow(),
-  RATE_LIMIT_AUTH_VERIFY_MAX: rateLimitMax(10),
-  RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: rateLimitWindow(),
-
-  // Settlement: creation builds and signs nothing but does load an account
-  // from Horizon; confirmation validates a signed envelope and submits it.
-  // Confirm is looser than create because a wallet may legitimately retry a
-  // submission whose result it never saw.
-  RATE_LIMIT_SETTLEMENT_CREATE_MAX: rateLimitMax(20),
-  RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: rateLimitWindow(),
-  RATE_LIMIT_SETTLEMENT_CONFIRM_MAX: rateLimitMax(30),
-  RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: rateLimitWindow(),
-
-  // Treasury signed submission — same shape of work as a settlement confirm,
-  // but budgeted separately so a busy treasury cannot starve settlements.
-  RATE_LIMIT_TREASURY_SUBMIT_MAX: rateLimitMax(30),
-  RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS: rateLimitWindow(),
-
-  // Anchor: initiation fans out to the anchor's stellar.toml, SEP-10, and
-  // SEP-24 interactive endpoints, so it is the tightest budget in the API.
-  // Polling reads are cheaper but still upstream-amplifying.
-  RATE_LIMIT_ANCHOR_INIT_MAX: rateLimitMax(10),
-  RATE_LIMIT_ANCHOR_INIT_WINDOW_MS: rateLimitWindow(),
-  RATE_LIMIT_ANCHOR_POLL_MAX: rateLimitMax(60),
-  RATE_LIMIT_ANCHOR_POLL_WINDOW_MS: rateLimitWindow(),
-  // Abuse protection only — never a substitute for ANCHOR_WEBHOOK_SECRET.
-  RATE_LIMIT_ANCHOR_WEBHOOK_MAX: rateLimitMax(60),
-  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: rateLimitWindow(),
-
-  // Ordinary authenticated work that is still worth bounding.
-  RATE_LIMIT_GROUP: rateLimitMax(30),
-  RATE_LIMIT_HISTORY: rateLimitMax(60),
-
+  RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().max(100000).default(100),
+  RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().max(100000).default(50),
+  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_CREATE_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  SEP24_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_GROUP: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_HISTORY: z.coerce.number().int().positive().max(100000).default(30),
+  // trusted proxies: only trust X-Forwarded-For if the direct peer is in this
+  // comma-separated list; otherwise Fastify falls back to req.ip = socket remote.
+  TRUSTED_PROXY_IPS: z.string().default(""),
+  // Anchor circuit breaker: open after this many consecutive failures.
+  ANCHOR_CIRCUIT_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(5),
+  // Anchor circuit breaker cooldown before transitioning to half-open (ms).
+  ANCHOR_CIRCUIT_COOLDOWN_MS: z.coerce.number().int().positive().default(30000),
   AUTH_BODY_LIMIT_BYTES: z.coerce
     .number()
     .int()
@@ -105,9 +89,49 @@ const schema = z.object({
     .positive()
     .max(50 * 1024 * 1024)
     .default(5 * 1024 * 1024),
-});
+}).refine(
+  (data) => {
+    // Validate that HORIZON_URL matches the network
+    const isTestnet = data.STELLAR_NETWORK === "testnet";
+    const horizonUrl = data.HORIZON_URL.toLowerCase();
+    
+    if (isTestnet && !horizonUrl.includes("testnet")) {
+      return false;
+    }
+    if (!isTestnet && horizonUrl.includes("testnet")) {
+      return false;
+    }
+    return true;
+  },
+  {
+    message: "HORIZON_URL must match STELLAR_NETWORK (testnet URLs for testnet, public URLs for public)",
+    path: ["HORIZON_URL"],
+  }
+);
 
-const parsed = schema.parse(process.env);
+function safeErrorMessage(error: unknown): string {
+  if (error instanceof z.ZodError) {
+    const issues = error.issues.map((issue) => {
+      const path = issue.path.length > 0 ? issue.path.join(".") : "configuration";
+      return `${path}: ${issue.message}`;
+    });
+    return issues.join("; ");
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+let parsed: z.infer<typeof schema>;
+try {
+  parsed = schema.parse(process.env);
+} catch (error) {
+  const message = safeErrorMessage(error);
+  console.error(`\n❌ Configuration validation failed:\n  ${message}\n`);
+  console.error("Please check your environment variables and try again.\n");
+  process.exit(1);
+}
 
 function hostOf(url: string): string {
   try {
@@ -119,13 +143,27 @@ function hostOf(url: string): string {
 
 const apiHost = hostOf(parsed.API_PUBLIC_URL);
 
+export function validateAssetConfig() {
+  if (
+    !parsed.STABLE_ASSET_ISSUER ||
+    parsed.STABLE_ASSET_ISSUER === "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+  ) {
+    throw new Error(
+      "STABLE_ASSET_ISSUER is not configured. Set it in the environment to a real issuer public key."
+    );
+  }
+}
+
+const networkPassphrase =
+  parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET;
+
 export const config = {
   ...parsed,
+  API_URL: parsed.API_PUBLIC_URL,
   SEP10_HOME_DOMAIN: parsed.SEP10_HOME_DOMAIN ?? apiHost,
   WEB_AUTH_DOMAIN: parsed.WEB_AUTH_DOMAIN ?? apiHost,
   isTest: process.env.NODE_ENV === "test" || process.env.VITEST === "true",
-  networkPassphrase:
-    parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET,
+  networkPassphrase,
   jwtExpiresIn: "12h" as const,
 };
 

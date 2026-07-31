@@ -1,14 +1,17 @@
 import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
+import rateLimitPlugin from "./plugins/rate-limit";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
-import { config } from "./config";
+import { config, validateAssetConfig } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import loggingPlugin from "./plugins/logging";
+import openAPIPlugin from "./plugins/openapi";
+import { validateAssetConfig } from "./services/assets";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
@@ -45,8 +48,6 @@ function globalRateLimitKey(request: FastifyRequest): string {
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
-  validateAssetConfig();
-
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
     // values are validated by genReqId before becoming request.id.
@@ -154,37 +155,17 @@ export async function buildApp(): Promise<FastifyInstance> {
   // (skipOnError), so a database hiccup degrades to "unlimited" rather than
   // blocking all traffic. The default "memory" store is per-process and
   // needs no failure handling of its own.
-  //
-  // Rate limiting is skipped entirely under NODE_ENV=test/VITEST so route
-  // tests never depend on a shared counter or on wall-clock windows; the
-  // policies themselves are covered by tests/rate-limit-*.test.ts.
-  if (!config.isTest) {
-    const useDatabaseStore = config.RATE_LIMIT_STORE === "database";
-    const globalPolicy = rateLimitPolicies().global;
-    await app.register(rateLimit, {
-      max: globalPolicy.max,
-      timeWindow: globalPolicy.timeWindow,
-      keyGenerator: globalRateLimitKey,
-      ...(useDatabaseStore
-        ? { store: PrismaRateLimitStore as never, skipOnError: true }
-        : {}),
-      addHeaders: {
-        "x-ratelimit-limit": true,
-        "x-ratelimit-remaining": true,
-        "x-ratelimit-reset": true,
-        "retry-after": true,
-      },
-      // 429s use the same envelope as every other API error, and never say
-      // anything about the caller's identity or whether an account exists.
-      errorResponseBuilder: (request, context) => ({
-        error: "RATE_LIMITED",
-        message: "Too many requests. Please retry later.",
-        statusCode: 429,
-        details: { retryAfterSeconds: Math.ceil(Number(context.ttl ?? 0) / 1000) },
-        requestId: getCorrelationId(request.id),
-      }),
-    });
-  }
+  await app.register(rateLimit, {
+    max: 100,
+    timeWindow: config.RATE_LIMIT_WINDOW_MS,
+    keyGenerator: securityKey,
+    addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
+    errorResponseBuilder: (request) => ({
+      code: "RATE_LIMITED",
+      message: "Too many requests. Please retry later.",
+      requestId: request.id,
+    }),
+  });
   await app.register(multipart, {
     limits: {
       fileSize: config.MULTIPART_FILE_SIZE_BYTES,
@@ -215,7 +196,30 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   app.addHook("onRoute", (routeOptions) => {
     const url = routeOptions.url;
-    const options = routeOptions as typeof routeOptions & { bodyLimit?: number };
+    let max: number | undefined;
+    let bodyLimit: number | undefined;
+
+    if (url === "/auth/challenge" || url === "/auth/verify") {
+      max = config.RATE_LIMIT_AUTH_CHALLENGE_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/expenses/:id/settle" ||
+      url === "/groups/:id/settlements" ||
+      url === "/settlements/:id/confirm"
+    ) {
+      max = config.RATE_LIMIT_SETTLEMENT_CREATE_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/anchors/deposit" ||
+      url === "/anchors/withdraw" ||
+      url === "/anchors/sessions/:id/complete" ||
+      url === "/uploads/receipt"
+    ) {
+      max = config.SEP24_RATE_LIMIT_MAX;
+      bodyLimit = url === "/uploads/receipt"
+        ? config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024
+        : config.AUTH_BODY_LIMIT_BYTES;
+    }
 
     if (url === "/uploads/receipt") {
       options.bodyLimit = config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024;
@@ -229,17 +233,19 @@ export async function buildApp(): Promise<FastifyInstance> {
     prefix: "/uploads/",
     decorateReply: false,
   });
+
+  await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {
     const correlationId = getCorrelationId(req.id);
     reply.header("x-request-id", correlationId);
     reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
-      error: "NOT_FOUND",
+      code: "NOT_FOUND",
       message: "Route not found",
-      statusCode: 404,
       requestId: correlationId,
     });
   });
@@ -250,18 +256,15 @@ export async function buildApp(): Promise<FastifyInstance> {
     time: new Date().toISOString(),
   }));
 
-  // Liveness: process is up. Deliberately touches no dependency so a database
-  // or Horizon outage never causes an orchestrator to restart healthy pods.
-  app.get("/health/live", async () => ({
+  app.get("/healthz", async () => ({
     status: "ok",
-    timestamp: new Date().toISOString(),
   }));
 
-  // Readiness: dependencies are usable. Results are cached briefly inside
-  // src/services/health.ts so probes cannot amplify into upstream load.
-  app.get("/health/ready", async (_req, reply) => {
+  const { getReadiness } = await import("./services/health.js");
+  app.get("/readyz", async (request, reply) => {
     const readiness = await getReadiness();
-    return reply.code(readiness.status === "ok" ? 200 : 503).send(readiness);
+    const statusCode = readiness.status === "ok" ? 200 : 503;
+    return reply.code(statusCode).send(readiness);
   });
 
   await app.register(authRoutes);
@@ -273,6 +276,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
+  await app.register(userGroupsRoutes);
 
   return app;
 }

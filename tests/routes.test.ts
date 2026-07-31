@@ -125,8 +125,7 @@ describe("auth routes", () => {
     });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("INVALID_ACCOUNT");
-    expect(body.statusCode).toBe(400);
+    expect(body.code).toBe("INVALID_ACCOUNT");
     expect(body.requestId).toBeTruthy();
   });
 
@@ -155,8 +154,7 @@ describe("auth routes", () => {
     const res = await app.inject({ method: "GET", url: "/me" });
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.error).toBe("UNAUTHORIZED");
-    expect(body.statusCode).toBe(401);
+    expect(body.code).toBe("UNAUTHORIZED");
     expect(body.requestId).toBeTruthy();
   });
 
@@ -210,8 +208,7 @@ describe("group routes", () => {
     });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("VALIDATION_ERROR");
-    expect(body.statusCode).toBe(400);
+    expect(body.code).toBe("VALIDATION_ERROR");
     expect(body.requestId).toBeTruthy();
     expect(Array.isArray(body.details)).toBe(true);
   });
@@ -226,8 +223,7 @@ describe("group routes", () => {
     });
     expect(res.statusCode).toBe(403);
     const body = res.json();
-    expect(body.error).toBe("FORBIDDEN");
-    expect(body.statusCode).toBe(403);
+    expect(body.code).toBe("FORBIDDEN");
     expect(body.requestId).toBeTruthy();
   });
 
@@ -325,7 +321,7 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(403);
-      expect(res.json().error).toBe("FORBIDDEN");
+      expect(res.json().code).toBe("FORBIDDEN");
     });
 
     it("returns 400 for an invalid public key", async () => {
@@ -369,7 +365,7 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(409);
-      expect(res.json().error).toBe("ALREADY_MEMBER");
+      expect(res.json().code).toBe("ALREADY_MEMBER");
     });
 
     it("returns 409 when a pending invitation already exists", async () => {
@@ -393,7 +389,7 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(409);
-      expect(res.json().error).toBe("INVITATION_PENDING");
+      expect(res.json().code).toBe("INVITATION_PENDING");
     });
   });
 });

@@ -47,6 +47,7 @@ model Group {
   treasuryTxs TreasuryTransaction[]
   invites     Invite[]
   invitations Invitation[]
+  auditLogs   AuditLog[]
 
   @@index([createdByUserId])
   @@map("groups")
@@ -108,24 +109,26 @@ model ExpenseShare {
 }
 
 model Settlement {
-  id             String   @id @default(cuid())
-  shortCode      String   @unique @map("short_code")
-  groupId        String   @map("group_id")
-  fromUserId     String   @map("from_user_id")
-  toUserId       String   @map("to_user_id")
-  amount         Decimal  @db.Decimal(20, 7)
-  assetCode      String   @map("asset_code")
-  assetIssuer    String?  @map("asset_issuer")
-  stellarTxHash  String?  @map("stellar_tx_hash")
-  transactionXdr String?  @map("transaction_xdr")
-  status         String   @default("pending")
-  retryCount     Int      @default(0) @map("retry_count")
-  failureReason  String?  @map("failure_reason")
+  id             String    @id @default(cuid())
+  shortCode      String    @unique @map("short_code")
+  groupId        String    @map("group_id")
+  fromUserId     String    @map("from_user_id")
+  toUserId       String    @map("to_user_id")
+  amount         Decimal   @db.Decimal(20, 7)
+  assetCode      String    @map("asset_code")
+  assetIssuer    String?   @map("asset_issuer")
+  stellarTxHash  String?   @map("stellar_tx_hash")
+  transactionXdr String?   @map("transaction_xdr")
+  status         String    @default("pending")
+  retryCount     Int       @default(0) @map("retry_count")
+  failureReason  String?   @map("failure_reason")
+  submittedAt    DateTime? @map("submitted_at")
+  confirmedAt    DateTime? @map("confirmed_at")
   memo           String?
-  expenseId      String?  @map("expense_id")
-  expenseShareId String?  @map("expense_share_id")
-  createdAt      DateTime @default(now()) @map("created_at")
-  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
+  expenseId      String?   @map("expense_id")
+  expenseShareId String?   @map("expense_share_id")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at")
 
   group        Group         @relation(fields: [groupId], references: [id], onDelete: Cascade)
   from         User          @relation("SettlementFrom", fields: [fromUserId], references: [id])
@@ -136,6 +139,7 @@ model Settlement {
   @@index([fromUserId])
   @@index([toUserId])
   @@index([status])
+  @@index([status, updatedAt]) // For worker reconciliation queries
   @@map("settlements")
 }
 
@@ -152,6 +156,9 @@ model TreasuryTransaction {
   stellarTxHash String?  @map("stellar_tx_hash")
   status        String   @default("pending")
   memo          String?
+  // Server-controlled signing deadline for the unsigned XDR — same contract as
+  // Settlement.expiresAt. See src/lib/time-bounds.ts.
+  expiresAt     DateTime? @map("expires_at")
   createdAt     DateTime @default(now()) @map("created_at")
 
   group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
@@ -159,6 +166,7 @@ model TreasuryTransaction {
 
   @@index([groupId])
   @@index([status])
+  @@index([expiresAt])
   @@map("treasury_transactions")
 }
 
@@ -207,6 +215,10 @@ model AnchorSession {
   failureReason         String?  @map("failure_reason")
   retryCount            Int      @default(0) @map("retry_count")
   lastPolledAt          DateTime? @map("last_polled_at")
+  claimedAt             DateTime? @map("claimed_at")
+  claimedBy             String?  @map("claimed_by")
+  leaseExpiresAt        DateTime?  @map("lease_expires_at")
+  nextAttemptAt         DateTime?  @map("next_attempt_at")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
 
@@ -215,6 +227,8 @@ model AnchorSession {
   @@index([userId])
   @@index([externalTransactionId])
   @@index([status])
+  @@index([anchorToken, externalTransactionId]) // For worker polling queries
+  @@index([status, lastPolledAt]) // For worker polling with time-based filtering
   @@map("anchor_sessions")
 }
 
@@ -241,15 +255,33 @@ model AuditLog {
   id         String   @id @default(cuid())
   userId     String?  @map("user_id")
   action     String
-  entityType String   @map("entity_type")
-  entityId   String   @map("entity_id")
+  groupId    String?  @map("group_id")
+  details    Json?
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id")
   metadata   Json?
   createdAt  DateTime @default(now()) @map("created_at")
 
-  user User? @relation(fields: [userId], references: [id])
+  user  User?  @relation(fields: [userId], references: [id])
+  group Group? @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
   @@index([userId])
+  @@index([groupId])
   @@map("audit_logs")
+}
+
+model StatusHistory {
+  id              String   @id @default(cuid())
+  entityType      String   @map("entity_type") // "settlement" or "anchor_session"
+  entityId        String   @map("entity_id")
+  status          String
+  reason          String?  // Safe, displayable reason for the status change
+  source          String?  // Source of the status change (e.g., "worker", "api", "anchor")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([entityType, entityId, createdAt])
+  @@map("status_history")
 }
 
 // Backing store for the optional database-backed rate limiter (see

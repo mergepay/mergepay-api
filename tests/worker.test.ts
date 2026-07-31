@@ -465,4 +465,86 @@ describe("processSubmittedSettlements", () => {
       })
     );
   });
+
+  it("treats a lost-response submission as confirmed if Horizon shows it already succeeded, without resubmitting", async () => {
+    const settlement = {
+      id: "settle_5",
+      shortCode: "AMBIG1",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "5.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-5",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
+    // The submission call itself fails (e.g. our client timed out waiting on Horizon)...
+    h.submitPayment.mockRejectedValue(new Error("timeout"));
+    // ...but the transaction the client actually signed was applied anyway.
+    h.hashOf.mockReturnValue("already_applied_hash");
+    h.getTransaction.mockResolvedValue({ successful: true });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(1); // never resubmitted
+    expect(h.getTransaction).toHaveBeenCalledWith("already_applied_hash");
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_5" },
+        data: expect.objectContaining({
+          status: "confirmed",
+          stellarTxHash: "already_applied_hash",
+        }),
+      })
+    );
+  });
+
+  it("retries normally when Horizon has no record of the transaction yet", async () => {
+    const settlement = {
+      id: "settle_6",
+      shortCode: "AMBIG2",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "5.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-6",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
+    h.hashOf.mockReturnValue("not_yet_applied_hash");
+    h.getTransaction.mockResolvedValue(null); // not visible on Horizon at all
+    h.submitPayment
+      .mockRejectedValueOnce(new Error("timeout"))
+      .mockResolvedValueOnce("hash_retry_ok");
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(2); // retried, not treated as ambiguous-success
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_6" },
+        data: expect.objectContaining({ status: "confirmed", stellarTxHash: "hash_retry_ok" }),
+      })
+    );
+  });
 });

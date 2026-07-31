@@ -82,11 +82,15 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const { id: expenseId } = idParamSchema.parse(req.params);
     const body = z
       .object({
-        assetCode: z.string().optional(),
+        assetCode: z.string().min(1).max(12).optional(),
         assetIssuer: z.string().nullable().optional(),
         // A client may ask for a *shorter* signing window than the default; the
         // schema bounds the request and the server clock decides the deadline.
         validitySeconds: intentValiditySchema.optional(),
+      })
+      .superRefine((val, ctx) => {
+        // assetCode omitted means "use the expense's own asset" — already validated at creation.
+        if (val.assetCode !== undefined) refineStellarAsset(ctx, val.assetCode, val.assetIssuer);
       })
       .parse(req.body ?? {});
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -187,11 +191,12 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const body = z
       .object({
         toUserId: z.string(),
-        amount: z.string().min(1),
-        assetCode: z.string().min(1),
+        amount: stellarAmountSchema,
+        assetCode: z.string().min(1).max(12),
         assetIssuer: z.string().nullable().optional(),
         validitySeconds: intentValiditySchema.optional(),
       })
+      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
@@ -617,6 +622,60 @@ async function buildSettlementXdr(params: {
     // intent it was issued for.
     validitySeconds: params.validitySeconds,
   });
+}
+
+/**
+ * Runs `run()` guarded by the request's `Idempotency-Key` header, if present.
+ * The key is claimed (a durable row, unique-constraint-serialized against
+ * concurrent callers) before `run()` executes, so two racing requests with
+ * the same key can never both create a settlement or submit a payment.
+ * Without a header, this is a no-op passthrough — idempotency stays opt-in.
+ */
+async function withIdempotency<T>(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  scope: string,
+  userId: string,
+  body: unknown,
+  run: () => Promise<T>
+) {
+  const idempotencyKey = (req.headers["idempotency-key"] as string | undefined) ?? null;
+  if (!idempotencyKey) return run();
+
+  const requestHash = hashIdempotentRequest({ userId, scope, body });
+  const outcome = await claimIdempotencyKey({ key: idempotencyKey, userId, requestHash });
+
+  if (outcome.kind === "replay") {
+    return reply.code(outcome.statusCode).send(outcome.body);
+  }
+  if (outcome.kind === "in_progress") {
+    return reply.code(409).send({
+      error: "idempotency_in_progress",
+      message: "A request with this idempotency key is already being processed",
+      statusCode: 409,
+      requestId: req.id as string,
+    });
+  }
+  if (outcome.kind === "conflict") {
+    return reply.code(409).send({
+      error: "idempotency_conflict",
+      message: "Idempotency key was already used with a different user or request body",
+      statusCode: 409,
+      requestId: req.id as string,
+    });
+  }
+
+  try {
+    const result = await run();
+    await completeIdempotencyKey(idempotencyKey, 200, result);
+    return result;
+  } catch (err) {
+    // Nothing durable happened under this key yet (see call sites — the
+    // side-effecting mutation always follows any side-effect-free I/O in
+    // `run()`), so it's safe to free the key for an unambiguous retry.
+    await failIdempotencyKey(idempotencyKey);
+    throw err;
+  }
 }
 
 function serializeUserSafe(u: any) {

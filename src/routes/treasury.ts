@@ -1,6 +1,5 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
@@ -34,10 +33,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/enable", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
     const body = z
       .object({
-        publicKey: z.string(),
+        publicKey: stellarPublicKeySchema,
         requiredSigners: z.number().int().min(1).max(20).optional(),
       })
       .parse(req.body);
@@ -56,19 +54,25 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       }
     }
 
-    const group = await prisma.group.update({
-      where: { id },
-      data: {
-        treasuryEnabled: true,
-        treasuryAccountPublicKey: body.publicKey,
-        treasuryRequiredSigners: body.requiredSigners ?? 1,
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: "treasury.enable",
-      entityType: "group",
-      entityId: id,
+    // The admin check and the update happen in one transaction so a
+    // concurrent demotion/removal of `auth.id` can't bypass authorization.
+    const group = await prisma.$transaction(async (tx) => {
+      await requireAdmin(id, auth.id, tx);
+      const updated = await tx.group.update({
+        where: { id },
+        data: {
+          treasuryEnabled: true,
+          treasuryAccountPublicKey: body.publicKey,
+          treasuryRequiredSigners: body.requiredSigners ?? 1,
+        },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "treasury.enable",
+        entityType: "group",
+        entityId: id,
+      });
+      return updated;
     });
     return { group: serializeGroup(group) };
   });
@@ -153,16 +157,16 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/deposit", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const body = z
       .object({
-        amount: z.string().min(1),
-        assetCode: z.string().min(1),
+        amount: stellarAmountSchema,
+        assetCode: z.string().min(1).max(12),
         assetIssuer: z.string().nullable().optional(),
         // A client may ask for a shorter signing window; the server clock still
         // decides the deadline.
         validitySeconds: intentValiditySchema.optional(),
       })
+      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
@@ -225,30 +229,27 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/withdraw", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
     const body = z
       .object({
-        amount: z.string().min(1),
-        assetCode: z.string().min(1),
+        amount: stellarAmountSchema,
+        assetCode: z.string().min(1).max(12),
         assetIssuer: z.string().nullable().optional(),
         destination: z.string(),
         validitySeconds: intentValiditySchema.optional(),
       })
+      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
     validateAmount(body.amount);
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
-    if (!StrKey.isValidEd25519PublicKey(body.destination)) {
-      throw Errors.badRequest("invalid_destination", "Invalid destination public key");
-    }
-
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
+    const amount = normalizeAmount(body.amount);
     const requiresMulti = (group.treasuryRequiredSigners ?? 1) > 1;
     const treasuryKey = group.treasuryAccountPublicKey!;
 
@@ -355,10 +356,23 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         expiresAt: ttx.expiresAt,
         resource: "treasury transaction",
       });
-    } catch (e) {
-      await prisma.treasuryTransaction.update({
-        where: { id },
-        data: { status: "failed" },
+    } catch (e: any) {
+      await prisma.$transaction(async (tx) => {
+        await tx.treasuryTransaction.update({
+          where: { id },
+          data: { status: "failed" },
+        });
+        await audit(
+          {
+            actor: { type: "user", userId: auth.id },
+            action: AuditAction.TreasuryConfirmFailed,
+            entityType: "treasury_transaction",
+            entityId: id,
+            outcome: "failure",
+            metadata: { direction: ttx.direction, reason: e?.message ?? String(e) },
+          },
+          tx
+        );
       });
       if (e instanceof AppError) throw e;
       throw Errors.upstream("Transaction submission failed");

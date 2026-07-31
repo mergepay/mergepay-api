@@ -5,9 +5,9 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
-import { isPositive } from "../services/money";
+import { normalizeAmount } from "../services/money";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
 import {
@@ -28,18 +28,20 @@ const shareInput = z.object({
   percent: z.number().optional(),
 });
 
-const createExpenseSchema = z.object({
-  title: z.string().min(1).max(80),
-  description: z.string().max(500).optional(),
-  amount: z.string().min(1),
-  assetCode: z.string().min(1).max(12),
-  assetIssuer: z.string().nullable().optional(),
-  splitType: z.enum(["equal", "custom", "percentage"]),
-  shares: z.array(shareInput).min(1),
-  payerUserId: z.string().optional(),
-  memo: z.string().max(24).optional(),
-  receiptUrl: z.string().nullable().optional(),
-});
+const createExpenseSchema = z
+  .object({
+    title: z.string().min(1).max(80),
+    description: z.string().max(500).optional(),
+    amount: stellarAmountSchema,
+    assetCode: z.string().min(1).max(12),
+    assetIssuer: z.string().nullable().optional(),
+    splitType: z.enum(["equal", "custom", "percentage"]),
+    shares: z.array(shareInput).min(1),
+    payerUserId: z.string().optional(),
+    memo: z.string().max(24).optional(),
+    receiptUrl: z.string().nullable().optional(),
+  })
+  .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer));
 
 const expenseInclude = {
   payer: true,
@@ -61,30 +63,9 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const payerUserId = body.payerUserId ?? auth.id;
 
-    // All participants (and payer) must be members of the group.
-    const memberIds = new Set(
-      (
-        await prisma.groupMember.findMany({
-          where: { groupId },
-          select: { userId: true },
-        })
-      ).map((m) => m.userId)
-    );
-    if (!memberIds.has(payerUserId)) {
-      throw Errors.badRequest("invalid_payer", "Payer must be a group member");
-    }
-    for (const s of body.shares) {
-      if (!memberIds.has(s.userId)) {
-        throw Errors.badRequest(
-          "invalid_participant",
-          "All participants must be group members"
-        );
-      }
-    }
-
     let computed;
     try {
-      computed = computeShares(body.amount, body.splitType as SplitType, body.shares);
+      computed = computeShares(amount, body.splitType as SplitType, body.shares);
     } catch (e: any) {
       throw Errors.badRequest("invalid_split", e?.message ?? "Invalid split");
     }
@@ -177,22 +158,27 @@ export default async function expenseRoutes(app: FastifyInstance) {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = updateExpenseSchema.parse(req.body);
 
-    const expense = await prisma.expense.findUnique({ where: { id } });
-    if (!expense) throw Errors.notFound("Expense not found");
-    const ctx = await requireMembership(expense.groupId, auth.id);
-    if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
-      throw Errors.forbidden("Only the payer or an admin can edit this expense");
-    }
+    // The membership/role check and the update run in one transaction: a
+    // concurrent removal or demotion of `auth.id` between the check and the
+    // write cannot slip an unauthorized edit through.
+    const updated = await prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.findUnique({ where: { id } });
+      if (!expense) throw Errors.notFound("Expense not found");
+      const ctx = await requireMembership(expense.groupId, auth.id, tx);
+      if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
+        throw Errors.forbidden("Only the payer or an admin can edit this expense");
+      }
 
-    const updated = await prisma.expense.update({
-      where: { id },
-      data: {
-        ...(body.title !== undefined && { title: body.title }),
-        ...(body.description !== undefined && { description: body.description }),
-        ...(body.memo !== undefined && { memo: body.memo }),
-        ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
-      },
-      include: expenseInclude,
+      return tx.expense.update({
+        where: { id },
+        data: {
+          ...(body.title !== undefined && { title: body.title }),
+          ...(body.description !== undefined && { description: body.description }),
+          ...(body.memo !== undefined && { memo: body.memo }),
+          ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
+        },
+        include: expenseInclude,
+      });
     });
     await auditLog.log("EXPENSE_UPDATED", auth.id, expense.groupId, { expenseId: id });
     return { expense: serializeExpense(updated) };
@@ -203,24 +189,27 @@ export default async function expenseRoutes(app: FastifyInstance) {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
 
-    const expense = await prisma.expense.findUnique({
-      where: { id },
-      include: { shares: true },
-    });
-    if (!expense) throw Errors.notFound("Expense not found");
-    const ctx = await requireMembership(expense.groupId, auth.id);
-    if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
-      throw Errors.forbidden("Only the payer or an admin can delete this expense");
-    }
-    const hasSettled = expense.shares.some(
-      (s) => s.status === "settled" && s.userId !== expense.payerUserId
-    );
-    if (hasSettled) {
-      throw Errors.conflict(
-        "expense_settled",
-        "Cannot delete an expense that already has settled shares"
+    // Same atomicity concern as the update route above: check and delete
+    // happen in one transaction.
+    await prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.findUnique({
+        where: { id },
+        include: { shares: true },
+      });
+      if (!expense) throw Errors.notFound("Expense not found");
+      const ctx = await requireMembership(expense.groupId, auth.id, tx);
+      if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
+        throw Errors.forbidden("Only the payer or an admin can delete this expense");
+      }
+      const hasSettled = expense.shares.some(
+        (s) => s.status === "settled" && s.userId !== expense.payerUserId
       );
-    }
+      if (hasSettled) {
+        throw Errors.conflict(
+          "expense_settled",
+          "Cannot delete an expense that already has settled shares"
+        );
+      }
 
     await prisma.$transaction(async (tx) => {
       await tx.expense.delete({ where: { id } });

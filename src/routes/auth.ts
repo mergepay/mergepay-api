@@ -55,7 +55,7 @@ export default async function authRoutes(app: FastifyInstance) {
 
       const token = signToken({ id: user.id, stellarPublicKey: publicKey });
       await audit({
-        userId: user.id,
+        actor: { type: "user", userId: user.id },
         action: "auth.verify",
         entityType: "user",
         entityId: user.id,

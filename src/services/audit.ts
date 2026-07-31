@@ -6,6 +6,8 @@ export interface AuditParams {
   action: string;
   entityType: string;
   entityId: string;
+  outcome?: AuditOutcome;
+  /** Safe, structured detail only — never private keys, bearer tokens, or signed XDRs. */
   metadata?: Record<string, unknown>;
 }
 
@@ -25,7 +27,7 @@ export async function audit(params: AuditParams): Promise<void> {
   try {
     await prisma.auditLog.create({ data: auditData(params) });
   } catch {
-    // swallow — auditing must not break the operation
+    // swallow — auditing outside a caller-managed transaction must not break the operation
   }
 }
 

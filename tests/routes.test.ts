@@ -275,7 +275,9 @@ describe("group routes", () => {
   });
 
   describe("POST /groups/:id/invite (direct invitation by public key)", () => {
-    const validPubKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    // A checksum-valid key is required now that the route validates with
+    // StrKey (not just a regex) — Keypair.random() guarantees that.
+    const validPubKey = Keypair.random().publicKey();
 
     it("returns 201 and creates an invitation", async () => {
       const user = fakeUser();

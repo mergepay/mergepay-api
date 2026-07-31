@@ -93,20 +93,27 @@ export default async function anchorRoutes(app: FastifyInstance) {
       auth.stellarPublicKey
     );
 
-    const session = await prisma.anchorSession.create({
-      data: {
-        userId: auth.id,
-        anchorName: body.anchorName ?? config.ANCHOR_NAME,
-        kind,
-        assetCode: body.assetCode,
-        status: "incomplete",
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: `anchor.${kind}.start`,
-      entityType: "anchor_session",
-      entityId: session.id,
+    const session = await prisma.$transaction(async (tx) => {
+      const created = await tx.anchorSession.create({
+        data: {
+          userId: auth.id,
+          anchorName: body.anchorName ?? config.ANCHOR_NAME,
+          kind,
+          assetCode: body.assetCode,
+          status: "incomplete",
+        },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.AnchorSessionStart,
+          entityType: "anchor_session",
+          entityId: created.id,
+          metadata: { kind, assetCode: body.assetCode },
+        },
+        tx
+      );
+      return created;
     });
 
     return {

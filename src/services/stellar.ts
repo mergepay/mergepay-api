@@ -207,7 +207,98 @@ export const stellar = {
       throw e;
     }
   },
+
+  /**
+   * Compute the hash a signed XDR will submit under, without submitting it.
+   * Used to check Horizon for an already-applied transaction when a prior
+   * submission attempt's response was lost (network timeout, worker crash)
+   * — the hash is deterministic from the envelope, so it's known before we
+   * ever call Horizon again.
+   */
+  hashOf(signedXdr: string): string {
+    return new Transaction(signedXdr, config.networkPassphrase).hash().toString("hex");
+  },
 };
+
+/**
+ * Parse, authenticate, and intent-check a signed payment XDR before it's
+ * ever handed to Horizon. This is the single choke point every settlement
+ * and treasury confirmation submission goes through:
+ *
+ *  1. malformed XDRs fail to parse and are rejected outright
+ *  2. expired time bounds are rejected without a network round-trip
+ *  3. the transaction must carry a signature that verifies against its own
+ *     source account for *our* configured network passphrase — this is what
+ *     catches unsigned transactions and transactions signed for the wrong
+ *     network (a signature made against a different passphrase produces a
+ *     different hash and will not verify here)
+ *  4. the transaction's source/destination/asset/amount/memo/operation shape
+ *     must match the server-issued payment intent (see validatePaymentTx)
+ *
+ * Never touches private key material — only verifies signatures already
+ * present on the envelope.
+ */
+export function verifySignedPaymentXdr(
+  signedXdr: string,
+  expected: {
+    sourcePublicKey: string;
+    destination: string;
+    asset: AssetSpec;
+    amount: string;
+    memoCode: string;
+  }
+): Transaction {
+  let tx: Transaction;
+  try {
+    tx = new Transaction(signedXdr, config.networkPassphrase);
+  } catch {
+    throw Errors.badRequest("xdr_malformed", "Signed transaction could not be parsed");
+  }
+
+  if (isExpiredTx(tx)) {
+    throw Errors.badRequest("xdr_expired", "Transaction time bounds have expired");
+  }
+
+  if (!hasValidSourceSignature(tx)) {
+    throw Errors.badRequest(
+      "xdr_unsigned",
+      "Transaction is not validly signed by its source account for the configured network"
+    );
+  }
+
+  validatePaymentTx(tx, expected);
+  return tx;
+}
+
+function isExpiredTx(tx: Transaction): boolean {
+  const maxTime = Number(tx.timeBounds?.maxTime ?? "0");
+  if (!maxTime) return false; // 0 = no upper bound
+  return Math.floor(Date.now() / 1000) > maxTime;
+}
+
+/**
+ * True only if at least one signature on the envelope verifies against the
+ * transaction's own source account, hashed with our configured network
+ * passphrase. An empty signature list (unsigned) or a signature produced
+ * against a different network passphrase both fail this check.
+ */
+function hasValidSourceSignature(tx: Transaction): boolean {
+  if (!tx.signatures || tx.signatures.length === 0) return false;
+  let sourceKeypair: Keypair;
+  try {
+    sourceKeypair = Keypair.fromPublicKey(tx.source);
+  } catch {
+    return false;
+  }
+  const hash = tx.hash();
+  return tx.signatures.some((sig) => {
+    try {
+      return sourceKeypair.verify(hash, sig.signature());
+    } catch {
+      return false;
+    }
+  });
+}
 
 /**
  * Strict validation that a transaction is exactly the payment we authorized.

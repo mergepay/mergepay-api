@@ -19,6 +19,8 @@ import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
+import { memoText } from "../services/stellar";
+import { paginationQuerySchema } from "../services/pagination";
 import { validateAsset, validateAmount } from "../services/assets";
 import { memoText, validateSignedXdr } from "../services/stellar";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
@@ -450,19 +452,19 @@ export default async function settlementRoutes(app: FastifyInstance) {
     ]);
 
     const entries = [
-      ...expenses.map((e) => ({
+      ...expenses.slice(0, query.limit).map((e) => ({
         type: "expense" as const,
         createdAt: e.createdAt,
         id: e.id,
         expense: serializeExpense(e),
       })),
-      ...settlements.map((s) => ({
+      ...settlements.slice(0, query.limit).map((s) => ({
         type: "settlement" as const,
         createdAt: s.createdAt,
         id: s.id,
         settlement: serializeSettlement(s),
       })),
-      ...treasuryTxs.map((t) => ({
+      ...treasuryTxs.slice(0, query.limit).map((t) => ({
         type: "treasury" as const,
         createdAt: t.createdAt,
         id: t.id,

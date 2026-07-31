@@ -9,6 +9,8 @@ import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import loggingPlugin from "./plugins/logging";
+import openAPIPlugin from "./plugins/openapi";
 import { validateAssetConfig } from "./services/assets";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
@@ -210,8 +212,11 @@ export async function buildApp(): Promise<FastifyInstance> {
     prefix: "/uploads/",
     decorateReply: false,
   });
+
+  await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {
     const correlationId = getCorrelationId(req.id);
@@ -250,6 +255,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
+  await app.register(userGroupsRoutes);
 
   return app;
 }

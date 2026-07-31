@@ -47,6 +47,7 @@ model Group {
   treasuryTxs TreasuryTransaction[]
   invites     Invite[]
   invitations Invitation[]
+  auditLogs   AuditLog[]
 
   @@index([createdByUserId])
   @@map("groups")
@@ -250,14 +251,18 @@ model AuditLog {
   id         String   @id @default(cuid())
   userId     String?  @map("user_id")
   action     String
-  entityType String   @map("entity_type")
-  entityId   String   @map("entity_id")
+  groupId    String?  @map("group_id")
+  details    Json?
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id")
   metadata   Json?
   createdAt  DateTime @default(now()) @map("created_at")
 
-  user User? @relation(fields: [userId], references: [id])
+  user  User?  @relation(fields: [userId], references: [id])
+  group Group? @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
   @@index([userId])
+  @@index([groupId])
   @@map("audit_logs")
 }
 

@@ -117,6 +117,11 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
       return created;
     });
+    await auditLog.log("EXPENSE_CREATED", auth.id, groupId, {
+      expenseId: expense.id,
+      amount: body.amount,
+      title: body.title,
+    });
 
     return { expense: serializeExpense(expense) };
   });
@@ -205,6 +210,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
       },
       include: expenseInclude,
     });
+    await auditLog.log("EXPENSE_UPDATED", auth.id, expense.groupId, { expenseId: id });
     return { expense: serializeExpense(updated) };
   });
 
@@ -243,6 +249,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
         },
       });
     });
+    await auditLog.log("EXPENSE_DELETED", auth.id, expense.groupId, { expenseId: id });
     return { ok: true };
   });
 }

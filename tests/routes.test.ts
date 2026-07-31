@@ -398,6 +398,61 @@ describe("group routes", () => {
       expect(res.statusCode).toBe(409);
       expect(res.json().code).toBe("INVITATION_PENDING");
     });
+
+    it("DELETE /groups/:id/members/:memberId removes member and creates audit log", async () => {
+      const admin = fakeUser({ id: "user_admin" });
+      const targetUser = fakeUser({ id: "user_target" });
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: admin.id,
+        role: "admin",
+      });
+      prisma.groupMember.findFirst.mockResolvedValueOnce({
+        id: "member_target",
+        groupId: "group_1",
+        userId: targetUser.id,
+        role: "member",
+      });
+      prisma.groupMember.delete.mockResolvedValueOnce({});
+      prisma.auditLog.create.mockResolvedValue({});
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/groups/group_1/members/user_target",
+        headers: authHeader(admin),
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().ok).toBe(true);
+      expect(prisma.groupMember.delete).toHaveBeenCalledWith({
+        where: { id: "member_target" },
+      });
+      expect(prisma.auditLog.create).toHaveBeenCalledWith({
+        data: {
+          action: "MEMBER_REMOVED",
+          userId: admin.id,
+          groupId: "group_1",
+          details: { memberId: "member_target", userId: targetUser.id },
+        },
+      });
+    });
+
+    it("DELETE /groups/:id/members/:memberId returns 403 for non-admin", async () => {
+      const nonAdmin = fakeUser({ id: "user_member" });
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: nonAdmin.id,
+        role: "member",
+      });
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/groups/group_1/members/user_target",
+        headers: authHeader(nonAdmin),
+      });
+
+      expect(res.statusCode).toBe(403);
+    });
   });
 });
 

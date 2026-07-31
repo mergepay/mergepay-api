@@ -6,12 +6,43 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
+import { applyAnchorSessionTransition } from "../services/anchor-status";
 import { audit } from "../services/audit";
+import { rateLimited } from "../lib/rate-limit";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
+import { validateAsset } from "../services/assets";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import { recordStatusTransition } from "../services/status-history";
 
 export default async function anchorRoutes(app: FastifyInstance) {
+  // Every anchor route that reaches an anchor gets an explicit budget so a
+  // client cannot amplify one Mergepay request into unbounded upstream ones.
+  //
+  //  - anchorInit  — deposit/withdraw start and interactive completion. Each
+  //    call fans out to stellar.toml + SEP-10 + SEP-24, so it is the tightest
+  //    policy in the API.
+  //  - anchorPoll  — status reads. Cheaper, but still upstream-amplifying (or,
+  //    for the DB-backed session list, the endpoint clients poll in a loop).
+  //
+  // Both are keyed by the authenticated user, so one caller can never exhaust
+  // another's budget. The webhook is keyed by IP because it is authenticated
+  // by shared secret rather than a session.
+  const initLimit = rateLimited("anchorInit");
+  const pollLimit = rateLimited("anchorPoll");
+
   // -- list anchors (public-ish, but behind auth for consistency) -------------
-  app.get("/anchors", { preHandler: [app.authenticate] }, async () => {
+  app.get(
+    "/anchors",
+    { preHandler: [app.authenticate], ...pollLimit },
+    async () => {
     try {
       const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
       return {
@@ -43,7 +74,8 @@ export default async function anchorRoutes(app: FastifyInstance) {
         ],
       };
     }
-  });
+  }
+  );
 
   // -- start deposit / withdraw -----------------------------------------------
   async function start(kind: "deposit" | "withdrawal", req: any) {
@@ -52,26 +84,36 @@ export default async function anchorRoutes(app: FastifyInstance) {
       .object({ assetCode: z.string().min(1), anchorName: z.string().optional() })
       .parse(req.body);
 
+    // Validate that the requested asset is supported.
+    validateAsset(body.assetCode);
+
     const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
     const challenge = await anchorService.getChallenge(
       t.webAuthEndpoint,
       auth.stellarPublicKey
     );
 
-    const session = await prisma.anchorSession.create({
-      data: {
-        userId: auth.id,
-        anchorName: body.anchorName ?? config.ANCHOR_NAME,
-        kind,
-        assetCode: body.assetCode,
-        status: "incomplete",
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: `anchor.${kind}.start`,
-      entityType: "anchor_session",
-      entityId: session.id,
+    const session = await prisma.$transaction(async (tx) => {
+      const created = await tx.anchorSession.create({
+        data: {
+          userId: auth.id,
+          anchorName: body.anchorName ?? config.ANCHOR_NAME,
+          kind,
+          assetCode: body.assetCode,
+          status: "incomplete",
+        },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.AnchorSessionStart,
+          entityType: "anchor_session",
+          entityId: created.id,
+          metadata: { kind, assetCode: body.assetCode },
+        },
+        tx
+      );
+      return created;
     });
 
     return {
@@ -80,23 +122,26 @@ export default async function anchorRoutes(app: FastifyInstance) {
     };
   }
 
-  app.post("/anchors/deposit", { preHandler: [app.authenticate] }, (req) =>
+  app.post("/anchors/deposit", { preHandler: [app.authenticate], ...initLimit }, (req) =>
     start("deposit", req)
   );
-  app.post("/anchors/withdraw", { preHandler: [app.authenticate] }, (req) =>
+  app.post("/anchors/withdraw", { preHandler: [app.authenticate], ...initLimit }, (req) =>
     start("withdrawal", req)
   );
 
   // -- complete (exchange signed challenge for interactive url) ---------------
   app.post(
     "/anchors/sessions/:id/complete",
-    { preHandler: [app.authenticate] },
+    { preHandler: [app.authenticate], ...initLimit },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string() }).parse(req.params);
       const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
 
-      const session = await prisma.anchorSession.findUnique({ where: { id } });
+      const session = await prisma.anchorSession.findUnique({ 
+        where: { id },
+        include: { statusHistory: true },
+      });
       if (!session || session.userId !== auth.id) {
         throw Errors.notFound("Anchor session not found");
       }
@@ -111,13 +156,17 @@ export default async function anchorRoutes(app: FastifyInstance) {
         account: auth.stellarPublicKey,
       });
 
-      const updated = await prisma.anchorSession.update({
-        where: { id },
-        data: {
+      // Never store the anchor JWT alongside the transition's audit
+      // metadata — only the status change and its source are recorded.
+      const { session: updated } = await applyAnchorSessionTransition({
+        sessionId: id,
+        nextStatus: "pending_user_transfer_start",
+        source: "user",
+        ownerUserId: auth.id,
+        extraData: {
           interactiveUrl: interactive.url,
           externalTransactionId: interactive.id,
           anchorToken: token,
-          status: "pending_user_transfer_start",
         },
       });
 
@@ -128,41 +177,113 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // -- sessions ---------------------------------------------------------------
   app.get("/anchors/sessions", { preHandler: [app.authenticate] }, async (req) => {
     const auth = requireUser(req);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
     const sessions = await prisma.anchorSession.findMany({
-      where: { userId: auth.id },
-      orderBy: { createdAt: "desc" },
+      where: {
+        userId: auth.id,
+        ...(decodedCursor && {
+          OR: [
+            { createdAt: { lt: decodedCursor.createdAt } },
+            {
+              createdAt: decodedCursor.createdAt,
+              id: { lt: decodedCursor.id },
+            },
+          ],
+        }),
+      },
+      include: { statusHistory: true },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
     });
-    return { sessions: sessions.map(serializeAnchorSession) };
+
+    const hasMore = sessions.length > limit;
+    const results = hasMore ? sessions.slice(0, limit) : sessions;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
+
+    return {
+      sessions: results.map(serializeAnchorSession),
+      meta: { nextCursor, hasMore },
+    };
   });
 
   // -- webhook (signed) -------------------------------------------------------
-  app.post("/anchors/webhook", async (req, reply) => {
-    const secret = (req.headers["x-anchor-signature"] ??
-      req.headers["x-webhook-secret"]) as string | undefined;
-    if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
-      return reply.code(200).send({ ok: true }); // don't reveal verification result
-    }
-    const body = z
-      .object({
-        transaction: z
-          .object({ id: z.string(), status: z.string() })
-          .optional(),
-        id: z.string().optional(),
-        status: z.string().optional(),
-      })
-      .passthrough()
-      .parse(req.body ?? {});
+  // Rate limiting here is abuse protection for an unauthenticated-until-
+  // checked endpoint; it never substitutes for the shared-secret check
+  // below, which remains the actual authentication/authorization gate.
+  app.post(
+    "/anchors/webhook",
+    {
+      config: {
+        rateLimit: {
+          max: config.SEP24_RATE_LIMIT_MAX,
+          timeWindow: config.RATE_LIMIT_WINDOW_MS,
+          keyGenerator: ipKey("anchor.webhook"),
+        },
+      },
+    },
+    async (req, reply) => {
+      const secret = (req.headers["x-anchor-signature"] ??
+        req.headers["x-webhook-secret"]) as string | undefined;
+      if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
+        return reply.code(200).send({ ok: true }); // don't reveal verification result
+      }
+      const body = z
+        .object({
+          transaction: z
+            .object({ id: z.string(), status: z.string() })
+            .optional(),
+          id: z.string().optional(),
+          status: z.string().optional(),
+        })
+        .passthrough()
+        .parse(req.body ?? {});
 
-    const externalId = body.transaction?.id ?? body.id;
-    const status = body.transaction?.status ?? body.status;
-    if (externalId && status) {
-      await prisma.anchorSession.updateMany({
-        where: { externalTransactionId: externalId },
-        data: { status: mapAnchorStatus(status) },
-      });
+      const externalId = body.transaction?.id ?? body.id;
+      const status = body.transaction?.status ?? body.status;
+      if (externalId && status) {
+        const mappedStatus = mapAnchorStatus(status);
+        await prisma.$transaction(async (tx) => {
+          const sessions = await tx.anchorSession.findMany({
+            where: { externalTransactionId: externalId },
+          });
+          for (const session of sessions) {
+            await tx.anchorSession.update({
+              where: { id: session.id },
+              data: { status: mappedStatus },
+            });
+            await recordStatusTransition({
+              entityType: "anchor_session",
+              entityId: session.id,
+              newStatus: mappedStatus,
+              source: "anchor_webhook",
+            });
+          }
+        });
+        for (const session of sessions) {
+          await applyAnchorSessionTransition({
+            sessionId: session.id,
+            nextStatus: mapAnchorStatus(status),
+            source: "webhook",
+          });
+        }
+      }
+      return reply.code(200).send({ ok: true });
     }
-    return reply.code(200).send({ ok: true });
-  });
+  );
 }
 
 function constantTimeEqual(a: string, b: string): boolean {

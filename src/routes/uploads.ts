@@ -14,8 +14,6 @@ const ALLOWED: Record<string, string> = {
   "application/pdf": "pdf",
 };
 
-const MAX_BYTES = 5 * 1024 * 1024;
-
 export default async function uploadRoutes(app: FastifyInstance) {
   app.post(
     "/uploads/receipt",
@@ -27,15 +25,30 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
       const ext = ALLOWED[data.mimetype];
       if (!ext) {
+        data.file.resume();
         throw Errors.badRequest(
           "bad_file_type",
           "Only PNG, JPEG, WEBP, GIF, or PDF are allowed"
         );
       }
 
-      const buffer = await data.toBuffer();
-      if (buffer.length > MAX_BYTES) {
-        throw Errors.badRequest("file_too_large", "Files must be under 5 MB");
+      let buffer: Buffer;
+      try {
+        buffer = await data.toBuffer();
+      } catch (error: any) {
+        if (error?.code === "FST_REQ_FILE_TOO_LARGE") {
+          throw Errors.badRequest(
+            "file_too_large",
+            `Files must be under ${Math.floor(config.MULTIPART_FILE_SIZE_BYTES / (1024 * 1024))} MB`
+          );
+        }
+        throw Errors.badRequest("bad_file_type", "Failed to read uploaded file");
+      }
+      if (buffer.length > config.MULTIPART_FILE_SIZE_BYTES) {
+        throw Errors.badRequest(
+          "file_too_large",
+          `Files must be under ${Math.floor(config.MULTIPART_FILE_SIZE_BYTES / (1024 * 1024))} MB`
+        );
       }
 
       const dir = path.resolve(config.UPLOADS_DIR);

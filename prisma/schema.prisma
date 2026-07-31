@@ -24,6 +24,7 @@ model User {
   invites          Invite[]
   anchorSessions   AnchorSession[]
   auditLogs        AuditLog[]
+  idempotencyKeys  IdempotencyKey[]
 
   @@map("users")
 }
@@ -46,6 +47,7 @@ model Group {
   treasuryTxs TreasuryTransaction[]
   invites     Invite[]
   invitations Invitation[]
+  auditLogs   AuditLog[]
 
   @@index([createdByUserId])
   @@map("groups")
@@ -63,6 +65,7 @@ model GroupMember {
 
   @@unique([groupId, userId])
   @@index([userId])
+  @@index([groupId])
   @@map("group_members")
 }
 
@@ -85,6 +88,7 @@ model Expense {
   shares ExpenseShare[]
 
   @@index([groupId])
+  @@index([payerUserId])
   @@map("expenses")
 }
 
@@ -105,20 +109,26 @@ model ExpenseShare {
 }
 
 model Settlement {
-  id             String   @id @default(cuid())
-  shortCode      String   @unique @map("short_code")
-  groupId        String   @map("group_id")
-  fromUserId     String   @map("from_user_id")
-  toUserId       String   @map("to_user_id")
-  amount         Decimal  @db.Decimal(20, 7)
-  assetCode      String   @map("asset_code")
-  assetIssuer    String?  @map("asset_issuer")
-  stellarTxHash  String?  @map("stellar_tx_hash")
-  status         String   @default("pending")
+  id             String    @id @default(cuid())
+  shortCode      String    @unique @map("short_code")
+  groupId        String    @map("group_id")
+  fromUserId     String    @map("from_user_id")
+  toUserId       String    @map("to_user_id")
+  amount         Decimal   @db.Decimal(20, 7)
+  assetCode      String    @map("asset_code")
+  assetIssuer    String?   @map("asset_issuer")
+  stellarTxHash  String?   @map("stellar_tx_hash")
+  transactionXdr String?   @map("transaction_xdr")
+  status         String    @default("pending")
+  retryCount     Int       @default(0) @map("retry_count")
+  failureReason  String?   @map("failure_reason")
+  submittedAt    DateTime? @map("submitted_at")
+  confirmedAt    DateTime? @map("confirmed_at")
   memo           String?
-  expenseId      String?  @map("expense_id")
-  expenseShareId String?  @map("expense_share_id")
-  createdAt      DateTime @default(now()) @map("created_at")
+  expenseId      String?   @map("expense_id")
+  expenseShareId String?   @map("expense_share_id")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at")
 
   group        Group         @relation(fields: [groupId], references: [id], onDelete: Cascade)
   from         User          @relation("SettlementFrom", fields: [fromUserId], references: [id])
@@ -129,6 +139,7 @@ model Settlement {
   @@index([fromUserId])
   @@index([toUserId])
   @@index([status])
+  @@index([status, updatedAt]) // For worker reconciliation queries
   @@map("settlements")
 }
 
@@ -145,6 +156,9 @@ model TreasuryTransaction {
   stellarTxHash String?  @map("stellar_tx_hash")
   status        String   @default("pending")
   memo          String?
+  // Server-controlled signing deadline for the unsigned XDR — same contract as
+  // Settlement.expiresAt. See src/lib/time-bounds.ts.
+  expiresAt     DateTime? @map("expires_at")
   createdAt     DateTime @default(now()) @map("created_at")
 
   group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
@@ -152,6 +166,7 @@ model TreasuryTransaction {
 
   @@index([groupId])
   @@index([status])
+  @@index([expiresAt])
   @@map("treasury_transactions")
 }
 
@@ -197,49 +212,103 @@ model AnchorSession {
   externalTransactionId String?  @map("external_transaction_id")
   anchorToken           String?  @map("anchor_token")
   status                String   @default("incomplete")
+  failureReason         String?  @map("failure_reason")
+  retryCount            Int      @default(0) @map("retry_count")
+  lastPolledAt          DateTime? @map("last_polled_at")
+  claimedAt             DateTime? @map("claimed_at")
+  claimedBy             String?  @map("claimed_by")
+  leaseExpiresAt        DateTime?  @map("lease_expires_at")
+  nextAttemptAt         DateTime?  @map("next_attempt_at")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
+  jobAttemptCount       Int      @default(0) @map("job_attempt_count")
+  jobClaimedAt          DateTime? @map("job_claimed_at")
+  jobEligibleAt         DateTime @default(now()) @map("job_eligible_at")
+  jobErrorSummary       String?  @map("job_error_summary")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([externalTransactionId])
+  @@index([status])
+  @@index([anchorToken, externalTransactionId]) // For worker polling queries
+  @@index([status, lastPolledAt]) // For worker polling with time-based filtering
   @@map("anchor_sessions")
 }
 
 model IdempotencyKey {
-  id            String   @id @default(cuid())
-  key           String   @unique
-  requestHash   String   @map("request_hash")
-  responseJson  String   @map("response_json")
-  createdAt     DateTime @default(now()) @map("created_at")
+  id           String   @id @default(cuid())
+  userId       String   @map("user_id")
+  // Distinguishes the operation an idempotency key applies to (e.g.
+  // "settlement.create" or "settlement.confirm") so the same client-chosen
+  // key string can't be replayed across unrelated endpoints.
+  scope        String
+  key          String
+  requestHash  String   @map("request_hash")
+  responseJson String   @map("response_json")
+  createdAt    DateTime @default(now()) @map("created_at")
 
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, scope, key])
+  @@index([userId])
   @@map("idempotency_keys")
 }
 
 model AuditLog {
   id         String   @id @default(cuid())
   userId     String?  @map("user_id")
+  groupId    String?  @map("group_id")
   action     String
-  entityType String   @map("entity_type")
-  entityId   String   @map("entity_id")
+  groupId    String?  @map("group_id")
+  details    Json?
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id")
   metadata   Json?
   createdAt  DateTime @default(now()) @map("created_at")
 
-  user User? @relation(fields: [userId], references: [id])
+  user  User?  @relation(fields: [userId], references: [id])
+  group Group? @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
   @@index([userId])
+  @@index([groupId])
   @@map("audit_logs")
 }
 
-model AccountBalance {
-  id         String   @id @default(cuid())
-  accountId  String   @map("account_id")
-  assetCode  String   @map("asset_code")
-  balance    Decimal  @db.Decimal(20, 7)
-  updatedAt  DateTime @updatedAt @map("updated_at")
+model StatusHistory {
+  id              String   @id @default(cuid())
+  entityType      String   @map("entity_type") // "settlement" or "anchor_session"
+  entityId        String   @map("entity_id")
+  status          String
+  reason          String?  // Safe, displayable reason for the status change
+  source          String?  // Source of the status change (e.g., "worker", "api", "anchor")
+  createdAt       DateTime @default(now()) @map("created_at")
 
-  @@unique([accountId, assetCode])
-  @@index([accountId])
-  @@map("account_balances")
+  @@index([entityType, entityId])
+  @@index([entityType, entityId, createdAt])
+  @@map("status_history")
+}
+
+// Backing store for the optional database-backed rate limiter (see
+// src/services/rate-limit-store.ts). Only used when RATE_LIMIT_STORE=database;
+// the default in-memory store never touches this table. Rows are
+// short-lived counters, not business records — safe to truncate at any time.
+model RateLimitBucket {
+  key       String   @id
+  count     Int      @default(0)
+  resetAt   DateTime @map("reset_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("rate_limit_buckets")
+}
+
+model Sep10Challenge {
+  id            String   @id @default(cuid())
+  fingerprint   String   @unique
+  clientAccount String   @map("client_account")
+  expiresAt     DateTime @map("expires_at")
+  consumedAt    DateTime @default(now()) @map("consumed_at")
+
+  @@index([expiresAt])
+  @@map("sep10_challenges")
 }

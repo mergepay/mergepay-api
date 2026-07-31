@@ -2,6 +2,10 @@
  * Stellar service — all Horizon I/O and transaction construction lives here so
  * tests can mock a single module. Mergepay only ever builds UNSIGNED envelopes;
  * the user's wallet signs, then we submit the signed XDR.
+ *
+ * Every external Horizon call has a bounded timeout. Timeout and transport
+ * errors are classified so callers (API routes, worker) can distinguish them
+ * from business-logic errors.
  */
 
 import {
@@ -18,6 +22,7 @@ import {
 import { config } from "../config";
 import { Errors } from "../errors";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
+import { withTimeout, TimeoutError, TransportError } from "./timeout";
 
 let _server: Horizon.Server | null = null;
 function server(): Horizon.Server {
@@ -59,7 +64,15 @@ export const stellar = {
   /** Load an account. Returns exists=false for unfunded accounts (404). */
   async loadAccount(publicKey: string): Promise<AccountSnapshot> {
     try {
-      const acct = await server().loadAccount(publicKey);
+      const acct = await withTimeout(
+        "Horizon.loadAccount",
+        config.HORIZON_ACCOUNT_TIMEOUT_MS,
+        async (signal) => {
+          // Horizon.Server.loadAccount doesn't accept AbortSignal directly,
+          // but we wrap it so timeout still fires and rejects the promise.
+          return server().loadAccount(publicKey);
+        }
+      );
       return {
         exists: true,
         sequence: acct.sequenceNumber(),
@@ -135,9 +148,21 @@ export const stellar = {
   ): Promise<string> {
     const { tx } = validateSignedXdr(signedXdr, expected);
     try {
-      const res = await server().submitTransaction(tx);
+      const res = await withTimeout(
+        "Horizon.submitTransaction",
+        config.HORIZON_SUBMIT_TIMEOUT_MS,
+        async (signal) => {
+          // Horizon.Server.submitTransaction doesn't accept AbortSignal directly,
+          // but we wrap it so timeout still fires and rejects the promise.
+          return server().submitTransaction(tx);
+        }
+      );
       return res.hash;
     } catch (e: any) {
+      // Re-throw TimeoutError and TransportError as-is for retry classification
+      if (e instanceof TimeoutError || e instanceof TransportError) {
+        throw e;
+      }
       const codes =
         e?.response?.data?.extras?.result_codes ??
         e?.response?.data?.result_codes;
@@ -151,7 +176,13 @@ export const stellar = {
     hash: string
   ): Promise<{ successful: boolean } | null> {
     try {
-      const tx = await server().transactions().transaction(hash).call();
+      const tx = await withTimeout(
+        "Horizon.getTransaction",
+        config.HORIZON_STATUS_TIMEOUT_MS,
+        async (signal) => {
+          return server().transactions().transaction(hash).call();
+        }
+      );
       return { successful: (tx as any).successful };
     } catch (e: any) {
       if (e?.response?.status === 404) return null;

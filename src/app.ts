@@ -235,6 +235,17 @@ export async function buildApp(): Promise<FastifyInstance> {
     time: new Date().toISOString(),
   }));
 
+  app.get("/healthz", async () => ({
+    status: "ok",
+  }));
+
+  const { getReadiness } = await import("./services/health.js");
+  app.get("/readyz", async (request, reply) => {
+    const readiness = await getReadiness();
+    const statusCode = readiness.status === "ok" ? 200 : 503;
+    return reply.code(statusCode).send(readiness);
+  });
+
   await app.register(authRoutes);
   await app.register(groupRoutes);
   await app.register(expenseRoutes);

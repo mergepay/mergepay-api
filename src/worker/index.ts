@@ -1,4 +1,5 @@
 import pino from "pino";
+import { randomUUID } from "crypto";
 import { config } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
@@ -12,10 +13,14 @@ import { pollForConfirmation } from "../services/horizon-confirm";
 import {
   anchorService,
   mapAnchorStatus,
-  TERMINAL_ANCHOR_STATUSES,
-  AUDITABLE_ANCHOR_STATUSES,
 } from "../services/anchor";
-import type { PollResult } from "../services/anchor";
+import { applyAnchorSessionTransition } from "../services/anchor-status";
+import {
+  classifyJobFailure,
+  failureTransactionHash,
+  retryDelayMs,
+  SETTLEMENT_RETRY_POLICY,
+} from "../services/job-retry";
 import { runReconciliation, startReconciliation } from "./reconciliation";
 import { reconcileSettlements } from "../services/settlement-reconciliation";
 import {
@@ -41,11 +46,13 @@ interface SettlementSubmissionRecord {
 
 const log = pino({ name: "worker" });
 
-export const SETTLEMENT_MAX_RETRIES = 3;
+export const SETTLEMENT_MAX_RETRIES = SETTLEMENT_RETRY_POLICY.maxAttempts;
 export const RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
 
+const WORKER_ID = randomUUID();
 const claimedSettlements = new Set<string>();
 const claimedAnchors = new Set<string>();
+let isShuttingDown = false;
 
 class PermanentSettlementError extends Error {
   constructor(message: string) {
@@ -63,35 +70,38 @@ function safeErrorMessage(error: unknown): string {
   return message
     .replace(/bearer\s+[a-z0-9._-]+/gi, "bearer [redacted]")
     .replace(/(?:secret|token|password|private[_ -]?key)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .replace(/(?:xdr|transaction)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
     .slice(0, 500);
 }
 
 async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<boolean> {
-  if (claimedSettlements.has(settlement.id)) return false;
+  if (isShuttingDown) return false;
+  if (claimedSettlements.has(settlement.id)) return true;
 
-  const model = prisma.settlement as any;
-  if (typeof model.updateMany !== "function") {
-    claimedSettlements.add(settlement.id);
-    return true;
-  }
+  const now = new Date();
+  const leaseExpiresAt = new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS);
 
-  const result = await model.updateMany({
+  const result = await prisma.settlement.updateMany({
     where: {
       id: settlement.id,
       status: { in: ["submitted", "verifying"] },
       retryCount: settlement.retryCount,
     },
-    data: { retryCount: { increment: 1 } },
   });
 
   if (result.count !== 1) return false;
-  claimedSettlements.add(settlement.id);
   settlement.retryCount += 1;
   return true;
 }
 
 async function releaseSettlementClaim(id: string): Promise<void> {
   claimedSettlements.delete(id);
+  if (!isShuttingDown) {
+    await prisma.settlement.updateMany({
+      where: { id, claimedBy: WORKER_ID },
+      data: { claimedAt: null, claimedBy: null, leaseExpiresAt: null },
+    }).catch(() => {});
+  }
 }
 
 async function markSettlementFailed(
@@ -118,7 +128,7 @@ export async function submitSettlement(
   ctx?: CorrelationContext
 ): Promise<string> {
   if (!settlement.transactionXdr) {
-    throw new PermanentSettlementError("settlement has no transaction XDR");
+    throw new Error("settlement has no transaction XDR");
   }
 
   const jobLog = loggerWithContext(log, ctx);
@@ -142,7 +152,7 @@ export async function submitSettlement(
   }
 }
 
-async function markSettlementFailed(
+async function markSubmitted(
   settlement: SettlementSubmissionRecord,
   message: string,
   ctx?: CorrelationContext
@@ -153,6 +163,7 @@ async function markSettlementFailed(
     where: { id: settlement.id },
     data: {
       status: "failed",
+      failureReason: message,
       retryCount: settlement.retryCount,
       failureReason: message,
     },
@@ -160,6 +171,7 @@ async function markSettlementFailed(
   await recordTransition(settlement.id, "settlement_failed", {
     attempt: settlement.retryCount,
     reason: message,
+    terminal,
   });
   jobLog.error(
     { id: settlement.id, attempt: settlement.retryCount, reason: message },
@@ -220,15 +232,22 @@ async function processSettlement(
           return;
         }
 
-        const delay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)];
+        const delay = retryDelayMs(attempt, SETTLEMENT_RETRY_POLICY);
+        const nextAttemptAt = new Date(Date.now() + delay);
         await prisma.settlement.update({
           where: { id: settlement.id },
-          data: { retryCount: attempt },
+          data: { 
+            retryCount: attempt,
+            nextAttemptAt,
+            leaseExpiresAt: new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS),
+          },
         });
         await recordTransition(settlement.id, "settlement_retry_scheduled", {
           attempt,
           nextDelayMs: delay,
+          nextAttemptAt: nextAttemptAt.toISOString(),
           reason: message,
+          failureCategory,
         });
         jobLog.warn(
           { id: settlement.id, attempt, nextRetryDelayMs: delay, reason: message },
@@ -237,56 +256,22 @@ async function processSettlement(
         await sleep(delay);
       }
     }
-  } finally {
-    await releaseSettlementClaim(settlement.id);
+    return false;
   }
 }
 
-export async function reconcilePending(): Promise<void> {
-  await runReconciliation();
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-/** Maximum number of failed poll attempts before marking a session as error. */
-const ANCHOR_MAX_RETRIES = 3;
-const ANCHOR_POLL_BATCH_SIZE = 50;
+export async function processSettlements(): Promise<void> {
+  const model = prisma.settlement as any;
+  if (typeof model.findMany !== "function") return;
 
-/**
- * Minimum interval between polls for the same session (seconds).
- * Sessions polled more recently than this are skipped.
- */
-const ANCHOR_MIN_POLL_INTERVAL_SEC = 30;
-
-/** Normalised SEP-24 terminal states that stop further polling. */
-const ANCHOR_POLL_TERMINAL = new Set([
-  ...TERMINAL_ANCHOR_STATUSES,
-  "incomplete", // before we have an external id
-]);
-
-/**
- * Poll pending SEP-24 anchor sessions and reconcile remote status with
- * local records.
- *
- * Design:
- * - Only discover sessions that haven't been polled in the last 30 seconds.
- * - Never overwrite a terminal status with a non-terminal one.
- * - Retry failures with bounded exponential backoff tracked via retryCount.
- * - Store error details in failureReason for support.
- * - Emit audit log events when a terminal status is reached via polling.
- */
-export async function reconcileAnchors(): Promise<void> {
-  const cutoff = new Date(
-    Date.now() - ANCHOR_MIN_POLL_INTERVAL_SEC * 1000
-  );
-
-  const sessions = await prisma.anchorSession.findMany({
+  const settlements = (await model.findMany({
     where: {
-      anchorToken: { not: null },
-      externalTransactionId: { not: null },
-      status: { notIn: [...ANCHOR_POLL_TERMINAL] },
-      OR: [
-        { lastPolledAt: null },
-        { lastPolledAt: { lt: cutoff } },
-      ],
+      status: { in: ["pending", "submitted"] },
+      retryCount: { lt: SETTLEMENT_MAX_RETRIES },
     },
     take: ANCHOR_POLL_BATCH_SIZE,
     orderBy: { lastPolledAt: "asc" as const },
@@ -304,6 +289,26 @@ export async function reconcileAnchors(): Promise<void> {
 
   for (const session of sessions) {
     if (claimedAnchors.has(session.id)) continue;
+    
+    // Claim the session with a lease
+    const now = new Date();
+    const leaseExpiresAt = new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS);
+    const claimResult = await prisma.anchorSession.updateMany({
+      where: {
+        id: session.id,
+        OR: [
+          { leaseExpiresAt: null },
+          { leaseExpiresAt: { lt: now } },
+        ],
+      },
+      data: {
+        claimedAt: now,
+        claimedBy: WORKER_ID,
+        leaseExpiresAt,
+      },
+    });
+
+    if (claimResult.count === 0) continue;
     claimedAnchors.add(session.id);
 
     const ctx = jobContext("anchor", session.id);
@@ -318,6 +323,14 @@ export async function reconcileAnchors(): Promise<void> {
         { sessionId: session.id, externalId: session.externalTransactionId, err: message },
         "unexpected error reconciling anchor session"
       );
+    } finally {
+      claimedAnchors.delete(session.id);
+      if (!isShuttingDown) {
+        await prisma.anchorSession.updateMany({
+          where: { id: session.id, claimedBy: WORKER_ID },
+          data: { claimedAt: null, claimedBy: null, leaseExpiresAt: null },
+        }).catch(() => {});
+      }
     }
   }
 }
@@ -365,10 +378,12 @@ async function reconcileSingleAnchor(
       failureReason: result.message,
     };
 
-    // If we've exhausted retries, mark as error.
-    if (!shouldBackoff) {
-      data.status = "error";
-    }
+  const sessions = await model.findMany({
+    where: {
+      status: { in: ["incomplete", "pending_user_transfer_start", "pending_anchor"] },
+      externalTransactionId: { not: null },
+    },
+  });
 
     await prisma.$transaction(async (tx) => {
       await tx.anchorSession.update({
@@ -388,24 +403,10 @@ async function reconcileSingleAnchor(
       jobLog.warn(
         {
           sessionId: session.id,
-          externalId: session.externalTransactionId,
-          retryCount: session.retryCount,
-          reason: result.message,
+          error: safeErrorMessage(error),
         },
-        "anchor session marked as error after exhausting retries"
+        "anchor reconciliation failed"
       );
-
-      await audit({
-        action: "anchor.session.failed",
-        entityType: "anchor_session",
-        entityId: session.id,
-        metadata: {
-          previousStatus: session.status,
-          status: "error",
-          failureReason: result.message,
-          retryCount: nextRetryCount,
-        },
-      });
     }
 
     return;
@@ -504,16 +505,22 @@ export async function expireInvites(): Promise<void> {
 }
 
 export async function processSubmittedSettlements(): Promise<void> {
+  const now = new Date();
   const settlements = await prisma.settlement.findMany({
     where: {
       status: { in: ["submitted", "verifying"] },
       transactionXdr: { not: null },
+      OR: [
+        { nextAttemptAt: null },
+        { nextAttemptAt: { lte: now } },
+      ],
     },
     include: {
       from: { select: { stellarPublicKey: true } },
       to: { select: { stellarPublicKey: true } },
     },
     take: 50,
+    orderBy: [{ nextAttemptAt: "asc" as const }, { createdAt: "asc" as const }],
   });
 
   for (const row of settlements) {
@@ -546,22 +553,51 @@ export async function runWorkerCycle(): Promise<void> {
   ]);
 }
 
-export function startWorker(): () => void {
-  const reconciliationStop = startReconciliation();
-  const timer = setInterval(() => {
-    void runWorkerCycle().catch((error) => {
-      log.error({ reason: safeErrorMessage(error) }, "worker cycle failed");
-    });
-  }, config.WORKER_INTERVAL_MS);
+export async function startWorker(): Promise<() => void> {
+  const stopReconciliation = startReconciliation();
+  let stopped = false;
 
-  void runWorkerCycle().catch((error) => {
-    log.error({ reason: safeErrorMessage(error) }, "initial worker cycle failed");
-  });
+  const loop = async (): Promise<void> => {
+    if (stopped) return;
+    try {
+      await runWorkerOnce();
+    } catch (error) {
+      log.error({ error: safeErrorMessage(error) }, "worker iteration failed");
+    }
+    if (!stopped) setTimeout(loop, config.WORKER_INTERVAL_MS);
+  };
 
-  return () => {
+  const shutdown = async () => {
+    isShuttingDown = true;
+    log.info("worker shutdown initiated, releasing claims...");
+    
+    // Release all claims
+    const releasePromises = [
+      prisma.settlement.updateMany({
+        where: { claimedBy: WORKER_ID },
+        data: { claimedAt: null, claimedBy: null, leaseExpiresAt: null },
+      }),
+      prisma.anchorSession.updateMany({
+        where: { claimedBy: WORKER_ID },
+        data: { claimedAt: null, claimedBy: null, leaseExpiresAt: null },
+      }),
+    ];
+    
+    await Promise.allSettled(releasePromises);
+    log.info("worker claims released");
+    
     clearInterval(timer);
     reconciliationStop();
   };
+
+  process.on("SIGINT", () => {
+    void shutdown();
+  });
+  process.on("SIGTERM", () => {
+    void shutdown();
+  });
+
+  return shutdown;
 }
 
 if (process.env.NODE_ENV !== "test") {

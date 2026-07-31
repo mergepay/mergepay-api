@@ -11,6 +11,13 @@ import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
 import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import { validateAmount, validateAsset } from "../services/assets";
+import {
+  validateProposedSignerConfig,
+  validateSignerChangeAgainstAccount,
+  snapshotToSignerConfig,
+  type ProposedSignerConfig,
+} from "../services/treasury-validation";
 
 export default async function treasuryRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -79,6 +86,59 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       })),
       signers: snapshot.signers,
       thresholds: snapshot.thresholds,
+    };
+  });
+
+  // -- validate signer config -------------------------------------------------
+  app.post("/groups/:id/treasury/validate-signers", async (req) => {
+    const auth = requireUser(req);
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireAdmin(id, auth.id);
+    
+    const body = z
+      .object({
+        signers: z.array(
+          z.object({
+            publicKey: z.string(),
+            weight: z.number().int().min(0).max(255),
+          })
+        ),
+        thresholds: z.object({
+          low: z.number().int().min(0).max(255),
+          med: z.number().int().min(0).max(255),
+          high: z.number().int().min(0).max(255),
+        }),
+      })
+      .parse(req.body);
+
+    const group = await prisma.group.findUnique({ where: { id } });
+    if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
+      throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
+    }
+
+    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
+    
+    const proposedConfig: ProposedSignerConfig = {
+      signers: body.signers,
+      thresholds: body.thresholds,
+    };
+
+    const validation = validateProposedSignerConfig(proposedConfig, snapshot);
+    
+    await audit({
+      userId: auth.id,
+      action: "treasury.signer_validation",
+      entityType: "group",
+      entityId: id,
+      metadata: {
+        valid: validation.valid,
+        errors: validation.errors,
+      },
+    });
+
+    return {
+      valid: validation.valid,
+      errors: validation.errors,
     };
   });
 

@@ -4,6 +4,10 @@
  * All outbound HTTP to the anchor is funnelled through this module so tests can
  * mock it. The default anchor is the SDF test anchor (testanchor.stellar.org).
  *
+ * Every external HTTP call has a bounded timeout. Timeout and transport errors
+ * are classified so callers (API routes, worker) can distinguish them from
+ * business-logic errors.
+ *
  * SEP-24 Transaction Statuses
  * ──────────────────────────
  * See: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md#transaction-history
@@ -30,6 +34,7 @@ import toml from "toml";
 import { z } from "zod";
 import { config } from "../config";
 import { Errors } from "../errors";
+import { fetchWithTimeout, withTimeout, TimeoutError, TransportError } from "./timeout";
 
 export interface AnchorToml {
   homeDomain: string;
@@ -41,9 +46,6 @@ export interface AnchorToml {
 
 const tomlCache = new Map<string, { value: AnchorToml; at: number }>();
 const TOML_TTL = 5 * 60 * 1000;
-
-/** Timeout for a single SEP-24 poll request (ms). */
-const DEFAULT_POLL_TIMEOUT_MS = 10_000;
 
 // ─── SEP-24 status mapping ─────────────────────────────────────────────────
 
@@ -96,6 +98,39 @@ export interface PollResult {
   stellarTransactionHash?: string;
 }
 
+// ─── Zod schemas for anchor responses ───────────────────────────────────────
+
+const challengeResponseSchema = z.object({
+  transaction: z.string(),
+  network_passphrase: z.string().optional(),
+});
+
+const tokenResponseSchema = z.object({
+  token: z.string(),
+});
+
+const interactiveResponseSchema = z.object({
+  url: z.string(),
+  id: z.string(),
+});
+
+const sep24TransactionResponseSchema = z.object({
+  transaction: z.object({
+    status: z.string(),
+    id: z.string().optional(),
+    kind: z.string().optional(),
+    amount_in: z.string().optional(),
+    amount_out: z.string().optional(),
+    amount_fee: z.string().optional(),
+    started_at: z.string().optional(),
+    completed_at: z.string().optional(),
+    stellar_transaction_hash: z.string().optional(),
+    external_transaction_id: z.string().optional(),
+    message: z.string().optional(),
+    refunds: z.any().optional(),
+  }),
+});
+
 // ─── Service implementation ─────────────────────────────────────────────────
 
 export const anchorService = {
@@ -105,7 +140,7 @@ export const anchorService = {
     if (cached && Date.now() - cached.at < TOML_TTL) return cached.value;
 
     const url = `https://${homeDomain}/.well-known/stellar.toml`;
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url, "Anchor.getToml", config.ANCHOR_TOML_TIMEOUT_MS);
     if (!res.ok) {
       throw Errors.upstream(`Could not load stellar.toml for ${homeDomain}`);
     }
@@ -150,7 +185,7 @@ export const anchorService = {
     account: string
   ): Promise<{ transaction: string; networkPassphrase: string }> {
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url, "Anchor.getChallenge", config.ANCHOR_CHALLENGE_TIMEOUT_MS);
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 challenge request failed");
     const data = parseJson(challengeResponseSchema, await res.json());
     return {
@@ -161,11 +196,16 @@ export const anchorService = {
 
   /** Step 2: exchange the signed challenge for an anchor JWT. */
   async getToken(webAuthEndpoint: string, signedXdr: string): Promise<string> {
-    const res = await fetch(webAuthEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ transaction: signedXdr }),
-    });
+    const res = await fetchWithTimeout(
+      webAuthEndpoint,
+      "Anchor.getToken",
+      config.ANCHOR_TOKEN_TIMEOUT_MS,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transaction: signedXdr }),
+      }
+    );
     if (!res.ok) throw Errors.upstream("Anchor SEP-10 token exchange failed");
     return parseJson(tokenResponseSchema, await res.json()).token;
   },
@@ -180,17 +220,22 @@ export const anchorService = {
   }): Promise<{ url: string; id: string }> {
     const path = params.kind === "deposit" ? "deposit" : "withdraw";
     const url = `${params.transferServer}/transactions/${path}/interactive`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${params.token}`,
-      },
-      body: JSON.stringify({
-        asset_code: params.assetCode,
-        account: params.account,
-      }),
-    });
+    const res = await fetchWithTimeout(
+      url,
+      "Anchor.startInteractive",
+      config.ANCHOR_INTERACTIVE_TIMEOUT_MS,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${params.token}`,
+        },
+        body: JSON.stringify({
+          asset_code: params.assetCode,
+          account: params.account,
+        }),
+      }
+    );
     if (!res.ok) throw Errors.upstream("Anchor interactive flow request failed");
     return parseJson(interactiveResponseSchema, await res.json());
   },
@@ -211,7 +256,7 @@ export const anchorService = {
     )}`;
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await fetchWithTimeout(url, "Anchor.getTransactionStatus", config.ANCHOR_POLL_TIMEOUT_MS, {
         headers: { Authorization: `Bearer ${params.token}` },
       });
     } catch {
@@ -422,4 +467,14 @@ export function mapAnchorStatus(raw: string): string {
 /** Whether a normalized status is terminal and no longer needs polling. */
 export function isTerminalAnchorStatus(status: string): boolean {
   return status === "completed" || status === "error" || status === "refunded";
+}
+
+// ─── Internal helpers ───────────────────────────────────────────────────────
+
+function parseJson<T>(schema: z.ZodSchema<T>, data: unknown): T {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    throw Errors.upstream("Anchor returned an unexpected response format");
+  }
+  return result.data;
 }

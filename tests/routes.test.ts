@@ -28,12 +28,15 @@ const h = vi.hoisted(() => {
     anchorSession: model(),
     auditLog: model(),
     idempotencyKey: model(),
+    $queryRaw: vi.fn(async () => [{ "?column?": 1 }]),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
+    $queryRaw: vi.fn(),
     $disconnect: vi.fn(),
   };
-  return { prisma };
+  const mockFetchBaseFee = vi.fn();
+  return { prisma, mockFetchBaseFee };
 });
 
 vi.mock("../src/db", () => ({ prisma: h.prisma }));
@@ -50,6 +53,18 @@ vi.mock("../src/services/stellar", async (importActual) => {
         balances: [],
         signers: [],
         thresholds: { low: 0, med: 0, high: 0 },
+      })),
+    },
+  };
+});
+
+vi.mock("@stellar/stellar-sdk", async (importActual) => {
+  const actual = await importActual<typeof import("@stellar/stellar-sdk")>();
+  return {
+    ...actual,
+    Horizon: {
+      Server: vi.fn().mockImplementation(() => ({
+        fetchBaseFee: h.mockFetchBaseFee,
       })),
     },
   };
@@ -73,6 +88,12 @@ const prisma = h.prisma;
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  // Reset $transaction to default behavior (passes prisma mock to callback)
+  h.prisma.$transaction.mockImplementation(async (arg: any) =>
+    typeof arg === "function" ? arg(h.prisma) : Promise.all(arg)
+  );
+  // Reset auditLog.create to default resolved
+  h.prisma.auditLog.create.mockImplementation(() => Promise.resolve({}));
   if (!app) app = await buildApp();
 });
 
@@ -83,6 +104,8 @@ function authHeader(user = fakeUser()) {
 
 describe("auth routes", () => {
   it("GET /health is open", async () => {
+    h.prisma.$queryRaw.mockResolvedValueOnce([{ 1: 1 }]);
+    h.mockFetchBaseFee.mockResolvedValueOnce(100);
     const res = await app.inject({ method: "GET", url: "/health" });
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("ok");
@@ -375,5 +398,164 @@ describe("group routes", () => {
       expect(res.statusCode).toBe(409);
       expect(res.json().code).toBe("INVITATION_PENDING");
     });
+  });
+});
+
+describe("expense routes", () => {
+  it("POST /groups/:id/expenses creates an expense and audit log", async () => {
+    const user = fakeUser();
+    const groupId = "group_1";
+
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: user.id },
+      { userId: "user_2" },
+    ]);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId,
+      userId: user.id,
+      role: "member",
+    });
+
+    const expense = {
+      id: "expense_1",
+      groupId,
+      payerUserId: user.id,
+      title: "Dinner",
+      description: "Team dinner",
+      amount: "100.00",
+      assetCode: "XLM",
+      assetIssuer: null,
+      splitType: "equal",
+      memo: "abc123",
+      receiptUrl: null,
+      createdAt: new Date(),
+      payer: user,
+      shares: [
+        { id: "share_1", expenseId: "expense_1", userId: user.id, shareAmount: "50.00", status: "settled", user },
+        { id: "share_2", expenseId: "expense_1", userId: "user_2", shareAmount: "50.00", status: "pending", user: { ...user, id: "user_2" } },
+      ],
+    };
+    prisma.expense.create.mockResolvedValueOnce(expense);
+    prisma.auditLog.create.mockResolvedValueOnce({});
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${groupId}/expenses`,
+      headers: authHeader(user),
+      payload: {
+        title: "Dinner",
+        description: "Team dinner",
+        amount: "100",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [{ userId: user.id }, { userId: "user_2" }],
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().expense.title).toBe("Dinner");
+    expect(prisma.expense.create).toHaveBeenCalledOnce();
+    expect(prisma.auditLog.create).toHaveBeenCalledOnce();
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: user.id,
+          action: "expense.create",
+          entityType: "expense",
+          entityId: "expense_1",
+        }),
+      })
+    );
+  });
+
+  it("POST /groups/:id/expenses rolls back expense if audit log fails", async () => {
+    const user = fakeUser();
+    const groupId = "group_1";
+
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: user.id },
+      { userId: "user_2" },
+    ]);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId,
+      userId: user.id,
+      role: "member",
+    });
+
+    // Make auditLog.create throw to simulate failure inside transaction
+    prisma.auditLog.create.mockImplementation(() => Promise.reject(new Error("DB error")));
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${groupId}/expenses`,
+      headers: authHeader(user),
+      payload: {
+        title: "Dinner",
+        amount: "100",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [{ userId: user.id }, { userId: "user_2" }],
+      },
+    });
+
+    // Transaction should fail and return error
+    expect(res.statusCode).toBe(500);
+    
+    // Reset to default for next test
+    prisma.auditLog.create.mockImplementation(() => Promise.resolve({}));
+  });
+
+  it("DELETE /expenses/:id deletes expense and creates audit log", async () => {
+    const user = fakeUser();
+    const expenseId = "expense_1";
+
+    const expense = {
+      id: expenseId,
+      groupId: "group_1",
+      payerUserId: user.id,
+      title: "Dinner",
+      description: "Team dinner",
+      amount: "100.00",
+      assetCode: "XLM",
+      assetIssuer: null,
+      splitType: "equal",
+      memo: "abc123",
+      receiptUrl: null,
+      createdAt: new Date(),
+      shares: [
+        { id: "share_1", expenseId, userId: user.id, shareAmount: "50.00", status: "settled" },
+        { id: "share_2", expenseId, userId: "user_2", shareAmount: "50.00", status: "pending" },
+      ],
+    };
+    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
+    prisma.expense.delete.mockResolvedValueOnce({});
+    // Explicitly ensure auditLog.create resolves
+    prisma.auditLog.create.mockImplementation(() => Promise.resolve({}));
+
+    const res = await app.inject({
+      method: "DELETE",
+      url: `/expenses/${expenseId}`,
+      headers: authHeader(user),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ok).toBe(true);
+    expect(prisma.expense.delete).toHaveBeenCalledOnce();
+    expect(prisma.auditLog.create).toHaveBeenCalledOnce();
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: user.id,
+          action: "expense.delete",
+          entityType: "expense",
+          entityId: expenseId,
+        }),
+      })
+    );
   });
 });

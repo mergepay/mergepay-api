@@ -210,6 +210,10 @@ model AnchorSession {
   failureReason         String?  @map("failure_reason")
   retryCount            Int      @default(0) @map("retry_count")
   lastPolledAt          DateTime? @map("last_polled_at")
+  claimedAt             DateTime? @map("claimed_at")
+  claimedBy             String?  @map("claimed_by")
+  leaseExpiresAt        DateTime?  @map("lease_expires_at")
+  nextAttemptAt         DateTime?  @map("next_attempt_at")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
 

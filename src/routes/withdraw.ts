@@ -1,186 +1,175 @@
-/**
- * SEP-24 fiat off-ramp — Issue #40.
- *
- * A user-facing facade that:
- *   - Auths the caller via the existing SEP-10 JWT (`app.authenticate`).
- *   - Validates the request body (positive amount, supported asset).
- *   - Checks the user's on-chain balance on the relevant trustline.
- *   - Persists a `Withdrawal` record with status="pending".
- *   - Resolves the configured anchor's `TRANSFER_SERVER_SEP0024` from its
- *     stellar.toml and constructs an "interactive URL" the user opens to
- *     finish KYC and receive fiat.
- *   - Surfaces `transaction_id` (= the internal Withdrawal id) so the
- *     frontend can poll `GET /withdraw/:id` for status updates.
- *   - Emits an audit log on every state-changing call.
- *
- * Status transitions
- * ------------------
- *   pending → pending_anchor → completed | failed
- *
- * The anchor (via its existing webhook on `/anchors/webhook`) updates the
- * status when it calls back. `GET /withdraw/:id` is the polling point.
- */
-
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { config } from "../config";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { stellar } from "../services/stellar";
-import { isPositive, toStroops } from "../services/money";
 import { anchorService } from "../services/anchor";
+import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
-import { serializeWithdrawal } from "../serializers";
 
-/** Supported asset codes for fiat off-ramp in this MVP. */
-const SUPPORTED_ASSETS = new Set(["XLM", "USDC"]);
+const amountSchema = z
+  .string()
+  .regex(/^\d+(?:\.\d{1,7})?$/, "Amount must be a positive decimal")
+  .refine(
+    (value) => {
+      const [whole, fraction = ""] = value.split(".");
+      return (
+        BigInt(whole) * 10000000n +
+          BigInt((fraction + "0000000").slice(0, 7)) >
+        0n
+      );
+    },
+    { message: "Amount must be greater than zero" }
+  );
 
-const createBodySchema = z.object({
-  amount: z.string().min(1),
-  assetCode: z.string().min(1).max(12),
-  assetIssuer: z.string().nullable().optional(),
-  memo: z.string().min(1).max(28).optional(),
+const withdrawalBody = z.object({
+  amount: amountSchema,
+  asset_code: z.enum(["USDC", "XLM"]),
+  memo: z.string().max(28).optional(),
 });
 
-export default async function withdrawRoutes(app: FastifyInstance) {
-  app.addHook("preHandler", app.authenticate);
+function units(value: string): bigint {
+  const [whole, fraction = ""] = value.split(".");
+  return (
+    BigInt(whole) * 10000000n +
+    BigInt((fraction + "0000000").slice(0, 7))
+  );
+}
 
-  // -- POST /withdraw ----------------------------------------------------------
-  app.post("/withdraw", async (req) => {
+function serializeWithdrawal(withdrawal: any) {
+  return {
+    id: withdrawal.id,
+    userId: withdrawal.userId,
+    amount: withdrawal.amount.toString(),
+    assetCode: withdrawal.assetCode,
+    memo: withdrawal.memo ?? null,
+    anchorTxId: withdrawal.anchorTxId ?? null,
+    status: withdrawal.status,
+    createdAt: withdrawal.createdAt.toISOString(),
+    updatedAt: withdrawal.updatedAt.toISOString(),
+  };
+}
+
+export default async function withdrawalRoutes(app: FastifyInstance) {
+  const withdrawalModel = (prisma as any).withdrawal;
+
+  app.post("/withdraw", { preHandler: [app.authenticate] }, async (req) => {
     const auth = requireUser(req);
-    const body = createBodySchema.parse(req.body);
+    const body = withdrawalBody.parse(req.body);
+    const account = await stellar.loadAccount(auth.stellarPublicKey);
 
-    if (!isPositive(body.amount)) {
-      throw Errors.badRequest("invalid_amount", "Amount must be a positive decimal string");
-    }
-    if (!SUPPORTED_ASSETS.has(body.assetCode)) {
-      throw Errors.badRequest(
-        "unsupported_asset",
-        `Asset ${body.assetCode} is not supported for withdrawal`
-      );
-    }
-
-    // Pre-flight: account must exist on the ledger.
-    const snapshot = await stellar.loadAccount(auth.stellarPublicKey);
-    if (!snapshot.exists) {
+    if (!account.exists) {
       throw Errors.badRequest(
         "account_unfunded",
-        "Your Stellar account is not funded yet. Fund it before withdrawing."
+        "Your Stellar account is not funded yet."
       );
     }
 
-    // Balance check against the trustline (or native for XLM).
-    const balance = snapshot.balances.find((b) => {
-      if (b.assetCode !== body.assetCode) return false;
-      if (body.assetCode === "XLM") return b.assetIssuer == null;
-      return b.assetIssuer === (body.assetIssuer ?? null);
-    });
-    if (!balance) {
-      throw Errors.badRequest(
-        "no_trustline",
-        `You have no ${body.assetCode} trustline`
-      );
-    }
-    if (BigInt(toStroops(balance.balance)) < BigInt(toStroops(body.amount))) {
+    const balance = account.balances.find(
+      (item) => item.assetCode === body.asset_code
+    );
+    if (!balance || units(balance.balance) < units(body.amount)) {
       throw Errors.badRequest(
         "insufficient_balance",
-        `Withdraw ${body.amount} ${body.assetCode} but only ${balance.balance} available`
+        "Insufficient balance for this withdrawal."
       );
     }
 
-    // Resolve the anchor's interactive endpoint. We fetch stellar.toml with a
-    // cached 5-minute TTL; failures fall back to a structural placeholder URL
-    // (the anchor is configured to reject unsupported assets early in its
-    // own wizard, so this is best-effort).
-    const anchorName = config.ANCHOR_NAME;
-    const anchorHomeDomain = config.ANCHOR_HOME_DOMAIN;
-    let transferServer = "";
-    try {
-      const toml = await anchorService.getToml(anchorHomeDomain);
-      transferServer = toml.transferServerSep24 ?? "";
-    } catch {
-      // ignored — handled below
-    }
-
-    const interactiveUrl = transferServer
-      ? buildInteractiveUrl({
-          transferServer,
-          assetCode: body.assetCode,
-          assetIssuer: body.assetIssuer ?? null,
-          account: auth.stellarPublicKey,
-          amount: body.amount,
-        })
-      : null;
-
-    // status starts "pending"; the anchor webhook flips to completed | failed.
-    const withdrawal = await prisma.withdrawal.create({
+    const withdrawal = await withdrawalModel.create({
       data: {
         userId: auth.id,
         amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
+        assetCode: body.asset_code,
         memo: body.memo ?? null,
-        interactiveUrl,
-        anchorTxId: null,
         status: "pending",
       },
     });
 
     await audit({
       userId: auth.id,
-      action: "withdrawal.create",
+      action: "withdrawal.start",
       entityType: "withdrawal",
       entityId: withdrawal.id,
-      metadata: {
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        amount: body.amount,
-        anchorName,
-        anchorHomeDomain,
-      },
+      metadata: { amount: body.amount, assetCode: body.asset_code },
     });
 
+    const anchor = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
+    const challenge = await anchorService.getChallenge(
+      anchor.webAuthEndpoint,
+      auth.stellarPublicKey
+    );
+
     return {
-      withdrawal: serializeWithdrawal(withdrawal),
-      // For convenience, also expose the explicit fields the issue spec asks for.
-      interactive_url: withdrawal.interactiveUrl,
-      transaction_id: withdrawal.id,
-      status: withdrawal.status,
+      ...serializeWithdrawal(withdrawal),
+      interactive_url: null,
+      transaction_id: null,
+      challenge,
+      networkPassphrase: challenge.networkPassphrase || config.networkPassphrase,
     };
   });
 
-  // -- GET /withdraw/:id -------------------------------------------------------
-  app.get("/withdraw/:id", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+  app.post(
+    "/withdraw/:id/confirm",
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+      const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+      const withdrawal = await withdrawalModel.findUnique({ where: { id } });
 
-    const withdrawal = await prisma.withdrawal.findUnique({ where: { id } });
-    if (!withdrawal) throw Errors.notFound("Withdrawal not found");
-    if (withdrawal.userId !== auth.id) {
-      throw Errors.forbidden("You can only view your own withdrawal");
+      if (!withdrawal || withdrawal.userId !== auth.id) {
+        throw Errors.notFound("Withdrawal not found");
+      }
+      if (withdrawal.status !== "pending") {
+        return serializeWithdrawal(withdrawal);
+      }
+
+      try {
+        const anchor = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
+        const token = await anchorService.getToken(
+          anchor.webAuthEndpoint,
+          body.signedXdr
+        );
+        const result = await anchorService.startInteractive({
+          transferServer: anchor.transferServerSep24,
+          token,
+          kind: "withdrawal",
+          assetCode: withdrawal.assetCode,
+          account: auth.stellarPublicKey,
+        });
+        const updated = await withdrawalModel.update({
+          where: { id },
+          data: { anchorTxId: result.id, status: "pending" },
+        });
+        return {
+          ...serializeWithdrawal(updated),
+          interactive_url: result.url,
+          transaction_id: result.id,
+        };
+      } catch (error) {
+        await withdrawalModel.update({
+          where: { id },
+          data: { status: "failed" },
+        });
+        if (error instanceof AppError) throw error;
+        throw Errors.upstream("Withdrawal confirmation failed");
+      }
     }
-    return { withdrawal: serializeWithdrawal(withdrawal) };
-  });
-}
+  );
 
-// ---------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------
+  app.get("/withdraw/:id", { preHandler: [app.authenticate] }, async (req) => {
+    const auth = requireUser(req);
+    const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+    const withdrawal = await withdrawalModel.findUnique({ where: { id } });
+    if (!withdrawal || withdrawal.userId !== auth.id) {
+      throw Errors.notFound("Withdrawal not found");
+    }
 
-function buildInteractiveUrl(params: {
-  transferServer: string;
-  assetCode: string;
-  assetIssuer: string | null;
-  account: string;
-  amount: string;
-}): string {
-  const base = params.transferServer.replace(/\/+$/, "");
-  const qs = new URLSearchParams({
-    asset_code: params.assetCode,
-    account: params.account,
-    amount: params.amount,
+    return {
+      ...serializeWithdrawal(withdrawal),
+      transaction_id: withdrawal.anchorTxId,
+      status: withdrawal.status,
+    };
   });
-  if (params.assetIssuer) qs.set("asset_issuer", params.assetIssuer);
-  return `${base}/withdraw?${qs.toString()}`;
 }

@@ -6,8 +6,13 @@ export const STROOPS_PER_XLM = 10_000_000n;
 export const MAX_STROOPS = 9_223_372_036_854_775_807n;
 export const MAX_AMOUNT = "922337203685.4775807";
 
-const CANONICAL_AMOUNT = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
-const CANONICAL_STROOPS = /^(?:0|[1-9]\d*)$/;
+const CANONICAL_AMOUNT = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
+const CANONICAL_STROOPS = /^-?(?:0|[1-9]\d*)$/;
+
+/** Absolute value of a bigint — used by balance math, which is signed. */
+export function bigIntAbs(value: bigint): bigint {
+  return value < 0n ? -value : value;
+}
 
 export function normalizeAmount(value: string): string {
   if (typeof value !== "string") {
@@ -34,23 +39,30 @@ export function normalizeAmount(value: string): string {
   return trimmedFraction.length > 0 ? `${whole}.${trimmedFraction}` : whole;
 }
 
-/** Parse a canonical decimal amount exactly, without floating-point arithmetic. */
+/**
+ * Parse a canonical decimal amount exactly, without floating-point arithmetic.
+ *
+ * Signed values are accepted because net balances are signed (negative = owes).
+ * Route input is validated with `normalizeAmount`/`amountSchema`, which stay
+ * strictly positive.
+ */
 export function toStroops(amount: string): bigint {
   if (typeof amount !== "string" || !CANONICAL_AMOUNT.test(amount)) {
     throw new Error("Amount must be a canonical decimal string");
   }
 
-  const [whole, fraction = ""] = amount.split(".");
+  const negative = amount.startsWith("-");
+  const [whole, fraction = ""] = (negative ? amount.slice(1) : amount).split(".");
   if (fraction.length > 7) {
     throw new Error("Amount must have at most 7 decimal places");
   }
 
   const paddedFraction = fraction.padEnd(7, "0");
-  const stroops = BigInt(whole) * STROOPS_PER_XLM + BigInt(paddedFraction || "0");
-  if (stroops > MAX_STROOPS) {
+  const magnitude = BigInt(whole) * STROOPS_PER_XLM + BigInt(paddedFraction || "0");
+  if (magnitude > MAX_STROOPS) {
     throw new Error("Amount exceeds the supported Stellar range");
   }
-  return stroops;
+  return negative ? -magnitude : magnitude;
 }
 
 /** Convert stroops to the canonical decimal representation used by the API. */
@@ -70,16 +82,34 @@ export function fromStroops(stroops: bigint | number | string): string {
     value = BigInt(stroops);
   }
 
-  if (value < 0n || value > MAX_STROOPS) {
+  if (bigIntAbs(value) > MAX_STROOPS) {
     throw new Error("Stroop value is outside the supported Stellar range");
   }
 
-  const whole = value / STROOPS_PER_XLM;
-  const fraction = (value % STROOPS_PER_XLM)
+  const sign = value < 0n ? "-" : "";
+  const magnitude = bigIntAbs(value);
+  const whole = magnitude / STROOPS_PER_XLM;
+  const fraction = (magnitude % STROOPS_PER_XLM)
     .toString()
     .padStart(7, "0")
     .replace(/0+$/, "");
-  return fraction.length > 0 ? `${whole}.${fraction}` : whole.toString();
+  return fraction.length > 0 ? `${sign}${whole}.${fraction}` : `${sign}${whole}`;
+}
+
+/**
+ * Render stroops the way Stellar itself expects an amount on the wire: always
+ * exactly 7 decimal places, no trailing-zero trimming. `fromStroops` is the
+ * canonical *API* representation; this is the canonical *ledger* one.
+ */
+export function stroopsToStellarAmount(stroops: bigint): string {
+  if (bigIntAbs(stroops) > MAX_STROOPS) {
+    throw new Error("Stroop value is outside the supported Stellar range");
+  }
+  const sign = stroops < 0n ? "-" : "";
+  const magnitude = bigIntAbs(stroops);
+  const whole = magnitude / STROOPS_PER_XLM;
+  const fraction = (magnitude % STROOPS_PER_XLM).toString().padStart(7, "0");
+  return `${sign}${whole}.${fraction}`;
 }
 
 /** Return true only for a valid, strictly positive Stellar amount. */

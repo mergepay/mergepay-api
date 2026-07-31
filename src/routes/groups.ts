@@ -33,19 +33,25 @@ export default async function groupRoutes(app: FastifyInstance) {
       })
       .parse(req.body);
 
-    const group = await prisma.group.create({
-      data: {
-        name: body.name,
-        description: body.description,
-        createdByUserId: auth.id,
-        members: { create: { userId: auth.id, role: "admin" } },
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: "group.create",
-      entityType: "group",
-      entityId: group.id,
+    const group = await prisma.$transaction(async (tx) => {
+      const created = await tx.group.create({
+        data: {
+          name: body.name,
+          description: body.description,
+          createdByUserId: auth.id,
+          members: { create: { userId: auth.id, role: "admin" } },
+        },
+      });
+      await audit(
+        {
+          actor: { type: "user", userId: auth.id },
+          action: AuditAction.GroupCreate,
+          entityType: "group",
+          entityId: created.id,
+        },
+        tx
+      );
+      return created;
     });
     await auditLog.log("GROUP_CREATED", auth.id, group.id, { name: body.name });
     return { group: serializeGroup(group) };
@@ -171,7 +177,7 @@ export default async function groupRoutes(app: FastifyInstance) {
     ) {
       const body = z
         .object({
-          publicKey: z.string().regex(/^G[A-Z0-9]{55}$/),
+          publicKey: stellarPublicKeySchema,
         })
         .parse(req.body);
 
@@ -323,20 +329,24 @@ export default async function groupRoutes(app: FastifyInstance) {
     });
 
     if (!existing) {
-      await prisma.$transaction([
-        prisma.groupMember.create({
+      await prisma.$transaction(async (tx) => {
+        await tx.groupMember.create({
           data: { groupId: invite.groupId, userId: auth.id, role: "member" },
-        }),
-        prisma.invite.update({
+        });
+        await tx.invite.update({
           where: { id: invite.id },
           data: { uses: { increment: 1 } },
-        }),
-      ]);
-      await audit({
-        userId: auth.id,
-        action: "group.join",
-        entityType: "group",
-        entityId: invite.groupId,
+        });
+        await audit(
+          {
+            actor: { type: "user", userId: auth.id },
+            action: AuditAction.GroupJoin,
+            entityType: "group",
+            entityId: invite.groupId,
+            metadata: { inviteId: invite.id },
+          },
+          tx
+        );
       });
       await auditLog.log("MEMBER_JOINED", auth.id, invite.groupId);
     }

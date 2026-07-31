@@ -7,10 +7,20 @@ import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
 import { isPositive } from "../services/money";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
+
+/** Every route in this file takes a single opaque resource id. */
+const idParamSchema = z.object({ id: z.string().min(1).max(64) });
 
 const shareInput = z.object({
   userId: z.string(),
@@ -42,7 +52,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   // -- create -----------------------------------------------------------------
   app.post("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
@@ -50,27 +60,6 @@ export default async function expenseRoutes(app: FastifyInstance) {
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
-
-    // All participants (and payer) must be members of the group.
-    const memberIds = new Set(
-      (
-        await prisma.groupMember.findMany({
-          where: { groupId },
-          select: { userId: true },
-        })
-      ).map((m) => m.userId)
-    );
-    if (!memberIds.has(payerUserId)) {
-      throw Errors.badRequest("invalid_payer", "Payer must be a group member");
-    }
-    for (const s of body.shares) {
-      if (!memberIds.has(s.userId)) {
-        throw Errors.badRequest(
-          "invalid_participant",
-          "All participants must be group members"
-        );
-      }
-    }
 
     let computed;
     try {
@@ -81,36 +70,46 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
-    const expense = await prisma.expense.create({
-      data: {
-        groupId,
-        payerUserId,
-        title: body.title,
-        description: body.description,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        splitType: body.splitType,
-        memo,
-        receiptUrl: body.receiptUrl ?? null,
-        shares: {
-          create: computed.map((c) => ({
-            userId: c.userId,
-            shareAmount: c.shareAmount,
-            // The payer's own share is already covered — mark it settled.
-            status: c.userId === payerUserId ? "settled" : "pending",
-          })),
+    const expense = await prisma.$transaction(async (tx) => {
+      const created = await tx.expense.create({
+        data: {
+          groupId,
+          payerUserId,
+          title: body.title,
+          description: body.description,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          splitType: body.splitType,
+          memo,
+          receiptUrl: body.receiptUrl ?? null,
+          shares: {
+            create: computed.map((c) => ({
+              userId: c.userId,
+              shareAmount: c.shareAmount,
+              status: c.userId === payerUserId ? "settled" : "pending",
+            })),
+          },
         },
-      },
-      include: expenseInclude,
-    });
+        include: expenseInclude,
+      });
 
-    await audit({
-      userId: auth.id,
-      action: "expense.create",
-      entityType: "expense",
-      entityId: expense.id,
-      metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.create",
+          entityType: "expense",
+          entityId: created.id,
+          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+        },
+      });
+
+      return created;
+    });
+    await auditLog.log("EXPENSE_CREATED", auth.id, groupId, {
+      expenseId: expense.id,
+      amount: body.amount,
+      title: body.title,
     });
 
     return { expense: serializeExpense(expense) };
@@ -119,55 +118,29 @@ export default async function expenseRoutes(app: FastifyInstance) {
   // -- list -------------------------------------------------------------------
   app.get("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    const { id: groupId } = idParamSchema.parse(req.params);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    // Membership is checked before any row is read, and the `groupId` filter
+    // below is what scopes the page — never the cursor.
     await requireMembership(groupId, auth.id);
 
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
+    const position = requireCursor(cursor);
 
     const expenses = await prisma.expense.findMany({
-      where: {
-        groupId,
-        ...(decodedCursor && {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }),
-      },
+      where: { groupId, ...cursorFilter(position, order) },
       include: expenseInclude,
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
     });
 
-    const hasMore = expenses.length > limit;
-    const results = hasMore ? expenses.slice(0, limit) : expenses;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
-
-    return {
-      expenses: results.map(serializeExpense),
-      meta: { nextCursor, hasMore },
-    };
+    const { items, meta } = buildPage(expenses, limit, order);
+    return { expenses: items.map(serializeExpense), meta };
   });
 
   // -- get one ----------------------------------------------------------------
   app.get("/expenses/:id", async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
     const expense = await prisma.expense.findUnique({
       where: { id },
       include: expenseInclude,
@@ -181,66 +154,73 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.patch("/expenses/:id", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z
-      .object({
-        title: z.string().min(1).max(80).optional(),
-        description: z.string().max(500).nullable().optional(),
-        memo: z.string().max(24).optional(),
-        receiptUrl: z.string().nullable().optional(),
-      })
-      .parse(req.body);
+    const body = updateExpenseSchema.parse(req.body);
 
-    const expense = await prisma.expense.findUnique({ where: { id } });
-    if (!expense) throw Errors.notFound("Expense not found");
-    const ctx = await requireMembership(expense.groupId, auth.id);
-    if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
-      throw Errors.forbidden("Only the payer or an admin can edit this expense");
-    }
+    // The membership/role check and the update run in one transaction: a
+    // concurrent removal or demotion of `auth.id` between the check and the
+    // write cannot slip an unauthorized edit through.
+    const updated = await prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.findUnique({ where: { id } });
+      if (!expense) throw Errors.notFound("Expense not found");
+      const ctx = await requireMembership(expense.groupId, auth.id, tx);
+      if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
+        throw Errors.forbidden("Only the payer or an admin can edit this expense");
+      }
 
-    const updated = await prisma.expense.update({
-      where: { id },
-      data: {
-        ...(body.title !== undefined && { title: body.title }),
-        ...(body.description !== undefined && { description: body.description }),
-        ...(body.memo !== undefined && { memo: body.memo }),
-        ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
-      },
-      include: expenseInclude,
+      return tx.expense.update({
+        where: { id },
+        data: {
+          ...(body.title !== undefined && { title: body.title }),
+          ...(body.description !== undefined && { description: body.description }),
+          ...(body.memo !== undefined && { memo: body.memo }),
+          ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
+        },
+        include: expenseInclude,
+      });
     });
+    await auditLog.log("EXPENSE_UPDATED", auth.id, expense.groupId, { expenseId: id });
     return { expense: serializeExpense(updated) };
   });
 
   // -- delete -----------------------------------------------------------------
   app.delete("/expenses/:id", async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
 
-    const expense = await prisma.expense.findUnique({
-      where: { id },
-      include: { shares: true },
-    });
-    if (!expense) throw Errors.notFound("Expense not found");
-    const ctx = await requireMembership(expense.groupId, auth.id);
-    if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
-      throw Errors.forbidden("Only the payer or an admin can delete this expense");
-    }
-    const hasSettled = expense.shares.some(
-      (s) => s.status === "settled" && s.userId !== expense.payerUserId
-    );
-    if (hasSettled) {
-      throw Errors.conflict(
-        "expense_settled",
-        "Cannot delete an expense that already has settled shares"
+    // Same atomicity concern as the update route above: check and delete
+    // happen in one transaction.
+    await prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.findUnique({
+        where: { id },
+        include: { shares: true },
+      });
+      if (!expense) throw Errors.notFound("Expense not found");
+      const ctx = await requireMembership(expense.groupId, auth.id, tx);
+      if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
+        throw Errors.forbidden("Only the payer or an admin can delete this expense");
+      }
+      const hasSettled = expense.shares.some(
+        (s) => s.status === "settled" && s.userId !== expense.payerUserId
       );
-    }
+      if (hasSettled) {
+        throw Errors.conflict(
+          "expense_settled",
+          "Cannot delete an expense that already has settled shares"
+        );
+      }
 
-    await prisma.expense.delete({ where: { id } });
-    await audit({
-      userId: auth.id,
-      action: "expense.delete",
-      entityType: "expense",
-      entityId: id,
+    await prisma.$transaction(async (tx) => {
+      await tx.expense.delete({ where: { id } });
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.delete",
+          entityType: "expense",
+          entityId: id,
+        },
+      });
     });
+    await auditLog.log("EXPENSE_DELETED", auth.id, expense.groupId, { expenseId: id });
     return { ok: true };
   });
 }

@@ -2,6 +2,10 @@
  * Stellar service — all Horizon I/O and transaction construction lives here so
  * tests can mock a single module. Mergepay only ever builds UNSIGNED envelopes;
  * the user's wallet signs, then we submit the signed XDR.
+ *
+ * Every external Horizon call has a bounded timeout. Timeout and transport
+ * errors are classified so callers (API routes, worker) can distinguish them
+ * from business-logic errors.
  */
 
 import {
@@ -19,11 +23,16 @@ import {
 import { config } from "../config";
 import { Errors } from "../errors";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
+import { withTimeout, TimeoutError, TransportError } from "./timeout";
 
 let _server: Horizon.Server | null = null;
 function server(): Horizon.Server {
   if (!_server) _server = new Horizon.Server(config.HORIZON_URL);
   return _server;
+}
+
+function logUpstreamError(e: unknown, codes: unknown): void {
+  console.error("[stellar] Upstream error:", e instanceof Error ? e.message : String(e), codes ? JSON.stringify(codes) : "");
 }
 
 export interface AssetSpec {
@@ -56,7 +65,15 @@ export const stellar = {
   /** Load an account. Returns exists=false for unfunded accounts (404). */
   async loadAccount(publicKey: string): Promise<AccountSnapshot> {
     try {
-      const acct = await server().loadAccount(publicKey);
+      const acct = await withTimeout(
+        "Horizon.loadAccount",
+        config.HORIZON_ACCOUNT_TIMEOUT_MS,
+        async (signal) => {
+          // Horizon.Server.loadAccount doesn't accept AbortSignal directly,
+          // but we wrap it so timeout still fires and rejects the promise.
+          return server().loadAccount(publicKey);
+        }
+      );
       return {
         exists: true,
         sequence: acct.sequenceNumber(),
@@ -97,6 +114,13 @@ export const stellar = {
     asset: AssetSpec;
     amount: string;
     memoCode: string;
+    /**
+     * Seconds the built envelope stays valid. Defaults to the shared intent
+     * window so the transaction's own `maxTime` and the intent expiry the
+     * caller records describe the same deadline. Callers pass the value they
+     * persisted, never a client-supplied one.
+     */
+    validitySeconds?: number;
   }): string {
     const source = new Account(params.sourcePublicKey, params.sourceSequence);
     const tx = new TransactionBuilder(source, {
@@ -111,7 +135,10 @@ export const stellar = {
         })
       )
       .addMemo(Memo.text(memoText(params.memoCode)))
-      .setTimeout(300)
+      // An unbounded envelope could be submitted indefinitely, so the timeout
+      // is what puts the intent's deadline on-chain: past it, Horizon itself
+      // rejects the transaction as tx_too_late.
+      .setTimeout(params.validitySeconds ?? INTENT_VALIDITY_SECONDS)
       .build();
     return tx.toXDR();
   },
@@ -128,24 +155,38 @@ export const stellar = {
       asset: AssetSpec;
       amount: string;
       memoCode: string;
+      /**
+       * The intent's recorded expiry. When present, the envelope's own time
+       * bounds are validated against it and an expired intent is rejected
+       * *before* anything is sent to Horizon.
+       */
+      expiresAt?: Date | null;
+      /** Names the resource in the expiration error, e.g. "settlement". */
+      resource?: string;
     }
   ): Promise<string> {
-    let tx: Transaction;
+    const { tx } = validateSignedXdr(signedXdr, expected);
     try {
-      tx = new Transaction(signedXdr, config.networkPassphrase);
-    } catch {
-      throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
-    }
-    validatePaymentTx(tx, expected);
-    try {
-      const res = await server().submitTransaction(tx);
+      const res = await withTimeout(
+        "Horizon.submitTransaction",
+        config.HORIZON_SUBMIT_TIMEOUT_MS,
+        async (signal) => {
+          // Horizon.Server.submitTransaction doesn't accept AbortSignal directly,
+          // but we wrap it so timeout still fires and rejects the promise.
+          return server().submitTransaction(tx);
+        }
+      );
       return res.hash;
     } catch (e: any) {
+      // Re-throw TimeoutError and TransportError as-is for retry classification
+      if (e instanceof TimeoutError || e instanceof TransportError) {
+        throw e;
+      }
       const codes =
         e?.response?.data?.extras?.result_codes ??
         e?.response?.data?.result_codes;
-      const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
-      throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+      logUpstreamError(e, codes);
+      throw Errors.upstream("Stellar rejected the transaction");
     }
   },
 
@@ -154,7 +195,13 @@ export const stellar = {
     hash: string
   ): Promise<{ successful: boolean } | null> {
     try {
-      const tx = await server().transactions().transaction(hash).call();
+      const tx = await withTimeout(
+        "Horizon.getTransaction",
+        config.HORIZON_STATUS_TIMEOUT_MS,
+        async (signal) => {
+          return server().transactions().transaction(hash).call();
+        }
+      );
       return { successful: (tx as any).successful };
     } catch (e: any) {
       if (e?.response?.status === 404) return null;
@@ -175,8 +222,22 @@ export function validatePaymentTx(
     asset: AssetSpec;
     amount: string;
     memoCode: string;
+    /** Recorded intent expiry; when present, the envelope's bounds must agree. */
+    expiresAt?: Date | null;
+    /** Names the resource in the expiration error, e.g. "settlement". */
+    resource?: string;
   }
 ): void {
+  // Checked first: a stale envelope should be reported as expired, not as some
+  // incidental mismatch further down, and an expired intent must never reach
+  // Horizon or an anchor. `assertTimeBoundsMatchIntent` also rejects an
+  // unbounded envelope, which would otherwise be submittable forever.
+  assertTimeBoundsMatchIntent(
+    readTimeBounds(tx as unknown as { timeBounds?: { minTime: number | string; maxTime: number | string } | null }),
+    expected.expiresAt ?? null,
+    expected.resource ?? "transaction"
+  );
+
   if (tx.source !== expected.sourcePublicKey) {
     throw Errors.badRequest("xdr_mismatch", "Transaction source does not match");
   }
@@ -233,61 +294,20 @@ function normalizeAmount(a: string): string {
 }
 
 /**
- * Parse a base64 signed XDR envelope against the expected network, rejecting
- * anything that isn't a single-signature-family payment transaction envelope
- * (e.g. fee-bump transactions) or that fails to decode at all. Never throws a
- * raw SDK exception — always surfaces a client-safe AppError instead.
+ * Parse and validate a signed XDR against the expected payment intent
+ * without submitting it to Horizon. Returns the parsed transaction and its
+ * hash on success. Throws AppError (400 XDR_MISMATCH) on any mismatch.
+ *
+ * Callers use this in API routes to reject invalid signed XDRs *before*
+ * persisting them, so Horizon is never called for transactions that fail
+ * structural validation.
  */
-export function parseSignedPaymentXdr(
-  signedXdr: string,
-  networkPassphrase: string = config.networkPassphrase
-): Transaction {
-  let envelope: Transaction | FeeBumpTransaction;
-  try {
-    envelope = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
-  } catch {
-    throw Errors.badRequest(
-      "xdr_mismatch",
-      "The provided transaction could not be parsed"
-    );
-  }
-  if (envelope instanceof FeeBumpTransaction) {
-    throw Errors.badRequest(
-      "xdr_mismatch",
-      "Fee-bump transaction envelopes are not supported"
-    );
-  }
-  return envelope;
+export interface SignedXdrValidation {
+  tx: Transaction;
+  hash: string;
 }
 
-/** Reject a transaction whose time bounds have already expired. */
-export function assertTimeBoundsValid(tx: Transaction): void {
-  const timeBounds = tx.timeBounds;
-  if (!timeBounds) return;
-  const maxTime = Number(timeBounds.maxTime);
-  if (maxTime > 0 && Date.now() > maxTime * 1000) {
-    throw Errors.badRequest(
-      "xdr_mismatch",
-      "Transaction time bounds have expired"
-    );
-  }
-  const minTime = Number(timeBounds.minTime);
-  if (minTime > 0 && Date.now() < minTime * 1000) {
-    throw Errors.badRequest(
-      "xdr_mismatch",
-      "Transaction is not yet valid (minTime in the future)"
-    );
-  }
-}
-
-/**
- * Parse and fully validate a signed payment XDR against the expected
- * settlement intent: network, envelope type, time bounds, source,
- * destination, asset, amount, and memo. Throws AppError (400) on any
- * mismatch or malformed input — callers must not submit to Horizon unless
- * this returns successfully.
- */
-export function validateSignedPaymentXdr(
+export function validateSignedXdr(
   signedXdr: string,
   expected: {
     sourcePublicKey: string;
@@ -295,11 +315,14 @@ export function validateSignedPaymentXdr(
     asset: AssetSpec;
     amount: string;
     memoCode: string;
-  },
-  networkPassphrase: string = config.networkPassphrase
-): Transaction {
-  const tx = parseSignedPaymentXdr(signedXdr, networkPassphrase);
-  assertTimeBoundsValid(tx);
+  }
+): SignedXdrValidation {
+  let tx: Transaction;
+  try {
+    tx = new Transaction(signedXdr, config.networkPassphrase);
+  } catch {
+    throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
+  }
   validatePaymentTx(tx, expected);
-  return tx;
+  return { tx, hash: tx.hash().toString("hex") };
 }

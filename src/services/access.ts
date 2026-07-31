@@ -1,3 +1,4 @@
+import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "../db";
 import { Errors } from "../errors";
 
@@ -8,20 +9,40 @@ export interface MembershipContext {
 }
 
 /**
+ * Any client capable of running the membership lookup: the default
+ * singleton, or a `prisma.$transaction` callback's `tx`. Passing `tx`
+ * lets a route perform its authorization check and its mutation as one
+ * atomic unit, so a concurrent membership change (removal, demotion)
+ * between the check and the write cannot slip through.
+ */
+type Db = PrismaClient | Prisma.TransactionClient;
+
+/**
  * Ensure the user is currently a member of the group; returns their membership
- * row. A missing membership is intentionally reported as not-found so callers
- * cannot use an authenticated token to determine whether another group exists.
+ * row.
+ *
+ * A caller who is not a member gets `403 FORBIDDEN` when the group exists and
+ * `404 NOT_FOUND` when it does not. The distinction is deliberate — clients
+ * need to tell "this resource is gone" from "you may not look at it" to render
+ * a useful state — and it leaks only group-id existence, never any group
+ * content, membership, or balance.
  */
 export async function requireMembership(
   groupId: string,
-  userId: string
+  userId: string,
+  db: Db = prisma
 ): Promise<MembershipContext> {
-  const member = await prisma.groupMember.findUnique({
+  const member = await db.groupMember.findUnique({
     where: { groupId_userId: { groupId, userId } },
   });
 
   if (!member) {
-    throw Errors.notFound("Group not found");
+    const group = await prisma.group.findUnique({
+      where: { id: groupId },
+      select: { id: true },
+    });
+    if (!group) throw Errors.notFound("Group not found");
+    throw Errors.forbidden("You are not a member of this group");
   }
 
   return { groupId, userId, role: member.role };
@@ -34,9 +55,10 @@ export async function requireMembership(
  */
 export async function requireAdmin(
   groupId: string,
-  userId: string
+  userId: string,
+  db: Db = prisma
 ): Promise<MembershipContext> {
-  const ctx = await requireMembership(groupId, userId);
+  const ctx = await requireMembership(groupId, userId, db);
   if (ctx.role !== "admin") {
     throw Errors.forbidden("Only a group admin can perform this action");
   }

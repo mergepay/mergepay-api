@@ -53,8 +53,7 @@ describe("Zod validation error handler", () => {
     const res = await app.inject({ method: "GET", url: "/test-zod/simple" });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("VALIDATION_ERROR");
-    expect(body.statusCode).toBe(400);
+    expect(body.code).toBe("VALIDATION_ERROR");
     expect(Array.isArray(body.details)).toBe(true);
     expect(body.details[0]).toMatchObject({
       field: expect.any(String),
@@ -68,7 +67,7 @@ describe("Zod validation error handler", () => {
     const res = await app.inject({ method: "GET", url: "/test-zod/nested" });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("VALIDATION_ERROR");
+    expect(body.code).toBe("VALIDATION_ERROR");
     expect(Array.isArray(body.details)).toBe(true);
     expect(body.details[0].field).toBe("user.age");
     expect(body.details[0].message).toContain("18");
@@ -79,8 +78,8 @@ describe("Zod validation error handler", () => {
     const res = await app.inject({ method: "GET", url: "/nonexistent-route-xyz" });
     expect(res.statusCode).toBe(404);
     const body = res.json();
-    expect(body.error).toBe("NOT_FOUND");
-    expect(body.statusCode).toBe(404);
+    expect(body.code).toBe("NOT_FOUND");
+    expect(body.statusCode).toBeUndefined();
   });
 
   it("returns 400 for malformed POST body to a route with Zod validation", async () => {
@@ -91,7 +90,6 @@ describe("Zod validation error handler", () => {
     });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("VALIDATION_ERROR");
-    expect(body.statusCode).toBe(400);
+    expect(body.code).toBe("VALIDATION_ERROR");
   });
 });

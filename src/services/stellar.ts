@@ -2,6 +2,10 @@
  * Stellar service — all Horizon I/O and transaction construction lives here so
  * tests can mock a single module. Mergepay only ever builds UNSIGNED envelopes;
  * the user's wallet signs, then we submit the signed XDR.
+ *
+ * Every external Horizon call has a bounded timeout. Timeout and transport
+ * errors are classified so callers (API routes, worker) can distinguish them
+ * from business-logic errors.
  */
 
 import {
@@ -18,11 +22,16 @@ import {
 import { config } from "../config";
 import { Errors } from "../errors";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
+import { withTimeout, TimeoutError, TransportError } from "./timeout";
 
 let _server: Horizon.Server | null = null;
 function server(): Horizon.Server {
   if (!_server) _server = new Horizon.Server(config.HORIZON_URL);
   return _server;
+}
+
+function logUpstreamError(e: unknown, codes: unknown): void {
+  console.error("[stellar] Upstream error:", e instanceof Error ? e.message : String(e), codes ? JSON.stringify(codes) : "");
 }
 
 export interface AssetSpec {
@@ -55,7 +64,15 @@ export const stellar = {
   /** Load an account. Returns exists=false for unfunded accounts (404). */
   async loadAccount(publicKey: string): Promise<AccountSnapshot> {
     try {
-      const acct = await server().loadAccount(publicKey);
+      const acct = await withTimeout(
+        "Horizon.loadAccount",
+        config.HORIZON_ACCOUNT_TIMEOUT_MS,
+        async (signal) => {
+          // Horizon.Server.loadAccount doesn't accept AbortSignal directly,
+          // but we wrap it so timeout still fires and rejects the promise.
+          return server().loadAccount(publicKey);
+        }
+      );
       return {
         exists: true,
         sequence: acct.sequenceNumber(),
@@ -129,22 +146,28 @@ export const stellar = {
       memoCode: string;
     }
   ): Promise<string> {
-    let tx: Transaction;
+    const { tx } = validateSignedXdr(signedXdr, expected);
     try {
-      tx = new Transaction(signedXdr, config.networkPassphrase);
-    } catch {
-      throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
-    }
-    validatePaymentTx(tx, expected);
-    try {
-      const res = await server().submitTransaction(tx);
+      const res = await withTimeout(
+        "Horizon.submitTransaction",
+        config.HORIZON_SUBMIT_TIMEOUT_MS,
+        async (signal) => {
+          // Horizon.Server.submitTransaction doesn't accept AbortSignal directly,
+          // but we wrap it so timeout still fires and rejects the promise.
+          return server().submitTransaction(tx);
+        }
+      );
       return res.hash;
     } catch (e: any) {
+      // Re-throw TimeoutError and TransportError as-is for retry classification
+      if (e instanceof TimeoutError || e instanceof TransportError) {
+        throw e;
+      }
       const codes =
         e?.response?.data?.extras?.result_codes ??
         e?.response?.data?.result_codes;
-      const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
-      throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+      logUpstreamError(e, codes);
+      throw Errors.upstream("Stellar rejected the transaction");
     }
   },
 
@@ -153,7 +176,13 @@ export const stellar = {
     hash: string
   ): Promise<{ successful: boolean } | null> {
     try {
-      const tx = await server().transactions().transaction(hash).call();
+      const tx = await withTimeout(
+        "Horizon.getTransaction",
+        config.HORIZON_STATUS_TIMEOUT_MS,
+        async (signal) => {
+          return server().transactions().transaction(hash).call();
+        }
+      );
       return { successful: (tx as any).successful };
     } catch (e: any) {
       if (e?.response?.status === 404) return null;
@@ -229,4 +258,38 @@ function normalizeAmount(a: string): string {
   // Compare at 7dp precision regardless of trailing zeros.
   const [w, f = ""] = a.split(".");
   return `${w}.${(f + "0000000").slice(0, 7)}`;
+}
+
+/**
+ * Parse and validate a signed XDR against the expected payment intent
+ * without submitting it to Horizon. Returns the parsed transaction and its
+ * hash on success. Throws AppError (400 XDR_MISMATCH) on any mismatch.
+ *
+ * Callers use this in API routes to reject invalid signed XDRs *before*
+ * persisting them, so Horizon is never called for transactions that fail
+ * structural validation.
+ */
+export interface SignedXdrValidation {
+  tx: Transaction;
+  hash: string;
+}
+
+export function validateSignedXdr(
+  signedXdr: string,
+  expected: {
+    sourcePublicKey: string;
+    destination: string;
+    asset: AssetSpec;
+    amount: string;
+    memoCode: string;
+  }
+): SignedXdrValidation {
+  let tx: Transaction;
+  try {
+    tx = new Transaction(signedXdr, config.networkPassphrase);
+  } catch {
+    throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
+  }
+  validatePaymentTx(tx, expected);
+  return { tx, hash: tx.hash().toString("hex") };
 }

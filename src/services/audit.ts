@@ -3,6 +3,7 @@ import { prisma } from "../db";
 
 export interface AuditParams {
   userId?: string | null;
+  groupId?: string | null;
   action: string;
   entityType: string;
   entityId: string;
@@ -25,6 +26,16 @@ export function auditData(params: AuditParams) {
 /** Best-effort audit log write. Never throws into the request path. */
 export async function audit(params: AuditParams): Promise<void> {
   try {
+    await prisma.auditLog.create({
+      data: {
+        userId: params.userId ?? null,
+        groupId: params.groupId ?? null,
+        action: params.action,
+        entityType: params.entityType,
+        entityId: params.entityId,
+        metadata: (params.metadata ?? undefined) as any,
+      },
+    });
     await prisma.auditLog.create({ data: auditData(params) });
   } catch {
     // swallow — auditing outside a caller-managed transaction must not break the operation

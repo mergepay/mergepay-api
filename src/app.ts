@@ -21,6 +21,7 @@ import anchorRoutes from "./routes/anchors";
 import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
+import auditLogRoutes from "./routes/audit-log";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
 import { validateAssetConfig } from "./services/assets";

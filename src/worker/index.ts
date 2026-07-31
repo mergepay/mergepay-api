@@ -436,6 +436,25 @@ async function reconcileSingleAnchor(
     const shouldBackoff = currentRetryCount <= ANCHOR_MAX_RETRIES;
     const category = ErrorCategory.TRANSIENT; // Poll errors are typically transient
 
+        await audit({
+          groupId: settlement.groupId,
+          action: "settlement.confirmed",
+          entityType: "settlement",
+          entityId: settlement.id,
+          metadata: { status: "confirmed", stellarTxHash: hash },
+        });
+      }
+    } catch (error: any) {
+      const msg = error?.message ?? String(error);
+
+      await prisma.settlement.update({
+        where: { id: settlement.id },
+        data: {
+          status: "failed",
+          failureReason: msg,
+          retryCount: { increment: 1 },
+        },
+      });
     const data: Record<string, unknown> = {
       lastPolledAt: now,
       retryCount: currentRetryCount,

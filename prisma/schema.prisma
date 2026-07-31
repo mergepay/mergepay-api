@@ -258,6 +258,7 @@ model IdempotencyKey {
 model AuditLog {
   id         String   @id @default(cuid())
   userId     String?  @map("user_id")
+  groupId    String?  @map("group_id")
   action     String
   groupId    String?  @map("group_id")
   details    Json?

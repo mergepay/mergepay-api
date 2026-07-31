@@ -175,3 +175,42 @@ export function serializeAnchorSession(s: any) {
     createdAt: iso(s.createdAt),
   };
 }
+
+// Metadata keys that must never reach the client, even if a future write
+// path accidentally includes them (audit metadata is meant to be a small
+// operational breadcrumb, not a payload dump).
+const SENSITIVE_AUDIT_METADATA_KEYS = new Set([
+  "signedxdr",
+  "transactionxdr",
+  "xdr",
+  "token",
+  "jwt",
+  "secret",
+  "password",
+  "privatekey",
+  "secretkey",
+  "authorization",
+]);
+
+function redactAuditMetadata(metadata: unknown): Record<string, unknown> | null {
+  if (!metadata || typeof metadata !== "object") return null;
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata as Record<string, unknown>)) {
+    if (SENSITIVE_AUDIT_METADATA_KEYS.has(key.toLowerCase())) continue;
+    redacted[key] = value;
+  }
+  return redacted;
+}
+
+export function serializeAuditLogEntry(e: any) {
+  return {
+    id: e.id,
+    createdAt: iso(e.createdAt),
+    actorUserId: e.userId ?? null,
+    actorDisplayName: e.user?.displayName ?? null,
+    action: e.action,
+    entityType: e.entityType,
+    entityId: e.entityId,
+    metadata: redactAuditMetadata(e.metadata),
+  };
+}

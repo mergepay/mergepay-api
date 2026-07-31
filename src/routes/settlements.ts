@@ -397,6 +397,13 @@ export default async function settlementRoutes(app: FastifyInstance) {
           });
         }
 
+    await audit({
+      userId: auth.id,
+      groupId: settlement.groupId,
+      action: "settlement.confirm",
+      entityType: "settlement",
+      entityId: id,
+      metadata: { status: "submitted" },
         return { settlement: serializeSettlement(finalSettlement) };
       },
     });

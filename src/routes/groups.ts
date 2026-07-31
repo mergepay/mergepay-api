@@ -17,12 +17,13 @@ import {
   groupPrimaryAsset,
   loadGroupBalances,
 } from "../services/group-balances";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 
 export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- create -----------------------------------------------------------------
-  app.post("/groups", { config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } } }, async (req) => {
+  app.post("/groups", { config: { rateLimit: { max: config.AUTH_RATE_LIMIT_MAX, timeWindow: "1 minute" } } }, async (req) => {
     const auth = requireUser(req);
     const body = z
       .object({
@@ -79,20 +80,52 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.get("/groups/:id", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
     const ctx = await requireMembership(id, auth.id);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group) throw Errors.notFound("Group not found");
+
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
     const members = await prisma.groupMember.findMany({
-      where: { groupId: id },
+      where: {
+        groupId: id,
+        ...(decodedCursor && {
+          OR: [
+            { joinedAt: { gt: decodedCursor.createdAt } },
+            {
+              joinedAt: decodedCursor.createdAt,
+              id: { gt: decodedCursor.id },
+            },
+          ],
+        }),
+      },
       include: { user: true },
-      orderBy: { joinedAt: "asc" },
+      orderBy: [{ joinedAt: "asc" }, { id: "asc" }],
+      take: limit + 1,
     });
+
+    const hasMore = members.length > limit;
+    const results = hasMore ? members.slice(0, limit) : members;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].joinedAt,
+          results[results.length - 1].id
+        )
+      : null;
 
     return {
       group: serializeGroup(group),
-      members: members.map(serializeMember),
+      members: results.map(serializeMember),
       yourRole: ctx.role,
+      meta: { nextCursor, hasMore },
     };
   });
 

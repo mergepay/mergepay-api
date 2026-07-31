@@ -2,6 +2,7 @@ import pino from "pino";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { type CorrelationContext, jobContext, loggerWithContext } from "../lib/correlation";
 
 const log = pino({ name: "transaction-reconciliation" });
 
@@ -126,7 +127,8 @@ async function writeStatus(
     reason?: string;
     hash?: string;
     retryCount?: number;
-  } = {}
+  } = {},
+  ctx?: CorrelationContext
 ): Promise<void> {
   const hashChanged =
     details.hash !== undefined && details.hash !== record.stellarTxHash;
@@ -149,7 +151,8 @@ async function writeStatus(
 
   const model = modelFor(table);
   if (!model?.update) {
-    log.warn({ table, id: record.id }, "reconciliation table is unavailable");
+    const wrnLog = loggerWithContext(log, ctx);
+    wrnLog.warn({ table, id: record.id }, "reconciliation table is unavailable");
     return;
   }
 
@@ -195,7 +198,8 @@ async function writeStatus(
     },
   });
 
-  log.info(
+  const infoLog = loggerWithContext(log, ctx);
+  infoLog.info(
     {
       table,
       id: record.id,
@@ -212,10 +216,12 @@ async function failOrRetry(
   table: ReconciliationTable,
   record: ReconciliationRecord,
   options: Required<ReconciliationOptions>,
-  reason: string
+  reason: string,
+  ctx?: CorrelationContext
 ): Promise<void> {
   const retryCount = typeof record.retryCount === "number" ? record.retryCount : 0;
   const service = stellar as unknown as StellarReconciliationService;
+  const jobLog = loggerWithContext(log, ctx);
 
   if (
     record.stellarTxHash &&
@@ -235,13 +241,13 @@ async function failOrRetry(
         retryCount: retryCount + 1,
       });
 
-      log.warn(
+      jobLog.warn(
         { table, id: record.id, hash: nextHash, retryCount: retryCount + 1 },
         "retried Stellar transaction"
       );
       return;
     } catch (error) {
-      log.warn(
+      jobLog.warn(
         { err: error, table, id: record.id },
         "Stellar transaction retry failed"
       );
@@ -253,7 +259,7 @@ async function failOrRetry(
     retryCount,
   });
 
-  log.warn(
+  jobLog.warn(
     { table, id: record.id, hash: record.stellarTxHash, retryCount },
     "Stellar transaction marked failed"
   );
@@ -275,9 +281,11 @@ async function getTransaction(hash: string): Promise<HorizonTransaction> {
 async function reconcileRecord(
   table: ReconciliationTable,
   record: ReconciliationRecord,
-  options: Required<ReconciliationOptions>
+  options: Required<ReconciliationOptions>,
+  ctx?: CorrelationContext
 ): Promise<void> {
   if (!record.stellarTxHash) return;
+  const jobLog = loggerWithContext(log, ctx);
 
   let transaction: HorizonTransaction | undefined;
 
@@ -285,7 +293,7 @@ async function reconcileRecord(
     transaction = await getTransaction(record.stellarTxHash);
   } catch (error) {
     if (!isNotFoundError(error)) {
-      log.warn(
+      jobLog.warn(
         { err: error, table, id: record.id },
         "unable to query Stellar transaction; will retry"
       );
@@ -298,9 +306,9 @@ async function reconcileRecord(
       await writeStatus(table, record, "confirmed", {
         ledger: transaction.ledger,
         hash: transaction.hash ?? record.stellarTxHash,
-      });
+      }, ctx);
     } else if (transaction.successful === false) {
-      await failOrRetry(table, record, options, "Stellar rejected the transaction");
+      await failOrRetry(table, record, options, "Stellar rejected the transaction", ctx);
     }
     return;
   }
@@ -311,7 +319,8 @@ async function reconcileRecord(
       table,
       record,
       options,
-      `Transaction was not found on Stellar after ${options.timeoutMs}ms`
+      `Transaction was not found on Stellar after ${options.timeoutMs}ms`,
+      ctx
     );
   }
 }
@@ -336,7 +345,8 @@ async function loadPendingRecords(
 }
 
 export async function runReconciliation(
-  options: ReconciliationOptions = {}
+  options: ReconciliationOptions = {},
+  cycleId?: string
 ): Promise<void> {
   const resolved = reconciliationConfig(options);
   const cutoff = new Date(Date.now() - resolved.intervalMs);
@@ -361,10 +371,14 @@ export async function runReconciliation(
     processedByTable[table] = records.length;
 
     for (const record of records) {
+      const ctx = record.id
+        ? jobContext(`reconcile.${table}`, record.id)
+        : undefined;
       try {
-        await reconcileRecord(table, record, resolved);
+        await reconcileRecord(table, record, resolved, ctx);
       } catch (error) {
-        log.error(
+        const jobLog = loggerWithContext(log, ctx);
+        jobLog.error(
           { err: error, table, id: record.id },
           "transaction reconciliation failed"
         );
@@ -387,6 +401,7 @@ export function startReconciliation(
   options: ReconciliationOptions = {}
 ): () => void {
   const resolved = reconciliationConfig(options);
+  let cycleCount = 0;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -394,8 +409,9 @@ export function startReconciliation(
     if (stopped) return;
 
     timer = setTimeout(async () => {
+      cycleCount += 1;
       try {
-        await runReconciliation(resolved);
+        await runReconciliation(resolved, `cycle-${cycleCount}`);
       } catch (error) {
         log.error({ err: error }, "reconciliation cycle failed");
       } finally {
@@ -405,8 +421,9 @@ export function startReconciliation(
   };
 
   void (async () => {
+    cycleCount += 1;
     try {
-      await runReconciliation(resolved);
+      await runReconciliation(resolved, `cycle-${cycleCount}`);
     } catch (error) {
       log.error({ err: error }, "initial reconciliation cycle failed");
     } finally {

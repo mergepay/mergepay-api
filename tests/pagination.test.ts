@@ -104,8 +104,8 @@ describe("Pagination routes", () => {
     expect(body.meta.nextCursor).toBeNull();
     
     // Check if the query filter used the decoded cursor
-    const callArgs = prisma.expense.findMany.mock.calls[0][0];
-    expect(callArgs.where.OR).toBeDefined();
+    const callArgs = prisma.expense.findMany.mock.calls[0]?.[0] as any;
+    expect(callArgs?.where.OR).toBeDefined();
   });
 
   it("handles equal timestamps safely without duplicates", async () => {
@@ -118,8 +118,8 @@ describe("Pagination routes", () => {
       headers: authHeader(),
     });
     
-    const callArgs = prisma.expense.findMany.mock.calls[0][0];
-    const orFilter = callArgs.where.OR;
+    const callArgs = prisma.expense.findMany.mock.calls[0]?.[0] as any;
+    const orFilter = callArgs?.where.OR;
     // Expected logic: lt timestamp OR (eq timestamp AND lt id)
     expect(orFilter[0].createdAt.lt).toEqual(new Date("2026-02-02T00:00:00Z"));
     expect(orFilter[1].createdAt).toEqual(new Date("2026-02-02T00:00:00Z"));
@@ -133,7 +133,7 @@ describe("Pagination routes", () => {
       headers: authHeader(),
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INVALID_CURSOR");
+    expect(res.json().code).toBe("INVALID_CURSOR");
   });
 
   it("enforces maximum limits and returns 400 for invalid limits", async () => {
@@ -143,7 +143,7 @@ describe("Pagination routes", () => {
       headers: authHeader(),
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("VALIDATION_ERROR");
+    expect(res.json().code).toBe("VALIDATION_ERROR");
   });
 
   it("handles empty results gracefully", async () => {

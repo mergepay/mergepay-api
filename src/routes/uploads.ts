@@ -42,7 +42,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
             `Files must be under ${Math.floor(config.MULTIPART_FILE_SIZE_BYTES / (1024 * 1024))} MB`
           );
         }
-        throw error;
+        throw Errors.badRequest("bad_file_type", "Failed to read uploaded file");
       }
       if (buffer.length > config.MULTIPART_FILE_SIZE_BYTES) {
         throw Errors.badRequest(

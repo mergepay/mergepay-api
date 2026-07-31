@@ -6,7 +6,8 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { inviteCode } from "../services/codes";
-import { audit, auditTx } from "../services/audit";
+import { audit } from "../services/audit";
+import { auditLog } from "../lib/auditLog";
 import {
   serializeGroup,
   serializeInvitation,
@@ -17,12 +18,13 @@ import {
   groupPrimaryAsset,
   loadGroupBalances,
 } from "../services/group-balances";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 
 export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- create -----------------------------------------------------------------
-  app.post("/groups", { config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } } }, async (req) => {
+  app.post("/groups", { config: { rateLimit: { max: config.AUTH_RATE_LIMIT_MAX, timeWindow: "1 minute" } } }, async (req) => {
     const auth = requireUser(req);
     const body = z
       .object({
@@ -45,20 +47,48 @@ export default async function groupRoutes(app: FastifyInstance) {
       entityType: "group",
       entityId: group.id,
     });
+    await auditLog.log("GROUP_CREATED", auth.id, group.id, { name: body.name });
     return { group: serializeGroup(group) };
   });
 
   // -- list (with summaries) -------------------------------------------------
+  //
+  // Paginated because each row costs a balance computation, so an unbounded
+  // list would scale that work with a user's group count. Membership rows are
+  // ordered by `joinedAt`, which is this resource's creation timestamp, so the
+  // shared cursor helpers are given that field as `createdAt`.
   app.get("/groups", async (req) => {
     const auth = requireUser(req);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const position = requireCursor(cursor);
+
+    const cursorScope = position
+      ? {
+          OR: [
+            { joinedAt: { [order === "desc" ? "lt" : "gt"]: position.createdAt } },
+            {
+              joinedAt: position.createdAt,
+              id: { [order === "desc" ? "lt" : "gt"]: position.id },
+            },
+          ],
+        }
+      : {};
+
     const memberships = await prisma.groupMember.findMany({
-      where: { userId: auth.id },
+      where: { userId: auth.id, ...cursorScope },
       include: { group: { include: { _count: { select: { members: true } } } } },
-      orderBy: { joinedAt: "desc" },
+      orderBy: [{ joinedAt: order }, { id: order }],
+      take: takeForPage(limit),
     });
 
+    const { items, meta } = buildPage(
+      memberships.map((m) => ({ ...m, createdAt: m.joinedAt })),
+      limit,
+      order
+    );
+
     const groups = await Promise.all(
-      memberships.map(async (m) => {
+      items.map(async (m) => {
         const balances = await loadGroupBalances(m.groupId);
         const asset = await groupPrimaryAsset(m.groupId);
         const yourNet =
@@ -72,27 +102,59 @@ export default async function groupRoutes(app: FastifyInstance) {
       })
     );
 
-    return { groups };
+    return { groups, meta };
   });
 
   // -- detail -----------------------------------------------------------------
   app.get("/groups/:id", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
     const ctx = await requireMembership(id, auth.id);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group) throw Errors.notFound("Group not found");
+
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
     const members = await prisma.groupMember.findMany({
-      where: { groupId: id },
+      where: {
+        groupId: id,
+        ...(decodedCursor && {
+          OR: [
+            { joinedAt: { gt: decodedCursor.createdAt } },
+            {
+              joinedAt: decodedCursor.createdAt,
+              id: { gt: decodedCursor.id },
+            },
+          ],
+        }),
+      },
       include: { user: true },
-      orderBy: { joinedAt: "asc" },
+      orderBy: [{ joinedAt: "asc" }, { id: "asc" }],
+      take: limit + 1,
     });
+
+    const hasMore = members.length > limit;
+    const results = hasMore ? members.slice(0, limit) : members;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].joinedAt,
+          results[results.length - 1].id
+        )
+      : null;
 
     return {
       group: serializeGroup(group),
-      members: members.map(serializeMember),
+      members: results.map(serializeMember),
       yourRole: ctx.role,
+      meta: { nextCursor, hasMore },
     };
   });
 
@@ -171,6 +233,10 @@ export default async function groupRoutes(app: FastifyInstance) {
 
         return created;
       });
+      await auditLog.log("MEMBER_INVITED", auth.id, id, {
+        inviteePublicKey: body.publicKey,
+        invitationId: invitation.id,
+      });
 
       return reply.status(201).send({ invitation: serializeInvitation(invitation) });
     }
@@ -199,7 +265,41 @@ export default async function groupRoutes(app: FastifyInstance) {
         },
       });
     });
+    await auditLog.log("INVITE_CREATED", auth.id, id, {
+      inviteId: invite.id,
+      code: invite.code,
+    });
     return { invite: serializeInvite(invite, config.WEB_URL) };
+  });
+
+  // -- remove member --------------------------------------------------------
+  app.delete("/groups/:id/members/:memberId", async (req) => {
+    const auth = requireUser(req);
+    const { id, memberId } = z
+      .object({ id: z.string(), memberId: z.string() })
+      .parse(req.params);
+    await requireAdmin(id, auth.id);
+
+    const member = await prisma.groupMember.findFirst({
+      where: {
+        groupId: id,
+        OR: [{ id: memberId }, { userId: memberId }],
+      },
+    });
+    if (!member) throw Errors.notFound("Member not found");
+
+    if (member.userId === auth.id) {
+      throw Errors.badRequest("cannot_remove_self", "Use leave endpoint to leave the group");
+    }
+
+    await prisma.groupMember.delete({
+      where: { id: member.id },
+    });
+    await auditLog.log("MEMBER_REMOVED", auth.id, id, {
+      memberId: member.id,
+      userId: member.userId,
+    });
+    return { ok: true };
   });
 
   // -- join -------------------------------------------------------------------
@@ -238,6 +338,7 @@ export default async function groupRoutes(app: FastifyInstance) {
         entityType: "group",
         entityId: invite.groupId,
       });
+      await auditLog.log("MEMBER_JOINED", auth.id, invite.groupId);
     }
 
     const group = await prisma.group.findUnique({
@@ -280,6 +381,54 @@ export default async function groupRoutes(app: FastifyInstance) {
         entityId: id,
       });
     });
+    await auditLog.log("MEMBER_LEFT", auth.id, id);
+    return { ok: true };
+  });
+
+  // -- remove member ---------------------------------------------------------
+  app.delete("/groups/:id/members/:memberId", async (req) => {
+    const auth = requireUser(req);
+    const { id, memberId } = z
+      .object({ id: z.string(), memberId: z.string() })
+      .parse(req.params);
+    await requireAdmin(id, auth.id);
+
+    if (memberId === auth.id) {
+      throw Errors.badRequest(
+        "SELF_REMOVE",
+        "Cannot remove yourself from the group; use the leave endpoint instead"
+      );
+    }
+
+    const target = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId: id, userId: memberId } },
+    });
+    if (!target) {
+      throw Errors.notFound("Member not found in this group");
+    }
+
+    if (target.role === "admin") {
+      const adminCount = await prisma.groupMember.count({
+        where: { groupId: id, role: "admin" },
+      });
+      if (adminCount <= 1) {
+        throw Errors.conflict(
+          "last_admin",
+          "Cannot remove the last admin from the group"
+        );
+      }
+    }
+
+    await prisma.groupMember.delete({
+      where: { groupId_userId: { groupId: id, userId: memberId } },
+    });
+    await audit({
+      userId: auth.id,
+      action: "group.member_remove",
+      entityType: "group",
+      entityId: id,
+      metadata: { removedUserId: memberId },
+    });
     return { ok: true };
   });
 
@@ -302,6 +451,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       });
       return updated;
     });
+    await auditLog.log("GROUP_ARCHIVED", auth.id, id);
     return { group: serializeGroup(group) };
   });
 }

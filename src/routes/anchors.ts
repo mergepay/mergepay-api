@@ -11,6 +11,8 @@ import { audit } from "../services/audit";
 import { ipKey } from "../services/rate-limit-keys";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
+import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import { recordStatusTransition } from "../services/status-history";
 
 export default async function anchorRoutes(app: FastifyInstance) {
   // -- list anchors (public-ish, but behind auth for consistency) -------------
@@ -102,7 +104,10 @@ export default async function anchorRoutes(app: FastifyInstance) {
       const { id } = z.object({ id: z.string() }).parse(req.params);
       const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
 
-      const session = await prisma.anchorSession.findUnique({ where: { id } });
+      const session = await prisma.anchorSession.findUnique({ 
+        where: { id },
+        include: { statusHistory: true },
+      });
       if (!session || session.userId !== auth.id) {
         throw Errors.notFound("Anchor session not found");
       }
@@ -138,11 +143,47 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // -- sessions ---------------------------------------------------------------
   app.get("/anchors/sessions", { preHandler: [app.authenticate] }, async (req) => {
     const auth = requireUser(req);
+    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+
+    let decodedCursor = null;
+    if (cursor) {
+      decodedCursor = decodeCursor(cursor);
+      if (!decodedCursor) {
+        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+      }
+    }
+
     const sessions = await prisma.anchorSession.findMany({
-      where: { userId: auth.id },
-      orderBy: { createdAt: "desc" },
+      where: {
+        userId: auth.id,
+        ...(decodedCursor && {
+          OR: [
+            { createdAt: { lt: decodedCursor.createdAt } },
+            {
+              createdAt: decodedCursor.createdAt,
+              id: { lt: decodedCursor.id },
+            },
+          ],
+        }),
+      },
+      include: { statusHistory: true },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: limit + 1,
     });
-    return { sessions: sessions.map(serializeAnchorSession) };
+
+    const hasMore = sessions.length > limit;
+    const results = hasMore ? sessions.slice(0, limit) : sessions;
+    const nextCursor = hasMore
+      ? encodeCursor(
+          results[results.length - 1].createdAt,
+          results[results.length - 1].id
+        )
+      : null;
+
+    return {
+      sessions: results.map(serializeAnchorSession),
+      meta: { nextCursor, hasMore },
+    };
   });
 
   // -- webhook (signed) -------------------------------------------------------
@@ -154,8 +195,8 @@ export default async function anchorRoutes(app: FastifyInstance) {
     {
       config: {
         rateLimit: {
-          max: config.RATE_LIMIT_ANCHOR_WEBHOOK_MAX,
-          timeWindow: config.RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS,
+          max: config.SEP24_RATE_LIMIT_MAX,
+          timeWindow: config.RATE_LIMIT_WINDOW_MS,
           keyGenerator: ipKey("anchor.webhook"),
         },
       },
@@ -180,9 +221,23 @@ export default async function anchorRoutes(app: FastifyInstance) {
       const externalId = body.transaction?.id ?? body.id;
       const status = body.transaction?.status ?? body.status;
       if (externalId && status) {
-        await prisma.anchorSession.updateMany({
-          where: { externalTransactionId: externalId },
-          data: { status: mapAnchorStatus(status) },
+        const mappedStatus = mapAnchorStatus(status);
+        await prisma.$transaction(async (tx) => {
+          const sessions = await tx.anchorSession.findMany({
+            where: { externalTransactionId: externalId },
+          });
+          for (const session of sessions) {
+            await tx.anchorSession.update({
+              where: { id: session.id },
+              data: { status: mappedStatus },
+            });
+            await recordStatusTransition({
+              entityType: "anchor_session",
+              entityId: session.id,
+              newStatus: mappedStatus,
+              source: "anchor_webhook",
+            });
+          }
         });
       }
       return reply.code(200).send({ ok: true });

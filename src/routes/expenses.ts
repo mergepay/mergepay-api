@@ -186,14 +186,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.patch("/expenses/:id", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z
-      .object({
-        title: z.string().min(1).max(80).optional(),
-        description: z.string().max(500).nullable().optional(),
-        memo: z.string().max(24).optional(),
-        receiptUrl: z.string().nullable().optional(),
-      })
-      .parse(req.body);
+    const body = updateExpenseSchema.parse(req.body);
 
     const expense = await prisma.expense.findUnique({ where: { id } });
     if (!expense) throw Errors.notFound("Expense not found");

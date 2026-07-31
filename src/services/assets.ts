@@ -98,6 +98,29 @@ function issuerKey(code: string, issuer: string | null): string {
   return `${code.toUpperCase()}::${issuer ?? ""}`;
 }
 
+/**
+ * Validate the asset configuration at startup. This ensures that:
+ * - All supported assets have valid codes and issuers
+ * - Issued assets have a non-empty issuer configured
+ * - No duplicate asset codes exist
+ *
+ * Called once during app bootstrap.
+ */
+export function validateAssetConfig(): void {
+  const seen = new Set<string>();
+  for (const a of SUPPORTED_ASSETS) {
+    if (seen.has(a.code.toUpperCase())) {
+      throw new Error(`Duplicate asset code "${a.code}" in SUPPORTED_ASSETS`);
+    }
+    seen.add(a.code.toUpperCase());
+    if (a.type === "issued" && !a.issuer) {
+      throw new Error(
+        `Issued asset "${a.code}" requires a non-empty issuer. Set STABLE_ASSET_ISSUER.`
+      );
+    }
+  }
+}
+
 // ─── Validation ────────────────────────────────────────────────────────────
 
 /**

@@ -7,7 +7,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
 import { stellar } from "../services/stellar";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, auditTx } from "../services/audit";
 import { userOrIpKey } from "../services/rate-limit-keys";
 import {
   serializeSettlement,
@@ -19,10 +19,13 @@ import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
-import { validateAsset, validateAmount } from "../services/assets";
 import { memoText } from "../services/stellar";
+import { paginationQuerySchema } from "../services/pagination";
+import { validateAsset, validateAmount } from "../services/assets";
+import { memoText, validateSignedXdr } from "../services/stellar";
+import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 
-const settlementInclude = { from: true, to: true } as const;
+const settlementInclude = { from: true, to: true, statusHistory: true } as const;
 
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -119,6 +122,13 @@ export default async function settlementRoutes(app: FastifyInstance) {
           include: settlementInclude,
         });
 
+        await recordStatusTransitionInTransaction(tx, {
+          entityType: "settlement",
+          entityId: settlement.id,
+          newStatus: "pending",
+          source: "api",
+        });
+
         await tx.expenseShare.update({
           where: { id: myShare.id },
           data: { status: "settling" },
@@ -192,6 +202,13 @@ export default async function settlementRoutes(app: FastifyInstance) {
           include: settlementInclude,
         });
 
+        await recordStatusTransitionInTransaction(tx, {
+          entityType: "settlement",
+          entityId: settlement.id,
+          newStatus: "pending",
+          source: "api",
+        });
+
         const xdr = await buildSettlementXdr({
           fromPublicKey: auth.stellarPublicKey,
           toPublicKey: recipient.user.stellarPublicKey,
@@ -217,6 +234,51 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
+    // Idempotency key is REQUIRED for settlement submission so that retries
+    // can never create duplicate on-chain payments.
+    if (!idempotencyKey) {
+      throw Errors.badRequest(
+        "missing_idempotency_key",
+        "Idempotency-Key header is required for settlement confirmation"
+      );
+    }
+
+    // Validate the signed XDR against the DB intent BEFORE entering the
+    // idempotent operation so that validation failures are never cached
+    // as idempotent successes and the client gets a fresh error each time.
+    const settlementRow = await prisma.settlement.findUnique({
+      where: { id },
+      include: settlementInclude,
+    });
+    if (!settlementRow) throw Errors.notFound("Settlement not found");
+    if (settlementRow.fromUserId !== auth.id) {
+      throw Errors.forbidden("Only the payer can confirm this settlement");
+    }
+
+    try {
+      validateSignedXdr(body.signedXdr, {
+        sourcePublicKey: settlementRow.from.stellarPublicKey,
+        destination: settlementRow.to.stellarPublicKey,
+        asset: {
+          code: settlementRow.assetCode,
+          issuer: settlementRow.assetIssuer,
+        },
+        amount: String(settlementRow.amount),
+        memoCode: settlementRow.shortCode,
+      });
+    } catch (err) {
+      await audit({
+        userId: auth.id,
+        action: "settlement.confirm.validation_failed",
+        entityType: "settlement",
+        entityId: id,
+        metadata: {
+          reason: err instanceof Error ? err.message : "validation failed",
+        },
+      });
+      throw err;
+    }
+
     return runIdempotent({
       userId: auth.id,
       scope: "settlement.confirm",
@@ -233,26 +295,49 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.forbidden("Only the payer can confirm this settlement");
         }
 
-        // Already confirmed, or moved past "pending" by a prior (possibly
-        // concurrent) confirm — return the current state rather than
-        // re-submitting or erroring, so retries are always safe.
-        if (settlement.status !== "pending") {
+        // Already completed or submitted — return the current state rather
+        // than re-submitting or erroring, so retries are always safe.
+        if (settlement.status === "completed" || settlement.status === "submitted") {
           return { settlement: serializeSettlement(settlement) };
         }
 
-        // Guard the transition with a conditional update rather than an
-        // unconditional one: if a concurrent confirm on the same settlement
-        // (e.g. a different idempotency key, or no key at all) already won
-        // the race and moved the status off "pending" between the read
-        // above and here, this update affects zero rows and we simply
-        // re-read the winning state instead of clobbering it.
+        // A previously-failed settlement can be retried with a new signed
+        // XDR (and a new idempotency key).  Reset the retry bookkeeping so
+        // the worker process picks it up fresh.
+        if (settlement.status === "failed") {
+          await auditTx(tx, {
+            userId: auth.id,
+            action: "settlement.confirm.retry",
+            entityType: "settlement",
+            entityId: id,
+            metadata: { previousFailure: settlement.failureReason },
+          });
+        }
+
+        // Guard the transition with a conditional update: only rows that
+        // are still in a confirmable status ("pending" or "failed") are
+        // moved to "submitted".  If a concurrent request already moved
+        // the settlement off a confirmable status between the read above
+        // and here, the update affects zero rows and we re-read the
+        // winning state instead of clobbering it.
         const { count } = await tx.settlement.updateMany({
-          where: { id, status: "pending" },
+          where: { id, status: { in: ["pending", "failed"] } },
           data: {
             transactionXdr: body.signedXdr,
             status: "submitted",
+            retryCount: 0,
+            failureReason: null,
           },
         });
+
+        if (count > 0) {
+          await recordStatusTransitionInTransaction(tx, {
+            entityType: "settlement",
+            entityId: id,
+            newStatus: "submitted",
+            source: "api",
+          });
+        }
 
         const finalSettlement = await tx.settlement.findUniqueOrThrow({
           where: { id },
@@ -260,7 +345,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         });
 
         if (count > 0) {
-          await audit({
+          await auditTx(tx, {
             userId: auth.id,
             action: "settlement.confirm",
             entityType: "settlement",
@@ -367,19 +452,19 @@ export default async function settlementRoutes(app: FastifyInstance) {
     ]);
 
     const entries = [
-      ...expenses.map((e) => ({
+      ...expenses.slice(0, query.limit).map((e) => ({
         type: "expense" as const,
         createdAt: e.createdAt,
         id: e.id,
         expense: serializeExpense(e),
       })),
-      ...settlements.map((s) => ({
+      ...settlements.slice(0, query.limit).map((s) => ({
         type: "settlement" as const,
         createdAt: s.createdAt,
         id: s.id,
         settlement: serializeSettlement(s),
       })),
-      ...treasuryTxs.map((t) => ({
+      ...treasuryTxs.slice(0, query.limit).map((t) => ({
         type: "treasury" as const,
         createdAt: t.createdAt,
         id: t.id,

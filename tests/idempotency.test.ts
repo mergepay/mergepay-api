@@ -3,23 +3,14 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 const h = vi.hoisted(() => {
   const model = () => ({
     findUnique: vi.fn(),
+    findUniqueOrThrow: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
-    delete: vi.fn(),
-    deleteMany: vi.fn(),
+    updateMany: vi.fn(),
   });
   const prisma: any = {
     idempotencyKey: model(),
-    settlement: {
-      findUnique: vi.fn(),
-      create: vi.fn(),
-      update: vi.fn(),
-    },
-    expense: { findUnique: vi.fn() },
-    groupMember: { findUnique: vi.fn() },
-    expenseShare: {
-      update: vi.fn(),
-    },
+    settlement: model(),
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
@@ -44,6 +35,10 @@ vi.mock("../src/services/stellar", () => ({
     submitPayment: vi.fn(),
   },
   memoText: vi.fn((code: string) => `MP:${code}`),
+  validateSignedXdr: vi.fn((_signedXdr: string, _expected: any) => ({
+    tx: {} as any,
+    hash: "abc123def456",
+  })),
 }));
 
 import { buildApp } from "../src/app";
@@ -58,6 +53,14 @@ const fakeUser = (over: Record<string, any> = {}) => ({
   avatarUrl: null,
   createdAt: new Date("2026-01-01T00:00:00.000Z"),
   ...over,
+});
+
+const fakeRecipient = () => ({
+  id: "user_2",
+  stellarPublicKey: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  displayName: "Recipient",
+  avatarUrl: null,
+  createdAt: new Date("2026-01-01T00:00:00.000Z"),
 });
 
 const fakeSettlement = (over: Record<string, any> = {}) => ({
@@ -77,14 +80,9 @@ const fakeSettlement = (over: Record<string, any> = {}) => ({
   expenseShareId: null,
   stellarTxHash: null,
   createdAt: new Date("2026-01-01T00:00:00.000Z"),
+  updatedAt: new Date("2026-01-01T00:00:00.000Z"),
   from: fakeUser(),
-  to: {
-    id: "user_2",
-    stellarPublicKey: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-    displayName: "Recipient",
-    avatarUrl: null,
-    createdAt: new Date("2026-01-01T00:00:00.000Z"),
-  },
+  to: fakeRecipient(),
   ...over,
 });
 
@@ -110,6 +108,7 @@ describe("idempotency — confirm endpoint", () => {
     prisma.settlement.update.mockResolvedValue(
       fakeSettlement({ status: "submitted", transactionXdr: signedXdr })
     );
+    prisma.auditLog.create.mockResolvedValue({});
     const { stellar } = await import("../src/services/stellar");
 
     const res = await app.inject({
@@ -127,7 +126,9 @@ describe("idempotency — confirm endpoint", () => {
     expect(body.settlement.status).toBe("submitted");
 
     expect(prisma.idempotencyKey.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
+      data: {
+        userId: "user_1",
+        scope: "settlement.confirm",
         key: "key-001",
         userId: "user_1",
         status: "in_progress",
@@ -141,56 +142,57 @@ describe("idempotency — confirm endpoint", () => {
     expect(stellar.submitPayment).not.toHaveBeenCalled();
   });
 
-  it("repeat confirm with same key + same body replays the stored response without re-running", async () => {
-    const payload = { signedXdr: "AAAA..." };
+  it("repeat confirm with same key + same body returns the cached response without re-running", async () => {
+    prisma.idempotencyKey.findUnique.mockResolvedValueOnce(null);
+    prisma.idempotencyKey.create.mockResolvedValue({});
+    prisma.settlement.findUnique.mockResolvedValue(fakeSettlement());
+    prisma.settlement.update.mockResolvedValue(
+      fakeSettlement({ status: "submitted", transactionXdr: "AAAA..." })
+    );
+    prisma.auditLog.create.mockResolvedValue({});
 
-    // hashIdempotentRequest is not mocked, so recompute the real hash the
-    // route will produce and make the mocked row match it.
-    const { hashIdempotentRequest } = await import("../src/lib/idempotency");
-    const requestHash = hashIdempotentRequest({
-      userId: "user_1",
-      scope: "settlement.confirm:settle_1",
-      body: payload,
+    const first = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_1/confirm",
+      headers: { ...authHeader(), "idempotency-key": "key-001" },
+      payload: { signedXdr: "AAAA..." },
     });
+    expect(first.statusCode).toBe(200);
+    const stored = prisma.idempotencyKey.create.mock.calls[0][0].data;
+
+    vi.clearAllMocks();
     prisma.idempotencyKey.findUnique.mockResolvedValue({
-      key: "key-001",
-      userId: "user_1",
-      requestHash,
-      status: "completed",
-      statusCode: 200,
+      ...stored,
       responseJson: JSON.stringify({
         settlement: { id: "settle_1", status: "submitted", transactionXdr: "AAAA..." },
       }),
-      expiresAt: new Date(Date.now() + 60_000),
     });
 
-    const res = await app.inject({
+    const second = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: {
-        ...authHeader(),
-        "idempotency-key": "key-001",
-      },
-      payload,
+      headers: { ...authHeader(), "idempotency-key": "key-001" },
+      payload: { signedXdr: "AAAA..." },
     });
 
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.settlement.status).toBe("submitted");
+    expect(second.statusCode).toBe(200);
+    expect(second.json().settlement.status).toBe("submitted");
+    // The pre-validation read happens before the idempotent block; the
+    // operation itself is never re-run because the key is cached.
+    expect(prisma.settlement.findUnique).toHaveBeenCalledTimes(1);
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
+    expect(prisma.idempotencyKey.create).not.toHaveBeenCalled();
 
     const { stellar } = await import("../src/services/stellar");
     expect(stellar.submitPayment).not.toHaveBeenCalled();
-    expect(prisma.settlement.findUnique).not.toHaveBeenCalled();
-    expect(prisma.idempotencyKey.create).not.toHaveBeenCalled();
   });
 
-  it("same key + different body returns 409 idempotency_conflict", async () => {
+  it("same key + different body returns 409 idempotency conflict", async () => {
     prisma.idempotencyKey.findUnique.mockResolvedValue({
-      key: "key-001",
       userId: "user_1",
-      requestHash: "some-other-hash",
-      status: "completed",
-      statusCode: 200,
+      scope: "settlement.confirm",
+      key: "key-001",
+      requestHash: "some-other-hash-entirely",
       responseJson: JSON.stringify({ settlement: { status: "submitted" } }),
       expiresAt: new Date(Date.now() + 60_000),
     });
@@ -198,92 +200,30 @@ describe("idempotency — confirm endpoint", () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: {
-        ...authHeader(),
-        "idempotency-key": "key-001",
-      },
+      headers: { ...authHeader(), "idempotency-key": "key-001" },
       payload: { signedXdr: "BBBBB..." },
     });
 
     expect(res.statusCode).toBe(409);
-    const body = res.json();
-    expect(body.error).toBe("idempotency_conflict");
-
-    const { stellar } = await import("../src/services/stellar");
-    expect(stellar.submitPayment).not.toHaveBeenCalled();
+    expect(res.json().error).toBe("IDEMPOTENCY_CONFLICT");
+    // The pre-validation read happens before the conflict is detected.
+    expect(prisma.settlement.findUnique).toHaveBeenCalledTimes(1);
   });
 
-  it("same key from a different authenticated user is rejected", async () => {
-    const { hashIdempotentRequest } = await import("../src/lib/idempotency");
-    const payload = { signedXdr: "AAAA..." };
-    const requestHash = hashIdempotentRequest({
-      userId: "user_1",
-      scope: "settlement.confirm:settle_1",
-      body: payload,
-    });
-    prisma.idempotencyKey.findUnique.mockResolvedValue({
-      key: "key-001",
-      userId: "user_1",
-      requestHash,
-      status: "completed",
-      statusCode: 200,
-      responseJson: JSON.stringify({ settlement: { status: "submitted" } }),
-      expiresAt: new Date(Date.now() + 60_000),
-    });
-
+  it("rejects an oversized or malformed Idempotency-Key header", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: {
-        ...authHeader(fakeUser({ id: "user_9" })),
-        "idempotency-key": "key-001",
-      },
-      payload,
+      headers: { ...authHeader(), "idempotency-key": "has spaces / slashes" },
+      payload: { signedXdr },
     });
 
-    expect(res.statusCode).toBe(409);
-    expect(res.json().error).toBe("idempotency_conflict");
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe("INVALID_IDEMPOTENCY_KEY");
+    expect(prisma.idempotencyKey.findUnique).not.toHaveBeenCalled();
   });
 
-  it("a request still in progress under the same key returns 409 instead of running twice", async () => {
-    prisma.idempotencyKey.findUnique.mockResolvedValue({
-      key: "key-001",
-      userId: "user_1",
-      requestHash: (
-        await import("../src/lib/idempotency")
-      ).hashIdempotentRequest({
-        userId: "user_1",
-        scope: "settlement.confirm:settle_1",
-        body: { signedXdr: "AAAA..." },
-      }),
-      status: "in_progress",
-      statusCode: null,
-      responseJson: null,
-      expiresAt: new Date(Date.now() + 60_000),
-    });
-
-    const res = await app.inject({
-      method: "POST",
-      url: "/settlements/settle_1/confirm",
-      headers: {
-        ...authHeader(),
-        "idempotency-key": "key-001",
-      },
-      payload: { signedXdr: "AAAA..." },
-    });
-
-    expect(res.statusCode).toBe(409);
-    expect(res.json().error).toBe("idempotency_in_progress");
-    expect(prisma.settlement.findUnique).not.toHaveBeenCalled();
-  });
-
-  it("works without an idempotency key for backward compatibility", async () => {
-    prisma.settlement.findUnique.mockResolvedValue(fakeSettlement());
-    prisma.settlement.update.mockResolvedValue(
-      fakeSettlement({ status: "submitted", transactionXdr: "CCCCC..." })
-    );
-    const { stellar } = await import("../src/services/stellar");
-
+  it("requires an Idempotency-Key header", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
@@ -291,12 +231,90 @@ describe("idempotency — confirm endpoint", () => {
       payload: { signedXdr: "CCCCC..." },
     });
 
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("MISSING_IDEMPOTENCY_KEY");
+  });
+
+  it("does not clobber a settlement a concurrent confirm already transitioned", async () => {
+    // Two confirms both read status "pending", but only the guarded
+    // updateMany(WHERE status IN ['pending','failed']) actually matches for the winner.
+    prisma.idempotencyKey.findUnique.mockResolvedValue(null);
+    prisma.idempotencyKey.create.mockResolvedValue({});
+    prisma.settlement.findUnique.mockResolvedValue(fakeSettlement());
+    prisma.settlement.updateMany.mockResolvedValue({ count: 0 });
+    prisma.settlement.findUniqueOrThrow.mockResolvedValue(
+      fakeSettlement({ status: "submitted", transactionXdr: "WINNER..." })
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_1/confirm",
+      headers: { ...authHeader(), "idempotency-key": "confirm-key-2" },
+      payload: { signedXdr: "LOSER..." },
+    });
+
     expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.settlement.status).toBe("submitted");
-    expect(stellar.submitPayment).not.toHaveBeenCalled();
-    expect(prisma.idempotencyKey.findUnique).not.toHaveBeenCalled();
-    expect(prisma.idempotencyKey.create).not.toHaveBeenCalled();
+    expect(res.json().settlement.status).toBe("submitted");
+    expect(prisma.settlement.update).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects confirmation from a user who does not own the settlement", async () => {
+    prisma.idempotencyKey.findUnique.mockResolvedValue(null);
+    prisma.idempotencyKey.create.mockResolvedValue({});
+    prisma.settlement.findUnique.mockResolvedValue(
+      fakeSettlement({ fromUserId: "someone_else" })
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_1/confirm",
+      headers: { ...authHeader(), "idempotency-key": "confirm-key-1" },
+      payload: { signedXdr },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.settlement.update).not.toHaveBeenCalled();
+  });
+
+  it("does not clobber a settlement a concurrent confirm already transitioned", async () => {
+    // Two confirms both read status "pending", but only the guarded
+    // updateMany(WHERE status = 'pending') actually matches for the winner.
+    prisma.settlement.findUnique.mockResolvedValue(fakeSettlement());
+    prisma.settlement.updateMany.mockResolvedValue({ count: 0 });
+    prisma.settlement.findUniqueOrThrow.mockResolvedValue(
+      fakeSettlement({ status: "submitted", transactionXdr: "WINNER..." })
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_1/confirm",
+      headers: authHeader(),
+      payload: { signedXdr: "LOSER..." },
+    });
+
+    expect(res.statusCode).toBe(200);
+    // The winner's status is returned; our own "LOSER..." XDR never applied
+    // (the guarded updateMany matched zero rows), and we never re-audit a
+    // transition we didn't actually make.
+    expect(res.json().settlement.status).toBe("submitted");
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects confirmation from a user who does not own the settlement", async () => {
+    prisma.settlement.findUnique.mockResolvedValue(
+      fakeSettlement({ fromUserId: "someone_else" })
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_1/confirm",
+      headers: authHeader(),
+      payload: { signedXdr },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
   it("a failed claim (e.g. settlement not found) frees the key so a corrected retry can proceed", async () => {

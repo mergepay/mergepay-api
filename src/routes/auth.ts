@@ -7,20 +7,27 @@ import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
 import { audit } from "../services/audit";
+import { rateLimited } from "../lib/rate-limit";
 
 function shortName(pk: string): string {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
 }
 
 export default async function authRoutes(app: FastifyInstance) {
-  // Tighter rate limit on auth endpoints.
-  const authLimit = {
-    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
-  };
+  // Requesting a challenge is cheap and legitimately retried (e.g. a wallet
+  // extension polling while the user approves), so it gets a more generous
+  // limit than completing the actual login. Verifying is the actual
+  // authentication step and is kept tighter to slow down brute-force attempts.
+  // Both buckets are keyed strictly by client IP — there is no authenticated
+  // user yet, and the wallet's public key must never become a bucket key,
+  // because differing 429 behaviour would then reveal whether an account is
+  // known to the API.
+  const challengeLimit = rateLimited("authChallenge");
+  const verifyLimit = rateLimited("authVerify");
 
   app.post(
     "/auth/challenge",
-    authLimit,
+    challengeLimit,
     async (req) => {
       const body = z.object({ account: z.string() }).parse(req.body);
       if (!StrKey.isValidEd25519PublicKey(body.account)) {
@@ -32,7 +39,7 @@ export default async function authRoutes(app: FastifyInstance) {
 
   app.post(
     "/auth/verify",
-    authLimit,
+    verifyLimit,
     async (req) => {
       const body = z.object({ transaction: z.string() }).parse(req.body);
       const publicKey = await verifyChallenge(body.transaction);

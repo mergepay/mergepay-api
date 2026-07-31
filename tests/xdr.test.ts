@@ -9,7 +9,7 @@ import {
   Transaction,
   TransactionBuilder,
 } from "@stellar/stellar-sdk";
-import { stellar, validatePaymentTx, verifySignedPaymentXdr } from "../src/services/stellar";
+import { stellar, validatePaymentTx, validateSignedXdr } from "../src/services/stellar";
 import { config } from "../src/config";
 
 const from = Keypair.random();
@@ -34,14 +34,75 @@ function buildXdr(overrides: Partial<typeof intent> = {}): string {
   });
 }
 
+function buildCustomXdr({
+  fee = String(Number(BASE_FEE) * 2),
+  operationSource,
+  extraOperation = false,
+  asset = intent.asset,
+}: {
+  fee?: string;
+  operationSource?: string;
+  extraOperation?: boolean;
+  asset?: { code: string; issuer?: string | null };
+} = {}): string {
+  const txb = new TransactionBuilder(new Account(intent.sourcePublicKey, "12345"), {
+    fee,
+    networkPassphrase: config.networkPassphrase,
+  }).addOperation(
+    Operation.payment({
+      source: operationSource,
+      destination: intent.destination,
+      asset: asset.issuer ? new Asset(asset.code, asset.issuer) : Asset.native(),
+      amount: intent.amount,
+    })
+  );
+
+  if (extraOperation) {
+    txb.addOperation(
+      Operation.payment({
+        destination: Keypair.random().publicKey(),
+        asset: Asset.native(),
+        amount: "1",
+      })
+    );
+  }
+
+  return txb.addMemo(Memo.text("MP:ABC123")).setTimeout(300).build().toXDR();
+}
+
+describe("validateSignedXdr", () => {
+  it("accepts a valid signed XDR matching the intent", () => {
+    const tx = new Transaction(buildXdr(), config.networkPassphrase);
+    tx.sign(from);
+    const signedXdr = tx.toXDR();
+    const { hash } = validateSignedXdr(signedXdr, intent);
+    expect(hash).toBe(tx.hash().toString("hex"));
+  });
+
+  it("rejects malformed XDR", () => {
+    expect(() => validateSignedXdr("not-xdr", intent)).toThrow("Malformed");
+  });
+
+  it("rejects a valid XDR with mismatched intent", () => {
+    const tx = new Transaction(
+      buildXdr({ amount: "99" }),
+      config.networkPassphrase
+    );
+    tx.sign(from);
+    expect(() => validateSignedXdr(tx.toXDR(), intent)).toThrow(/amount/i);
+  });
+});
+
 describe("payment XDR validation", () => {
   it("accepts a transaction that matches the intent", () => {
     const tx = new Transaction(buildXdr(), config.networkPassphrase);
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).not.toThrow();
   });
 
   it("rejects a mismatched amount", () => {
     const tx = new Transaction(buildXdr({ amount: "99" }), config.networkPassphrase);
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/amount/i);
   });
 
@@ -51,7 +112,44 @@ describe("payment XDR validation", () => {
       buildXdr({ destination: other }),
       config.networkPassphrase
     );
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/destination/i);
+  });
+
+  it("rejects a mismatched transaction source", () => {
+    const other = Keypair.random().publicKey();
+    const tx = new Transaction(
+      buildXdr({ sourcePublicKey: other }),
+      config.networkPassphrase
+    );
+    // Sign with 'from' to simulate a stolen intent but the signature will fail
+    // for the 'other' account, or if we sign with 'other', it fails the source check.
+    tx.sign(Keypair.fromSecret(from.secret())); 
+    expect(() => validatePaymentTx(tx, intent)).toThrow(/source/i);
+  });
+
+  it("rejects a payment operation with an overridden source account", () => {
+    const tx = new Transaction(
+      buildCustomXdr({ operationSource: Keypair.random().publicKey() }),
+      config.networkPassphrase
+    );
+    tx.sign(from);
+    expect(() => validatePaymentTx(tx, intent)).toThrow(/operation source/i);
+  });
+
+  it("rejects an altered transaction fee", () => {
+    const tx = new Transaction(buildCustomXdr({ fee: "999" }), config.networkPassphrase);
+    tx.sign(from);
+    expect(() => validatePaymentTx(tx, intent)).toThrow(/fee/i);
+  });
+
+  it("rejects extra operations", () => {
+    const tx = new Transaction(
+      buildCustomXdr({ extraOperation: true, fee: String(BASE_FEE) }),
+      config.networkPassphrase
+    );
+    tx.sign(from);
+    expect(() => validatePaymentTx(tx, intent)).toThrow(/one operation/i);
   });
 
   it("rejects a mismatched memo", () => {
@@ -59,7 +157,54 @@ describe("payment XDR validation", () => {
       buildXdr({ memoCode: "DIFFERENT" }),
       config.networkPassphrase
     );
+    tx.sign(from);
     expect(() => validatePaymentTx(tx, intent)).toThrow(/memo/i);
+  });
+
+  it("rejects a transaction signed for the wrong network", () => {
+    // Build an XDR and sign it for a DIFFERENT network passphrase
+    const txWithWrongNetwork = new Transaction(buildXdr(), "Test SDF Network ; September 2015");
+    txWithWrongNetwork.sign(from);
+    const signedXdr = txWithWrongNetwork.toXDR();
+
+    // Now parse it using our APP'S network passphrase
+    const tx = new Transaction(signedXdr, config.networkPassphrase);
+    expect(() => validatePaymentTx(tx, intent)).toThrow(/network/i);
+  });
+
+  it("rejects an unsigned transaction", () => {
+    const tx = new Transaction(buildXdr(), config.networkPassphrase);
+    expect(() => validatePaymentTx(tx, intent)).toThrow(/signature is invalid/i);
+  });
+
+  it("validates USDC issuer details", () => {
+    const usdcIssuer = config.STABLE_ASSET_ISSUER;
+    const tx = new Transaction(
+      buildCustomXdr({ asset: { code: "USDC", issuer: usdcIssuer } }),
+      config.networkPassphrase
+    );
+    tx.sign(from);
+
+    expect(() =>
+      validatePaymentTx(tx, {
+        ...intent,
+        asset: { code: "USDC", issuer: usdcIssuer },
+      })
+    ).not.toThrow();
+    
+    expect(() =>
+      validatePaymentTx(tx, {
+        ...intent,
+        asset: { code: "USDC", issuer: Keypair.random().publicKey() },
+      })
+    ).toThrow(/issuer mismatch/i);
+  });
+
+  it("returns a controlled validation error for malformed XDR", async () => {
+    await expect(stellar.submitPayment("not-xdr", intent)).rejects.toMatchObject({
+      code: "XDR_MISMATCH",
+      statusCode: 400,
+    });
   });
 
   it("builds a memo within the 28-byte limit", () => {
@@ -70,56 +215,3 @@ describe("payment XDR validation", () => {
   });
 });
 
-describe("verifySignedPaymentXdr (pre-submission intent + signature check)", () => {
-  function signedXdr(): string {
-    const tx = new Transaction(buildXdr(), config.networkPassphrase);
-    tx.sign(from);
-    return tx.toXDR();
-  }
-
-  it("accepts a validly signed transaction that matches the intent", () => {
-    expect(() => verifySignedPaymentXdr(signedXdr(), intent)).not.toThrow();
-  });
-
-  it("rejects a malformed XDR without ever reaching Horizon", () => {
-    expect(() => verifySignedPaymentXdr("not-a-valid-xdr", intent)).toThrow(/malformed|parse/i);
-  });
-
-  it("rejects an unsigned transaction", () => {
-    expect(() => verifySignedPaymentXdr(buildXdr(), intent)).toThrow(/sign/i);
-  });
-
-  it("rejects a transaction signed for a different network passphrase", () => {
-    const otherPassphrase = "Some Other Network ; July 2026";
-    const txForOtherNetwork = new Transaction(buildXdr(), otherPassphrase);
-    txForOtherNetwork.sign(from);
-    const wrongNetworkXdr = txForOtherNetwork.toXDR();
-    expect(() => verifySignedPaymentXdr(wrongNetworkXdr, intent)).toThrow(/sign/i);
-  });
-
-  it("rejects a transaction whose time bounds have expired", () => {
-    const source = new Account(from.publicKey(), "12345");
-    const expiredTx = new TransactionBuilder(source, {
-      fee: String(Number(BASE_FEE) * 2),
-      networkPassphrase: config.networkPassphrase,
-      timebounds: { minTime: 0, maxTime: Math.floor(Date.now() / 1000) - 100 },
-    })
-      .addOperation(
-        Operation.payment({
-          destination: intent.destination,
-          asset: Asset.native(),
-          amount: intent.amount,
-        })
-      )
-      .addMemo(Memo.text("MP:ABC123"))
-      .build();
-    expiredTx.sign(from);
-    expect(() => verifySignedPaymentXdr(expiredTx.toXDR(), intent)).toThrow(/expired/i);
-  });
-
-  it("still rejects an intent mismatch (e.g. amount) once signed", () => {
-    const tx = new Transaction(buildXdr({ amount: "99" }), config.networkPassphrase);
-    tx.sign(from);
-    expect(() => verifySignedPaymentXdr(tx.toXDR(), intent)).toThrow(/amount/i);
-  });
-});

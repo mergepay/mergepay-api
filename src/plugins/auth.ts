@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import jwt from "jsonwebtoken";
+import { z } from "zod";
 import { config } from "../config";
 import { Errors } from "../errors";
 
@@ -31,12 +32,17 @@ export function verifyToken(token: string): AuthUser {
   return { id: String(decoded.sub), stellarPublicKey: String(decoded.pk) };
 }
 
+const authorizationHeaderSchema = z
+  .string()
+  .regex(/^Bearer\s+\S+$/, "Authorization must use the Bearer scheme");
+
 async function authenticate(req: FastifyRequest, _reply: FastifyReply) {
-  const header = req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) {
+  const parsedHeader = authorizationHeaderSchema.safeParse(req.headers.authorization);
+  if (!parsedHeader.success) {
     throw Errors.unauthorized();
   }
-  const token = header.slice("Bearer ".length).trim();
+
+  const token = parsedHeader.data.slice("Bearer ".length).trim();
   try {
     req.user = verifyToken(token);
   } catch {

@@ -5,6 +5,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { serializeExpense, serializeSettlement } from "../serializers";
+import { paginationQuerySchema, decodeCursor, buildPaginatedResponse } from "../services/pagination";
 import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 
 const historyQuerySchema = z.object({
@@ -16,14 +17,49 @@ export default async function historyRoutes(app: FastifyInstance) {
 
   app.get("/history", { config: { rateLimit: { max: config.AUTH_RATE_LIMIT_MAX, timeWindow: "1 minute" } } }, async (req) => {
     const auth = requireUser(req);
+    const query = paginationQuerySchema.parse(req.query);
+
+    let cursorCondition: any = {};
+    if (query.cursor) {
+      const cursor = decodeCursor(query.cursor);
+      cursorCondition = {
+        OR: [
+          { createdAt: { lt: cursor.createdAt } },
+          { createdAt: { equals: cursor.createdAt }, id: { lt: cursor.id } },
+        ],
+      };
+    }
+
+    const statusFilter = query.status
+      ? { status: query.status }
+      : undefined;
+
+    const assetFilter = query.assetCode
+      ? { assetCode: query.assetCode }
+      : undefined;
+
+    const dateFilter: any = {};
+    if (query.fromDate) {
+      dateFilter.createdAt = { ...(dateFilter.createdAt || {}), gte: new Date(query.fromDate) };
+    }
+    if (query.toDate) {
+      dateFilter.createdAt = { ...(dateFilter.createdAt || {}), lte: new Date(query.toDate) };
+    }
     historyQuerySchema.parse(req.query ?? {});
 
     const [expenses, settlements] = await Promise.all([
       prisma.expense.findMany({
         where: {
-          OR: [
-            { payerUserId: auth.id },
-            { shares: { some: { userId: auth.id } } },
+          AND: [
+            {
+              OR: [
+                { payerUserId: auth.id },
+                { shares: { some: { userId: auth.id } } },
+              ],
+            },
+            cursorCondition,
+            assetFilter,
+            dateFilter,
           ],
           ...cursorFilter,
         },

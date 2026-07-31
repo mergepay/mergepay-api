@@ -98,6 +98,29 @@ function issuerKey(code: string, issuer: string | null): string {
   return `${code.toUpperCase()}::${issuer ?? ""}`;
 }
 
+/**
+ * Validate the asset configuration at startup. This ensures that:
+ * - All supported assets have valid codes and issuers
+ * - Issued assets have a non-empty issuer configured
+ * - No duplicate asset codes exist
+ *
+ * Called once during app bootstrap.
+ */
+export function validateAssetConfig(): void {
+  const seen = new Set<string>();
+  for (const a of SUPPORTED_ASSETS) {
+    if (seen.has(a.code.toUpperCase())) {
+      throw new Error(`Duplicate asset code "${a.code}" in SUPPORTED_ASSETS`);
+    }
+    seen.add(a.code.toUpperCase());
+    if (a.type === "issued" && !a.issuer) {
+      throw new Error(
+        `Issued asset "${a.code}" requires a non-empty issuer. Set STABLE_ASSET_ISSUER.`
+      );
+    }
+  }
+}
+
 // ─── Validation ────────────────────────────────────────────────────────────
 
 /**
@@ -266,6 +289,36 @@ export function isSupportedAsset(code: string, issuer?: string | null): boolean 
  */
 export function supportedAssetCodes(): string[] {
   return [..._byCode.keys()];
+}
+
+/**
+ * Startup validation of the asset-related configuration, called once by
+ * `buildApp()`. Failing here surfaces a misconfigured deployment at boot
+ * rather than as a confusing 400 on the first settlement attempt.
+ */
+export function validateAssetConfig(): void {
+  const stableCode = config.STABLE_ASSET_CODE?.trim();
+  if (!stableCode) {
+    throw new Error("STABLE_ASSET_CODE must be set");
+  }
+
+  const stable = _byCode.get(stableCode.toUpperCase());
+  if (!stable) {
+    throw new Error(
+      `STABLE_ASSET_CODE "${stableCode}" is not one of the supported assets ` +
+        `(${supportedAssetCodes().join(", ")})`
+    );
+  }
+
+  if (stable.type === "issued") {
+    const issuer = config.STABLE_ASSET_ISSUER?.trim();
+    if (!issuer) {
+      throw new Error(`STABLE_ASSET_ISSUER must be set for issued asset "${stableCode}"`);
+    }
+    if (!StrKey.isValidEd25519PublicKey(issuer)) {
+      throw new Error("STABLE_ASSET_ISSUER is not a valid Stellar public key");
+    }
+  }
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────────

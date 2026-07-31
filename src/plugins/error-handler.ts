@@ -18,19 +18,17 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
       const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
 
       return reply.code(400).send({
-        error: "VALIDATION_ERROR",
+        code: "VALIDATION_ERROR",
         message,
-        statusCode: 400,
-        details,
         requestId,
+        details,
       });
     }
 
     if (err instanceof AppError) {
       const body: Record<string, unknown> = {
-        error: err.code,
+        code: err.code,
         message: err.message,
-        statusCode: err.status,
         requestId,
       };
       if (err.details !== undefined) {
@@ -40,11 +38,9 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     }
 
     if ((err as any).statusCode === 429) {
-      const retryAfter = reply.getHeader("Retry-After") as string | undefined;
-      const body: Record<string, unknown> = {
-        error: "RATE_LIMITED",
+      return reply.code(429).send({
+        code: "RATE_LIMITED",
         message: "Too many requests, slow down.",
-        statusCode: 429,
         requestId,
       };
       if (retryAfter) {
@@ -56,18 +52,16 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     if ((err as any).statusCode && (err as any).statusCode < 500) {
       const status: number = (err as any).statusCode;
       return reply.code(status).send({
-        error: "BAD_REQUEST",
+        code: "BAD_REQUEST",
         message: err.message,
-        statusCode: status,
         requestId,
       });
     }
 
     app.log.error({ err, requestId }, "Unhandled error");
     return reply.code(500).send({
-      error: "INTERNAL_ERROR",
+      code: "INTERNAL_ERROR",
       message: "Something went wrong.",
-      statusCode: 500,
       requestId,
     });
   });

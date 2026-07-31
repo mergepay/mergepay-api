@@ -9,12 +9,16 @@ import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import loggingPlugin from "./plugins/logging";
+import openAPIPlugin from "./plugins/openapi";
+import { validateAssetConfig } from "./services/assets";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
 import anchorRoutes from "./routes/anchors";
+import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import { getCorrelationId } from "./lib/correlation";
@@ -32,8 +36,6 @@ function securityKey(request: FastifyRequest): string {
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
-  validateAssetConfig();
-
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
     // values are validated by genReqId before becoming request.id.
@@ -147,9 +149,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     keyGenerator: securityKey,
     addHeaders: true,
     errorResponseBuilder: (request) => ({
-      error: "RATE_LIMITED",
+      code: "RATE_LIMITED",
       message: "Too many requests. Please retry later.",
-      statusCode: 429,
       requestId: request.id,
     }),
   });
@@ -212,17 +213,18 @@ export async function buildApp(): Promise<FastifyInstance> {
     decorateReply: false,
   });
 
+  await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {
     const correlationId = getCorrelationId(req.id);
     reply.header("x-request-id", correlationId);
     reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
-      error: "NOT_FOUND",
+      code: "NOT_FOUND",
       message: "Route not found",
-      statusCode: 404,
       requestId: correlationId,
     });
   });
@@ -233,14 +235,27 @@ export async function buildApp(): Promise<FastifyInstance> {
     time: new Date().toISOString(),
   }));
 
+  app.get("/healthz", async () => ({
+    status: "ok",
+  }));
+
+  const { getReadiness } = await import("./services/health.js");
+  app.get("/readyz", async (request, reply) => {
+    const readiness = await getReadiness();
+    const statusCode = readiness.status === "ok" ? 200 : 503;
+    return reply.code(statusCode).send(readiness);
+  });
+
   await app.register(authRoutes);
   await app.register(groupRoutes);
   await app.register(expenseRoutes);
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
   await app.register(anchorRoutes);
+  await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
+  await app.register(userGroupsRoutes);
 
   return app;
 }

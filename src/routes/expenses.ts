@@ -81,36 +81,46 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
-    const expense = await prisma.expense.create({
-      data: {
-        groupId,
-        payerUserId,
-        title: body.title,
-        description: body.description,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-        splitType: body.splitType,
-        memo,
-        receiptUrl: body.receiptUrl ?? null,
-        shares: {
-          create: computed.map((c) => ({
-            userId: c.userId,
-            shareAmount: c.shareAmount,
-            // The payer's own share is already covered — mark it settled.
-            status: c.userId === payerUserId ? "settled" : "pending",
-          })),
+    const expense = await prisma.$transaction(async (tx) => {
+      const created = await tx.expense.create({
+        data: {
+          groupId,
+          payerUserId,
+          title: body.title,
+          description: body.description,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          splitType: body.splitType,
+          memo,
+          receiptUrl: body.receiptUrl ?? null,
+          shares: {
+            create: computed.map((c) => ({
+              userId: c.userId,
+              shareAmount: c.shareAmount,
+              status: c.userId === payerUserId ? "settled" : "pending",
+            })),
+          },
         },
-      },
-      include: expenseInclude,
-    });
+        include: expenseInclude,
+      });
 
-    await audit({
-      userId: auth.id,
-      action: "expense.create",
-      entityType: "expense",
-      entityId: expense.id,
-      metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.create",
+          entityType: "expense",
+          entityId: created.id,
+          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+        },
+      });
+
+      return created;
+    });
+    await auditLog.log("EXPENSE_CREATED", auth.id, groupId, {
+      expenseId: expense.id,
+      amount: body.amount,
+      title: body.title,
     });
 
     return { expense: serializeExpense(expense) };
@@ -181,14 +191,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.patch("/expenses/:id", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z
-      .object({
-        title: z.string().min(1).max(80).optional(),
-        description: z.string().max(500).nullable().optional(),
-        memo: z.string().max(24).optional(),
-        receiptUrl: z.string().nullable().optional(),
-      })
-      .parse(req.body);
+    const body = updateExpenseSchema.parse(req.body);
 
     const expense = await prisma.expense.findUnique({ where: { id } });
     if (!expense) throw Errors.notFound("Expense not found");
@@ -207,6 +210,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
       },
       include: expenseInclude,
     });
+    await auditLog.log("EXPENSE_UPDATED", auth.id, expense.groupId, { expenseId: id });
     return { expense: serializeExpense(updated) };
   });
 
@@ -234,13 +238,18 @@ export default async function expenseRoutes(app: FastifyInstance) {
       );
     }
 
-    await prisma.expense.delete({ where: { id } });
-    await audit({
-      userId: auth.id,
-      action: "expense.delete",
-      entityType: "expense",
-      entityId: id,
+    await prisma.$transaction(async (tx) => {
+      await tx.expense.delete({ where: { id } });
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.delete",
+          entityType: "expense",
+          entityId: id,
+        },
+      });
     });
+    await auditLog.log("EXPENSE_DELETED", auth.id, expense.groupId, { expenseId: id });
     return { ok: true };
   });
 }

@@ -220,6 +220,40 @@ cover the settlement engine (splits, net balances, greedy suggestions), money
 math, SEP-10 challenge/verify, signed-XDR validation, and the auth & group routes
 via `app.inject`.
 
+## Local API exploration (REST Client)
+
+[docs/api.http](docs/api.http) is a committed request collection for the
+[VS Code REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client)
+extension (also compatible with JetBrains HTTP Client). It walks the full happy
+path end-to-end:
+
+1. **SEP-10 auth** — challenge & verify (you sign the challenge with your
+   Stellar secret key via [Stellar Laboratory](https://laboratory.stellar.org)
+   or the SDK)
+2. **Create a group**
+3. **Add an expense** (equal split)
+4. **Attempt settlement** (requires a second group member as payer)
+5. **Fetch personal history**
+
+### Getting a token
+
+1. Open `docs/api.http` in VS Code.
+2. Run **1. Health Check** to confirm the server is running.
+3. Generate a Stellar keypair — use the
+   [Stellar Laboratory](https://laboratory.stellar.org/#account-creator?network=testnet)
+   or run:
+   ```bash
+   node -e "console.log(require('@stellar/stellar-sdk').Keypair.random().secret())"
+   ```
+4. Replace `GDULW5...` in **2. SEP-10 Challenge** with your public key and send.
+5. Copy the `transaction` XDR from the response, sign it with your secret key
+   (see instructions in the file), and paste the signed XDR into **3. SEP-10 Verify**.
+6. After a successful verify, copy the `token` value and paste it into the
+   `@token` variable at the top of the file.
+
+Subsequent requests use `{{token}}` automatically. Response variables
+(`@name` / `{{…}}`) chain group and expense IDs for you.
+
 ## Deployment
 
 Deploys to **Render / Fly.io / Railway**. Provision Postgres (Neon/Supabase/RDS),

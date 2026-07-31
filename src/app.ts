@@ -1,7 +1,7 @@
 import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
+import rateLimitPlugin from "./plugins/rate-limit";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
@@ -9,6 +9,8 @@ import { config, validateAssetConfig } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import loggingPlugin from "./plugins/logging";
+import openAPIPlugin from "./plugins/openapi";
 import { validateAssetConfig } from "./services/assets";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
@@ -210,8 +212,11 @@ export async function buildApp(): Promise<FastifyInstance> {
     prefix: "/uploads/",
     decorateReply: false,
   });
+
+  await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {
     const correlationId = getCorrelationId(req.id);
@@ -230,6 +235,17 @@ export async function buildApp(): Promise<FastifyInstance> {
     time: new Date().toISOString(),
   }));
 
+  app.get("/healthz", async () => ({
+    status: "ok",
+  }));
+
+  const { getReadiness } = await import("./services/health.js");
+  app.get("/readyz", async (request, reply) => {
+    const readiness = await getReadiness();
+    const statusCode = readiness.status === "ok" ? 200 : 503;
+    return reply.code(statusCode).send(readiness);
+  });
+
   await app.register(authRoutes);
   await app.register(groupRoutes);
   await app.register(expenseRoutes);
@@ -239,6 +255,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
+  await app.register(userGroupsRoutes);
 
   return app;
 }

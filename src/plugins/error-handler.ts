@@ -42,7 +42,11 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         code: "RATE_LIMITED",
         message: "Too many requests, slow down.",
         requestId,
-      });
+      };
+      if (retryAfter) {
+        body.retryAfter = retryAfter;
+      }
+      return reply.code(429).send(body);
     }
 
     if ((err as any).statusCode && (err as any).statusCode < 500) {

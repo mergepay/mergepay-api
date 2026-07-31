@@ -159,6 +159,7 @@ const networkPassphrase =
 
 export const config = {
   ...parsed,
+  API_URL: parsed.API_PUBLIC_URL,
   SEP10_HOME_DOMAIN: parsed.SEP10_HOME_DOMAIN ?? apiHost,
   WEB_AUTH_DOMAIN: parsed.WEB_AUTH_DOMAIN ?? apiHost,
   isTest: process.env.NODE_ENV === "test" || process.env.VITEST === "true",

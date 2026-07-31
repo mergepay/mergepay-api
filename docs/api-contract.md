@@ -32,6 +32,10 @@ Every error — validation, authorization, rate limiting, upstream — uses one 
 | `INVALID_CURSOR` | 400 | Pagination cursor was not produced by this API |
 | `INTENT_EXPIRED` | 400 | The unsigned transaction's signing window has closed — request a new one |
 | `XDR_MISMATCH` | 400 | The signed envelope does not match the intent it was built for |
+| `INVALID_IDEMPOTENCY_KEY` | 400 | `Idempotency-Key` is outside 1–255 characters of `A–Z a–z 0–9 - _ . :` |
+| `MISSING_IDEMPOTENCY_KEY` | 400 | The route requires an `Idempotency-Key` header and none was sent |
+| `IDEMPOTENCY_CONFLICT` | 409 | The key was already used with a different payload |
+| `IDEMPOTENCY_IN_PROGRESS` | 409 | The first request with this key is still running; retry shortly |
 | `UNAUTHORIZED` | 401 | Missing or invalid session |
 | `FORBIDDEN` | 403 | Authenticated, but not permitted on this resource |
 | `NOT_FOUND` | 404 | The resource does not exist |
@@ -86,6 +90,64 @@ Guarantees:
 `GET /history` paginates two resources independently: `cursor` walks the expense
 stream, `settlementCursor` walks the settlement stream, with metadata in `meta`
 and `settlementMeta` respectively.
+
+---
+
+## Idempotency
+
+Defined in [../src/services/idempotency.ts](../src/services/idempotency.ts).
+Mobile networks and wallet callbacks retry after timeouts, so every
+state-changing settlement request can be replayed safely.
+
+### The header
+
+| | |
+| --- | --- |
+| Header | `Idempotency-Key` |
+| Length | 1–255 characters |
+| Charset | `A–Z`, `a–z`, `0–9`, `-`, `_`, `.`, `:` |
+| Validation | Zod, before any database read — out of bounds is `INVALID_IDEMPOTENCY_KEY` (400) |
+
+| Endpoint | Key |
+| --- | --- |
+| `POST /expenses/:id/settle` | optional, honoured when sent |
+| `POST /groups/:id/settlements` | optional, honoured when sent |
+| `POST /settlements/:id/confirm` | **required** — missing is `MISSING_IDEMPOTENCY_KEY` (400) |
+| `POST /groups/:id/treasury/{deposit,withdraw}`, `POST /treasury-transactions/:id/confirm` | optional, honoured when sent |
+
+Submission requires a key because it is the request that ends in money moving:
+a retry that slipped through unguarded could mean a second on-chain payment.
+
+### Semantics
+
+A key is stored against `(authenticated user, operation scope, key)` together
+with a hash of the request's intent (scope, resource id, body).
+
+- **Replay** — same user, same key, equivalent payload → the **original**
+  response is returned verbatim. No second settlement record is created and no
+  second envelope is handed to the worker for Horizon submission.
+- **Different payload** — same user and key, different body → `409
+  IDEMPOTENCY_CONFLICT`. The first request's result is untouched.
+- **Different user** — a key is invisible outside the account that used it.
+  Another user sending the same string starts a fresh request; it never replays
+  and never conflicts.
+- **Different endpoint** — the scope is part of the identity, so the same string
+  on an unrelated route is a separate key.
+- **Concurrency** — the reservation row is written before the guarded operation
+  runs, and the unique constraint serializes racing retries. The loser gets
+  `409 IDEMPOTENCY_IN_PROGRESS` rather than a second execution, so concurrent
+  requests produce exactly one durable outcome.
+- **Failure** — the guarded operation runs inside a database transaction, so a
+  failure rolls back completely and the key is marked `failed`. The same key may
+  then be retried and will run exactly once more. A settlement is never left
+  looking complete without a confirmed transaction: the request path only
+  records a signed envelope, and the status only advances past `submitted` once
+  the worker has a Horizon result.
+- **Retention** — keys replay for 24 hours, then are swept.
+
+Signed XDR validation happens **before** the key's operation begins, so an
+invalid envelope is never recorded as an idempotent success — every retry with a
+bad envelope gets the same fresh `XDR_MISMATCH`.
 
 ---
 

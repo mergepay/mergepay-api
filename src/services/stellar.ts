@@ -519,6 +519,10 @@ export function validateSignedXdr(
     asset: AssetSpec;
     amount: string;
     memoCode: string;
+    /** Recorded intent expiry; when present, the envelope's bounds must agree. */
+    expiresAt?: Date | null;
+    /** Names the resource in the expiration error, e.g. "settlement". */
+    resource?: string;
   }
 ): SignedXdrValidation {
   let tx: Transaction;

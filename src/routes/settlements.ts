@@ -8,23 +8,60 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
 import { stellar, validatePaymentTx } from "../services/stellar";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, auditTx } from "../services/audit";
 import { userOrIpKey } from "../services/rate-limit-keys";
 import {
   serializeSettlement,
   serializeExpense,
   serializeTreasuryTx,
 } from "../serializers";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
-import { validateAsset, validateAmount } from "../services/assets";
 import { memoText } from "../services/stellar";
+import { paginationQuerySchema } from "../services/pagination";
+import { validateAsset, validateAmount } from "../services/assets";
+import { memoText, validateSignedXdr } from "../services/stellar";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 
-const settlementInclude = { from: true, to: true } as const;
+const settlementInclude = { from: true, to: true, statusHistory: true } as const;
+
+/** Every route in this file takes a single opaque resource id. */
+const idParamSchema = z.object({ id: z.string().min(1).max(64) });
+
+/**
+ * A settlement's public identifier: either its cuid or its short code. Both are
+ * unique. Constrained to the characters those identifiers actually use, so a
+ * malformed path is a validation error before it reaches the database.
+ */
+const settlementIdParamSchema = z.object({
+  id: z
+    .string()
+    .min(4)
+    .max(64)
+    .regex(/^[A-Za-z0-9_-]+$/, "Not a valid settlement identifier"),
+});
+
+const settlementStatusQuerySchema = z.object({
+  /**
+   * Whether to consult Horizon for on-chain confirmation. On by default —
+   * confirming a payment is the point of the endpoint — but a client rendering
+   * a list can pass `refresh=false` to read only persisted state.
+   */
+  refresh: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+});
 
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -32,38 +69,24 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // Settlement submission builds a real Stellar payment XDR (create) or
   // hands a signed one off for submission (confirm) — both are the kind of
   // expensive, state-changing operation that needs its own explicit budget
-  // rather than sharing the blanket global limit. Rate-limiting runs as a
-  // preHandler (after the app.authenticate hook above sets req.user) so the
-  // key can be the authenticated user rather than falling back to IP.
-  const createLimit = {
-    config: {
-      rateLimit: {
-        max: config.RATE_LIMIT_SETTLEMENT_CREATE_MAX,
-        timeWindow: config.RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS,
-        hook: "preHandler" as const,
-        keyGenerator: userOrIpKey("settlement.create"),
-      },
-    },
-  };
-  const confirmLimit = {
-    config: {
-      rateLimit: {
-        max: config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX,
-        timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
-        hook: "preHandler" as const,
-        keyGenerator: userOrIpKey("settlement.confirm"),
-      },
-    },
-  };
+  // rather than sharing the blanket global limit, and neither shares a bucket
+  // with the read routes below. Both policies run as a preHandler (after the
+  // app.authenticate hook above sets req.user) so the key is the authenticated
+  // user rather than falling back to IP.
+  const createLimit = rateLimited("settlementCreate");
+  const confirmLimit = rateLimited("settlementConfirm");
 
   // -- settle a specific expense share ----------------------------------------
   app.post("/expenses/:id/settle", createLimit, async (req) => {
     const auth = requireUser(req);
-    const { id: expenseId } = z.object({ id: z.string() }).parse(req.params);
+    const { id: expenseId } = idParamSchema.parse(req.params);
     const body = z
       .object({
         assetCode: z.string().optional(),
         assetIssuer: z.string().nullable().optional(),
+        // A client may ask for a *shorter* signing window than the default; the
+        // schema bounds the request and the server clock decides the deadline.
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body ?? {});
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -104,6 +127,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         }
 
         const code = shortCode();
+        const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({
           data: {
             shortCode: code,
@@ -117,8 +141,16 @@ export default async function settlementRoutes(app: FastifyInstance) {
             memo: memoText(code),
             expenseId: expense.id,
             expenseShareId: myShare.id,
+            expiresAt,
           },
           include: settlementInclude,
+        });
+
+        await recordStatusTransitionInTransaction(tx, {
+          entityType: "settlement",
+          entityId: settlement.id,
+          newStatus: "pending",
+          source: "api",
         });
 
         await tx.expenseShare.update({
@@ -133,12 +165,15 @@ export default async function settlementRoutes(app: FastifyInstance) {
           assetIssuer,
           amount: myShare.shareAmount.toString(),
           memoCode: code,
+          validitySeconds,
         });
 
         return {
           settlement: serializeSettlement(settlement),
           xdr,
           networkPassphrase: config.networkPassphrase,
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: secondsUntilExpiry(expiresAt),
         };
       },
     });
@@ -147,7 +182,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // -- freeform settle-up against net balance ---------------------------------
   app.post("/groups/:id/settlements", createLimit, async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
     const body = z
       .object({
@@ -155,6 +190,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         amount: z.string().min(1),
         assetCode: z.string().min(1),
         assetIssuer: z.string().nullable().optional(),
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -179,6 +215,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       payload: body,
       operation: async (tx) => {
         const code = shortCode();
+        const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({
           data: {
             shortCode: code,
@@ -190,8 +227,16 @@ export default async function settlementRoutes(app: FastifyInstance) {
             assetIssuer: body.assetIssuer ?? null,
             status: "pending",
             memo: memoText(code),
+            expiresAt,
           },
           include: settlementInclude,
+        });
+
+        await recordStatusTransitionInTransaction(tx, {
+          entityType: "settlement",
+          entityId: settlement.id,
+          newStatus: "pending",
+          source: "api",
         });
 
         const xdr = await buildSettlementXdr({
@@ -201,12 +246,15 @@ export default async function settlementRoutes(app: FastifyInstance) {
           assetIssuer: body.assetIssuer ?? null,
           amount: body.amount,
           memoCode: code,
+          validitySeconds,
         });
 
         return {
           settlement: serializeSettlement(settlement),
           xdr,
           networkPassphrase: config.networkPassphrase,
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: secondsUntilExpiry(expiresAt),
         };
       },
     });
@@ -215,9 +263,54 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // -- confirm (submit signed xdr) --------------------------------------------
   app.post("/settlements/:id/confirm", confirmLimit, async (req, reply) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
+
+    // Idempotency key is REQUIRED for settlement submission so that retries
+    // can never create duplicate on-chain payments.
+    if (!idempotencyKey) {
+      throw Errors.badRequest(
+        "missing_idempotency_key",
+        "Idempotency-Key header is required for settlement confirmation"
+      );
+    }
+
+    // Validate the signed XDR against the DB intent BEFORE entering the
+    // idempotent operation so that validation failures are never cached
+    // as idempotent successes and the client gets a fresh error each time.
+    const settlementRow = await prisma.settlement.findUnique({
+      where: { id },
+      include: settlementInclude,
+    });
+    if (!settlementRow) throw Errors.notFound("Settlement not found");
+    if (settlementRow.fromUserId !== auth.id) {
+      throw Errors.forbidden("Only the payer can confirm this settlement");
+    }
+
+    try {
+      validateSignedXdr(body.signedXdr, {
+        sourcePublicKey: settlementRow.from.stellarPublicKey,
+        destination: settlementRow.to.stellarPublicKey,
+        asset: {
+          code: settlementRow.assetCode,
+          issuer: settlementRow.assetIssuer,
+        },
+        amount: String(settlementRow.amount),
+        memoCode: settlementRow.shortCode,
+      });
+    } catch (err) {
+      await audit({
+        userId: auth.id,
+        action: "settlement.confirm.validation_failed",
+        entityType: "settlement",
+        entityId: id,
+        metadata: {
+          reason: err instanceof Error ? err.message : "validation failed",
+        },
+      });
+      throw err;
+    }
 
     return runIdempotent({
       userId: auth.id,
@@ -235,47 +328,49 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.forbidden("Only the payer can confirm this settlement");
         }
 
-        // Already confirmed, or moved past "pending" by a prior (possibly
-        // concurrent) confirm — return the current state rather than
-        // re-submitting or erroring, so retries are always safe.
-        if (settlement.status !== "pending") {
+        // Already completed or submitted — return the current state rather
+        // than re-submitting or erroring, so retries are always safe.
+        if (settlement.status === "completed" || settlement.status === "submitted") {
           return { settlement: serializeSettlement(settlement) };
         }
 
-        // Validate the signed XDR against the settlement's own recorded
-        // intent before it is ever persisted. Actual Horizon submission is
-        // deferred to the worker (so it can be retried), which re-validates
-        // independently before submitting — this check exists so a
-        // mismatched XDR is rejected immediately with a client-safe error
-        // instead of being silently accepted here and only failing later in
-        // the background.
-        let signedTx: Transaction;
-        try {
-          signedTx = new Transaction(body.signedXdr, config.networkPassphrase);
-        } catch {
-          throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
+        // A previously-failed settlement can be retried with a new signed
+        // XDR (and a new idempotency key).  Reset the retry bookkeeping so
+        // the worker process picks it up fresh.
+        if (settlement.status === "failed") {
+          await auditTx(tx, {
+            userId: auth.id,
+            action: "settlement.confirm.retry",
+            entityType: "settlement",
+            entityId: id,
+            metadata: { previousFailure: settlement.failureReason },
+          });
         }
-        validatePaymentTx(signedTx, {
-          sourcePublicKey: settlement.from.stellarPublicKey,
-          destination: settlement.to.stellarPublicKey,
-          asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
-          amount: settlement.amount.toString(),
-          memoCode: settlement.shortCode,
-        });
 
-        // Guard the transition with a conditional update rather than an
-        // unconditional one: if a concurrent confirm on the same settlement
-        // (e.g. a different idempotency key, or no key at all) already won
-        // the race and moved the status off "pending" between the read
-        // above and here, this update affects zero rows and we simply
-        // re-read the winning state instead of clobbering it.
+        // Guard the transition with a conditional update: only rows that
+        // are still in a confirmable status ("pending" or "failed") are
+        // moved to "submitted".  If a concurrent request already moved
+        // the settlement off a confirmable status between the read above
+        // and here, the update affects zero rows and we re-read the
+        // winning state instead of clobbering it.
         const { count } = await tx.settlement.updateMany({
-          where: { id, status: "pending" },
+          where: { id, status: { in: ["pending", "failed"] } },
           data: {
             transactionXdr: body.signedXdr,
             status: "submitted",
+            retryCount: 0,
+            failureReason: null,
           },
         });
+
+        if (count > 0) {
+          await recordStatusTransitionInTransaction(tx, {
+            entityType: "settlement",
+            entityId: id,
+            newStatus: "submitted",
+            source: "api",
+          });
+        }
 
         const finalSettlement = await tx.settlement.findUniqueOrThrow({
           where: { id },
@@ -283,7 +378,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         });
 
         if (count > 0) {
-          await audit({
+          await auditTx(tx, {
             userId: auth.id,
             action: "settlement.confirm",
             entityType: "settlement",
@@ -297,10 +392,79 @@ export default async function settlementRoutes(app: FastifyInstance) {
     });
   });
 
+  // -- status -----------------------------------------------------------------
+  //
+  // The single source of truth a client polls after creating or signing a
+  // settlement, so it never has to infer progress from an unrelated group or
+  // expense response.
+  //
+  // Access: any member of the settlement's group may read it, enforced through
+  // the same `requireMembership` helper every mutating route uses — there is no
+  // second authorization path here. A settlement that does not exist is a 404;
+  // one the caller may not inspect is a 403. That distinction is deliberate
+  // (clients need to tell "gone" from "not yours") and leaks only the existence
+  // of an opaque identifier, never any amount, party, group, or on-chain detail.
+  //
+  // The response never includes a signed or unsigned XDR, a token, provider
+  // credentials, or upstream error text — see src/services/settlement-status.ts.
+  app.get("/settlements/:id/status", async (req) => {
+    const auth = requireUser(req);
+    const { id } = settlementIdParamSchema.parse(req.params);
+    const { refresh } = settlementStatusQuerySchema.parse(req.query ?? {});
+
+    // `id` accepts either the cuid or the human-facing short code, both of
+    // which are unique and already public (the short code appears in the
+    // payment memo, so a user reading their wallet history can look it up).
+    const settlement = await prisma.settlement.findFirst({
+      where: { OR: [{ id }, { shortCode: id }] },
+      include: settlementInclude,
+    });
+    if (!settlement) throw Errors.notFound("Settlement not found");
+
+    await requireMembership(settlement.groupId, auth.id);
+
+    // Skipping the provider lookup is opt-in via `refresh=false`, for a client
+    // that wants only the persisted state (e.g. rendering a list).
+    const resolved = refresh
+      ? await resolveSettlementStatus(settlement)
+      : {
+          status: toPublicStatus(settlement),
+          onChain: {
+            checked: false,
+            found: false,
+            successful: null,
+            transactionHash: settlement.stellarTxHash ?? null,
+          },
+          failure: settlement.failureReason
+            ? { reason: settlement.failureReason }
+            : null,
+          expiresAt: settlement.expiresAt
+            ? settlement.expiresAt.toISOString()
+            : null,
+          expiresInSeconds: settlement.expiresAt
+            ? secondsUntilExpiry(settlement.expiresAt)
+            : null,
+          checkedAt: new Date().toISOString(),
+        };
+
+    return {
+      settlement: serializeSettlement(settlement),
+      status: resolved.status,
+      terminal: isTerminalSettlementStatus(resolved.status),
+      onChain: resolved.onChain,
+      failure: resolved.failure,
+      expiresAt: resolved.expiresAt,
+      expiresInSeconds: resolved.expiresInSeconds,
+      createdAt: settlement.createdAt.toISOString(),
+      updatedAt: settlement.updatedAt.toISOString(),
+      checkedAt: resolved.checkedAt,
+    };
+  });
+
   // -- balances + suggestions -------------------------------------------------
   app.get("/groups/:id/balances", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
+    const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
 
     const { balances, suggestions } = await loadGroupBalancesWithSuggestions(groupId);
@@ -340,98 +504,83 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- ledger -----------------------------------------------------------------
+  //
+  // The ledger interleaves three tables. Each is read with the same bounded
+  // `limit + 1` window and the same `(createdAt, id)` ordering, then merged
+  // using that identical total order, so the merged page obeys the shared
+  // pagination contract: a cursor from any page resumes exactly where the last
+  // one stopped, whichever table the boundary row came from.
   app.get("/groups/:id/ledger", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    const { id: groupId } = idParamSchema.parse(req.params);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
     await requireMembership(groupId, auth.id);
 
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
-
-    const cursorFilter = decodedCursor
-      ? {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }
-      : {};
-
-    const takeCount = limit + 1;
+    const position = requireCursor(cursor);
+    const where = { groupId, ...cursorFilter(position, order) };
+    const orderBy = cursorOrderBy(order);
+    const take = takeForPage(limit);
 
     const [expenses, settlements, treasuryTxs] = await Promise.all([
       prisma.expense.findMany({
-        where: { groupId, ...cursorFilter },
+        where,
         include: { payer: true, shares: { include: { user: true } } },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-        take: takeCount,
+        orderBy,
+        take,
       }),
       prisma.settlement.findMany({
-        where: { groupId, ...cursorFilter },
-        include: { from: true, to: true },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-        take: takeCount,
+        where,
+        include: settlementInclude,
+        orderBy,
+        take,
       }),
       prisma.treasuryTransaction.findMany({
-        where: { groupId, ...cursorFilter },
+        where,
         include: { user: true },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-        take: takeCount,
+        orderBy,
+        take,
       }),
     ]);
 
+    const direction = order === "desc" ? -1 : 1;
     const entries = [
-      ...expenses.map((e) => ({
+      ...expenses.slice(0, query.limit).map((e) => ({
         type: "expense" as const,
         createdAt: e.createdAt,
         id: e.id,
         expense: serializeExpense(e),
       })),
-      ...settlements.map((s) => ({
+      ...settlements.slice(0, query.limit).map((s) => ({
         type: "settlement" as const,
         createdAt: s.createdAt,
         id: s.id,
         settlement: serializeSettlement(s),
       })),
-      ...treasuryTxs.map((t) => ({
+      ...treasuryTxs.slice(0, query.limit).map((t) => ({
         type: "treasury" as const,
         createdAt: t.createdAt,
         id: t.id,
         treasuryTransaction: serializeTreasuryTx(t),
       })),
     ].sort((a, b) => {
-      if (a.createdAt < b.createdAt) return 1;
-      if (a.createdAt > b.createdAt) return -1;
-      return a.id < b.id ? 1 : -1;
+      if (a.createdAt.getTime() !== b.createdAt.getTime()) {
+        return a.createdAt < b.createdAt ? -direction : direction;
+      }
+      // Ids from different tables can collide in sort position only by string
+      // comparison, which is still a total order — the same one the per-table
+      // queries used, so the merge stays consistent with the cursor.
+      if (a.id === b.id) return 0;
+      return a.id < b.id ? -direction : direction;
     });
 
-    const hasMore = entries.length > limit;
-    const results = hasMore ? entries.slice(0, limit) : entries;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
+    const { items, meta } = buildPage(entries, limit, order);
 
     return {
-      entries: results.map((r) => {
-        const { id, ...rest } = r;
-        return {
-          ...rest,
-          createdAt: r.createdAt.toISOString(),
-        };
-      }),
-      meta: { nextCursor, hasMore },
+      entries: items.map(({ id: _id, createdAt, ...rest }) => ({
+        ...rest,
+        createdAt: createdAt.toISOString(),
+      })),
+      meta,
     };
   });
 }
@@ -447,6 +596,7 @@ async function buildSettlementXdr(params: {
   assetIssuer: string | null;
   amount: string;
   memoCode: string;
+  validitySeconds: number;
 }): Promise<string> {
   const account = await stellar.loadAccount(params.fromPublicKey);
   if (!account.exists) {
@@ -462,6 +612,10 @@ async function buildSettlementXdr(params: {
     asset: { code: params.assetCode, issuer: params.assetIssuer },
     amount: params.amount,
     memoCode: params.memoCode,
+    // The envelope's own maxTime and the persisted expiresAt describe the same
+    // deadline, so a wallet cannot return something valid longer than the
+    // intent it was issued for.
+    validitySeconds: params.validitySeconds,
   });
 }
 

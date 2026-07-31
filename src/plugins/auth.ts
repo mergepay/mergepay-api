@@ -19,17 +19,48 @@ declare module "fastify" {
   }
 }
 
+const JWT_ALGORITHM = "HS256" as const;
+
 export function signToken(user: AuthUser): string {
   return jwt.sign(
     { sub: user.id, pk: user.stellarPublicKey },
     config.JWT_SECRET,
-    { expiresIn: config.jwtExpiresIn }
+    {
+      algorithm: JWT_ALGORITHM,
+      expiresIn: config.jwtExpiresIn,
+      issuer: config.JWT_ISSUER,
+      audience: config.JWT_AUDIENCE,
+    }
   );
 }
 
+/**
+ * Verify a bearer token and return the account it was issued for.
+ *
+ * Enforces algorithm, issuer, audience, and expiration in addition to the
+ * signature so a token minted for a different environment/audience (or
+ * signed with a different algorithm) is rejected outright, and validates the
+ * claim shape so a malformed/tampered payload can't be coerced into
+ * authenticating as an arbitrary account.
+ */
 export function verifyToken(token: string): AuthUser {
-  const decoded = jwt.verify(token, config.JWT_SECRET) as jwt.JwtPayload;
-  return { id: String(decoded.sub), stellarPublicKey: String(decoded.pk) };
+  let decoded: jwt.JwtPayload;
+  try {
+    decoded = jwt.verify(token, config.JWT_SECRET, {
+      algorithms: [JWT_ALGORITHM],
+      issuer: config.JWT_ISSUER,
+      audience: config.JWT_AUDIENCE,
+    }) as jwt.JwtPayload;
+  } catch {
+    throw Errors.unauthorized();
+  }
+
+  const { sub, pk } = decoded;
+  if (typeof sub !== "string" || !sub || typeof pk !== "string" || !pk) {
+    throw Errors.unauthorized();
+  }
+
+  return { id: sub, stellarPublicKey: pk };
 }
 
 const authorizationHeaderSchema = z

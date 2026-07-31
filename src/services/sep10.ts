@@ -51,10 +51,6 @@ function validAccount(account: string): boolean {
   }
 }
 
-function genericChallengeError(): never {
-  throw Errors.badRequest("invalid_challenge", "Invalid or expired authentication challenge");
-}
-
 function operationValue(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value === "string") return value;
@@ -249,9 +245,7 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
       new Date((now + CHALLENGE_VALIDITY_SECONDS) * 1000)
     );
   } catch (error) {
-    if (error instanceof Error && error.message === "Invalid or expired authentication challenge") {
-      throw error;
-    }
+    if (error instanceof AppError) throw error;
     invalidChallenge();
   }
 

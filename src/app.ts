@@ -9,6 +9,7 @@ import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import { validateAssetConfig } from "./services/assets";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
@@ -33,8 +34,6 @@ function securityKey(request: FastifyRequest): string {
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
-  // Asset configuration is validated on-demand in routes
-
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
     // values are validated by genReqId before becoming request.id.
@@ -148,9 +147,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     keyGenerator: securityKey,
     addHeaders: true,
     errorResponseBuilder: (request) => ({
-      error: "RATE_LIMITED",
+      code: "RATE_LIMITED",
       message: "Too many requests. Please retry later.",
-      statusCode: 429,
       requestId: request.id,
     }),
   });
@@ -220,9 +218,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     reply.header("x-request-id", correlationId);
     reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
-      error: "NOT_FOUND",
+      code: "NOT_FOUND",
       message: "Route not found",
-      statusCode: 404,
       requestId: correlationId,
     });
   });

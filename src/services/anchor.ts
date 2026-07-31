@@ -287,16 +287,23 @@ export const anchorService = {
     id: string;
     timeoutMs?: number;
   }): Promise<PollResult> {
-    const timeoutMs = params.timeoutMs ?? config.ANCHOR_POLL_TIMEOUT_MS;
+    const timeoutMs = params.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
     const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
       params.id
     )}`;
 
     let response: Response;
     try {
-      response = await fetchWithTimeout(url, "Anchor.pollTransaction", timeoutMs, {
-        headers: { Authorization: `Bearer ${params.token}` },
-      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        response = await fetch(url, {
+          headers: { Authorization: `Bearer ${params.token}` },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return {
@@ -391,6 +398,7 @@ export const anchorService = {
           : undefined,
     };
   },
+
 };
 
 // ─── Status mapping ─────────────────────────────────────────────────────────

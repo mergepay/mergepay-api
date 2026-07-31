@@ -2,32 +2,54 @@ import "dotenv/config";
 import { z } from "zod";
 import { Networks } from "@stellar/stellar-sdk";
 
+// URL validation helper
+const urlSchema = z.string().url("Invalid URL format");
+
+// Stellar public key validation (G followed by 56 base32 characters)
+const stellarPublicKeySchema = z.string().regex(/^G[A-Z0-9]{55}$/, "Invalid Stellar public key format");
+
 const schema = z.object({
-  DATABASE_URL: z.string().default("postgresql://postgres:postgres@localhost:5432/mergepay"),
+  // Required core configuration
+  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   PORT: z.coerce.number().int().positive().default(4000),
-  API_PUBLIC_URL: z.string().default("http://localhost:4000"),
+  API_PUBLIC_URL: urlSchema,
   // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
   WEB_URL: z.string().default("*"),
-  JWT_SECRET: z.string().default("change-me-in-production"),
-  STELLAR_NETWORK: z.enum(["testnet", "public"]).default("public"),
-  HORIZON_URL: z.string().default("https://horizon.stellar.org"),
+  JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
+  
+  // Stellar configuration - required
+  STELLAR_NETWORK: z.enum(["testnet", "public"], {
+    errorMap: () => ({ message: "STELLAR_NETWORK must be either 'testnet' or 'public'" }),
+  }),
+  HORIZON_URL: urlSchema,
+  
+  // Fee configuration with sensible defaults
   FEE_CACHE_TTL: z.coerce.number().positive().default(30),
   MAX_FEE_STROOPS: z.coerce.number().int().positive().default(1000),
   DEFAULT_FEE_STROOPS: z.coerce.number().int().positive().default(100),
+  
+  // SEP-10 configuration - optional but validated if provided
   SEP10_SIGNING_SECRET: z.string().optional(),
   // If not set, derived from API_PUBLIC_URL so the deployed domain is used automatically.
   SEP10_HOME_DOMAIN: z.string().optional(),
   WEB_AUTH_DOMAIN: z.string().optional(),
-  ANCHOR_HOME_DOMAIN: z.string().default("testanchor.stellar.org"),
-  ANCHOR_NAME: z.string().default("Stellar Test Anchor"),
-  ANCHOR_WEBHOOK_SECRET: z.string().default("change-me"),
-  STABLE_ASSET_CODE: z.string().default("USDC"),
-  STABLE_ASSET_ISSUER: z
-    .string()
-    .default("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
+  
+  // Anchor configuration
+  ANCHOR_HOME_DOMAIN: z.string().min(1, "ANCHOR_HOME_DOMAIN is required"),
+  ANCHOR_NAME: z.string().min(1, "ANCHOR_NAME is required"),
+  ANCHOR_WEBHOOK_SECRET: z.string().min(1, "ANCHOR_WEBHOOK_SECRET is required"),
+  
+  // Stable asset configuration
+  STABLE_ASSET_CODE: z.string().min(1, "STABLE_ASSET_CODE is required"),
+  STABLE_ASSET_ISSUER: stellarPublicKeySchema,
+  
+  // File storage
   UPLOADS_DIR: z.string().default("./uploads"),
+  
+  // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
-  WORKER_LEASE_TIMEOUT_MS: z.coerce.number().positive().default(300000),
+  CONFIRM_POLL_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
+  CONFIRM_POLL_DELAY_MS: z.coerce.number().int().positive().default(1500),
   NODE_ENV: z.string().default("development"),
 
   // Security-sensitive endpoint policies.
@@ -52,29 +74,49 @@ const schema = z.object({
     .positive()
     .max(50 * 1024 * 1024)
     .default(5 * 1024 * 1024),
+}).refine(
+  (data) => {
+    // Validate that HORIZON_URL matches the network
+    const isTestnet = data.STELLAR_NETWORK === "testnet";
+    const horizonUrl = data.HORIZON_URL.toLowerCase();
+    
+    if (isTestnet && !horizonUrl.includes("testnet")) {
+      return false;
+    }
+    if (!isTestnet && horizonUrl.includes("testnet")) {
+      return false;
+    }
+    return true;
+  },
+  {
+    message: "HORIZON_URL must match STELLAR_NETWORK (testnet URLs for testnet, public URLs for public)",
+    path: ["HORIZON_URL"],
+  }
+);
 
-  // ── Timeout configuration for external calls ──────────────────────────
-  // Horizon account lookup timeout (ms). Account lookups are fast reads.
-  HORIZON_ACCOUNT_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
-  // Horizon transaction submission timeout (ms). Submissions may take longer.
-  HORIZON_SUBMIT_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
-  // Horizon transaction status lookup timeout (ms).
-  HORIZON_STATUS_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
-  // Horizon fee stats timeout (ms).
-  HORIZON_FEE_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
-  // Anchor SEP-10 challenge request timeout (ms).
-  ANCHOR_CHALLENGE_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
-  // Anchor SEP-10 token exchange timeout (ms).
-  ANCHOR_TOKEN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
-  // Anchor SEP-24 interactive flow start timeout (ms).
-  ANCHOR_INTERACTIVE_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
-  // Anchor SEP-24 transaction status poll timeout (ms).
-  ANCHOR_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
-  // Anchor stellar.toml fetch timeout (ms).
-  ANCHOR_TOML_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
-});
+function safeErrorMessage(error: unknown): string {
+  if (error instanceof z.ZodError) {
+    const issues = error.issues.map((issue) => {
+      const path = issue.path.length > 0 ? issue.path.join(".") : "configuration";
+      return `${path}: ${issue.message}`;
+    });
+    return issues.join("; ");
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
 
-const parsed = schema.parse(process.env);
+let parsed: z.infer<typeof schema>;
+try {
+  parsed = schema.parse(process.env);
+} catch (error) {
+  const message = safeErrorMessage(error);
+  console.error(`\n❌ Configuration validation failed:\n  ${message}\n`);
+  console.error("Please check your environment variables and try again.\n");
+  process.exit(1);
+}
 
 function hostOf(url: string): string {
   try {

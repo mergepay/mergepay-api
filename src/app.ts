@@ -1,14 +1,17 @@
 import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
+import rateLimitPlugin from "./plugins/rate-limit";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
-import { config } from "./config";
+import { config, validateAssetConfig } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import loggingPlugin from "./plugins/logging";
+import openAPIPlugin from "./plugins/openapi";
+import { validateAssetConfig } from "./services/assets";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
@@ -19,22 +22,32 @@ import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import { getCorrelationId } from "./lib/correlation";
+import { rateLimitPolicies } from "./lib/rate-limit";
+import { validateAssetConfig } from "./services/assets";
+import { PrismaRateLimitStore } from "./services/rate-limit-store";
+import { getReadiness } from "./services/health";
 
-function securityKey(request: FastifyRequest): string {
+/**
+ * Global-policy key. Unlike the per-route policies (which run on `preHandler`
+ * and can read `req.user`), the global limiter runs on `onRequest`, before any
+ * route's authenticate hook, so it resolves the identity from the bearer token
+ * itself. An unparseable token deliberately falls back to the client IP so
+ * invalid credentials share one bucket instead of minting a fresh one each try.
+ */
+function globalRateLimitKey(request: FastifyRequest): string {
   const authorization = request.headers.authorization;
   if (authorization?.startsWith("Bearer ")) {
     try {
-      return `user:${verifyToken(authorization.slice("Bearer ".length).trim()).id}`;
+      const user = verifyToken(authorization.slice("Bearer ".length).trim());
+      return `global:user:${user.id}`;
     } catch {
       // Invalid credentials are deliberately grouped by client IP.
     }
   }
-  return `ip:${request.ip}`;
+  return `global:ip:${request.ip}`;
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
-  validateAssetConfig();
-
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
     // values are validated by genReqId before becoming request.id.
@@ -131,11 +144,11 @@ export async function buildApp(): Promise<FastifyInstance> {
         },
     credentials: false,
   });
-  // Global default limit. Sensitive routes (SEP-10 auth, settlement
-  // submission, the SEP-24 callback) override this with their own,
-  // route-appropriate config — see routes/auth.ts, routes/settlements.ts,
-  // routes/anchors.ts. Keys are the authenticated user id when available,
-  // otherwise the resolved client IP — never a wallet public key.
+  // Global default limit. Sensitive routes (SEP-10 auth, settlement and
+  // treasury submission, anchor initiation and polling) override this with
+  // their own bucket — see src/lib/rate-limit.ts for the policy table and the
+  // routes that name each policy. Keys are the authenticated user id when
+  // available, otherwise the resolved client IP — never a wallet public key.
   //
   // RATE_LIMIT_STORE=database shares counters across instances via Postgres
   // (src/services/rate-limit-store.ts) and fails OPEN if that store errors
@@ -146,11 +159,10 @@ export async function buildApp(): Promise<FastifyInstance> {
     max: config.RATE_LIMIT_GLOBAL_MAX,
     timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: securityKey,
-    addHeaders: true,
+    addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: (request) => ({
-      error: "RATE_LIMITED",
+      code: "RATE_LIMITED",
       message: "Too many requests. Please retry later.",
-      statusCode: 429,
       requestId: request.id,
     }),
   });
@@ -162,83 +174,57 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
   });
 
-  // Apply stricter policies only to expensive or abuse-prone endpoints.
+  // Cap the request body on routes that take signed envelopes or credentials,
+  // so a malformed or hostile payload is rejected by Fastify before any Zod
+  // parsing, cryptographic work, or upstream call happens. Rate-limit policy
+  // is *not* set here — each route names its own policy from
+  // src/lib/rate-limit.ts, which keeps the limit next to the handler it guards.
+  const BODY_LIMITED_ROUTES = new Set([
+    "/auth/challenge",
+    "/auth/verify",
+    "/expenses/:id/settle",
+    "/groups/:id/settlements",
+    "/settlements/:id/confirm",
+    "/groups/:id/treasury/deposit",
+    "/groups/:id/treasury/withdraw",
+    "/treasury-transactions/:id/confirm",
+    "/anchors/deposit",
+    "/anchors/withdraw",
+    "/anchors/sessions/:id/complete",
+    "/anchors/webhook",
+  ]);
+
   app.addHook("onRoute", (routeOptions) => {
     const url = routeOptions.url;
     let rateLimit: { max: number; timeWindow: number } | undefined;
     let bodyLimit: number | undefined;
 
-    // Auth endpoints: challenge is more forgiving (wallet polling), verify is strict
-    if (url === "/auth/challenge") {
-      rateLimit = {
-        max: config.RATE_LIMIT_AUTH_CHALLENGE_MAX,
-        timeWindow: config.RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS,
-      };
-      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
-    } else if (url === "/auth/verify") {
-      rateLimit = {
-        max: config.RATE_LIMIT_AUTH_VERIFY_MAX,
-        timeWindow: config.RATE_LIMIT_AUTH_VERIFY_WINDOW_MS,
-      };
-      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
-    }
-    // Settlement endpoints: create/initiate is more restricted than confirm
-    else if (url === "/expenses/:id/settle" || url === "/groups/:id/settlements") {
-      rateLimit = {
-        max: config.RATE_LIMIT_SETTLEMENT_CREATE_MAX,
-        timeWindow: config.RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS,
-      };
-      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
-    } else if (url === "/settlements/:id/confirm" || url === "/settlements/:id/submit") {
-      rateLimit = {
-        max: config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX,
-        timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
-      };
-      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
-    }
-    // SEP-24 anchor endpoints: initiate/status distinction
-    else if (url === "/anchors/deposit" || url === "/anchors/withdraw") {
-      rateLimit = {
-        max: config.RATE_LIMIT_ANCHOR_INITIATE_MAX,
-        timeWindow: config.RATE_LIMIT_ANCHOR_INITIATE_WINDOW_MS,
-      };
-      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
-    } else if (url === "/anchors/sessions/:id/complete" || url === "/anchors/sessions") {
-      rateLimit = {
-        max: config.RATE_LIMIT_ANCHOR_STATUS_MAX,
-        timeWindow: config.RATE_LIMIT_ANCHOR_STATUS_WINDOW_MS,
-      };
-      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
-    } else if (url === "/anchors/webhook") {
-      rateLimit = {
-        max: config.RATE_LIMIT_ANCHOR_WEBHOOK_MAX,
-        timeWindow: config.RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS,
-      };
-      bodyLimit = config.JSON_BODY_LIMIT_BYTES;
-    }
-    // File uploads: large multipart bodies allowed
-    else if (url === "/uploads/receipt") {
-      rateLimit = {
-        max: config.RATE_LIMIT_ANCHOR_INITIATE_MAX,
-        timeWindow: config.RATE_LIMIT_ANCHOR_INITIATE_WINDOW_MS,
-      };
-      bodyLimit = config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024;
+    if (url === "/auth/challenge" || url === "/auth/verify") {
+      max = config.RATE_LIMIT_AUTH_CHALLENGE_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/expenses/:id/settle" ||
+      url === "/groups/:id/settlements" ||
+      url === "/settlements/:id/confirm"
+    ) {
+      max = config.RATE_LIMIT_SETTLEMENT_CREATE_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/anchors/deposit" ||
+      url === "/anchors/withdraw" ||
+      url === "/anchors/sessions/:id/complete" ||
+      url === "/uploads/receipt"
+    ) {
+      max = config.SEP24_RATE_LIMIT_MAX;
+      bodyLimit = url === "/uploads/receipt"
+        ? config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024
+        : config.AUTH_BODY_LIMIT_BYTES;
     }
 
-    if (rateLimit !== undefined) {
-      const options = routeOptions as typeof routeOptions & {
-        config?: Record<string, unknown>;
-        bodyLimit?: number;
-      };
-      options.config = {
-        ...(options.config ?? {}),
-        rateLimit: {
-          max: rateLimit.max,
-          timeWindow: rateLimit.timeWindow,
-          keyGenerator: securityKey,
-        },
-      };
-      options.bodyLimit = bodyLimit;
+    if (url === "/uploads/receipt") {
+      options.bodyLimit = config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024;
+    } else if (BODY_LIMITED_ROUTES.has(url)) {
+      options.bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
     }
   });
 
@@ -247,17 +233,19 @@ export async function buildApp(): Promise<FastifyInstance> {
     prefix: "/uploads/",
     decorateReply: false,
   });
+
+  await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {
     const correlationId = getCorrelationId(req.id);
     reply.header("x-request-id", correlationId);
     reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
-      error: "NOT_FOUND",
+      code: "NOT_FOUND",
       message: "Route not found",
-      statusCode: 404,
       requestId: correlationId,
     });
   });
@@ -268,6 +256,17 @@ export async function buildApp(): Promise<FastifyInstance> {
     time: new Date().toISOString(),
   }));
 
+  app.get("/healthz", async () => ({
+    status: "ok",
+  }));
+
+  const { getReadiness } = await import("./services/health.js");
+  app.get("/readyz", async (request, reply) => {
+    const readiness = await getReadiness();
+    const statusCode = readiness.status === "ok" ? 200 : 503;
+    return reply.code(statusCode).send(readiness);
+  });
+
   await app.register(authRoutes);
   await app.register(groupRoutes);
   await app.register(expenseRoutes);
@@ -277,6 +276,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
+  await app.register(userGroupsRoutes);
 
   return app;
 }

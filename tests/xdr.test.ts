@@ -9,7 +9,7 @@ import {
   Transaction,
   TransactionBuilder,
 } from "@stellar/stellar-sdk";
-import { stellar, validatePaymentTx } from "../src/services/stellar";
+import { stellar, validatePaymentTx, validateSignedXdr } from "../src/services/stellar";
 import { config } from "../src/config";
 
 const from = Keypair.random();
@@ -69,6 +69,29 @@ function buildCustomXdr({
 
   return txb.addMemo(Memo.text("MP:ABC123")).setTimeout(300).build().toXDR();
 }
+
+describe("validateSignedXdr", () => {
+  it("accepts a valid signed XDR matching the intent", () => {
+    const tx = new Transaction(buildXdr(), config.networkPassphrase);
+    tx.sign(from);
+    const signedXdr = tx.toXDR();
+    const { hash } = validateSignedXdr(signedXdr, intent);
+    expect(hash).toBe(tx.hash().toString("hex"));
+  });
+
+  it("rejects malformed XDR", () => {
+    expect(() => validateSignedXdr("not-xdr", intent)).toThrow("Malformed");
+  });
+
+  it("rejects a valid XDR with mismatched intent", () => {
+    const tx = new Transaction(
+      buildXdr({ amount: "99" }),
+      config.networkPassphrase
+    );
+    tx.sign(from);
+    expect(() => validateSignedXdr(tx.toXDR(), intent)).toThrow(/amount/i);
+  });
+});
 
 describe("payment XDR validation", () => {
   it("accepts a transaction that matches the intent", () => {

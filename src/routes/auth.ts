@@ -2,13 +2,12 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
-import { config } from "../config";
 import { Errors } from "../errors";
 import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
 import { audit } from "../services/audit";
-import { ipKey } from "../services/rate-limit-keys";
+import { rateLimited } from "../lib/rate-limit";
 
 function shortName(pk: string): string {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
@@ -17,27 +16,14 @@ function shortName(pk: string): string {
 export default async function authRoutes(app: FastifyInstance) {
   // Requesting a challenge is cheap and legitimately retried (e.g. a wallet
   // extension polling while the user approves), so it gets a more generous
-  // limit than completing the actual login.
-  const challengeLimit = {
-    config: {
-      rateLimit: {
-        max: config.RATE_LIMIT_AUTH_CHALLENGE_MAX,
-        timeWindow: config.RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS,
-        keyGenerator: ipKey("auth.challenge"),
-      },
-    },
-  };
-  // Verifying is the actual authentication step; keep it tighter to slow
-  // down brute-force / credential-stuffing-style attempts against it.
-  const verifyLimit = {
-    config: {
-      rateLimit: {
-        max: config.RATE_LIMIT_AUTH_VERIFY_MAX,
-        timeWindow: config.RATE_LIMIT_AUTH_VERIFY_WINDOW_MS,
-        keyGenerator: ipKey("auth.verify"),
-      },
-    },
-  };
+  // limit than completing the actual login. Verifying is the actual
+  // authentication step and is kept tighter to slow down brute-force attempts.
+  // Both buckets are keyed strictly by client IP — there is no authenticated
+  // user yet, and the wallet's public key must never become a bucket key,
+  // because differing 429 behaviour would then reveal whether an account is
+  // known to the API.
+  const challengeLimit = rateLimited("authChallenge");
+  const verifyLimit = rateLimited("authVerify");
 
   app.post(
     "/auth/challenge",

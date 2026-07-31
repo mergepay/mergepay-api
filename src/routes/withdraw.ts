@@ -2,7 +2,7 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { config } from "../config";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService } from "../services/anchor";
 import { stellar } from "../services/stellar";
@@ -152,7 +152,8 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           where: { id },
           data: { status: "failed" },
         });
-        throw error;
+        if (error instanceof AppError) throw error;
+        throw Errors.upstream("Withdrawal confirmation failed");
       }
     }
   );

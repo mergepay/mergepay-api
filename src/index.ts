@@ -3,6 +3,13 @@ import { config } from "./config";
 import { prisma } from "./db";
 
 async function main() {
+  // Config validation already happened at module load time in config.ts
+  // This explicit check ensures we fail before building the app if config is invalid
+  if (!config.DATABASE_URL || !config.API_PUBLIC_URL || !config.JWT_SECRET) {
+    console.error("❌ Critical configuration missing. Exiting.");
+    process.exit(1);
+  }
+
   const app = await buildApp();
 
   const shutdown = async (signal: string) => {

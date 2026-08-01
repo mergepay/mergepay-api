@@ -32,6 +32,7 @@ Every error — validation, authorization, rate limiting, upstream — uses one 
 | `INVALID_CURSOR` | 400 | Pagination cursor was not produced by this API |
 | `INTENT_EXPIRED` | 400 | The unsigned transaction's signing window has closed — request a new one |
 | `XDR_MISMATCH` | 400 | The signed envelope does not match the intent it was built for |
+| `XDR_MALFORMED` | 400 | The envelope could not be parsed at all |
 | `INVALID_IDEMPOTENCY_KEY` | 400 | `Idempotency-Key` is outside 1–255 characters of `A–Z a–z 0–9 - _ . :` |
 | `MISSING_IDEMPOTENCY_KEY` | 400 | The route requires an `Idempotency-Key` header and none was sent |
 | `IDEMPOTENCY_CONFLICT` | 409 | The key was already used with a different payload |
@@ -184,6 +185,40 @@ Endpoints that return an unsigned XDR (`POST /expenses/:id/settle`,
 
 `Settlement` and `TreasuryTransaction` payloads both carry
 `expiresAt: string | null` (null on rows predating expiration tracking).
+
+### Signed XDR validation
+
+Defined in [../src/services/settlement-xdr.ts](../src/services/settlement-xdr.ts)
+and [../src/services/stellar.ts](../src/services/stellar.ts).
+
+`POST /settlements/:id/confirm` loads the settlement's **stored** intent — never
+anything the client sent alongside the envelope — and validates the signed XDR
+against it before the envelope is persisted and before anything reaches Horizon.
+The worker repeats the same check at submission time.
+
+Checked, in order:
+
+| Property | Rejected when |
+| --- | --- |
+| Envelope | Unparseable, or a fee-bump wrapper (`XDR_MALFORMED` / `XDR_MISMATCH`) |
+| Validity window | No expiry, valid longer than the intent, already lapsed, or not yet valid |
+| Transaction source | Not the settlement's payer |
+| Operation count | Anything other than exactly one operation |
+| Fee | Below the network minimum or above the fee the API built (per operation) |
+| Operation type | Not a payment |
+| Operation source | Overridden to an account other than the payer |
+| Destination | Not the settlement's recipient |
+| Asset | Different code, or the same code with a different issuer |
+| Amount | Differs at 7-decimal precision |
+| Memo | Not the settlement's own short code |
+| Signature | Missing, or not verifiable against the source account for the configured network passphrase |
+
+A mismatch is a `400` with a stable code (`XDR_MISMATCH`, `XDR_MALFORMED`, or
+`INTENT_EXPIRED`) and a message naming the field that diverged. The signed
+envelope, its signatures, and any key material are never included in the
+response or in logs. A rejected transaction is never submitted and never
+advances the settlement's status — the settlement stays awaiting a signature and
+the wallet can sign the correct envelope instead.
 
 ---
 

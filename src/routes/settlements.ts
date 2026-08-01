@@ -24,7 +24,8 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
-import { stellar, memoText, validateSignedXdr } from "../services/stellar";
+import { stellar, memoText } from "../services/stellar";
+import { validateSettlementXdr } from "../services/settlement-xdr";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
@@ -310,9 +311,11 @@ export default async function settlementRoutes(app: FastifyInstance) {
       "settlement confirmation"
     );
 
-    // Validate the signed XDR against the persisted intent BEFORE entering the
-    // idempotent operation, so a validation failure is never recorded as an
-    // idempotent success and the client gets a fresh error on every retry.
+    // Load the *original* intent and validate the signed envelope against it
+    // BEFORE entering the idempotent operation. Two reasons: a validation
+    // failure is never recorded as an idempotent success, and a transaction
+    // that does not match what the API authorized is rejected before it can be
+    // persisted, submitted to Horizon, or advance the settlement's status.
     const settlementRow = await prisma.settlement.findUnique({
       where: { id },
       include: settlementInclude,
@@ -323,18 +326,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
     }
 
     try {
-      validateSignedXdr(body.signedXdr, {
-        sourcePublicKey: settlementRow.from.stellarPublicKey,
-        destination: settlementRow.to.stellarPublicKey,
-        asset: {
-          code: settlementRow.assetCode,
-          issuer: settlementRow.assetIssuer,
-        },
-        amount: String(settlementRow.amount),
-        memoCode: settlementRow.shortCode,
-        expiresAt: settlementRow.expiresAt,
-        resource: "settlement",
-      });
+      validateSettlementXdr(body.signedXdr, settlementRow);
     } catch (err) {
       await audit({
         userId: auth.id,

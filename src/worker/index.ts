@@ -43,6 +43,7 @@ import {
   type SettlementStatus,
 } from "../services/settlement-machine";
 import { pollForConfirmation } from "../services/horizon-confirm";
+import { settlementPaymentIntent } from "../services/settlement-xdr";
 import {
   anchorService,
   AUDITABLE_ANCHOR_STATUSES,
@@ -429,15 +430,21 @@ export async function processSettlementJob(
     await recordAttemptStarted(job, attempt);
 
     try {
-      // submitPayment re-validates the stored envelope against this
-      // settlement's own intent before anything reaches Horizon.
-      const hash = await stellar.submitPayment(job.transactionXdr, {
-        sourcePublicKey: job.fromPublicKey,
-        destination: job.toPublicKey,
-        asset: { code: job.assetCode, issuer: job.assetIssuer },
-        amount: job.amount,
-        memoCode: job.shortCode,
-      });
+      // The stored envelope is re-validated against this settlement's own
+      // recorded intent before anything reaches Horizon — the API's intent,
+      // not whatever was persisted alongside it.
+      const hash = await stellar.submitPayment(
+        job.transactionXdr,
+        settlementPaymentIntent({
+          shortCode: job.shortCode,
+          amount: job.amount,
+          assetCode: job.assetCode,
+          assetIssuer: job.assetIssuer,
+          expiresAt: job.expiresAt,
+          from: { stellarPublicKey: job.fromPublicKey },
+          to: { stellarPublicKey: job.toPublicKey },
+        })
+      );
 
       await confirmSubmission({ job, hash, attempt, ctx });
       return;

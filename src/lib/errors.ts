@@ -45,6 +45,10 @@ export const ErrorCode = {
   BAD_FILE_TYPE: "BAD_FILE_TYPE",
   FILE_TOO_LARGE: "FILE_TOO_LARGE",
   XDR_MISMATCH: "XDR_MISMATCH",
+  /** The envelope could not be parsed at all — not that it failed to match. */
+  XDR_MALFORMED: "XDR_MALFORMED",
+  /** An envelope arrived with no usable signature for the configured network. */
+  XDR_UNSIGNED: "XDR_UNSIGNED",
   /**
    * An unsigned transaction intent was signed or submitted after its
    * server-controlled validity window. Distinct from XDR_MISMATCH (the

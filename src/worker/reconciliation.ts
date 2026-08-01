@@ -185,12 +185,13 @@ async function writeStatus(
   }
 
   await audit({
-    actor: { type: "system", worker: "transaction-reconciliation" },
+    userId: null,
     action: `stellar_transaction_${status}`,
     entityType: table,
     entityId: record.id,
     outcome: status === "failed" ? "failure" : "success",
     metadata: {
+      worker: "transaction-reconciliation",
       stellarTxHash: details.hash ?? record.stellarTxHash,
       previousStatus: record.status,
       status,

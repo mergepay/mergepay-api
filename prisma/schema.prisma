@@ -123,7 +123,19 @@ model Settlement {
   stellarTxHash  String?   @map("stellar_tx_hash")
   transactionXdr String?   @map("transaction_xdr")
   status         String    @default("pending")
+  // Durable job state for the settlement worker (see src/worker/index.ts).
+  // `retryCount` is the number of submission attempts already made;
+  // `nextAttemptAt` gates when the row becomes eligible again after a backoff;
+  // `errorCategory` records why the last attempt failed ("transient",
+  // "indeterminate", "permanent") so operators can tell a stuck job from a
+  // dead one. The lease columns are what stop two workers processing the same
+  // transition: a claim is only granted when no live lease exists.
   retryCount     Int       @default(0) @map("retry_count")
+  nextAttemptAt  DateTime? @map("next_attempt_at")
+  errorCategory  String?   @map("error_category")
+  claimedBy      String?   @map("claimed_by")
+  claimedAt      DateTime? @map("claimed_at")
+  leaseExpiresAt DateTime? @map("lease_expires_at")
   failureReason  String?   @map("failure_reason")
   submittedAt    DateTime? @map("submitted_at")
   confirmedAt    DateTime? @map("confirmed_at")
@@ -143,6 +155,8 @@ model Settlement {
   @@index([toUserId])
   @@index([status])
   @@index([status, updatedAt]) // For worker reconciliation queries
+  @@index([status, nextAttemptAt]) // For picking up eligible worker jobs
+  @@index([leaseExpiresAt]) // For recovering leases from crashed workers
   @@map("settlements")
 }
 
@@ -221,7 +235,10 @@ model AnchorSession {
   claimedAt             DateTime? @map("claimed_at")
   claimedBy             String?  @map("claimed_by")
   leaseExpiresAt        DateTime?  @map("lease_expires_at")
+  // Same durable job-state contract as Settlement: when the session becomes
+  // eligible again, and why the last poll failed. See src/worker/index.ts.
   nextAttemptAt         DateTime?  @map("next_attempt_at")
+  errorCategory         String?    @map("error_category")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
   jobAttemptCount       Int      @default(0) @map("job_attempt_count")

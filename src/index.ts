@@ -5,6 +5,7 @@ import { prisma } from "./db";
 async function main() {
   const app = await buildApp();
 
+
   const shutdown = async (signal: string) => {
     app.log.info(`Received ${signal}, shutting down…`);
     await app.close();
@@ -14,6 +15,7 @@ async function main() {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
+
   try {
     await app.listen({ port: config.PORT, host: "0.0.0.0" });
     app.log.info(`Mergepay API listening on :${config.PORT} (${config.STELLAR_NETWORK})`);
@@ -22,5 +24,6 @@ async function main() {
     process.exit(1);
   }
 }
+
 
 main();

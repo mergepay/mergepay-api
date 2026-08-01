@@ -13,6 +13,18 @@ function iso(d: Date): string {
   return d.toISOString();
 }
 
+export function serializeStatusHistory(h: any) {
+  return {
+    id: h.id,
+    entityType: h.entityType,
+    entityId: h.entityId,
+    status: h.status,
+    reason: h.reason ?? null,
+    source: h.source ?? null,
+    createdAt: iso(h.createdAt),
+  };
+}
+
 export function serializeUser(u: any) {
   return {
     id: u.id,
@@ -91,9 +103,15 @@ export function serializeSettlement(s: any) {
     assetIssuer: s.assetIssuer ?? null,
     stellarTxHash: s.stellarTxHash ?? null,
     status: s.status,
+    failureReason: s.failureReason ?? null,
+    retryCount: s.retryCount,
+    submittedAt: s.submittedAt ? iso(s.submittedAt) : null,
+    confirmedAt: s.confirmedAt ? iso(s.confirmedAt) : null,
     memo: s.memo ?? null,
     expenseId: s.expenseId ?? null,
+    expenseShareId: s.expenseShareId ?? null,
     createdAt: iso(s.createdAt),
+    statusHistory: (s.statusHistory ?? []).map(serializeStatusHistory),
   };
 }
 
@@ -111,6 +129,7 @@ export function serializeTreasuryTx(t: any) {
     stellarTxHash: t.stellarTxHash ?? null,
     status: t.status,
     memo: t.memo ?? null,
+    expiresAt: t.expiresAt ? iso(t.expiresAt) : null,
     createdAt: iso(t.createdAt),
   };
 }
@@ -149,6 +168,49 @@ export function serializeAnchorSession(s: any) {
     interactiveUrl: s.interactiveUrl ?? null,
     externalTransactionId: s.externalTransactionId ?? null,
     status: s.status,
+    statusHistory: (s.statusHistory ?? []).map(serializeStatusHistory),
+    failureReason: s.failureReason ?? null,
+    retryCount: s.retryCount ?? 0,
+    lastPolledAt: s.lastPolledAt ? iso(s.lastPolledAt) : null,
     createdAt: iso(s.createdAt),
+  };
+}
+
+// Metadata keys that must never reach the client, even if a future write
+// path accidentally includes them (audit metadata is meant to be a small
+// operational breadcrumb, not a payload dump).
+const SENSITIVE_AUDIT_METADATA_KEYS = new Set([
+  "signedxdr",
+  "transactionxdr",
+  "xdr",
+  "token",
+  "jwt",
+  "secret",
+  "password",
+  "privatekey",
+  "secretkey",
+  "authorization",
+]);
+
+function redactAuditMetadata(metadata: unknown): Record<string, unknown> | null {
+  if (!metadata || typeof metadata !== "object") return null;
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata as Record<string, unknown>)) {
+    if (SENSITIVE_AUDIT_METADATA_KEYS.has(key.toLowerCase())) continue;
+    redacted[key] = value;
+  }
+  return redacted;
+}
+
+export function serializeAuditLogEntry(e: any) {
+  return {
+    id: e.id,
+    createdAt: iso(e.createdAt),
+    actorUserId: e.userId ?? null,
+    actorDisplayName: e.user?.displayName ?? null,
+    action: e.action,
+    entityType: e.entityType,
+    entityId: e.entityId,
+    metadata: redactAuditMetadata(e.metadata),
   };
 }

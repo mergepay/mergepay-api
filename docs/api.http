@@ -1,0 +1,104 @@
+### ─── Variables ────────────────────────────────────────────────────────
+@baseUrl = http://localhost:4000
+@token = YOUR_JWT_TOKEN
+
+### ───────────────────────────────────────────────────────────────────────
+###  SEP-10 Authentication
+### ───────────────────────────────────────────────────────────────────────
+### These two requests establish a session.  You need a Stellar keypair
+### (public/secret).  Generate one at https://laboratory.stellar.org
+### or run:  node -e "console.log(require('@stellar/stellar-sdk').Keypair.random().secret())"
+###
+### After step 3, copy the `token` field from the response and paste it
+### into the @token variable at the top of this file.
+
+### 1. Health Check
+GET {{baseUrl}}/health
+
+### 2. SEP-10 Challenge
+# @name challenge
+POST {{baseUrl}}/auth/challenge
+Content-Type: application/json
+
+{
+  "account": "GDULW5..."
+}
+
+### 3. SEP-10 Verify
+# Paste the *signed* challenge XDR below, replacing "AAAAA...".
+#
+# How to sign:
+#   Option A — Stellar Laboratory
+#     Open https://laboratory.stellar.org/#xdr-viewer?type=TransactionEnvelope
+#     Paste the challenge transaction XDR → "Sign" → paste your secret key.
+#
+#   Option B — Node.js (run from repo root)
+#     node -e "
+#       const {Keypair,TransactionBuilder} = require('@stellar/stellar-sdk');
+#       const tx = TransactionBuilder.fromXDR(process.argv[1], 'Testnet SDF Network ; September 2015');
+#       tx.sign(Keypair.fromSecret(process.argv[2]));
+#       console.log(tx.toXDR());
+#     " '<challenge-xdr>' '<your-secret>'
+#
+# @name verify
+POST {{baseUrl}}/auth/verify
+Content-Type: application/json
+
+{
+  "transaction": "AAAAA..."
+}
+
+### ───────────────────────────────────────────────────────────────────────
+###  Authenticated requests (set @token above first)
+### ───────────────────────────────────────────────────────────────────────
+
+### 4. Get current user
+GET {{baseUrl}}/me
+Authorization: Bearer {{token}}
+
+### 5. Create a group
+# @name createGroup
+POST {{baseUrl}}/groups
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "name": "Test Group",
+  "description": "Created via REST Client for local API exploration"
+}
+
+### 6. Add an expense
+@groupId = {{createGroup.response.body.group.id}}
+# @name createExpense
+POST {{baseUrl}}/groups/{{groupId}}/expenses
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "title": "Pizza",
+  "amount": "45.00",
+  "assetCode": "XLM",
+  "splitType": "equal",
+  "shares": [
+    {
+      "userId": "CHANGE_ME"
+    }
+  ]
+}
+
+### 7. Settle an expense (your unpaid share)
+# Note: you can only settle a share where you are NOT the payer.
+# The payer's share is auto-settled on creation.  For this to succeed you
+# need at least one other group member who is the payer.
+@expenseId = {{createExpense.response.body.expense.id}}
+POST {{baseUrl}}/expenses/{{expenseId}}/settle
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "assetCode": "XLM"
+}
+
+### 8. Get personal history
+GET {{baseUrl}}/history
+Authorization: Bearer {{token}}

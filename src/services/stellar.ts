@@ -61,13 +61,15 @@ export interface AccountSnapshot {
   thresholds: { low: number; med: number; high: number };
 }
 
-export interface PaymentIntent {
-  sourcePublicKey: string;
-  destination: string;
-  asset: AssetSpec;
-  amount: string;
-  memoCode: string;
-}
+/**
+ * A server-issued payment intent. `PaymentExpectation` (below) is the same
+ * shape plus the optional expiry and resource name used when validating a
+ * signed envelope against it.
+ */
+export type PaymentIntent = Pick<
+  PaymentExpectation,
+  "sourcePublicKey" | "destination" | "asset" | "amount" | "memoCode"
+>;
 
 export interface MultisigRequirement {
   /** Public keys of the accounts authorized to sign for this treasury. */
@@ -162,8 +164,8 @@ export const stellar = {
    * Validate a signed payment XDR matches an expected intent, then submit it.
    * Throws AppError on mismatch or Horizon failure. Returns the tx hash.
    */
-  async submitPayment(signedXdr: string, expected: PaymentIntent): Promise<string> {
-    const tx = parseSignedTransaction(signedXdr);
+  async submitPayment(signedXdr: string, expected: PaymentExpectation): Promise<string> {
+    const tx = parseSignedPaymentXdr(signedXdr, "Malformed transaction envelope");
     validatePaymentTx(tx, expected);
     return submitToHorizon(tx);
   },
@@ -269,13 +271,33 @@ export const stellar = {
   },
 };
 
-/** Parse a signed XDR envelope, rejecting malformed input as a client error. */
-function parseSignedTransaction(signedXdr: string): Transaction {
+/**
+ * Parse an envelope against **our** network passphrase, rejecting malformed
+ * input and fee-bump wrappers as client errors.
+ *
+ * A fee-bump envelope wraps someone else's transaction and pays for it with a
+ * different source account. Nothing in this API builds one, so accepting one
+ * would mean submitting a transaction whose outer envelope we never authored.
+ */
+export function parseSignedPaymentXdr(
+  signedXdr: string,
+  malformedMessage = "Signed transaction could not be parsed"
+): Transaction {
+  let parsed: Transaction | FeeBumpTransaction;
   try {
-    return new Transaction(signedXdr, config.networkPassphrase);
+    parsed = TransactionBuilder.fromXDR(signedXdr, config.networkPassphrase);
   } catch {
-    throw Errors.badRequest("xdr_mismatch", "Malformed transaction envelope");
+    throw Errors.badRequest("xdr_malformed", malformedMessage);
   }
+
+  if (parsed instanceof FeeBumpTransaction) {
+    throw Errors.badRequest(
+      "xdr_mismatch",
+      "Fee-bump transaction envelopes are not accepted"
+    );
+  }
+
+  return parsed;
 }
 
 async function submitToHorizon(tx: Transaction): Promise<string> {
@@ -354,24 +376,11 @@ export function verifyMultisig(tx: Transaction, requirement: MultisigRequirement
  */
 export function verifySignedPaymentXdr(
   signedXdr: string,
-  expected: {
-    sourcePublicKey: string;
-    destination: string;
-    asset: AssetSpec;
-    amount: string;
-    memoCode: string;
-  }
+  expected: PaymentExpectation
 ): Transaction {
-  let tx: Transaction;
-  try {
-    tx = new Transaction(signedXdr, config.networkPassphrase);
-  } catch {
-    throw Errors.badRequest("xdr_malformed", "Signed transaction could not be parsed");
-  }
+  const tx = parseSignedPaymentXdr(signedXdr);
 
-  if (isExpiredTx(tx)) {
-    throw Errors.badRequest("xdr_expired", "Transaction time bounds have expired");
-  }
+  assertTimeBoundsValid(tx, expected.expiresAt, expected.resource);
 
   if (!hasValidSourceSignature(tx)) {
     throw Errors.badRequest(
@@ -380,14 +389,8 @@ export function verifySignedPaymentXdr(
     );
   }
 
-  validatePaymentTx(tx, expected);
+  assertMatchesIntent(tx, expected);
   return tx;
-}
-
-function isExpiredTx(tx: Transaction): boolean {
-  const maxTime = Number(tx.timeBounds?.maxTime ?? "0");
-  if (!maxTime) return false; // 0 = no upper bound
-  return Math.floor(Date.now() / 1000) > maxTime;
 }
 
 /**
@@ -415,43 +418,88 @@ function hasValidSourceSignature(tx: Transaction): boolean {
 }
 
 /**
- * Strict validation that a transaction is exactly the payment we authorized.
- * This is the guardrail that stops a wallet returning a different transaction.
+ * What a signed envelope must match to be the payment this API authorized.
+ * Every field a wallet could alter between XDR creation and submission is
+ * named here; anything absent from an intent is not checked, so callers pass
+ * the whole intent, never a subset.
  */
-export function validatePaymentTx(
-  tx: Transaction,
-  expected: {
-    sourcePublicKey: string;
-    destination: string;
-    asset: AssetSpec;
-    amount: string;
-    memoCode: string;
-    /** Recorded intent expiry; when present, the envelope's bounds must agree. */
-    expiresAt?: Date | null;
-    /** Names the resource in the expiration error, e.g. "settlement". */
-    resource?: string;
-  }
-): void {
-  // Checked first: a stale envelope should be reported as expired, not as some
-  // incidental mismatch further down, and an expired intent must never reach
-  // Horizon or an anchor. `assertTimeBoundsMatchIntent` also rejects an
-  // unbounded envelope, which would otherwise be submittable forever.
-  assertTimeBoundsMatchIntent(
-    readTimeBounds(tx as unknown as { timeBounds?: { minTime: number | string; maxTime: number | string } | null }),
-    expected.expiresAt ?? null,
-    expected.resource ?? "transaction"
-  );
+export interface PaymentExpectation {
+  sourcePublicKey: string;
+  destination: string;
+  asset: AssetSpec;
+  amount: string;
+  memoCode: string;
+  /** Recorded intent expiry; when present, the envelope's bounds must agree. */
+  expiresAt?: Date | null;
+  /** Names the resource in the expiration error, e.g. "settlement". */
+  resource?: string;
+}
 
+/**
+ * Lower bound for an acceptable fee: the network's own minimum per operation.
+ * Below it the transaction cannot be included at all.
+ */
+const MIN_FEE_STROOPS_PER_OP = Number(BASE_FEE);
+
+/**
+ * Upper bound: the fee this API builds into its envelopes. A wallet may return
+ * a *cheaper* transaction, but never a more expensive one — an inflated fee is
+ * money leaving the user's account beyond what they agreed to.
+ */
+const MAX_FEE_STROOPS_PER_OP = Number(BASE_FEE) * 2;
+
+/**
+ * Validate a transaction's own validity window.
+ *
+ * Three distinct failures, each with its own meaning: an envelope with no
+ * expiry (submittable forever), one valid longer than the intent it was built
+ * for, and one that has already lapsed. An intent-less call still rejects the
+ * first and the third.
+ */
+export function assertTimeBoundsValid(
+  tx: Transaction,
+  expiresAt?: Date | null,
+  resource = "transaction"
+): void {
+  assertTimeBoundsMatchIntent(
+    readTimeBounds(
+      tx as unknown as {
+        timeBounds?: { minTime: number | string; maxTime: number | string } | null;
+      }
+    ),
+    expiresAt ?? null,
+    resource
+  );
+}
+
+/**
+ * Structural check that a transaction is exactly the payment we authorized.
+ *
+ * Ordered deliberately: shape before content, so an envelope carrying extra
+ * operations is reported as such rather than as an incidental fee or asset
+ * mismatch further down.
+ */
+function assertMatchesIntent(tx: Transaction, expected: PaymentExpectation): void {
   if (tx.source !== expected.sourcePublicKey) {
     throw Errors.badRequest("xdr_mismatch", "Transaction source does not match");
   }
-  const expectedFee = String(Number(BASE_FEE) * 2);
-  if (String(tx.fee) !== expectedFee) {
-    throw Errors.badRequest("xdr_mismatch", "Transaction fee does not match");
-  }
+
   if (tx.operations.length !== 1) {
     throw Errors.badRequest("xdr_mismatch", "Expected exactly one operation");
   }
+
+  const fee = Number(tx.fee);
+  if (
+    !Number.isFinite(fee) ||
+    fee < MIN_FEE_STROOPS_PER_OP * tx.operations.length ||
+    fee > MAX_FEE_STROOPS_PER_OP * tx.operations.length
+  ) {
+    throw Errors.badRequest(
+      "xdr_mismatch",
+      "Transaction fee is outside the accepted range"
+    );
+  }
+
   const op = tx.operations[0] as any;
   if (op.type !== "payment") {
     throw Errors.badRequest("xdr_mismatch", "Expected a payment operation");
@@ -462,32 +510,75 @@ export function validatePaymentTx(
   if (op.destination !== expected.destination) {
     throw Errors.badRequest("xdr_mismatch", "Payment destination does not match");
   }
+
   const wantAsset = toAsset(expected.asset);
   const gotAsset: Asset = op.asset;
   if (!gotAsset.equals(wantAsset)) {
+    // An issuer swap keeps the familiar code and changes what the recipient
+    // actually receives, so it is called out separately from a code mismatch.
+    if (gotAsset.getCode() === wantAsset.getCode()) {
+      throw Errors.badRequest("xdr_mismatch", "Payment asset issuer mismatch");
+    }
     throw Errors.badRequest("xdr_mismatch", "Payment asset does not match");
   }
+
   if (normalizeAmount(op.amount) !== normalizeAmount(expected.amount)) {
     throw Errors.badRequest("xdr_mismatch", "Payment amount does not match");
   }
+
   const wantMemo = memoText(expected.memoCode);
   const gotMemo =
-    tx.memo && (tx.memo as any).value
-      ? (tx.memo as any).value.toString()
-      : "";
+    tx.memo && (tx.memo as any).value ? (tx.memo as any).value.toString() : "";
   if (gotMemo !== wantMemo) {
     throw Errors.badRequest("xdr_mismatch", "Memo does not match the expense reference");
   }
+}
 
-  // Verify at least one signature matches the expected source account.
-  // This implicitly validates the network passphrase, as the signature hash includes it.
+/**
+ * Parse an envelope and check it against an intent, without requiring a
+ * signature. Used where the envelope's authorship is established elsewhere
+ * (an unsigned intent readback, a multisig proposal), and as the shared core
+ * of the signed paths below.
+ */
+export function validateSignedPaymentXdr(
+  signedXdr: string,
+  expected: PaymentExpectation
+): Transaction {
+  const tx = parseSignedPaymentXdr(signedXdr);
+  assertTimeBoundsValid(tx, expected.expiresAt, expected.resource);
+  assertMatchesIntent(tx, expected);
+  return tx;
+}
+
+/**
+ * Strict validation that a *signed* transaction is exactly the payment we
+ * authorized. This is the guardrail that stops a wallet returning a different
+ * transaction than the one it was handed.
+ */
+export function validatePaymentTx(tx: Transaction, expected: PaymentExpectation): void {
+  // Checked first: a stale envelope should be reported as expired, not as some
+  // incidental mismatch further down, and an expired intent must never reach
+  // Horizon or an anchor.
+  assertTimeBoundsValid(tx, expected.expiresAt, expected.resource);
+  assertMatchesIntent(tx, expected);
+
+  // A signature is computed over bytes that include the network passphrase, so
+  // verifying it against the expected source account also proves the envelope
+  // was signed for *our* network. An unsigned envelope fails here too.
   const sourceKeypair = Keypair.fromPublicKey(expected.sourcePublicKey);
   const txHash = tx.hash();
-  const hasValidSignature = tx.signatures.some((sig) =>
-    sourceKeypair.verify(txHash, sig.signature())
-  );
+  const hasValidSignature = tx.signatures.some((sig) => {
+    try {
+      return sourceKeypair.verify(txHash, sig.signature());
+    } catch {
+      return false;
+    }
+  });
   if (!hasValidSignature) {
-    throw Errors.badRequest("xdr_mismatch", "Transaction signature is invalid or for the wrong network");
+    throw Errors.badRequest(
+      "xdr_mismatch",
+      "Transaction signature is invalid or for the wrong network"
+    );
   }
 }
 
@@ -503,8 +594,8 @@ function normalizeAmount(a: string): string {
  * hash on success. Throws AppError (400 XDR_MISMATCH) on any mismatch.
  *
  * Callers use this in API routes to reject invalid signed XDRs *before*
- * persisting them, so Horizon is never called for transactions that fail
- * structural validation.
+ * persisting them, so Horizon is never called for a transaction that fails
+ * validation and no settlement is advanced on the strength of one.
  */
 export interface SignedXdrValidation {
   tx: Transaction;
@@ -513,20 +604,9 @@ export interface SignedXdrValidation {
 
 export function validateSignedXdr(
   signedXdr: string,
-  expected: {
-    sourcePublicKey: string;
-    destination: string;
-    asset: AssetSpec;
-    amount: string;
-    memoCode: string;
-  }
+  expected: PaymentExpectation
 ): SignedXdrValidation {
-  let tx: Transaction;
-  try {
-    tx = new Transaction(signedXdr, config.networkPassphrase);
-  } catch {
-    throw Errors.badRequest("xdr_mismatch", "Malformed or unsupported signed XDR");
-  }
+  const tx = parseSignedPaymentXdr(signedXdr, "Malformed or unsupported signed XDR");
   validatePaymentTx(tx, expected);
   return { tx, hash: tx.hash().toString("hex") };
 }

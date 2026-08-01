@@ -16,7 +16,11 @@ const schema = z.object({
   // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
   WEB_URL: z.string().default("*"),
   JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
-  
+  // Bound a session to this deployment: a token minted for another environment
+  // or audience is rejected even when the signing secret is shared.
+  JWT_ISSUER: z.string().default("mergepay-api"),
+  JWT_AUDIENCE: z.string().default("mergepay-app"),
+
   // Stellar configuration - required
   STELLAR_NETWORK: z.enum(["testnet", "public"], {
     errorMap: () => ({ message: "STELLAR_NETWORK must be either 'testnet' or 'public'" }),
@@ -48,24 +52,12 @@ const schema = z.object({
   
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
-  // How long a worker holds an exclusive claim on a settlement or anchor
-  // session before another worker instance is allowed to reclaim it (e.g.
-  // after a crash mid-job). Must comfortably exceed a single job's worst-case
-  // duration (Horizon calls, retries) to avoid two workers processing the
-  // same row concurrently.
-  WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
-  // Per-call network timeouts (ms) — every outbound Horizon/anchor request
-  // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
-  // a slow or hung upstream can't block a worker cycle indefinitely.
-  HORIZON_ACCOUNT_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  HORIZON_SUBMIT_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
-  HORIZON_STATUS_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  HORIZON_FEE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  ANCHOR_TOML_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  ANCHOR_CHALLENGE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  ANCHOR_TOKEN_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  ANCHOR_INTERACTIVE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  ANCHOR_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  // How long a worker's claim on a job survives without renewal. A process that
+  // crashes mid-job leaves its lease behind; another worker may take the job
+  // over only once the lease has lapsed.
+  WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
+  // Maximum jobs of one kind pulled per cycle.
+  WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
   CONFIRM_POLL_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
   CONFIRM_POLL_DELAY_MS: z.coerce.number().int().positive().default(1500),
   NODE_ENV: z.string().default("development"),
@@ -74,6 +66,13 @@ const schema = z.object({
   RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().max(100000).default(100),
+  RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_TREASURY_SUBMIT_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_ANCHOR_INIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_ANCHOR_INIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_ANCHOR_POLL_MAX: z.coerce.number().int().positive().max(100000).default(60),
+  RATE_LIMIT_ANCHOR_POLL_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().max(100000).default(50),
   RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(30),

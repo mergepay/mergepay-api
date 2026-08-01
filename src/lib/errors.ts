@@ -31,6 +31,8 @@ export const ErrorCode = {
   INVALID_RECIPIENT: "INVALID_RECIPIENT",
   INVALID_DESTINATION: "INVALID_DESTINATION",
   INVALID_IDEMPOTENCY_KEY: "INVALID_IDEMPOTENCY_KEY",
+  /** A route that requires `Idempotency-Key` was called without one. */
+  MISSING_IDEMPOTENCY_KEY: "MISSING_IDEMPOTENCY_KEY",
   NO_SHARE: "NO_SHARE",
   PAYER_SHARE: "PAYER_SHARE",
   SELF_SETTLE: "SELF_SETTLE",
@@ -43,6 +45,10 @@ export const ErrorCode = {
   BAD_FILE_TYPE: "BAD_FILE_TYPE",
   FILE_TOO_LARGE: "FILE_TOO_LARGE",
   XDR_MISMATCH: "XDR_MISMATCH",
+  /** The envelope could not be parsed at all — not that it failed to match. */
+  XDR_MALFORMED: "XDR_MALFORMED",
+  /** An envelope arrived with no usable signature for the configured network. */
+  XDR_UNSIGNED: "XDR_UNSIGNED",
   /**
    * An unsigned transaction intent was signed or submitted after its
    * server-controlled validity window. Distinct from XDR_MISMATCH (the
@@ -61,6 +67,8 @@ export const ErrorCode = {
   // 409
   CONFLICT: "CONFLICT",
   IDEMPOTENCY_CONFLICT: "IDEMPOTENCY_CONFLICT",
+  /** The same key is still executing its first request; retry shortly. */
+  IDEMPOTENCY_IN_PROGRESS: "IDEMPOTENCY_IN_PROGRESS",
   ALREADY_SETTLED: "ALREADY_SETTLED",
   EXPENSE_SETTLED: "EXPENSE_SETTLED",
   LAST_ADMIN: "LAST_ADMIN",

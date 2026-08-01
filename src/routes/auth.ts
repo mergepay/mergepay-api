@@ -53,12 +53,15 @@ export default async function authRoutes(app: FastifyInstance) {
         },
       });
 
+      // The claims contract is unchanged by SEP-10 hardening: verification
+      // still yields a public key, and the session is still minted here.
       const token = signToken({ id: user.id, stellarPublicKey: publicKey });
       await audit({
-        actor: { type: "user", userId: user.id },
+        userId: user.id,
         action: "auth.verify",
         entityType: "user",
         entityId: user.id,
+        outcome: "success",
       });
       return { token, user: serializeUser(user) };
     }

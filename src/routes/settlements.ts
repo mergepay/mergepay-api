@@ -1,19 +1,38 @@
+/**
+ * Settlement routes.
+ *
+ * Two shapes of write live here and both are idempotent (see
+ * src/services/idempotency.ts):
+ *
+ *  - **creation** (`POST /expenses/:id/settle`, `POST /groups/:id/settlements`)
+ *    mints a settlement record and returns an *unsigned* XDR for the wallet to
+ *    sign. `Idempotency-Key` is optional but honoured: a retry with the same
+ *    key and an equivalent payload returns the original settlement and XDR
+ *    instead of creating a second record.
+ *  - **submission** (`POST /settlements/:id/confirm`) accepts the wallet's
+ *    signed envelope. `Idempotency-Key` is **required** here — this is the
+ *    request that leads to money moving, and a retry that slipped through
+ *    could mean a second on-chain payment.
+ *
+ * The API never holds a private key. Everything Horizon-facing lives in
+ * src/services/stellar.ts so it can be mocked in tests.
+ */
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { Transaction } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
-import { stellar, validatePaymentTx } from "../services/stellar";
+import { stellar, memoText } from "../services/stellar";
+import { validateSettlementXdr } from "../services/settlement-xdr";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
-import { userOrIpKey } from "../services/rate-limit-keys";
+import { rateLimited } from "../lib/rate-limit";
 import {
-  claimIdempotencyKey,
-  completeIdempotencyKey,
-  failIdempotencyKey,
+  readIdempotencyKey,
+  requireIdempotencyKey,
+  runIdempotent,
 } from "../services/idempotency";
 import {
   serializeSettlement,
@@ -32,11 +51,19 @@ import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
-import { memoText } from "../services/stellar";
-import { paginationQuerySchema } from "../services/pagination";
 import { validateAsset, validateAmount } from "../services/assets";
-import { memoText, validateSignedXdr } from "../services/stellar";
-import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
+import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
+import {
+  intentExpiry,
+  intentValiditySchema,
+  secondsUntilExpiry,
+} from "../lib/time-bounds";
+import {
+  isTerminalSettlementStatus,
+  resolveSettlementStatus,
+  toPublicStatus,
+} from "../services/settlement-status";
+import { recordStatusTransitionInTransaction } from "../services/status-history";
 
 const settlementInclude = { from: true, to: true, statusHistory: true } as const;
 
@@ -271,24 +298,24 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
-  app.post("/settlements/:id/confirm", confirmLimit, async (req, reply) => {
+  app.post("/settlements/:id/confirm", confirmLimit, async (req) => {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
-    const idempotencyKey = readIdempotencyKey(req.headers);
 
-    // Idempotency key is REQUIRED for settlement submission so that retries
-    // can never create duplicate on-chain payments.
-    if (!idempotencyKey) {
-      throw Errors.badRequest(
-        "missing_idempotency_key",
-        "Idempotency-Key header is required for settlement confirmation"
-      );
-    }
+    // Required, not optional: this is the request that ends in a payment, and a
+    // wallet or mobile client retrying after a timeout must never be able to
+    // produce a second submission.
+    const idempotencyKey = requireIdempotencyKey(
+      req.headers,
+      "settlement confirmation"
+    );
 
-    // Validate the signed XDR against the DB intent BEFORE entering the
-    // idempotent operation so that validation failures are never cached
-    // as idempotent successes and the client gets a fresh error each time.
+    // Load the *original* intent and validate the signed envelope against it
+    // BEFORE entering the idempotent operation. Two reasons: a validation
+    // failure is never recorded as an idempotent success, and a transaction
+    // that does not match what the API authorized is rejected before it can be
+    // persisted, submitted to Horizon, or advance the settlement's status.
     const settlementRow = await prisma.settlement.findUnique({
       where: { id },
       include: settlementInclude,
@@ -299,23 +326,16 @@ export default async function settlementRoutes(app: FastifyInstance) {
     }
 
     try {
-      validateSignedXdr(body.signedXdr, {
-        sourcePublicKey: settlementRow.from.stellarPublicKey,
-        destination: settlementRow.to.stellarPublicKey,
-        asset: {
-          code: settlementRow.assetCode,
-          issuer: settlementRow.assetIssuer,
-        },
-        amount: String(settlementRow.amount),
-        memoCode: settlementRow.shortCode,
-      });
+      validateSettlementXdr(body.signedXdr, settlementRow);
     } catch (err) {
       await audit({
         userId: auth.id,
+        groupId: settlementRow.groupId,
         action: "settlement.confirm.validation_failed",
         entityType: "settlement",
         entityId: id,
         metadata: {
+          // The message is the service's own stable text, never the envelope.
           reason: err instanceof Error ? err.message : "validation failed",
         },
       });
@@ -338,16 +358,19 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.forbidden("Only the payer can confirm this settlement");
         }
 
-        // Already completed or submitted — return the current state rather
-        // than re-submitting or erroring, so retries are always safe.
-        if (settlement.status === "completed" || settlement.status === "submitted") {
+        // Already accepted — return the current state rather than re-submitting
+        // or erroring, so a retry without the original key is still safe.
+        if (
+          settlement.status === "completed" ||
+          settlement.status === "confirmed" ||
+          settlement.status === "submitted"
+        ) {
           return { settlement: serializeSettlement(settlement) };
         }
 
-        // A previously-failed settlement can be retried with a new signed
-        // XDR (and a new idempotency key).  Reset the retry bookkeeping so
-        // the worker process picks it up fresh.
         if (settlement.status === "failed") {
+          // A previously-failed settlement can be re-signed and retried. The
+          // retry bookkeeping is reset below so the worker picks it up fresh.
           await auditTx(tx, {
             userId: auth.id,
             action: "settlement.confirm.retry",
@@ -357,17 +380,17 @@ export default async function settlementRoutes(app: FastifyInstance) {
           });
         }
 
-        // Guard the transition with a conditional update: only rows that
-        // are still in a confirmable status ("pending" or "failed") are
-        // moved to "submitted".  If a concurrent request already moved
-        // the settlement off a confirmable status between the read above
-        // and here, the update affects zero rows and we re-read the
-        // winning state instead of clobbering it.
+        // Guard the transition with a conditional update: only rows still in a
+        // confirmable status are moved to "submitted". If a concurrent request
+        // moved the settlement off a confirmable status between the read above
+        // and here, this affects zero rows and we return the winning state
+        // instead of clobbering it.
         const { count } = await tx.settlement.updateMany({
           where: { id, status: { in: ["pending", "failed"] } },
           data: {
             transactionXdr: body.signedXdr,
             status: "submitted",
+            submittedAt: new Date(),
             retryCount: 0,
             failureReason: null,
           },
@@ -380,14 +403,6 @@ export default async function settlementRoutes(app: FastifyInstance) {
             newStatus: "submitted",
             source: "api",
           });
-        }
-
-        const finalSettlement = await tx.settlement.findUniqueOrThrow({
-          where: { id },
-          include: settlementInclude,
-        });
-
-        if (count > 0) {
           await auditTx(tx, {
             userId: auth.id,
             action: "settlement.confirm",
@@ -397,13 +412,11 @@ export default async function settlementRoutes(app: FastifyInstance) {
           });
         }
 
-    await audit({
-      userId: auth.id,
-      groupId: settlement.groupId,
-      action: "settlement.confirm",
-      entityType: "settlement",
-      entityId: id,
-      metadata: { status: "submitted" },
+        const finalSettlement = await tx.settlement.findUniqueOrThrow({
+          where: { id },
+          include: settlementInclude,
+        });
+
         return { settlement: serializeSettlement(finalSettlement) };
       },
     });
@@ -561,19 +574,19 @@ export default async function settlementRoutes(app: FastifyInstance) {
 
     const direction = order === "desc" ? -1 : 1;
     const entries = [
-      ...expenses.slice(0, query.limit).map((e) => ({
+      ...expenses.map((e) => ({
         type: "expense" as const,
         createdAt: e.createdAt,
         id: e.id,
         expense: serializeExpense(e),
       })),
-      ...settlements.slice(0, query.limit).map((s) => ({
+      ...settlements.map((s) => ({
         type: "settlement" as const,
         createdAt: s.createdAt,
         id: s.id,
         settlement: serializeSettlement(s),
       })),
-      ...treasuryTxs.slice(0, query.limit).map((t) => ({
+      ...treasuryTxs.map((t) => ({
         type: "treasury" as const,
         createdAt: t.createdAt,
         id: t.id,
@@ -634,60 +647,6 @@ async function buildSettlementXdr(params: {
     // intent it was issued for.
     validitySeconds: params.validitySeconds,
   });
-}
-
-/**
- * Runs `run()` guarded by the request's `Idempotency-Key` header, if present.
- * The key is claimed (a durable row, unique-constraint-serialized against
- * concurrent callers) before `run()` executes, so two racing requests with
- * the same key can never both create a settlement or submit a payment.
- * Without a header, this is a no-op passthrough — idempotency stays opt-in.
- */
-async function withIdempotency<T>(
-  req: FastifyRequest,
-  reply: FastifyReply,
-  scope: string,
-  userId: string,
-  body: unknown,
-  run: () => Promise<T>
-) {
-  const idempotencyKey = (req.headers["idempotency-key"] as string | undefined) ?? null;
-  if (!idempotencyKey) return run();
-
-  const requestHash = hashIdempotentRequest({ userId, scope, body });
-  const outcome = await claimIdempotencyKey({ key: idempotencyKey, userId, requestHash });
-
-  if (outcome.kind === "replay") {
-    return reply.code(outcome.statusCode).send(outcome.body);
-  }
-  if (outcome.kind === "in_progress") {
-    return reply.code(409).send({
-      error: "idempotency_in_progress",
-      message: "A request with this idempotency key is already being processed",
-      statusCode: 409,
-      requestId: req.id as string,
-    });
-  }
-  if (outcome.kind === "conflict") {
-    return reply.code(409).send({
-      error: "idempotency_conflict",
-      message: "Idempotency key was already used with a different user or request body",
-      statusCode: 409,
-      requestId: req.id as string,
-    });
-  }
-
-  try {
-    const result = await run();
-    await completeIdempotencyKey(idempotencyKey, 200, result);
-    return result;
-  } catch (err) {
-    // Nothing durable happened under this key yet (see call sites — the
-    // side-effecting mutation always follows any side-effect-free I/O in
-    // `run()`), so it's safe to free the key for an unambiguous retry.
-    await failIdempotencyKey(idempotencyKey);
-    throw err;
-  }
 }
 
 function serializeUserSafe(u: any) {

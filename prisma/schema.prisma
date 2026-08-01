@@ -331,7 +331,6 @@ model AuditLog {
   userId     String?  @map("user_id")
   groupId    String?  @map("group_id")
   action     String
-  groupId    String?  @map("group_id")
   details    Json?
   entityType String?  @map("entity_type")
   entityId   String?  @map("entity_id")

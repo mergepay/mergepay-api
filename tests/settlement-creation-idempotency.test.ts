@@ -145,6 +145,7 @@ describe("POST /expenses/:id/settle — idempotency", () => {
 
     prisma.idempotencyKey.findUnique.mockResolvedValueOnce({
       ...stored,
+      status: "completed",
       responseJson: JSON.stringify(first.json()),
     });
 
@@ -174,7 +175,10 @@ describe("POST /expenses/:id/settle — idempotency", () => {
       method: "POST",
       url: "/expenses/expense_1/settle",
       headers: { ...authHeader(), "idempotency-key": "settle-key-1" },
-      payload: { assetCode: "USDC" },
+      payload: {
+        assetCode: "USDC",
+        assetIssuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      },
     });
 
     expect(res.statusCode).toBe(409);

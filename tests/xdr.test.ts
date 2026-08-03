@@ -202,7 +202,7 @@ describe("payment XDR validation", () => {
 
   it("returns a controlled validation error for malformed XDR", async () => {
     await expect(stellar.submitPayment("not-xdr", intent)).rejects.toMatchObject({
-      code: "XDR_MISMATCH",
+      code: "XDR_MALFORMED",
       statusCode: 400,
     });
   });

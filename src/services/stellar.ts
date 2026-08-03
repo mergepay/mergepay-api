@@ -24,6 +24,11 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
 import { withTimeout, TimeoutError, TransportError } from "./timeout";
+import {
+  INTENT_VALIDITY_SECONDS,
+  assertTimeBoundsMatchIntent,
+  readTimeBounds,
+} from "../lib/time-bounds";
 
 let _server: Horizon.Server | null = null;
 function server(): Horizon.Server {

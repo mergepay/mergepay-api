@@ -231,7 +231,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error).toBe("XDR_MALFORMED");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 });

@@ -7,18 +7,19 @@ const h = vi.hoisted(() => {
   const settlement = {
     findMany: vi.fn(),
     findUnique: vi.fn(() => currentSettlementState),
-    update: vi.fn(({ data }: any) => {
+    update: vi.fn(async ({ data }: any) => {
       if (currentSettlementState) {
         currentSettlementState = { ...currentSettlementState, ...data };
       }
       return currentSettlementState;
     }),
-    updateMany: vi.fn(() => ({ count: 1 })),
+    updateMany: vi.fn(async () => ({ count: 1 })),
   };
   const anchorSession = {
     findMany: vi.fn(),
-    update: vi.fn(),
-    updateMany: vi.fn(),
+    findUnique: vi.fn(),
+    update: vi.fn(async () => undefined),
+    updateMany: vi.fn(async () => ({ count: 1 })),
   };
   const auditLog = { create: vi.fn() };
   const prisma: any = {
@@ -157,8 +158,10 @@ describe("reconcileAnchors", () => {
   beforeEach(() => {
     h.prisma.anchorSession.update.mockReset();
     h.prisma.anchorSession.updateMany.mockReset();
+    h.prisma.anchorSession.findUnique.mockReset();
     h.prisma.anchorSession.update.mockResolvedValue({});
     h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.anchorSession.findUnique.mockResolvedValue(baseSession);
   });
 
   it("discovers pending sessions and polls them", async () => {
@@ -426,6 +429,8 @@ describe("processSubmittedSettlements", () => {
       asset: { code: "USDC", issuer: "GISSUERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
       amount: "42.5000000",
       memoCode: "INTENT1",
+      expiresAt: null,
+      resource: "settlement",
     });
   });
 

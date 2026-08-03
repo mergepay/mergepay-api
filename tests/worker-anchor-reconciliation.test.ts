@@ -89,6 +89,7 @@ describe("reconcileAnchors", () => {
   it("applies a transition discovered via polling and audits the terminal state", async () => {
     const session = fakeSession();
     prisma.anchorSession.findMany.mockResolvedValue([session]);
+    prisma.anchorSession.findUnique.mockResolvedValue(session);
     h.pollTransaction.mockResolvedValue(pollResult("completed"));
     prisma.anchorSession.update.mockResolvedValue({ ...session, status: "completed" });
 
@@ -127,6 +128,9 @@ describe("reconcileAnchors", () => {
     const sessionA = fakeSession({ id: "session_a", externalTransactionId: "ext_a" });
     const sessionB = fakeSession({ id: "session_b", externalTransactionId: "ext_b" });
     prisma.anchorSession.findMany.mockResolvedValue([sessionA, sessionB]);
+    prisma.anchorSession.findUnique.mockImplementation(async ({ where }: any) =>
+      where.id === "session_a" ? sessionA : sessionB
+    );
     h.pollTransaction
       .mockRejectedValueOnce(new Error("network blip"))
       .mockResolvedValueOnce(pollResult("completed"));

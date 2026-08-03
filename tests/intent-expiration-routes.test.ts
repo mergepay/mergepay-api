@@ -344,15 +344,16 @@ describe("settlement confirm rejects an expired intent", () => {
   });
 
   it("rejects a stale intent with the stable expiration error", async () => {
+    const expiresAt = longExpired();
     prisma.settlement.findUnique.mockResolvedValue(
-      fakeSettlement({ expiresAt: longExpired() })
+      fakeSettlement({ expiresAt })
     );
 
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
       headers: { ...authHeader(), "idempotency-key": "intent-expiration-confirm" },
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr: signedXdrFor({ expiresAt }) },
     });
 
     expect(res.statusCode).toBe(400);

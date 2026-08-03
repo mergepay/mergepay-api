@@ -1,11 +1,11 @@
 import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import rateLimitPlugin from "./plugins/rate-limit";
+import rateLimit from "@fastify/rate-limit";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
-import { config, validateAssetConfig } from "./config";
+import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
@@ -23,9 +23,9 @@ import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import auditLogRoutes from "./routes/audit-log";
+import userGroupsRoutes from "./routes/user-groups";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
-import { validateAssetConfig } from "./services/assets";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 
@@ -50,6 +50,8 @@ function globalRateLimitKey(request: FastifyRequest): string {
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
+  validateAssetConfig();
+
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
     // values are validated by genReqId before becoming request.id.
@@ -158,11 +160,12 @@ export async function buildApp(): Promise<FastifyInstance> {
   // blocking all traffic. The default "memory" store is per-process and
   // needs no failure handling of its own.
   await app.register(rateLimit, {
+    global: true,
     max: config.RATE_LIMIT_GLOBAL_MAX,
     timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
-    keyGenerator: securityKey,
+    keyGenerator: globalRateLimitKey,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
-    errorResponseBuilder: (request) => ({
+    errorResponseBuilder: (request: FastifyRequest) => ({
       code: "RATE_LIMITED",
       message: "Too many requests. Please retry later.",
       requestId: request.id,
@@ -198,35 +201,11 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   app.addHook("onRoute", (routeOptions) => {
     const url = routeOptions.url;
-    let rateLimit: { max: number; timeWindow: number } | undefined;
-    let bodyLimit: number | undefined;
-
-    if (url === "/auth/challenge" || url === "/auth/verify") {
-      max = config.RATE_LIMIT_AUTH_CHALLENGE_MAX;
-      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
-    } else if (
-      url === "/expenses/:id/settle" ||
-      url === "/groups/:id/settlements" ||
-      url === "/settlements/:id/confirm"
-    ) {
-      max = config.RATE_LIMIT_SETTLEMENT_CREATE_MAX;
-      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
-    } else if (
-      url === "/anchors/deposit" ||
-      url === "/anchors/withdraw" ||
-      url === "/anchors/sessions/:id/complete" ||
-      url === "/uploads/receipt"
-    ) {
-      max = config.SEP24_RATE_LIMIT_MAX;
-      bodyLimit = url === "/uploads/receipt"
-        ? config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024
-        : config.AUTH_BODY_LIMIT_BYTES;
-    }
 
     if (url === "/uploads/receipt") {
-      options.bodyLimit = config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024;
+      routeOptions.bodyLimit = config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024;
     } else if (BODY_LIMITED_ROUTES.has(url)) {
-      options.bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+      routeOptions.bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
     }
   });
 
@@ -252,18 +231,15 @@ export async function buildApp(): Promise<FastifyInstance> {
     });
   });
 
-  app.get("/health", async () => ({
+  const liveness = async () => ({
     status: "ok",
-    network: config.STELLAR_NETWORK,
-    time: new Date().toISOString(),
-  }));
-
-  app.get("/healthz", async () => ({
-    status: "ok",
-  }));
+    timestamp: new Date().toISOString(),
+  });
+  app.get("/health", liveness);
+  app.get("/health/live", liveness);
 
   const { getReadiness } = await import("./services/health.js");
-  app.get("/readyz", async (request, reply) => {
+  app.get("/health/ready", async (request, reply) => {
     const readiness = await getReadiness();
     const statusCode = readiness.status === "ok" ? 200 : 503;
     return reply.code(statusCode).send(readiness);
@@ -280,6 +256,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
   await app.register(userGroupsRoutes);
+  await app.register(auditLogRoutes);
 
   return app;
 }

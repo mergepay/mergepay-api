@@ -37,7 +37,7 @@ export async function requireMembership(
   });
 
   if (!member) {
-    const group = await prisma.group.findUnique({
+    const group = await db.group.findUnique({
       where: { id: groupId },
       select: { id: true },
     });

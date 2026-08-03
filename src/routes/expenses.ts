@@ -28,20 +28,25 @@ const shareInput = z.object({
   percent: z.number().optional(),
 });
 
-const createExpenseSchema = z
-  .object({
-    title: z.string().min(1).max(80),
-    description: z.string().max(500).optional(),
-    amount: stellarAmountSchema,
-    assetCode: z.string().min(1).max(12),
-    assetIssuer: z.string().nullable().optional(),
-    splitType: z.enum(["equal", "custom", "percentage"]),
-    shares: z.array(shareInput).min(1),
-    payerUserId: z.string().optional(),
-    memo: z.string().max(24).optional(),
-    receiptUrl: z.string().nullable().optional(),
-  })
-  .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer));
+const createExpenseSchema = z.object({
+  title: z.string().min(1).max(80),
+  description: z.string().max(500).optional(),
+  amount: z.string().min(1),
+  assetCode: z.string().min(1).max(12),
+  assetIssuer: z.string().nullable().optional(),
+  splitType: z.enum(["equal", "custom", "percentage"]),
+  shares: z.array(shareInput).min(1),
+  payerUserId: z.string().optional(),
+  memo: z.string().max(24).optional(),
+  receiptUrl: z.string().nullable().optional(),
+});
+
+const updateExpenseSchema = z.object({
+  title: z.string().min(1).max(80).optional(),
+  description: z.string().max(500).nullable().optional(),
+  memo: z.string().max(24).optional(),
+  receiptUrl: z.string().nullable().optional(),
+});
 
 const expenseInclude = {
   payer: true,
@@ -65,7 +70,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     let computed;
     try {
-      computed = computeShares(amount, body.splitType as SplitType, body.shares);
+      computed = computeShares(body.amount, body.splitType as SplitType, body.shares);
     } catch (e: any) {
       throw Errors.badRequest("invalid_split", e?.message ?? "Invalid split");
     }
@@ -107,11 +112,6 @@ export default async function expenseRoutes(app: FastifyInstance) {
       });
 
       return created;
-    });
-    await auditLog.log("EXPENSE_CREATED", auth.id, groupId, {
-      expenseId: expense.id,
-      amount: body.amount,
-      title: body.title,
     });
 
     return { expense: serializeExpense(expense) };
@@ -169,7 +169,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
         throw Errors.forbidden("Only the payer or an admin can edit this expense");
       }
 
-      return tx.expense.update({
+      const result = await tx.expense.update({
         where: { id },
         data: {
           ...(body.title !== undefined && { title: body.title }),
@@ -179,8 +179,18 @@ export default async function expenseRoutes(app: FastifyInstance) {
         },
         include: expenseInclude,
       });
+
+      await tx.auditLog.create({
+        data: {
+          userId: auth.id,
+          action: "expense.update",
+          entityType: "expense",
+          entityId: id,
+        },
+      });
+
+      return result;
     });
-    await auditLog.log("EXPENSE_UPDATED", auth.id, expense.groupId, { expenseId: id });
     return { expense: serializeExpense(updated) };
   });
 
@@ -192,17 +202,17 @@ export default async function expenseRoutes(app: FastifyInstance) {
     // Same atomicity concern as the update route above: check and delete
     // happen in one transaction.
     await prisma.$transaction(async (tx) => {
-      const expense = await tx.expense.findUnique({
+      const found = await tx.expense.findUnique({
         where: { id },
         include: { shares: true },
       });
-      if (!expense) throw Errors.notFound("Expense not found");
-      const ctx = await requireMembership(expense.groupId, auth.id, tx);
-      if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
+      if (!found) throw Errors.notFound("Expense not found");
+      const ctx = await requireMembership(found.groupId, auth.id, tx);
+      if (found.payerUserId !== auth.id && ctx.role !== "admin") {
         throw Errors.forbidden("Only the payer or an admin can delete this expense");
       }
-      const hasSettled = expense.shares.some(
-        (s) => s.status === "settled" && s.userId !== expense.payerUserId
+      const hasSettled = found.shares.some(
+        (s) => s.status === "settled" && s.userId !== found.payerUserId
       );
       if (hasSettled) {
         throw Errors.conflict(
@@ -211,7 +221,6 @@ export default async function expenseRoutes(app: FastifyInstance) {
         );
       }
 
-    await prisma.$transaction(async (tx) => {
       await tx.expense.delete({ where: { id } });
       await tx.auditLog.create({
         data: {
@@ -222,7 +231,6 @@ export default async function expenseRoutes(app: FastifyInstance) {
         },
       });
     });
-    await auditLog.log("EXPENSE_DELETED", auth.id, expense.groupId, { expenseId: id });
     return { ok: true };
   });
 }

@@ -98,29 +98,6 @@ function issuerKey(code: string, issuer: string | null): string {
   return `${code.toUpperCase()}::${issuer ?? ""}`;
 }
 
-/**
- * Validate the asset configuration at startup. This ensures that:
- * - All supported assets have valid codes and issuers
- * - Issued assets have a non-empty issuer configured
- * - No duplicate asset codes exist
- *
- * Called once during app bootstrap.
- */
-export function validateAssetConfig(): void {
-  const seen = new Set<string>();
-  for (const a of SUPPORTED_ASSETS) {
-    if (seen.has(a.code.toUpperCase())) {
-      throw new Error(`Duplicate asset code "${a.code}" in SUPPORTED_ASSETS`);
-    }
-    seen.add(a.code.toUpperCase());
-    if (a.type === "issued" && !a.issuer) {
-      throw new Error(
-        `Issued asset "${a.code}" requires a non-empty issuer. Set STABLE_ASSET_ISSUER.`
-      );
-    }
-  }
-}
-
 // ─── Validation ────────────────────────────────────────────────────────────
 
 /**
@@ -294,9 +271,25 @@ export function supportedAssetCodes(): string[] {
 /**
  * Startup validation of the asset-related configuration, called once by
  * `buildApp()`. Failing here surfaces a misconfigured deployment at boot
- * rather than as a confusing 400 on the first settlement attempt.
+ * rather than as a confusing 400 on the first settlement attempt. Also
+ * validates the static SUPPORTED_ASSETS list itself (no duplicate codes,
+ * every issued asset has an issuer) so a bad edit to that list is caught
+ * the same way as bad environment configuration.
  */
 export function validateAssetConfig(): void {
+  const seen = new Set<string>();
+  for (const a of SUPPORTED_ASSETS) {
+    if (seen.has(a.code.toUpperCase())) {
+      throw new Error(`Duplicate asset code "${a.code}" in SUPPORTED_ASSETS`);
+    }
+    seen.add(a.code.toUpperCase());
+    if (a.type === "issued" && !a.issuer) {
+      throw new Error(
+        `Issued asset "${a.code}" requires a non-empty issuer. Set STABLE_ASSET_ISSUER.`
+      );
+    }
+  }
+
   const stableCode = config.STABLE_ASSET_CODE?.trim();
   if (!stableCode) {
     throw new Error("STABLE_ASSET_CODE must be set");

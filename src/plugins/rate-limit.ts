@@ -6,6 +6,6 @@ export default fp(async function rateLimitPlugin(app) {
   await app.register(rateLimit, {
     global: true,
     max: config.RATE_LIMIT_GLOBAL_MAX,
-    timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW,
+    timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
   });
 });

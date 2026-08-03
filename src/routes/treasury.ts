@@ -1,5 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
@@ -7,7 +8,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { rateLimited } from "../lib/rate-limit";
 import {
@@ -17,14 +18,24 @@ import {
   secondsUntilExpiry,
 } from "../lib/time-bounds";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
-import { validateAmount, validateAsset } from "../services/assets";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
+import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 import {
   validateProposedSignerConfig,
   validateSignerChangeAgainstAccount,
   snapshotToSignerConfig,
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
+
+const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
+const stellarAmountSchema = z.string().min(1);
 
 export default async function treasuryRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -166,7 +177,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         // decides the deadline.
         validitySeconds: intentValiditySchema.optional(),
       })
-      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
@@ -187,6 +197,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       payload: body,
       operation: async () => {
         const code = shortCode();
+        const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const ttx = await prisma.treasuryTransaction.create({
           data: {
             shortCode: code,
@@ -199,6 +210,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             destination: treasuryKey,
             status: "pending",
             memo: memoText(code),
+            expiresAt,
           },
           include: { user: true },
         });
@@ -214,11 +226,14 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
           amount: body.amount,
           memoCode: code,
+          validitySeconds,
         });
 
         return {
           treasuryTransaction: serializeTreasuryTx(ttx),
           xdr,
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: secondsUntilExpiry(expiresAt),
           networkPassphrase: config.networkPassphrase,
         };
       },
@@ -237,19 +252,21 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         destination: z.string(),
         validitySeconds: intentValiditySchema.optional(),
       })
-      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
     validateAmount(body.amount);
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
+    if (!StrKey.isValidEd25519PublicKey(body.destination)) {
+      throw Errors.badRequest("invalid_destination", "Not a valid Stellar public key");
+    }
+
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
-    const amount = normalizeAmount(body.amount);
     const requiresMulti = (group.treasuryRequiredSigners ?? 1) > 1;
     const treasuryKey = group.treasuryAccountPublicKey!;
 
@@ -261,6 +278,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       payload: body,
       operation: async () => {
         const code = shortCode();
+        const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const ttx = await prisma.treasuryTransaction.create({
           data: {
             shortCode: code,
@@ -273,6 +291,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             destination: body.destination,
             status: requiresMulti ? "awaiting_signatures" : "pending",
             memo: memoText(code),
+            expiresAt,
           },
           include: { user: true },
         });
@@ -288,10 +307,13 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
           amount: body.amount,
           memoCode: code,
+          validitySeconds,
         });
 
         return {
           treasuryTransaction: serializeTreasuryTx(ttx),
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: secondsUntilExpiry(expiresAt),
           xdr,
           networkPassphrase: config.networkPassphrase,
         };
@@ -333,114 +355,73 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     // never be submitted to Horizon.
     assertIntentNotExpired(ttx.expiresAt, "treasury transaction");
 
-    const source =
-      ttx.direction === "deposit"
-        ? auth.stellarPublicKey
-        : group.treasuryAccountPublicKey;
-    const destination =
-      ttx.direction === "deposit"
-        ? group.treasuryAccountPublicKey
-        : ttx.destination!;
-    const intent = {
-      sourcePublicKey: source,
-      destination,
-      asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
-      amount: ttx.amount.toString(),
-      memoCode: ttx.shortCode,
-    };
+    const treasuryAccountPublicKey = group.treasuryAccountPublicKey;
+    const source = ttx.direction === "deposit" ? auth.stellarPublicKey : treasuryAccountPublicKey;
+    const destination = ttx.direction === "deposit" ? treasuryAccountPublicKey : ttx.destination!;
 
-    let hash: string;
-    try {
-      hash = await stellar.submitPayment(body.signedXdr, {
-        sourcePublicKey: source,
-        destination,
-        asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
-        amount: ttx.amount.toString(),
-        memoCode: ttx.shortCode,
-        // submitPayment re-validates the envelope's own time bounds against the
-        // stored intent, so a stale signature is rejected locally rather than
-        // by Horizon.
-        expiresAt: ttx.expiresAt,
-        resource: "treasury transaction",
-      });
-    } catch (e: any) {
-      await prisma.$transaction(async (tx) => {
-        await tx.treasuryTransaction.update({
-          where: { id },
-          data: { status: "failed" },
-        });
-        await audit(
-          {
-            actor: { type: "user", userId: auth.id },
-            action: AuditAction.TreasuryConfirmFailed,
-            entityType: "treasury_transaction",
-            entityId: id,
-            outcome: "failure",
-            metadata: { direction: ttx.direction, reason: e?.message ?? String(e) },
-          },
-          tx
+    // A withdrawal spends from the shared treasury account, so it must carry
+    // signatures from the account's own configured co-signers (checked
+    // against the threshold on file), not just a single valid signature.
+    let multisig: { signers: string[]; threshold: number } | null = null;
+    if (ttx.direction === "withdrawal") {
+      const account = await stellar.loadAccount(treasuryAccountPublicKey);
+      if (!account.exists) {
+        throw Errors.badRequest(
+          "treasury_unfunded",
+          "The treasury account is not funded on-chain"
         );
-      });
-      if (e instanceof AppError) throw e;
-      throw Errors.upstream("Transaction submission failed");
+      }
+      multisig = {
+        signers: account.signers.map((s) => s.key),
+        threshold: group.treasuryRequiredSigners ?? 1,
+      };
     }
 
-    const updated = await prisma.treasuryTransaction.update({
-      where: { id },
-      data: { status: "confirmed", stellarTxHash: hash },
-      include: { user: true },
-    });
-    await audit({
+    return runIdempotent({
       userId: auth.id,
       scope: "treasury.confirm",
       key: idempotencyKey,
       resourceId: id,
       payload: body,
       operation: async (tx) => {
-        const ttx = await tx.treasuryTransaction.findUnique({ where: { id } });
-        if (!ttx) throw Errors.notFound("Treasury transaction not found");
-
-        const group = await tx.group.findUnique({ where: { id: ttx.groupId } });
-        if (!group?.treasuryAccountPublicKey) {
-          throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
+        const fresh = await tx.treasuryTransaction.findUnique({ where: { id } });
+        if (!fresh) throw Errors.notFound("Treasury transaction not found");
+        if (fresh.status === "confirmed") {
+          return { treasuryTransaction: serializeTreasuryTx(fresh) };
         }
-
-        if (ttx.direction === "deposit") {
-          if (ttx.userId !== auth.id) {
-            throw Errors.forbidden("Only the depositor can confirm this deposit");
-          }
-        } else {
-          await requireAdmin(ttx.groupId, auth.id);
-        }
-
-        if (ttx.status === "confirmed") {
-          return { treasuryTransaction: serializeTreasuryTx(ttx) };
-        }
-
-        const source =
-          ttx.direction === "deposit"
-            ? auth.stellarPublicKey
-            : group.treasuryAccountPublicKey;
-        const destination =
-          ttx.direction === "deposit"
-            ? group.treasuryAccountPublicKey
-            : ttx.destination!;
 
         let hash: string;
         try {
-          hash = await stellar.submitPayment(body.signedXdr, {
+          const expected = {
             sourcePublicKey: source,
             destination,
-            asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
-            amount: ttx.amount.toString(),
-            memoCode: ttx.shortCode,
-          });
+            asset: { code: fresh.assetCode, issuer: fresh.assetIssuer },
+            amount: fresh.amount.toString(),
+            memoCode: fresh.shortCode,
+            expiresAt: fresh.expiresAt,
+            resource: "treasury transaction",
+          };
+          hash = multisig
+            ? await stellar.submitMultisigPayment(body.signedXdr, expected, multisig)
+            : await stellar.submitPayment(body.signedXdr, expected);
         } catch (e) {
           await tx.treasuryTransaction.update({
             where: { id },
             data: { status: "failed" },
           });
-          throw e;
+          await auditTx(tx, {
+            userId: auth.id,
+            action: "treasury.confirm.failed",
+            entityType: "treasury_transaction",
+            entityId: id,
+            outcome: "failure",
+            metadata: {
+              direction: fresh.direction,
+              reason: e instanceof Error ? e.message : String(e),
+            },
+          });
+          if (e instanceof AppError) throw e;
+          throw Errors.upstream("Transaction submission failed");
         }
 
         const updated = await tx.treasuryTransaction.update({
@@ -448,12 +429,12 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           data: { status: "confirmed", stellarTxHash: hash },
           include: { user: true },
         });
-        await audit({
+        await auditTx(tx, {
           userId: auth.id,
           action: "treasury.confirm",
           entityType: "treasury_transaction",
           entityId: id,
-          metadata: { hash, direction: ttx.direction },
+          metadata: { hash, direction: fresh.direction },
         });
         return { treasuryTransaction: serializeTreasuryTx(updated) };
       },

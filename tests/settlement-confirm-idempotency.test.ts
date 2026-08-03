@@ -5,6 +5,7 @@ const h = vi.hoisted(() => {
   const model = () => ({
     findUnique: vi.fn(),
     findUniqueOrThrow: vi.fn(),
+    findFirst: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
@@ -12,6 +13,7 @@ const h = vi.hoisted(() => {
   const prisma: any = {
     settlement: model(),
     idempotencyKey: model(),
+    statusHistory: model(),
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
@@ -230,7 +232,11 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json().settlement.status).toBe("submitted");
-    expect(prisma.settlement.updateMany).toHaveBeenCalledTimes(1); // loser's rolled back
+    // The loser never enters the operation at all: the idempotency key is
+    // reserved (as "pending") before the operation runs, so a losing racer's
+    // create() conflicts and it falls straight through to the winner's
+    // cached response without ever touching settlement.updateMany.
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
   it("allows re-confirmation of a failed settlement with a new idempotency key", async () => {

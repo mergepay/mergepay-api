@@ -320,7 +320,8 @@ describe("group routes", () => {
         userId: user.id,
         role: "member",
       });
-      prisma.group.findUnique.mockResolvedValueOnce({ id: "group_1" });
+      // No group.findUnique mock: requireMembership only reads it when no
+      // membership row is found at all, which isn't the case here.
 
       const res = await app.inject({
         method: "POST",
@@ -335,11 +336,8 @@ describe("group routes", () => {
 
     it("returns 400 for an invalid public key", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      // No groupMember mock: the public key fails validation before the
+      // route ever opens a transaction or checks membership.
 
       const res = await app.inject({
         method: "POST",
@@ -409,7 +407,7 @@ describe("group routes", () => {
         userId: admin.id,
         role: "admin",
       });
-      prisma.groupMember.findFirst.mockResolvedValueOnce({
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
         id: "member_target",
         groupId: "group_1",
         userId: targetUser.id,
@@ -427,14 +425,16 @@ describe("group routes", () => {
       expect(res.statusCode).toBe(200);
       expect(res.json().ok).toBe(true);
       expect(prisma.groupMember.delete).toHaveBeenCalledWith({
-        where: { id: "member_target" },
+        where: { groupId_userId: { groupId: "group_1", userId: targetUser.id } },
       });
       expect(prisma.auditLog.create).toHaveBeenCalledWith({
         data: {
-          action: "MEMBER_REMOVED",
           userId: admin.id,
-          groupId: "group_1",
-          details: { memberId: "member_target", userId: targetUser.id },
+          groupId: null,
+          action: "group.member_remove",
+          entityType: "group",
+          entityId: "group_1",
+          metadata: { removedUserId: targetUser.id },
         },
       });
     });

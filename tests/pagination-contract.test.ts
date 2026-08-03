@@ -397,7 +397,7 @@ describe("pagination never widens access", () => {
   it("scopes the caller's own history and anchor sessions to the caller", async () => {
     await app.inject({ method: "GET", url: "/history", headers: authHeader() });
     const historyArgs = prisma.expense.findMany.mock.calls[0][0] as any;
-    expect(JSON.stringify(historyArgs.where.OR)).toContain(USER_ID);
+    expect(JSON.stringify(historyArgs.where.AND[0].OR)).toContain(USER_ID);
 
     await app.inject({ method: "GET", url: "/anchors/sessions", headers: authHeader() });
     const sessionArgs = prisma.anchorSession.findMany.mock.calls[0][0] as any;

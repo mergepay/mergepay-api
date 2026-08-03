@@ -23,6 +23,10 @@ beforeEach(async () => {
   clearReadinessCache();
   h.queryRaw.mockResolvedValue([{ 1: 1 }]);
   h.feeStats.mockResolvedValue({ minAcceptedFee: 100 });
+  // checkAnchor reads process.env live at call time; unset it here (after
+  // config's own startup validation already ran) so readiness reports the
+  // anchor check as "disabled" instead of making a real network call.
+  vi.stubEnv("ANCHOR_HOME_DOMAIN", "");
   if (!app) app = await buildApp();
 });
 

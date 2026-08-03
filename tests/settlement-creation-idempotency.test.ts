@@ -5,6 +5,7 @@ const h = vi.hoisted(() => {
   const model = () => ({
     findUnique: vi.fn(),
     findUniqueOrThrow: vi.fn(),
+    findFirst: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
@@ -16,6 +17,7 @@ const h = vi.hoisted(() => {
     group: model(),
     settlement: model(),
     idempotencyKey: model(),
+    statusHistory: model(),
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
@@ -203,12 +205,12 @@ describe("POST /expenses/:id/settle — idempotency", () => {
       payload: {},
     });
 
-    // Our attempt did run settlement.create (its writes would roll back with
-    // the real transaction in production), but the client only ever sees a
-    // single logical settlement in the response, never a duplicate-creation
-    // error surfaced as a 500.
+    // The idempotency key is reserved (as "pending") before the operation
+    // runs, so our losing attempt's create() conflicts before ever calling
+    // settlement.create — we fall straight through to the winner's cached
+    // response instead of a duplicate-creation error surfaced as a 500.
     expect(res.statusCode).toBe(200);
-    expect(prisma.settlement.create).toHaveBeenCalledTimes(1);
+    expect(prisma.settlement.create).not.toHaveBeenCalled();
   });
 
   it("rejects settling an already-settled share even with a fresh idempotency key", async () => {

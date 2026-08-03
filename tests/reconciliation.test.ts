@@ -16,11 +16,12 @@ const h = vi.hoisted(() => {
   const stellar = {
     getTransaction: vi.fn(),
   };
-  const logger = {
+  const logger: any = {
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   };
+  logger.child = vi.fn(() => logger);
   return { prisma, stellar, logger };
 });
 

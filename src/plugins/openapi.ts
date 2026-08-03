@@ -85,7 +85,7 @@ export default async function openAPIPlugin(app: FastifyInstance) {
               memo: { type: ["string", "null"] },
               receiptUrl: { type: ["string", "null"] },
               createdAt: { type: "string", format: "date-time" },
-              shares: { type: "array" },
+              shares: { type: "array", items: { type: "object" } },
             },
           },
           Settlement: {

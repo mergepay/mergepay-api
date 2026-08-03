@@ -7,20 +7,19 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { applyAnchorSessionTransition } from "../services/anchor-status";
-import { audit } from "../services/audit";
+import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
+import { ipKey } from "../services/rate-limit-keys";
 import {
+  paginationQuerySchema,
   buildPage,
   cursorFilter,
   cursorOrderBy,
-  paginationQuerySchema,
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
-import { recordStatusTransition } from "../services/status-history";
 
 export default async function anchorRoutes(app: FastifyInstance) {
   // Every anchor route that reaches an anchor gets an explicit budget so a
@@ -103,16 +102,13 @@ export default async function anchorRoutes(app: FastifyInstance) {
           status: "incomplete",
         },
       });
-      await audit(
-        {
-          actor: { type: "user", userId: auth.id },
-          action: AuditAction.AnchorSessionStart,
-          entityType: "anchor_session",
-          entityId: created.id,
-          metadata: { kind, assetCode: body.assetCode },
-        },
-        tx
-      );
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "anchor_session.start",
+        entityType: "anchor_session",
+        entityId: created.id,
+        metadata: { kind, assetCode: body.assetCode },
+      });
       return created;
     });
 
@@ -138,9 +134,8 @@ export default async function anchorRoutes(app: FastifyInstance) {
       const { id } = z.object({ id: z.string() }).parse(req.params);
       const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
 
-      const session = await prisma.anchorSession.findUnique({ 
+      const session = await prisma.anchorSession.findUnique({
         where: { id },
-        include: { statusHistory: true },
       });
       if (!session || session.userId !== auth.id) {
         throw Errors.notFound("Anchor session not found");
@@ -177,46 +172,23 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // -- sessions ---------------------------------------------------------------
   app.get("/anchors/sessions", { preHandler: [app.authenticate] }, async (req) => {
     const auth = requireUser(req);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
-
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const position = requireCursor(cursor);
 
     const sessions = await prisma.anchorSession.findMany({
       where: {
         userId: auth.id,
-        ...(decodedCursor && {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }),
+        ...cursorFilter(position, order),
       },
-      include: { statusHistory: true },
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
     });
 
-    const hasMore = sessions.length > limit;
-    const results = hasMore ? sessions.slice(0, limit) : sessions;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
+    const { items, meta } = buildPage(sessions, limit, order);
 
     return {
-      sessions: results.map(serializeAnchorSession),
-      meta: { nextCursor, hasMore },
+      sessions: items.map(serializeAnchorSession),
+      meta,
     };
   });
 
@@ -256,27 +228,18 @@ export default async function anchorRoutes(app: FastifyInstance) {
       const status = body.transaction?.status ?? body.status;
       if (externalId && status) {
         const mappedStatus = mapAnchorStatus(status);
-        await prisma.$transaction(async (tx) => {
-          const sessions = await tx.anchorSession.findMany({
-            where: { externalTransactionId: externalId },
-          });
-          for (const session of sessions) {
-            await tx.anchorSession.update({
-              where: { id: session.id },
-              data: { status: mappedStatus },
-            });
-            await recordStatusTransition({
-              entityType: "anchor_session",
-              entityId: session.id,
-              newStatus: mappedStatus,
-              source: "anchor_webhook",
-            });
-          }
+        const sessions = await prisma.anchorSession.findMany({
+          where: { externalTransactionId: externalId },
         });
         for (const session of sessions) {
+          // applyAnchorSessionTransition atomically validates the transition
+          // against the finite state map and writes its audit record in the
+          // same database transaction as the status change — see
+          // src/services/anchor-status.ts. An out-of-order or duplicate
+          // webhook delivery is a no-op rather than a regression.
           await applyAnchorSessionTransition({
             sessionId: session.id,
-            nextStatus: mapAnchorStatus(status),
+            nextStatus: mappedStatus,
             source: "webhook",
           });
         }

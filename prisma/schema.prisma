@@ -137,11 +137,9 @@ model Settlement {
   claimedAt      DateTime? @map("claimed_at")
   leaseExpiresAt DateTime? @map("lease_expires_at")
   failureReason  String?   @map("failure_reason")
-  errorCategory  String?   @map("error_category")
-  nextAttemptAt  DateTime? @map("next_attempt_at")
-  claimedAt      DateTime? @map("claimed_at")
-  claimedBy      String?   @map("claimed_by")
-  leaseExpiresAt DateTime? @map("lease_expires_at")
+  // Server-controlled expiry for the unsigned intent (nullable: rows created
+  // before expiration tracking existed have no recorded deadline).
+  expiresAt      DateTime? @map("expires_at")
   submittedAt    DateTime? @map("submitted_at")
   confirmedAt    DateTime? @map("confirmed_at")
   memo           String?
@@ -162,6 +160,7 @@ model Settlement {
   @@index([status, updatedAt]) // For worker reconciliation queries
   @@index([status, nextAttemptAt]) // For picking up eligible worker jobs
   @@index([leaseExpiresAt]) // For recovering leases from crashed workers
+  @@index([expiresAt])
   @@map("settlements")
 }
 
@@ -244,7 +243,6 @@ model AnchorSession {
   // Same durable job-state contract as Settlement: when the session becomes
   // eligible again, and why the last poll failed. See src/worker/index.ts.
   nextAttemptAt         DateTime?  @map("next_attempt_at")
-  errorCategory         String?    @map("error_category")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
   jobAttemptCount       Int      @default(0) @map("job_attempt_count")
@@ -404,4 +402,19 @@ model Sep10Challenge {
 
   @@index([expiresAt])
   @@map("sep10_challenges")
+}
+
+// Cached Stellar account balances, periodically refreshed from Horizon by
+// src/worker/tasks/balance-sync.ts so src/routes/accounts.ts can serve
+// balance reads without a live Horizon round-trip on every request.
+model AccountBalance {
+  id         String   @id @default(cuid())
+  accountId  String   @map("account_id")
+  assetCode  String   @map("asset_code")
+  balance    String
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@unique([accountId, assetCode])
+  @@index([accountId])
+  @@map("account_balances")
 }

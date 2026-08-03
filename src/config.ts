@@ -49,7 +49,10 @@ const schema = z.object({
   
   // File storage
   UPLOADS_DIR: z.string().default("./uploads"),
-  
+  JSON_BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(1024 * 1024),
+  MULTIPART_MAX_FILES: z.coerce.number().int().positive().default(1),
+  MULTIPART_MAX_FIELDS: z.coerce.number().int().positive().default(20),
+
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
   // How long a worker's claim on a job survives without renewal. A process that
@@ -58,6 +61,18 @@ const schema = z.object({
   WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   // Maximum jobs of one kind pulled per cycle.
   WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
+  // Per-call network timeouts (ms) — every outbound Horizon/anchor request
+  // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
+  // a slow or hung upstream can't block a worker cycle indefinitely.
+  HORIZON_ACCOUNT_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  HORIZON_SUBMIT_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  HORIZON_STATUS_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  HORIZON_FEE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_TOML_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_CHALLENGE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_TOKEN_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_INTERACTIVE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ANCHOR_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   CONFIRM_POLL_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
   CONFIRM_POLL_DELAY_MS: z.coerce.number().int().positive().default(1500),
   NODE_ENV: z.string().default("development"),
@@ -67,14 +82,15 @@ const schema = z.object({
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().max(100000).default(100),
   RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce.number().int().positive().default(60000),
-  RATE_LIMIT_TREASURY_SUBMIT_MAX: z.coerce.number().int().positive().max(100000).default(30),
-  RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_HEALTH: z.coerce.number().int().positive().max(100000).default(60),
+  RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().max(100000).default(50),
+  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_ANCHOR_INIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
   RATE_LIMIT_ANCHOR_INIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_ANCHOR_POLL_MAX: z.coerce.number().int().positive().max(100000).default(60),
   RATE_LIMIT_ANCHOR_POLL_WINDOW_MS: z.coerce.number().int().positive().default(60000),
-  RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().max(100000).default(50),
-  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_TREASURY_SUBMIT_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(30),
   RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().max(100000).default(10),
@@ -159,17 +175,6 @@ function hostOf(url: string): string {
 }
 
 const apiHost = hostOf(parsed.API_PUBLIC_URL);
-
-export function validateAssetConfig() {
-  if (
-    !parsed.STABLE_ASSET_ISSUER ||
-    parsed.STABLE_ASSET_ISSUER === "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
-  ) {
-    throw new Error(
-      "STABLE_ASSET_ISSUER is not configured. Set it in the environment to a real issuer public key."
-    );
-  }
-}
 
 const networkPassphrase =
   parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET;

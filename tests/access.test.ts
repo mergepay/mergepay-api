@@ -1,10 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
 import { requireMembership, requireAdmin } from "../src/services/access";
 
-function fakeDb(member: { role: string } | null) {
+function fakeDb(member: { role: string } | null, group: { id: string } | null = { id: "group_1" }) {
   return {
     groupMember: {
       findUnique: vi.fn(async () => member),
+    },
+    group: {
+      findUnique: vi.fn(async () => group),
     },
   } as any;
 }
@@ -20,18 +23,19 @@ describe("access service", () => {
       });
     });
 
-    it("throws a not-found error (not forbidden) for a non-member, to avoid leaking group existence", async () => {
-      const db = fakeDb(null);
+    it("throws a not-found error for a group that does not exist", async () => {
+      const db = fakeDb(null, null);
       await expect(requireMembership("group_1", "ghost", db)).rejects.toMatchObject({
         status: 404,
         code: "NOT_FOUND",
       });
     });
 
-    it("throws not-found for a removed member (no membership row left)", async () => {
+    it("throws forbidden (not not-found) for a removed member of an existing group", async () => {
       const db = fakeDb(null);
       await expect(requireMembership("group_1", "former_member", db)).rejects.toMatchObject({
-        status: 404,
+        status: 403,
+        code: "FORBIDDEN",
       });
     });
 
@@ -52,8 +56,8 @@ describe("access service", () => {
       });
     });
 
-    it("rejects a non-member the same way requireMembership does (not-found, not forbidden)", async () => {
-      const db = fakeDb(null);
+    it("rejects a non-member the same way requireMembership does (not-found for a missing group)", async () => {
+      const db = fakeDb(null, null);
       await expect(requireAdmin("group_1", "ghost", db)).rejects.toMatchObject({
         status: 404,
         code: "NOT_FOUND",

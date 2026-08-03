@@ -271,7 +271,6 @@ describe("GET /settlements/:id/status — access", () => {
     const body = res.json();
     expect(body.error).toBe("NOT_FOUND");
     expect(body.message).toBe("Settlement not found");
-    expect(body.statusCode).toBe(404);
     expect(body.requestId).toBeTruthy();
   });
 

@@ -8,6 +8,8 @@ export const MAX_AMOUNT = "922337203685.4775807";
 
 const CANONICAL_AMOUNT = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
 const CANONICAL_STROOPS = /^-?(?:0|[1-9]\d*)$/;
+/** Looser shape accepted by `normalizeAmount` — leading/trailing zeros allowed. */
+const RAW_AMOUNT = /^-?\d+(?:\.\d+)?$/;
 
 /** Absolute value of a bigint — used by balance math, which is signed. */
 export function bigIntAbs(value: bigint): bigint {
@@ -15,19 +17,22 @@ export function bigIntAbs(value: bigint): bigint {
 }
 
 export function normalizeAmount(value: string): string {
-  if (typeof value !== "string") {
+  if (typeof value !== "string" || !RAW_AMOUNT.test(value)) {
     throw new Error("Amount must be a decimal string");
   }
-  if (!CANONICAL_AMOUNT.test(value)) {
-    throw new Error("Amount must be a canonical decimal string");
-  }
 
-  const [whole, fraction = ""] = value.split(".");
-  if (fraction.length > 7) {
+  const negative = value.startsWith("-");
+  const unsigned = negative ? value.slice(1) : value;
+  const [wholeRaw, fractionRaw = ""] = unsigned.split(".");
+  if (fractionRaw.length > 7) {
     throw new Error("Amount must have at most 7 decimal places");
   }
 
-  const stroops = toStroops(value);
+  const whole = wholeRaw.replace(/^0+(?=\d)/, "");
+  const fraction = fractionRaw.replace(/0+$/, "");
+  const canonical = `${negative ? "-" : ""}${whole}${fraction ? `.${fraction}` : ""}`;
+
+  const stroops = toStroops(canonical);
   if (stroops <= 0n) {
     throw new Error("Amount must be greater than zero");
   }
@@ -35,8 +40,7 @@ export function normalizeAmount(value: string): string {
     throw new Error("Amount exceeds the supported Stellar range");
   }
 
-  const trimmedFraction = fraction.replace(/0+$/, "");
-  return trimmedFraction.length > 0 ? `${whole}.${trimmedFraction}` : whole;
+  return canonical;
 }
 
 /**

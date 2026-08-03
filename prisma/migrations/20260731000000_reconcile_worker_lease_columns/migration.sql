@@ -16,6 +16,8 @@ ALTER TABLE "settlements" ADD COLUMN IF NOT EXISTS "next_attempt_at" TIMESTAMP(3
 ALTER TABLE "settlements" ADD COLUMN IF NOT EXISTS "claimed_at" TIMESTAMP(3);
 ALTER TABLE "settlements" ADD COLUMN IF NOT EXISTS "claimed_by" TEXT;
 ALTER TABLE "settlements" ADD COLUMN IF NOT EXISTS "lease_expires_at" TIMESTAMP(3);
+ALTER TABLE "settlements" ADD COLUMN IF NOT EXISTS "expires_at" TIMESTAMP(3);
+ALTER TABLE "treasury_transactions" ADD COLUMN IF NOT EXISTS "expires_at" TIMESTAMP(3);
 
 ALTER TABLE "anchor_sessions" ADD COLUMN IF NOT EXISTS "error_category" TEXT;
 ALTER TABLE "anchor_sessions" ADD COLUMN IF NOT EXISTS "next_attempt_at" TIMESTAMP(3);
@@ -25,3 +27,5 @@ ALTER TABLE "anchor_sessions" ADD COLUMN IF NOT EXISTS "lease_expires_at" TIMEST
 
 CREATE INDEX IF NOT EXISTS "settlements_lease_expires_at_idx" ON "settlements"("lease_expires_at");
 CREATE INDEX IF NOT EXISTS "anchor_sessions_lease_expires_at_idx" ON "anchor_sessions"("lease_expires_at");
+CREATE INDEX IF NOT EXISTS "settlements_expires_at_idx" ON "settlements"("expires_at");
+CREATE INDEX IF NOT EXISTS "treasury_transactions_expires_at_idx" ON "treasury_transactions"("expires_at");

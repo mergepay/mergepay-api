@@ -140,7 +140,7 @@ beforeEach(async () => {
 describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () => {
   it("submits once the configured threshold of on-chain signers has signed", async () => {
     const ttx = fakeTreasuryTx();
-    prisma.treasuryTransaction.findUnique.mockResolvedValueOnce(ttx);
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
     prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
@@ -183,7 +183,7 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
 
   it("rejects and marks failed when only one of two required signers has signed", async () => {
     const ttx = fakeTreasuryTx();
-    prisma.treasuryTransaction.findUnique.mockResolvedValueOnce(ttx);
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
     prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
@@ -220,7 +220,7 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
   it("rejects a signature from an account outside the treasury's signer set", async () => {
     const ttx = fakeTreasuryTx();
     const outsider = Keypair.random();
-    prisma.treasuryTransaction.findUnique.mockResolvedValueOnce(ttx);
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
     prisma.group.findUnique.mockResolvedValueOnce(fakeGroup({ treasuryRequiredSigners: 1 }));
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
@@ -249,7 +249,7 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
 
   it("rejects a withdrawal envelope with a tampered amount before touching Horizon", async () => {
     const ttx = fakeTreasuryTx({ amount: "25.0000000" });
-    prisma.treasuryTransaction.findUnique.mockResolvedValueOnce(ttx);
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
     prisma.group.findUnique.mockResolvedValueOnce(fakeGroup({ treasuryRequiredSigners: 1 }));
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
@@ -288,7 +288,7 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
 
   it("rejects malformed XDR without updating status to confirmed", async () => {
     const ttx = fakeTreasuryTx();
-    prisma.treasuryTransaction.findUnique.mockResolvedValueOnce(ttx);
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
     prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
@@ -318,7 +318,7 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
 
   it("rejects when the treasury account is unfunded", async () => {
     const ttx = fakeTreasuryTx();
-    prisma.treasuryTransaction.findUnique.mockResolvedValueOnce(ttx);
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
     prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
@@ -348,7 +348,7 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
 
   it("only an admin can confirm a withdrawal", async () => {
     const ttx = fakeTreasuryTx();
-    prisma.treasuryTransaction.findUnique.mockResolvedValueOnce(ttx);
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
     prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",

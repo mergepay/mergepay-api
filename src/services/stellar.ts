@@ -194,9 +194,14 @@ export const stellar = {
       expiresAt?: Date | null;
       /** Names the resource in the expiration error, e.g. "settlement". */
       resource?: string;
-    }
+    },
+    requirement: MultisigRequirement
   ): Promise<string> {
-    const { tx } = validateSignedXdr(signedXdr, expected);
+    const { tx } = validateSignedXdr(signedXdr, {
+      ...expected,
+      skipSourceSignatureCheck: true,
+    });
+    verifyMultisig(tx, requirement);
     try {
       const res = await withTimeout(
         "Horizon.submitTransaction",
@@ -433,6 +438,13 @@ export interface PaymentExpectation {
   expiresAt?: Date | null;
   /** Names the resource in the expiration error, e.g. "settlement". */
   resource?: string;
+  /**
+   * Skip the "source account itself signed" check. Set this for multisig
+   * accounts, where the source is a shared account that never signs with
+   * its own key — `verifyMultisig` checks authorization instead, against
+   * the account's actual configured co-signers and threshold.
+   */
+  skipSourceSignatureCheck?: boolean;
 }
 
 /**
@@ -565,20 +577,24 @@ export function validatePaymentTx(tx: Transaction, expected: PaymentExpectation)
   // A signature is computed over bytes that include the network passphrase, so
   // verifying it against the expected source account also proves the envelope
   // was signed for *our* network. An unsigned envelope fails here too.
-  const sourceKeypair = Keypair.fromPublicKey(expected.sourcePublicKey);
-  const txHash = tx.hash();
-  const hasValidSignature = tx.signatures.some((sig) => {
-    try {
-      return sourceKeypair.verify(txHash, sig.signature());
-    } catch {
-      return false;
+  // Skipped for multisig accounts, whose own key never signs — verifyMultisig
+  // checks authorization there instead.
+  if (!expected.skipSourceSignatureCheck) {
+    const sourceKeypair = Keypair.fromPublicKey(expected.sourcePublicKey);
+    const txHash = tx.hash();
+    const hasValidSignature = tx.signatures.some((sig) => {
+      try {
+        return sourceKeypair.verify(txHash, sig.signature());
+      } catch {
+        return false;
+      }
+    });
+    if (!hasValidSignature) {
+      throw Errors.badRequest(
+        "xdr_mismatch",
+        "Transaction signature is invalid or for the wrong network"
+      );
     }
-  });
-  if (!hasValidSignature) {
-    throw Errors.badRequest(
-      "xdr_mismatch",
-      "Transaction signature is invalid or for the wrong network"
-    );
   }
 }
 

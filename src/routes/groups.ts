@@ -6,8 +6,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { inviteCode } from "../services/codes";
-import { audit } from "../services/audit";
-import { auditLog } from "../lib/auditLog";
+import { audit, auditTx } from "../services/audit";
 import {
   serializeGroup,
   serializeInvitation,
@@ -18,13 +17,22 @@ import {
   groupPrimaryAsset,
   loadGroupBalances,
 } from "../services/group-balances";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import {
+  buildPage,
+  encodeCursor,
+  decodeCursor,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
+
+const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
 
 export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- create -----------------------------------------------------------------
-  app.post("/groups", { config: { rateLimit: { max: config.AUTH_RATE_LIMIT_MAX, timeWindow: "1 minute" } } }, async (req) => {
+  app.post("/groups", { config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } } }, async (req) => {
     const auth = requireUser(req);
     const body = z
       .object({
@@ -42,18 +50,15 @@ export default async function groupRoutes(app: FastifyInstance) {
           members: { create: { userId: auth.id, role: "admin" } },
         },
       });
-      await audit(
-        {
-          actor: { type: "user", userId: auth.id },
-          action: AuditAction.GroupCreate,
-          entityType: "group",
-          entityId: created.id,
-        },
-        tx
-      );
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "group.create",
+        entityType: "group",
+        entityId: created.id,
+        metadata: { name: body.name },
+      });
       return created;
     });
-    await auditLog.log("GROUP_CREATED", auth.id, group.id, { name: body.name });
     return { group: serializeGroup(group) };
   });
 
@@ -239,10 +244,6 @@ export default async function groupRoutes(app: FastifyInstance) {
 
         return created;
       });
-      await auditLog.log("MEMBER_INVITED", auth.id, id, {
-        inviteePublicKey: body.publicKey,
-        invitationId: invitation.id,
-      });
 
       return reply.status(201).send({ invitation: serializeInvitation(invitation) });
     }
@@ -261,7 +262,7 @@ export default async function groupRoutes(app: FastifyInstance) {
 
     const invite = await prisma.$transaction(async (tx) => {
       await requireAdmin(id, auth.id, tx);
-      return tx.invite.create({
+      const created = await tx.invite.create({
         data: {
           groupId: id,
           code: inviteCode(),
@@ -270,42 +271,16 @@ export default async function groupRoutes(app: FastifyInstance) {
           expiresAt,
         },
       });
-    });
-    await auditLog.log("INVITE_CREATED", auth.id, id, {
-      inviteId: invite.id,
-      code: invite.code,
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "group.invite_code_create",
+        entityType: "invite",
+        entityId: created.id,
+        metadata: { groupId: id },
+      });
+      return created;
     });
     return { invite: serializeInvite(invite, config.WEB_URL) };
-  });
-
-  // -- remove member --------------------------------------------------------
-  app.delete("/groups/:id/members/:memberId", async (req) => {
-    const auth = requireUser(req);
-    const { id, memberId } = z
-      .object({ id: z.string(), memberId: z.string() })
-      .parse(req.params);
-    await requireAdmin(id, auth.id);
-
-    const member = await prisma.groupMember.findFirst({
-      where: {
-        groupId: id,
-        OR: [{ id: memberId }, { userId: memberId }],
-      },
-    });
-    if (!member) throw Errors.notFound("Member not found");
-
-    if (member.userId === auth.id) {
-      throw Errors.badRequest("cannot_remove_self", "Use leave endpoint to leave the group");
-    }
-
-    await prisma.groupMember.delete({
-      where: { id: member.id },
-    });
-    await auditLog.log("MEMBER_REMOVED", auth.id, id, {
-      memberId: member.id,
-      userId: member.userId,
-    });
-    return { ok: true };
   });
 
   // -- join -------------------------------------------------------------------
@@ -337,18 +312,14 @@ export default async function groupRoutes(app: FastifyInstance) {
           where: { id: invite.id },
           data: { uses: { increment: 1 } },
         });
-        await audit(
-          {
-            actor: { type: "user", userId: auth.id },
-            action: AuditAction.GroupJoin,
-            entityType: "group",
-            entityId: invite.groupId,
-            metadata: { inviteId: invite.id },
-          },
-          tx
-        );
+        await auditTx(tx, {
+          userId: auth.id,
+          action: "group.join",
+          entityType: "group",
+          entityId: invite.groupId,
+          metadata: { inviteId: invite.id },
+        });
       });
-      await auditLog.log("MEMBER_JOINED", auth.id, invite.groupId);
     }
 
     const group = await prisma.group.findUnique({
@@ -391,7 +362,6 @@ export default async function groupRoutes(app: FastifyInstance) {
         entityId: id,
       });
     });
-    await auditLog.log("MEMBER_LEFT", auth.id, id);
     return { ok: true };
   });
 
@@ -461,7 +431,6 @@ export default async function groupRoutes(app: FastifyInstance) {
       });
       return updated;
     });
-    await auditLog.log("GROUP_ARCHIVED", auth.id, id);
     return { group: serializeGroup(group) };
   });
 }

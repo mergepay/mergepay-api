@@ -19,6 +19,7 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
 
       return reply.code(400).send({
         code: "VALIDATION_ERROR",
+        error: "VALIDATION_ERROR",
         message,
         requestId,
         details,
@@ -28,6 +29,7 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     if (err instanceof AppError) {
       const body: Record<string, unknown> = {
         code: err.code,
+        error: err.code,
         message: err.message,
         requestId,
       };
@@ -40,19 +42,17 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     if ((err as any).statusCode === 429) {
       return reply.code(429).send({
         code: "RATE_LIMITED",
+        error: "RATE_LIMITED",
         message: "Too many requests, slow down.",
         requestId,
-      };
-      if (retryAfter) {
-        body.retryAfter = retryAfter;
-      }
-      return reply.code(429).send(body);
+      });
     }
 
     if ((err as any).statusCode && (err as any).statusCode < 500) {
       const status: number = (err as any).statusCode;
       return reply.code(status).send({
         code: "BAD_REQUEST",
+        error: "BAD_REQUEST",
         message: err.message,
         requestId,
       });
@@ -61,6 +61,7 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     app.log.error({ err, requestId }, "Unhandled error");
     return reply.code(500).send({
       code: "INTERNAL_ERROR",
+      error: "INTERNAL_ERROR",
       message: "Something went wrong.",
       requestId,
     });

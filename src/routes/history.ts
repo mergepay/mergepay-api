@@ -2,51 +2,47 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { config } from "../config";
-import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { rateLimited } from "../lib/rate-limit";
 import { serializeExpense, serializeSettlement } from "../serializers";
-import { paginationQuerySchema, decodeCursor, buildPaginatedResponse } from "../services/pagination";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
+import {
+  paginationQuerySchema,
+  cursorFilter,
+  requireCursor,
+  takeForPage,
+  encodeCursor,
+  type CursorPosition,
+} from "../lib/pagination";
 
-const historyQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(100).optional(),
+const historyQuerySchema = paginationQuerySchema.extend({
+  assetCode: z.string().optional(),
+  status: z.string().optional(),
+  fromDate: z.string().datetime().optional(),
+  toDate: z.string().datetime().optional(),
 });
 
 export default async function historyRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-  app.get("/history", { config: { rateLimit: { max: config.AUTH_RATE_LIMIT_MAX, timeWindow: "1 minute" } } }, async (req) => {
+  app.get("/history", { config: { rateLimit: { max: config.RATE_LIMIT_HISTORY, timeWindow: "1 minute" } } }, async (req) => {
     const auth = requireUser(req);
-    const query = paginationQuerySchema.parse(req.query);
+    const query = historyQuerySchema.parse(req.query);
+    const position = requireCursor(query.cursor);
+    const cursorCondition = cursorFilter(position, query.order);
 
-    let cursorCondition: any = {};
-    if (query.cursor) {
-      const cursor = decodeCursor(query.cursor);
-      cursorCondition = {
-        OR: [
-          { createdAt: { lt: cursor.createdAt } },
-          { createdAt: { equals: cursor.createdAt }, id: { lt: cursor.id } },
-        ],
+    const assetFilter = query.assetCode ? { assetCode: query.assetCode } : {};
+
+    const dateFilter: Record<string, unknown> = {};
+    if (query.fromDate) {
+      dateFilter.createdAt = { gte: new Date(query.fromDate) };
+    }
+    if (query.toDate) {
+      dateFilter.createdAt = {
+        ...(dateFilter.createdAt as object | undefined),
+        lte: new Date(query.toDate),
       };
     }
 
-    const statusFilter = query.status
-      ? { status: query.status }
-      : undefined;
-
-    const assetFilter = query.assetCode
-      ? { assetCode: query.assetCode }
-      : undefined;
-
-    const dateFilter: any = {};
-    if (query.fromDate) {
-      dateFilter.createdAt = { ...(dateFilter.createdAt || {}), gte: new Date(query.fromDate) };
-    }
-    if (query.toDate) {
-      dateFilter.createdAt = { ...(dateFilter.createdAt || {}), lte: new Date(query.toDate) };
-    }
-    historyQuerySchema.parse(req.query ?? {});
+    const takeCount = takeForPage(query.limit);
 
     const [expenses, settlements] = await Promise.all([
       prisma.expense.findMany({
@@ -61,26 +57,30 @@ export default async function historyRoutes(app: FastifyInstance) {
             cursorCondition,
             assetFilter,
             dateFilter,
+            ...(query.status ? [{ status: query.status }] : []),
           ],
-          ...cursorFilter,
         },
         include: { payer: true, shares: { include: { user: true } } },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        orderBy: [{ createdAt: query.order }, { id: query.order }],
         take: takeCount,
       }),
       prisma.settlement.findMany({
-        where: { 
-          OR: [{ fromUserId: auth.id }, { toUserId: auth.id }],
-          ...cursorFilter,
+        where: {
+          AND: [
+            { OR: [{ fromUserId: auth.id }, { toUserId: auth.id }] },
+            cursorCondition,
+            assetFilter,
+            dateFilter,
+            ...(query.status ? [{ status: query.status }] : []),
+          ],
         },
         include: { from: true, to: true },
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        orderBy: [{ createdAt: query.order }, { id: query.order }],
         take: takeCount,
       }),
     ]);
 
-    // Merge and sort by createdAt desc, then id desc
-    const entries = [
+    const merged: (CursorPosition & { type: "expense" | "settlement"; data: unknown })[] = [
       ...expenses.map((e) => ({
         type: "expense" as const,
         createdAt: e.createdAt,
@@ -94,26 +94,24 @@ export default async function historyRoutes(app: FastifyInstance) {
         data: serializeSettlement(s),
       })),
     ].sort((a, b) => {
-      if (a.createdAt < b.createdAt) return 1;
-      if (a.createdAt > b.createdAt) return -1;
-      return a.id < b.id ? 1 : -1;
+      const dir = query.order === "desc" ? -1 : 1;
+      if (a.createdAt.getTime() !== b.createdAt.getTime()) {
+        return a.createdAt.getTime() > b.createdAt.getTime() ? dir : -dir;
+      }
+      return a.id > b.id ? dir : -dir;
     });
 
-    const hasMore = entries.length > limit;
-    const results = hasMore ? entries.slice(0, limit) : entries;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
+    const hasMore = merged.length > query.limit;
+    const results = hasMore ? merged.slice(0, query.limit) : merged;
+    const last = results[results.length - 1];
+    const nextCursor = hasMore && last ? encodeCursor(last.createdAt, last.id) : null;
 
     return {
-      entries: results.map((r) => ({
+      expenses: results.map((r) => ({
         type: r.type,
-        ...r.data,
+        ...(r.data as object),
       })),
-      meta: { nextCursor, hasMore },
+      meta: { nextCursor, hasMore, limit: query.limit, order: query.order },
     };
   });
 }

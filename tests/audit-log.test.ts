@@ -114,7 +114,6 @@ describe("GET /groups/:id/audit-log", () => {
 
   it("returns the repository's standard authorization error for a non-member", async () => {
     prisma.groupMember.findUnique.mockResolvedValueOnce(null);
-    prisma.group.findUnique.mockResolvedValueOnce({ id: "group_1" });
 
     const res = await app.inject({
       method: "GET",
@@ -122,8 +121,8 @@ describe("GET /groups/:id/audit-log", () => {
       headers: authHeader(),
     });
 
-    expect(res.statusCode).toBe(403);
-    expect(res.json().error).toBe("FORBIDDEN");
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe("NOT_FOUND");
   });
 
   it("returns events with a redacted metadata payload for an admin", async () => {

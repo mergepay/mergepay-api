@@ -1,10 +1,20 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
+  Account,
+  Asset,
+  BASE_FEE,
+  Keypair,
+  Memo,
+  Operation,
+  TransactionBuilder,
+} from "@stellar/stellar-sdk";
+import {
   CLOCK_SKEW_TOLERANCE_SECONDS,
   INTENT_VALIDITY_SECONDS,
   MAX_INTENT_VALIDITY_SECONDS,
 } from "../src/lib/time-bounds";
 import { signToken } from "../src/plugins/auth";
+import { config } from "../src/config";
 
 const h = vi.hoisted(() => {
   const model = () => ({
@@ -25,6 +35,7 @@ const h = vi.hoisted(() => {
     group: model(),
     user: model(),
     auditLog: model(),
+    statusHistory: model(),
     idempotencyKey: model(),
   };
   prisma.$transaction = vi.fn(async (arg: any) =>
@@ -58,13 +69,57 @@ let app: Awaited<ReturnType<typeof buildApp>>;
 const prisma = h.prisma;
 
 const USER_ID = "user_1";
-const PAYER_KEY = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const PAYEE_KEY = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const payerKeypair = Keypair.random();
+const payeeKeypair = Keypair.random();
+const PAYER_KEY = payerKeypair.publicKey();
+const PAYEE_KEY = payeeKeypair.publicKey();
 
 function authHeader(userId = USER_ID) {
   return {
     authorization: `Bearer ${signToken({ id: userId, stellarPublicKey: PAYER_KEY })}`,
   };
+}
+
+/**
+ * Build a real signed payment envelope matching a settlement/treasury
+ * intent, so confirm-route tests exercise the actual XDR validation path
+ * instead of relying on it being bypassed.
+ */
+function signedXdrFor({
+  destination = PAYEE_KEY,
+  amount = "10",
+  assetCode = "XLM",
+  assetIssuer = null,
+  memoCode = "ABC123",
+  expiresAt,
+}: {
+  destination?: string;
+  amount?: string;
+  assetCode?: string;
+  assetIssuer?: string | null;
+  memoCode?: string;
+  expiresAt?: Date | null;
+} = {}) {
+  const account = new Account(PAYER_KEY, "1");
+  const maxTime = expiresAt
+    ? Math.floor(expiresAt.getTime() / 1000)
+    : Math.floor(Date.now() / 1000) + INTENT_VALIDITY_SECONDS;
+  const tx = new TransactionBuilder(account, {
+    fee: String(Number(BASE_FEE) * 2),
+    networkPassphrase: config.networkPassphrase,
+  })
+    .addOperation(
+      Operation.payment({
+        destination,
+        asset: assetIssuer ? new Asset(assetCode, assetIssuer) : Asset.native(),
+        amount,
+      })
+    )
+    .addMemo(Memo.text(`MP:${memoCode}`))
+    .setTimebounds(0, maxTime)
+    .build();
+  tx.sign(payerKeypair);
+  return tx.toXDR();
 }
 
 function fakeUser(id: string, key: string) {
@@ -280,8 +335,8 @@ describe("settlement confirm rejects an expired intent", () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      headers: { ...authHeader(), "idempotency-key": "intent-expiration-confirm" },
+      payload: { signedXdr: signedXdrFor({ expiresAt: settlement.expiresAt }) },
     });
 
     expect(res.statusCode).toBe(200);
@@ -296,7 +351,7 @@ describe("settlement confirm rejects an expired intent", () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: authHeader(),
+      headers: { ...authHeader(), "idempotency-key": "intent-expiration-confirm" },
       payload: { signedXdr: "signed-xdr-abc" },
     });
 
@@ -315,7 +370,7 @@ describe("settlement confirm rejects an expired intent", () => {
     await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: authHeader(),
+      headers: { ...authHeader(), "idempotency-key": "intent-expiration-confirm" },
       payload: { signedXdr: "signed-xdr-abc" },
     });
 
@@ -324,10 +379,9 @@ describe("settlement confirm rejects an expired intent", () => {
   });
 
   it("accepts a confirm arriving within the clock-skew tolerance", async () => {
+    const nearExpiry = new Date(Date.now() - (CLOCK_SKEW_TOLERANCE_SECONDS - 5) * 1000);
     prisma.settlement.findUnique.mockResolvedValue(
-      fakeSettlement({
-        expiresAt: new Date(Date.now() - (CLOCK_SKEW_TOLERANCE_SECONDS - 5) * 1000),
-      })
+      fakeSettlement({ expiresAt: nearExpiry })
     );
     prisma.settlement.findUniqueOrThrow.mockResolvedValue(
       fakeSettlement({ status: "submitted" })
@@ -336,8 +390,8 @@ describe("settlement confirm rejects an expired intent", () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      headers: { ...authHeader(), "idempotency-key": "intent-expiration-confirm" },
+      payload: { signedXdr: signedXdrFor({ expiresAt: nearExpiry }) },
     });
 
     expect(res.statusCode).toBe(200);
@@ -351,7 +405,7 @@ describe("settlement confirm rejects an expired intent", () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: authHeader(),
+      headers: { ...authHeader(), "idempotency-key": "intent-expiration-confirm" },
       payload: { signedXdr: "signed-xdr-abc" },
     });
 
@@ -365,7 +419,7 @@ describe("settlement confirm rejects an expired intent", () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: authHeader(),
+      headers: { ...authHeader(), "idempotency-key": "intent-expiration-confirm" },
       payload: { signedXdr: "signed-xdr-abc" },
     });
 
@@ -384,8 +438,8 @@ describe("settlement confirm rejects an expired intent", () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      headers: { ...authHeader(), "idempotency-key": "intent-expiration-confirm" },
+      payload: { signedXdr: signedXdrFor() },
     });
 
     expect(res.statusCode).toBe(200);

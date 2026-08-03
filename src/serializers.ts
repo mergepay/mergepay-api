@@ -111,6 +111,7 @@ export function serializeSettlement(s: any) {
     expenseId: s.expenseId ?? null,
     expenseShareId: s.expenseShareId ?? null,
     createdAt: iso(s.createdAt),
+    expiresAt: s.expiresAt ? iso(s.expiresAt) : null,
     statusHistory: (s.statusHistory ?? []).map(serializeStatusHistory),
   };
 }
@@ -131,6 +132,23 @@ export function serializeTreasuryTx(t: any) {
     memo: t.memo ?? null,
     expiresAt: t.expiresAt ? iso(t.expiresAt) : null,
     createdAt: iso(t.createdAt),
+  };
+}
+
+export function serializeTreasuryProposal(p: any) {
+  return {
+    id: p.id,
+    groupId: p.groupId,
+    creatorId: p.creatorId,
+    xdr: p.xdr,
+    threshold: p.threshold,
+    signatures: p.signatures ?? [],
+    signatureCount: Array.isArray(p.signatures) ? p.signatures.length : 0,
+    status: p.status,
+    stellarTxHash: p.stellarTxHash ?? null,
+    failureReason: p.failureReason ?? null,
+    createdAt: iso(p.createdAt),
+    updatedAt: iso(p.updatedAt),
   };
 }
 

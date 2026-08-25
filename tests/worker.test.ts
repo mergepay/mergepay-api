@@ -256,7 +256,9 @@ describe("processSubmittedSettlements", () => {
     expect(h.prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          action: "settlement.status_changed",
+          action: "settlement.confirmed",
+          userId: null,
+          actorType: "worker",
           entityId: "settle_1",
           metadata: expect.objectContaining({ to: "confirmed" }),
         }),

@@ -9,6 +9,7 @@ import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import { validateAsset, validateAmount } from "../services/assets";
 import { rateLimited } from "../lib/rate-limit";
 import {
@@ -79,9 +80,14 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
-        action: "treasury.enable",
+        actorType: "user",
+        action: AuditAction.TREASURY_SIGNER_CHANGED,
         entityType: "group",
         entityId: id,
+        metadata: {
+          publicKey: body.publicKey,
+          requiredSigners: body.requiredSigners ?? 1,
+        },
       });
       return updated;
     });
@@ -195,10 +201,10 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       key: idempotencyKey,
       resourceId: id,
       payload: body,
-      operation: async () => {
+      operation: async (tx) => {
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
-        const ttx = await prisma.treasuryTransaction.create({
+        const ttx = await tx.treasuryTransaction.create({
           data: {
             shortCode: code,
             groupId: id,
@@ -213,6 +219,19 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             expiresAt,
           },
           include: { user: true },
+        });
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: id,
+          actorType: "user",
+          action: AuditAction.TREASURY_DEPOSIT_CREATED,
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          metadata: {
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+          },
         });
 
         const account = await stellar.loadAccount(auth.stellarPublicKey);
@@ -276,10 +295,10 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       key: idempotencyKey,
       resourceId: id,
       payload: body,
-      operation: async () => {
+      operation: async (tx) => {
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
-        const ttx = await prisma.treasuryTransaction.create({
+        const ttx = await tx.treasuryTransaction.create({
           data: {
             shortCode: code,
             groupId: id,
@@ -294,6 +313,20 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             expiresAt,
           },
           include: { user: true },
+        });
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: id,
+          actorType: "user",
+          action: AuditAction.TREASURY_WITHDRAWAL_CREATED,
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          metadata: {
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            destination: body.destination,
+          },
         });
 
         const account = await stellar.loadAccount(treasuryKey);
@@ -411,7 +444,8 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           });
           await auditTx(tx, {
             userId: auth.id,
-            action: "treasury.confirm.failed",
+            actorType: "user",
+            action: AuditAction.TREASURY_TX_FAILED,
             entityType: "treasury_transaction",
             entityId: id,
             outcome: "failure",
@@ -431,7 +465,8 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         });
         await auditTx(tx, {
           userId: auth.id,
-          action: "treasury.confirm",
+          actorType: "user",
+          action: AuditAction.TREASURY_TX_CONFIRMED,
           entityType: "treasury_transaction",
           entityId: id,
           metadata: { hash, direction: fresh.direction },

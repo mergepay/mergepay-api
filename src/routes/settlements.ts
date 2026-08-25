@@ -27,7 +27,9 @@ import { requireMembership } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { validateSettlementXdr } from "../services/settlement-xdr";
 import { shortCode } from "../services/codes";
-import { audit, auditTx } from "../services/audit";
+import { audit } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
+import { recordSettlementCreated, submitSettlementXdr } from "../services/settlement-machine";
 import { rateLimited } from "../lib/rate-limit";
 import {
   readIdempotencyKey,
@@ -189,6 +191,16 @@ export default async function settlementRoutes(app: FastifyInstance) {
           source: "api",
         });
 
+        await recordSettlementCreated(tx, {
+          settlementId: settlement.id,
+          groupId: expense.groupId,
+          userId: auth.id,
+          toUserId: expense.payerUserId,
+          amount: myShare.shareAmount.toString(),
+          assetCode,
+          assetIssuer,
+        });
+
         await tx.expenseShare.update({
           where: { id: myShare.id },
           data: { status: "settling" },
@@ -276,6 +288,16 @@ export default async function settlementRoutes(app: FastifyInstance) {
           source: "api",
         });
 
+        await recordSettlementCreated(tx, {
+          settlementId: settlement.id,
+          groupId,
+          userId: auth.id,
+          toUserId: body.toUserId,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+        });
+
         const xdr = await buildSettlementXdr({
           fromPublicKey: auth.stellarPublicKey,
           toPublicKey: recipient.user.stellarPublicKey,
@@ -322,6 +344,19 @@ export default async function settlementRoutes(app: FastifyInstance) {
     });
     if (!settlementRow) throw Errors.notFound("Settlement not found");
     if (settlementRow.fromUserId !== auth.id) {
+      // Best-effort, not auditTx: there is no transaction here to be atomic
+      // with, and this event must still be recorded even though the request
+      // itself is about to be rejected.
+      await audit({
+        userId: auth.id,
+        groupId: settlementRow.groupId,
+        actorType: "user",
+        action: AuditAction.SETTLEMENT_REJECTED,
+        entityType: "settlement",
+        entityId: id,
+        outcome: "rejected",
+        metadata: { reason: "unauthorized" },
+      });
       throw Errors.forbidden("Only the payer can confirm this settlement");
     }
 
@@ -331,9 +366,11 @@ export default async function settlementRoutes(app: FastifyInstance) {
       await audit({
         userId: auth.id,
         groupId: settlementRow.groupId,
-        action: "settlement.confirm.validation_failed",
+        actorType: "user",
+        action: AuditAction.SETTLEMENT_REJECTED,
         entityType: "settlement",
         entityId: id,
+        outcome: "rejected",
         metadata: {
           // The message is the service's own stable text, never the envelope.
           reason: err instanceof Error ? err.message : "validation failed",
@@ -368,49 +405,21 @@ export default async function settlementRoutes(app: FastifyInstance) {
           return { settlement: serializeSettlement(settlement) };
         }
 
-        if (settlement.status === "failed") {
-          // A previously-failed settlement can be re-signed and retried. The
-          // retry bookkeeping is reset below so the worker picks it up fresh.
-          await auditTx(tx, {
-            userId: auth.id,
-            action: "settlement.confirm.retry",
-            entityType: "settlement",
-            entityId: id,
-            metadata: { previousFailure: settlement.failureReason },
-          });
-        }
-
         // Guard the transition with a conditional update: only rows still in a
         // confirmable status are moved to "submitted". If a concurrent request
         // moved the settlement off a confirmable status between the read above
         // and here, this affects zero rows and we return the winning state
-        // instead of clobbering it.
-        const { count } = await tx.settlement.updateMany({
-          where: { id, status: { in: ["pending", "failed"] } },
-          data: {
-            transactionXdr: body.signedXdr,
-            status: "submitted",
-            submittedAt: new Date(),
-            retryCount: 0,
-            failureReason: null,
-          },
+        // instead of clobbering it. The retry bookkeeping (for a previously
+        // failed settlement being re-signed) is reset as part of that same
+        // guarded update — see submitSettlementXdr.
+        await submitSettlementXdr({
+          tx,
+          settlementId: id,
+          userId: auth.id,
+          signedXdr: body.signedXdr,
+          currentStatus: settlement.status,
+          previousFailureReason: settlement.failureReason,
         });
-
-        if (count > 0) {
-          await recordStatusTransitionInTransaction(tx, {
-            entityType: "settlement",
-            entityId: id,
-            newStatus: "submitted",
-            source: "api",
-          });
-          await auditTx(tx, {
-            userId: auth.id,
-            action: "settlement.confirm",
-            entityType: "settlement",
-            entityId: id,
-            metadata: { status: "submitted" },
-          });
-        }
 
         const finalSettlement = await tx.settlement.findUniqueOrThrow({
           where: { id },

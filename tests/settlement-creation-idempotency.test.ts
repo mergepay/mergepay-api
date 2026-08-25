@@ -162,6 +162,41 @@ describe("POST /expenses/:id/settle — idempotency", () => {
     expect(prisma.settlement.create).toHaveBeenCalledTimes(1);
   });
 
+  it("records a SETTLEMENT_CREATED audit event with actor, target, and amount, atomically with the creation", async () => {
+    prisma.idempotencyKey.findUnique.mockResolvedValueOnce(null);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/expenses/expense_1/settle",
+      headers: { ...authHeader(), "idempotency-key": "settle-audit-key" },
+      payload: {},
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user_1",
+        groupId: "group_1",
+        actorType: "user",
+        action: "settlement.created",
+        entityType: "settlement",
+        entityId: "settle_new",
+        metadata: expect.objectContaining({
+          toUserId: "payer_1",
+          amount: "10",
+          assetCode: "XLM",
+        }),
+      }),
+    });
+
+    // The unsigned XDR the response also carries must never leak into the
+    // audit trail.
+    const auditedMetadata = JSON.stringify(
+      prisma.auditLog.create.mock.calls.map((c: any[]) => c[0].data.metadata)
+    );
+    expect(auditedMetadata).not.toContain("unsigned-xdr");
+  });
+
   it("returns a conflict when the same key is reused for a different request", async () => {
     prisma.idempotencyKey.findUnique.mockResolvedValue({
       userId: "user_1",

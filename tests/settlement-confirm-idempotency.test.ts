@@ -273,7 +273,7 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
     expect(prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          action: "settlement.confirm.retry",
+          action: "settlement.retried",
           metadata: expect.objectContaining({
             previousFailure: "insufficient balance",
           }),
@@ -303,6 +303,42 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
     expect(res.json().settlement.status).toBe("completed");
     // The handler returns early for completed/submitted settlements, so
     // updateMany and audit are never called — the settlement is not modified.
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects (403) and audits a SETTLEMENT_REJECTED event when someone other than the payer tries to confirm", async () => {
+    prisma.idempotencyKey.findUnique.mockResolvedValue(null);
+    prisma.settlement.findUnique.mockResolvedValue(pendingSettlement()); // fromUserId: "user_1"
+
+    const intruderToken = signToken({
+      id: "user_intruder",
+      stellarPublicKey: "GINTRUDERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_1/confirm",
+      headers: {
+        authorization: `Bearer ${intruderToken}`,
+        "idempotency-key": "confirm-intruder",
+      },
+      payload: { signedXdr: "SOME_XDR" },
+    });
+
+    expect(res.statusCode).toBe(403);
+    // Never silently un-logged: the rejection is recorded even though the
+    // request never reaches the idempotent operation or the transaction.
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user_intruder",
+        groupId: "group_1",
+        actorType: "user",
+        action: "settlement.rejected",
+        entityType: "settlement",
+        entityId: "settle_1",
+        metadata: expect.objectContaining({ outcome: "rejected", reason: "unauthorized" }),
+      }),
+    });
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 });

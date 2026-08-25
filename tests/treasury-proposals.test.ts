@@ -219,6 +219,22 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
     expect(body.proposal.id).toBe("prop_1");
     expect(body.proposal.threshold).toBe(2);
     expect(body.xdr).toBe("AAAA-unsigned");
+
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: user.id,
+        groupId: group.id,
+        actorType: "user",
+        action: "treasury.proposal_created",
+        entityType: "treasury_proposal",
+        entityId: "prop_1",
+      }),
+    });
+    // The unsigned envelope itself must never appear in the audit trail.
+    const auditedMetadata = JSON.stringify(
+      prisma.auditLog.create.mock.calls.map((c: any[]) => c[0].data.metadata)
+    );
+    expect(auditedMetadata).not.toContain("AAAA-unsigned");
   });
 
   it("rejects a non-Stellar destination", async () => {
@@ -508,6 +524,105 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
     expect(body.threshold).toBe(1);
     expect(body.stellarTxHash).toBe("hash_xyz");
     expect(body.status).toBe("confirmed");
+
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: user.id,
+        groupId: "group_1",
+        actorType: "user",
+        action: "treasury.proposal_submitted",
+        entityType: "treasury_proposal",
+        entityId: "prop_1",
+        metadata: expect.objectContaining({ stellarTxHash: "hash_xyz" }),
+      }),
+    });
+    // No signature blob or envelope ever lands in the audit trail.
+    const auditedMetadata = JSON.stringify(
+      prisma.auditLog.create.mock.calls.map((c: any[]) => c[0].data.metadata)
+    );
+    expect(auditedMetadata).not.toContain(signed.toXDR());
+  });
+
+  it("records a TREASURY_PROPOSAL_FAILED event (outcome: failure) when Horizon rejects the merged submission", async () => {
+    const user = fakeUser({ id: "u_signatory" });
+    const treasury = Keypair.random();
+
+    const proposalXdr = makeUnsignedXdr({
+      source: treasury,
+      destination: Keypair.random().publicKey(),
+      amount: "5",
+    });
+    const pendingProposal = {
+      id: "prop_1",
+      groupId: "group_1",
+      creatorId: "u_creator",
+      xdr: proposalXdr,
+      threshold: 1,
+      signatures: [],
+      status: "pending",
+      stellarTxHash: null,
+      failureReason: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "member",
+    });
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { user: { stellarPublicKey: treasury.publicKey() } },
+    ]);
+    prisma.treasuryProposal.findUnique
+      .mockResolvedValueOnce(pendingProposal)
+      .mockResolvedValueOnce(pendingProposal);
+
+    const signed = new Transaction(proposalXdr, NET);
+    signed.sign(treasury);
+
+    prisma.treasuryProposal.update.mockResolvedValue({
+      ...pendingProposal,
+      status: "failed",
+      failureReason: "Horizon rejected the transaction",
+    });
+
+    const { stellar } = await import("../src/services/stellar");
+    vi.mocked(stellar.submitSigned).mockRejectedValueOnce(
+      new Error("Horizon rejected the transaction")
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals/prop_1/sign",
+      headers: authHeader(user),
+      payload: { signedXdr: signed.toXDR() },
+    });
+
+    // The Horizon rejection is a real 502 to the caller...
+    expect(res.statusCode).toBe(502);
+
+    // ...but the failure was still durably recorded, atomically with the
+    // proposal's own status:"failed" write — never silently un-logged.
+    expect(prisma.treasuryProposal.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "failed" }),
+      })
+    );
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: user.id,
+        groupId: "group_1",
+        actorType: "user",
+        action: "treasury.proposal_failed",
+        entityType: "treasury_proposal",
+        entityId: "prop_1",
+        metadata: expect.objectContaining({
+          outcome: "failure",
+          reason: "Horizon rejected the transaction",
+        }),
+      }),
+    });
   });
 });
 

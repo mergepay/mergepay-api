@@ -186,6 +186,7 @@ async function writeStatus(
 
   await audit({
     userId: null,
+    actorType: "worker",
     action: `stellar_transaction_${status}`,
     entityType: table,
     entityId: record.id,

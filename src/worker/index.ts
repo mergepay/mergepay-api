@@ -316,6 +316,7 @@ async function confirmSubmission(params: {
   await audit({
     userId: null,
     groupId: job.groupId,
+    actorType: "worker",
     action: "settlement.submitted_to_stellar",
     entityType: "settlement",
     entityId: job.id,

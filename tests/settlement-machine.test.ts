@@ -5,6 +5,11 @@ const h = vi.hoisted(() => {
     settlement: {
       findUnique: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
+    },
+    statusHistory: {
+      findFirst: vi.fn(async () => null),
+      create: vi.fn(async (args: any) => args.data),
     },
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
@@ -19,6 +24,8 @@ import {
   isTerminalSettlementStatus,
   isSettlementRecoverable,
   applySettlementTransition,
+  recordSettlementCreated,
+  submitSettlementXdr,
   classifySettlementError,
   type SettlementStatus,
 } from "../src/services/settlement-machine";
@@ -187,13 +194,64 @@ describe("applySettlementTransition", () => {
     );
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
-        action: "settlement.status_changed",
+        action: "settlement.xdr_submitted",
+        userId: "user_1",
+        actorType: "user",
         entityId: "settle_1",
         metadata: expect.objectContaining({
           from: "pending",
           to: "submitted",
           source: "user",
         }),
+      }),
+    });
+  });
+
+  it("attributes a worker-sourced transition to a worker actor, not the payer", async () => {
+    prisma.settlement.findUnique.mockResolvedValue(
+      fakeSettlement({ status: "verifying" })
+    );
+    prisma.settlement.update.mockResolvedValue(
+      fakeSettlement({ status: "confirmed", confirmedAt: new Date() })
+    );
+
+    await applySettlementTransition({
+      settlementId: "settle_1",
+      nextStatus: "confirmed",
+      source: "worker",
+      extraData: { stellarTxHash: "hash_123" },
+    });
+
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "settlement.confirmed",
+        userId: null,
+        actorType: "worker",
+        entityId: "settle_1",
+      }),
+    });
+  });
+
+  it("records a failed transition with a failure outcome", async () => {
+    prisma.settlement.findUnique.mockResolvedValue(
+      fakeSettlement({ status: "submitted" })
+    );
+    prisma.settlement.update.mockResolvedValue(
+      fakeSettlement({ status: "failed", failureReason: "boom" })
+    );
+
+    await applySettlementTransition({
+      settlementId: "settle_1",
+      nextStatus: "failed",
+      source: "worker",
+    });
+
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "settlement.failed",
+        userId: null,
+        actorType: "worker",
+        metadata: expect.objectContaining({ outcome: "failure" }),
       }),
     });
   });
@@ -318,5 +376,150 @@ describe("applySettlementTransition", () => {
         source: "worker",
       })
     ).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("rolls back the whole transition when the audit write fails — no unaudited mutation is left committed", async () => {
+    prisma.settlement.findUnique.mockResolvedValue(fakeSettlement());
+    prisma.settlement.update.mockResolvedValue(
+      fakeSettlement({ status: "submitted" })
+    );
+    prisma.auditLog.create.mockRejectedValueOnce(new Error("audit db down"));
+
+    // applySettlementTransition runs settlement.update and auditTx inside the
+    // SAME prisma.$transaction callback. In real Postgres, a callback that
+    // throws rolls back every write it made, including settlement.update —
+    // so a failed audit insert can never leave an unaudited status change
+    // committed. This test proves the *contract* the transaction relies on:
+    // the promise this function returns must reject, exactly as it would if
+    // Postgres itself rolled the transaction back.
+    await expect(
+      applySettlementTransition({
+        settlementId: "settle_1",
+        nextStatus: "submitted",
+        source: "user",
+      })
+    ).rejects.toThrow("audit db down");
+  });
+});
+
+describe("recordSettlementCreated", () => {
+  it("audits creation with actor, target, and settlement details", async () => {
+    const tx = prisma;
+    await recordSettlementCreated(tx, {
+      settlementId: "settle_new",
+      groupId: "group_1",
+      userId: "user_1",
+      toUserId: "user_2",
+      amount: "12.5000000",
+      assetCode: "USDC",
+      assetIssuer: "GISSUER",
+    });
+
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user_1",
+        groupId: "group_1",
+        actorType: "user",
+        action: "settlement.created",
+        entityType: "settlement",
+        entityId: "settle_new",
+        metadata: expect.objectContaining({
+          toUserId: "user_2",
+          amount: "12.5000000",
+          assetCode: "USDC",
+          assetIssuer: "GISSUER",
+        }),
+      }),
+    });
+  });
+
+  it("never includes a signed XDR or private key in the recorded metadata", async () => {
+    await recordSettlementCreated(prisma, {
+      settlementId: "settle_new",
+      groupId: "group_1",
+      userId: "user_1",
+      toUserId: "user_2",
+      amount: "12.5000000",
+      assetCode: "USDC",
+      assetIssuer: null,
+    });
+
+    const call = prisma.auditLog.create.mock.calls[0][0];
+    const serialized = JSON.stringify(call.data.metadata);
+    expect(serialized).not.toMatch(/AAAA[A-Za-z0-9+/]{20,}/); // no XDR-shaped base64 blob
+    expect(call.data.metadata).not.toHaveProperty("privateKey");
+    expect(call.data.metadata).not.toHaveProperty("signedXdr");
+  });
+});
+
+describe("submitSettlementXdr", () => {
+  it("moves a pending settlement to submitted and records SETTLEMENT_XDR_SUBMITTED", async () => {
+    prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+
+    const result = await submitSettlementXdr({
+      tx: prisma,
+      settlementId: "settle_1",
+      userId: "user_1",
+      signedXdr: "signed-envelope-not-logged",
+      currentStatus: "pending",
+    });
+
+    expect(result.count).toBe(1);
+    expect(prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_1", status: { in: ["pending", "failed"] } },
+        data: expect.objectContaining({ status: "submitted" }),
+      })
+    );
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user_1",
+        actorType: "user",
+        action: "settlement.xdr_submitted",
+        entityType: "settlement",
+        entityId: "settle_1",
+      }),
+    });
+    // The signed envelope itself must never appear in the audit trail.
+    const auditedMetadata = JSON.stringify(
+      prisma.auditLog.create.mock.calls.map((c: any[]) => c[0].data.metadata)
+    );
+    expect(auditedMetadata).not.toContain("signed-envelope-not-logged");
+  });
+
+  it("records SETTLEMENT_RETRIED (in addition to the submission event) when retrying a failed settlement", async () => {
+    prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+
+    await submitSettlementXdr({
+      tx: prisma,
+      settlementId: "settle_1",
+      userId: "user_1",
+      signedXdr: "new-signed-envelope",
+      currentStatus: "failed",
+      previousFailureReason: "insufficient balance",
+    });
+
+    const actions = prisma.auditLog.create.mock.calls.map(
+      (c: any[]) => c[0].data.action
+    );
+    expect(actions).toEqual(["settlement.retried", "settlement.xdr_submitted"]);
+  });
+
+  it("does not record SETTLEMENT_XDR_SUBMITTED when a concurrent request already won the transition (count 0)", async () => {
+    prisma.settlement.updateMany.mockResolvedValue({ count: 0 });
+
+    const result = await submitSettlementXdr({
+      tx: prisma,
+      settlementId: "settle_1",
+      userId: "user_1",
+      signedXdr: "signed-envelope",
+      currentStatus: "pending",
+    });
+
+    expect(result.count).toBe(0);
+    const actions = prisma.auditLog.create.mock.calls.map(
+      (c: any[]) => c[0].data.action
+    );
+    expect(actions).not.toContain("settlement.xdr_submitted");
   });
 });

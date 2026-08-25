@@ -23,7 +23,6 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar } from "../services/stellar";
-import { audit } from "../services/audit";
 import { isPositive } from "../services/money";
 import {
   serializeGroup,
@@ -94,19 +93,8 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         threshold
       );
 
-    await audit({
-      userId: auth.id,
-      action: "treasury.proposal.created",
-      entityType: "treasury_proposal",
-      entityId: proposal.id,
-      metadata: {
-        groupId,
-        destination: body.destination,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        threshold,
-      },
-    });
+    // Creation is audited inside treasuryProposalsService.create, atomically
+    // with the proposal row — no separate call needed here.
 
     return {
       proposal: serializeTreasuryProposal(proposal),
@@ -149,24 +137,14 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
       const result = await treasuryProposalsService.submitSignatures({
         proposalId,
         groupId,
+        userId: auth.id,
         memberPublicKeys,
         signedXdr: body.signedXdr,
       });
 
-      await audit({
-        userId: auth.id,
-        action:
-          result.status === "confirmed"
-            ? "treasury.proposal.submitted"
-            : "treasury.proposal.signed",
-        entityType: "treasury_proposal",
-        entityId: proposalId,
-        metadata: {
-          signatureCount: result.signatureCount,
-          threshold: result.threshold,
-          stellarTxHash: result.stellarTxHash,
-        },
-      });
+      // Signing, submission, and submission failure are each audited inside
+      // treasuryProposalsService, atomically with their state write — no
+      // separate call needed here.
 
       const proposal = await prisma.treasuryProposal.findUnique({
         where: { id: proposalId },

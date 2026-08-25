@@ -432,6 +432,7 @@ describe("group routes", () => {
           userId: admin.id,
           groupId: null,
           action: "group.member_remove",
+          actorType: "user",
           entityType: "group",
           entityId: "group_1",
           metadata: { removedUserId: targetUser.id },

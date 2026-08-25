@@ -356,6 +356,12 @@ model AuditLog {
   entityType String?  @map("entity_type")
   entityId   String?  @map("entity_id")
   metadata   Json?
+  // Who/what performed the action: "user" (userId is set), "worker"
+  // (background job, e.g. settlement submission/reconciliation), or "system"
+  // (any other non-interactive process). Defaults to "user" so every
+  // pre-existing row (all written by user-attributed code paths) reads
+  // correctly without a backfill. See src/services/audit.ts.
+  actorType  String   @default("user") @map("actor_type")
   createdAt  DateTime @default(now()) @map("created_at")
 
   user  User?  @relation(fields: [userId], references: [id])

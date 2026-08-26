@@ -90,7 +90,7 @@ model Expense {
   payer  User           @relation("ExpensePayer", fields: [payerUserId], references: [id])
   shares ExpenseShare[]
 
-  @@index([groupId])
+  @@index([groupId, createdAt, id])
   @@index([payerUserId])
   @@map("expenses")
 }

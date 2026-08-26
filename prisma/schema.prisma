@@ -287,35 +287,57 @@ model Withdrawal {
   @@map("withdrawals")
 }
 
-/// Multisig treasury proposal. Holds an unsigned transaction XDR that
-/// group members incrementally sign; once `signatures.length >= threshold`
-/// the backend concatenates the signatures and submits to Horizon. See
-/// Issue #41.
+/// Multisig treasury proposal. Holds an unsigned transaction envelope (XDR)
+/// sourced from a group's treasury account; authorized group admins sign it
+/// incrementally, and once the collected signer weight reaches `threshold`
+/// the backend merges the signatures and submits to Horizon.
+///
+/// Status lifecycle: PENDING_SIGNATURES -> READY -> SUBMITTED / FAILED.
 model TreasuryProposal {
   id         String   @id @default(cuid())
   groupId    String   @map("group_id")
   creatorId  String   @map("creator_id")
-  /// Unsigned transaction envelope (XDR). The field is named `xdr` per the
-  /// issue spec; values are always pre-signature when this row is created.
+  /// Unsigned transaction envelope (base64 XDR). Always pre-signature when
+  /// this row is created.
   xdr        String   @map("xdr")
+  /// Cumulative signer weight required before submission — the treasury
+  /// account's on-chain "high" threshold captured at creation time.
   threshold  Int      @default(1)
-  /// Array of `{ publicKey, signature }` records explicitly verified by
-  /// the backend. Stored as JSON for simplicity (signatures are bounded
-  /// by the group threshold, ~few entries per proposal).
-  signatures Json     @default("[]")
-  status     String   @default("pending")
+  status     String   @default("PENDING_SIGNATURES")
   stellarTxHash String? @map("stellar_tx_hash")
   failureReason  String? @map("failure_reason")
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
 
-  group   Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
-  creator User  @relation("ProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  group      Group               @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  creator    User                @relation("ProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  signatures TreasurySignature[]
 
   @@index([groupId])
   @@index([status])
   @@index([creatorId])
   @@map("treasury_proposals")
+}
+
+/// One verified partial signature collected against a TreasuryProposal.
+/// Only the base64 signature and signer public key are ever stored — never
+/// a private key or seed (see `assertTreasuryPolicy` / signature
+/// verification in src/services/treasury.ts).
+model TreasurySignature {
+  id              String   @id @default(cuid())
+  proposalId      String   @map("proposal_id")
+  signerPublicKey String   @map("signer_public_key")
+  /// Base64-encoded 64-byte ed25519 signature.
+  signature       String
+  /// The signer's on-chain signing weight at the time of verification.
+  weight          Int
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  proposal TreasuryProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+
+  @@unique([proposalId, signerPublicKey])
+  @@index([proposalId])
+  @@map("treasury_signatures")
 }
 
 model IdempotencyKey {

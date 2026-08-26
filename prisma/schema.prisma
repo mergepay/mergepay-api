@@ -283,7 +283,12 @@ model Withdrawal {
 
   @@index([userId])
   @@index([status])
-  @@index([anchorTxId])
+  // Unique (not just indexed): the anchor's transaction id is the
+  // idempotency key for webhook/poll reconciliation — two Withdrawal rows
+  // must never be able to claim the same anchor transaction. Postgres
+  // allows any number of NULL anchor_tx_id rows (pre-confirm withdrawals)
+  // under a unique index, so this doesn't constrain row creation.
+  @@unique([anchorTxId])
   @@map("withdrawals")
 }
 

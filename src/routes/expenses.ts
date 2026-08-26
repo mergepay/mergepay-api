@@ -5,10 +5,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
-import { normalizeAmount } from "../services/money";
 import { shortCode } from "../services/codes";
-import { auditTx } from "../services/audit";
-import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
 import {
   buildPage,
@@ -18,6 +15,7 @@ import {
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
+import { refineValidatedAsset, canonicalAmountSchema } from "../lib/money";
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });
@@ -28,18 +26,22 @@ const shareInput = z.object({
   percent: z.number().optional(),
 });
 
-const createExpenseSchema = z.object({
-  title: z.string().min(1).max(80),
-  description: z.string().max(500).optional(),
-  amount: z.string().min(1),
-  assetCode: z.string().min(1).max(12),
-  assetIssuer: z.string().nullable().optional(),
-  splitType: z.enum(["equal", "custom", "percentage"]),
-  shares: z.array(shareInput).min(1),
-  payerUserId: z.string().optional(),
-  memo: z.string().max(24).optional(),
-  receiptUrl: z.string().nullable().optional(),
-});
+const createExpenseSchema = z
+  .object({
+    title: z.string().min(1).max(80),
+    description: z.string().max(500).optional(),
+    amount: canonicalAmountSchema,
+    assetCode: z.string().min(1).max(12),
+    assetIssuer: z.string().nullable().optional(),
+    splitType: z.enum(["equal", "custom", "percentage"]),
+    shares: z.array(shareInput).min(1),
+    payerUserId: z.string().optional(),
+    memo: z.string().max(24).optional(),
+    receiptUrl: z.string().nullable().optional(),
+  })
+  .superRefine((val, ctx) => {
+    refineValidatedAsset(ctx, val.assetCode, val.assetIssuer);
+  });
 
 const updateExpenseSchema = z.object({
   title: z.string().min(1).max(80).optional(),
@@ -63,8 +65,6 @@ export default async function expenseRoutes(app: FastifyInstance) {
     await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
-    validateAmount(body.amount);
-    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
 

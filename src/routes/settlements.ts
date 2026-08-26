@@ -51,7 +51,6 @@ import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
-import { validateAsset, validateAmount } from "../services/assets";
 import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
 import {
   intentExpiry,
@@ -231,9 +230,6 @@ export default async function settlementRoutes(app: FastifyInstance) {
       .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
-
-    validateAmount(body.amount);
-    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     if (body.toUserId === auth.id) {
       throw Errors.badRequest("self_settle", "You cannot settle with yourself");

@@ -29,6 +29,7 @@ import {
   assertTimeBoundsMatchIntent,
   readTimeBounds,
 } from "../lib/time-bounds";
+import { compareAmounts } from "../lib/money";
 
 let _server: Horizon.Server | null = null;
 function server(): Horizon.Server {
@@ -539,7 +540,7 @@ function assertMatchesIntent(tx: Transaction, expected: PaymentExpectation): voi
     throw Errors.badRequest("xdr_mismatch", "Payment asset does not match");
   }
 
-  if (normalizeAmount(op.amount) !== normalizeAmount(expected.amount)) {
+  if (compareAmounts(op.amount, expected.amount) !== 0) {
     throw Errors.badRequest("xdr_mismatch", "Payment amount does not match");
   }
 
@@ -601,12 +602,6 @@ export function validatePaymentTx(tx: Transaction, expected: PaymentExpectation)
       );
     }
   }
-}
-
-function normalizeAmount(a: string): string {
-  // Compare at 7dp precision regardless of trailing zeros.
-  const [w, f = ""] = a.split(".");
-  return `${w}.${(f + "0000000").slice(0, 7)}`;
 }
 
 /**

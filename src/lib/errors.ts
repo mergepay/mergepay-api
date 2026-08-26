@@ -76,8 +76,15 @@ export const ErrorCode = {
   RATE_LIMITED: "RATE_LIMITED",
   // 500
   INTERNAL_ERROR: "INTERNAL_ERROR",
-  // 502
+  // 502 — an upstream dependency (Horizon, anchor) was unreachable or unusable.
   UPSTREAM_ERROR: "UPSTREAM_ERROR",
+  /**
+   * 502 — the provider processed the request and rejected it (e.g. Horizon
+   * result codes such as `tx_bad_seq`, or an anchor 4xx). Distinct from
+   * UPSTREAM_ERROR so callers and workers can tell a permanent rejection from
+   * a transient dependency failure. See src/lib/provider-error.ts.
+   */
+  PROVIDER_REJECTED: "PROVIDER_REJECTED",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];

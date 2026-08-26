@@ -2,6 +2,7 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
+import { TimeoutError, TransportError } from "../services/timeout";
 
 export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
@@ -23,6 +24,18 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         message,
         requestId,
         details,
+      });
+    }
+
+    // A service let a raw timeout/transport failure escape (it should have
+    // converted it via toProviderError). Still answer with a safe 502 rather
+    // than the generic 500.
+    if (err instanceof TimeoutError || err instanceof TransportError) {
+      return reply.code(502).send({
+        code: "UPSTREAM_ERROR",
+        error: "UPSTREAM_ERROR",
+        message: "An upstream provider is temporarily unavailable.",
+        requestId,
       });
     }
 

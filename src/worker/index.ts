@@ -38,6 +38,7 @@ import { prisma } from "../db";
 import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { processPendingWebhookDeliveries } from "../services/webhook";
 import {
   verifyTransactionMemo,
   verifyPaymentOperation,
@@ -919,6 +920,22 @@ export async function expireInvites(): Promise<void> {
   });
 }
 
+/**
+ * Send queued webhook deliveries. Sending lives here rather than in the request
+ * path so a slow or unreachable receiver cannot hold an API request open for
+ * the length of its own backoff.
+ */
+export async function deliverPendingWebhooks(): Promise<void> {
+  const { delivered, failed, attempted } = await processPendingWebhookDeliveries();
+
+  if (attempted > 0) {
+    log.info(
+      { job: "webhook_delivery", outcome: "ok", attempted, delivered, failed },
+      "processed webhook deliveries"
+    );
+  }
+}
+
 export async function runWorkerCycle(): Promise<void> {
   // Recover first: a restart should adopt the previous process's work before
   // looking for new jobs.
@@ -930,6 +947,7 @@ export async function runWorkerCycle(): Promise<void> {
     reconcileSettlements(),
     reconcileAllTreasuryBalances(),
     expireInvites(),
+    deliverPendingWebhooks(),
     cleanupChallenges(),
   ]);
 }

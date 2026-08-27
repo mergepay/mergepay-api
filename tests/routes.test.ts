@@ -427,14 +427,21 @@ describe("group routes", () => {
       expect(prisma.groupMember.delete).toHaveBeenCalledWith({
         where: { groupId_userId: { groupId: "group_1", userId: targetUser.id } },
       });
+      // The record now carries the group it belongs to — it was written with
+      // groupId: null before, so group-scoped audit queries never saw member
+      // removals — along with the role the removed member held.
       expect(prisma.auditLog.create).toHaveBeenCalledWith({
         data: {
           userId: admin.id,
-          groupId: null,
+          groupId: "group_1",
           action: "group.member_remove",
           entityType: "group",
           entityId: "group_1",
-          metadata: { removedUserId: targetUser.id },
+          metadata: {
+            removedUserId: targetUser.id,
+            removedRole: "member",
+            outcome: "success",
+          },
         },
       });
     });

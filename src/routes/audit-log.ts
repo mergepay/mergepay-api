@@ -2,9 +2,8 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { requireAdmin, requireMembership } from "../services/access";
+import { requireAdmin } from "../services/access";
 import { listAuditLogs } from "../services/audit-log";
-import { getGroupAuditLogs } from "../services/auditLogService";
 import { serializeAuditLogEntry } from "../serializers";
 
 const querySchema = z.object({
@@ -12,8 +11,6 @@ const querySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
   action: z.string().min(1).max(100).optional(),
   actorUserId: z.string().min(1).optional(),
-  startDate: z.string().datetime().optional(),
-  endDate: z.string().datetime().optional(),
   from: z.string().datetime().optional(),
   to: z.string().datetime().optional(),
 });
@@ -21,21 +18,22 @@ const querySchema = z.object({
 export default async function auditLogRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-  const handler = async (req: any, legacy = false) => {
+  // Group administrators only — audit history is a privileged view into
+  // membership, expense, treasury, and settlement changes for the group.
+  const listAuditHistory = async (req: any) => {
     const auth = requireUser(req);
-    const { groupId } = z.object({ groupId: z.string().min(1).max(64) }).parse(req.params);
-    if (legacy) await requireAdmin(groupId, auth.id);
-    else await requireMembership(groupId, auth.id);
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireAdmin(id, auth.id);
 
     const query = querySchema.parse(req.query);
-    const from = query.startDate ? new Date(query.startDate) : query.from ? new Date(query.from) : undefined;
-    const to = query.endDate ? new Date(query.endDate) : query.to ? new Date(query.to) : undefined;
+    const from = query.from ? new Date(query.from) : undefined;
+    const to = query.to ? new Date(query.to) : undefined;
     if (from && to && from > to) {
-      throw Errors.badRequest("invalid_range", "`startDate` must not be after `endDate`");
+      throw Errors.badRequest("invalid_range", "`from` must not be after `to`");
     }
 
-    const { events, nextCursor } = await (legacy ? listAuditLogs : getGroupAuditLogs)(
-      groupId,
+    const { events, nextCursor } = await listAuditLogs(
+      id,
       { action: query.action, actorUserId: query.actorUserId, from, to },
       query.cursor,
       query.limit
@@ -47,8 +45,6 @@ export default async function auditLogRoutes(app: FastifyInstance) {
     };
   };
 
-  app.get("/groups/:groupId/audit-logs", (req) => handler(req));
-  // Preserve the original admin-only URL while clients migrate to the
-  // membership-authorized plural endpoint.
-  app.get("/groups/:groupId/audit-log", (req) => handler(req, true));
+  app.get("/groups/:id/audit-log", listAuditHistory);
+  app.get("/groups/:id/audit-logs", listAuditHistory);
 }

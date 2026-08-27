@@ -27,7 +27,7 @@ import userGroupsRoutes from "./routes/user-groups";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
-import { getReadiness } from "./services/health";
+
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -238,11 +238,17 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.get("/health", liveness);
   app.get("/health/live", liveness);
 
-  const { getReadiness } = await import("./services/health.js");
+  const { getReadiness, getDeepHealth } = await import("./services/health.js");
   app.get("/health/ready", async (request, reply) => {
     const readiness = await getReadiness();
     const statusCode = readiness.status === "ok" ? 200 : 503;
     return reply.code(statusCode).send(readiness);
+  });
+
+  app.get("/health/deep", async (request, reply) => {
+    const deepHealth = await getDeepHealth();
+    const statusCode = deepHealth.status === "ok" ? 200 : 503;
+    return reply.code(statusCode).send(deepHealth);
   });
 
   await app.register(authRoutes);

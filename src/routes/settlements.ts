@@ -61,6 +61,7 @@ import {
 import {
   isTerminalSettlementStatus,
   resolveSettlementStatus,
+  toFailureInfo,
   toPublicStatus,
 } from "../services/settlement-status";
 import { recordStatusTransitionInTransaction } from "../services/status-history";
@@ -397,7 +398,11 @@ export default async function settlementRoutes(app: FastifyInstance) {
             status: "submitted",
             submittedAt: new Date(),
             retryCount: 0,
+            // A re-signed settlement starts clean: leaving the previous
+            // attempt's category behind would report a live submission as
+            // having failed for a reason that no longer applies.
             failureReason: null,
+            failureCategory: null,
           },
         });
 
@@ -460,19 +465,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
 
     // Skipping the provider lookup is opt-in via `refresh=false`, for a client
     // that wants only the persisted state (e.g. rendering a list).
+    const persistedStatus = toPublicStatus(settlement);
     const resolved = refresh
       ? await resolveSettlementStatus(settlement)
       : {
-          status: toPublicStatus(settlement),
+          status: persistedStatus,
           onChain: {
             checked: false,
             found: false,
             successful: null,
             transactionHash: settlement.stellarTxHash ?? null,
           },
-          failure: settlement.failureReason
-            ? { reason: settlement.failureReason }
-            : null,
+          // Same helper the refreshing path uses, so skipping the Horizon
+          // lookup changes what is *known*, never how a failure is reported.
+          failure: toFailureInfo(settlement, persistedStatus),
           expiresAt: settlement.expiresAt
             ? settlement.expiresAt.toISOString()
             : null,

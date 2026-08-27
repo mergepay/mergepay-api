@@ -255,7 +255,13 @@ interface SettlementStatusResponse {
     successful: boolean | null;        // Horizon's own flag; null if not found
     transactionHash: string | null;
   };
-  failure: { reason: string } | null;  // scrubbed; no upstream text or stack
+  // Present only when `status` is "failed"; null otherwise, including while a
+  // settlement is still being retried. `category` is the stable value to
+  // branch on; `reason` is scrubbed — no upstream text, XDR, or stack.
+  failure: {
+    category: SettlementFailureCategory;
+    reason: string;
+  } | null;
   expiresAt: string | null;            // ISO 8601
   expiresInSeconds: number | null;     // negative once lapsed
   createdAt: string;                   // ISO 8601
@@ -280,11 +286,40 @@ type SettlementStatus =
 | `awaiting_signature` | no | Unsigned XDR issued; no signed envelope returned yet | Sign it before `expiresAt` |
 | `submitted` | no | A signed envelope was accepted and is being submitted; not yet confirmed on-chain | Keep polling |
 | `confirmed` | yes | The payment succeeded on-chain | Done |
-| `failed` | yes | Submission was rejected, or the transaction failed on-chain | Read `failure.reason` |
+| `failed` | yes | Submission was rejected, or the transaction failed on-chain | Branch on `failure.category` |
 | `expired` | yes | The signing window closed before submission | Create a new settlement |
 
 An unrecognised internal status maps to `awaiting_signature` — conservative, and
 never reported as paid.
+
+### Failure categories
+
+```ts
+type SettlementFailureCategory =
+  | "validation"
+  | "insufficient_funds"
+  | "expired"
+  | "upstream"
+  | "ledger_rejected"
+  | "internal";
+```
+
+| Category | Meaning | Client action |
+| --- | --- | --- |
+| `validation` | The request or signed envelope was wrong (malformed XDR, intent mismatch, authorization) | Fix the request; retrying the same input fails identically |
+| `insufficient_funds` | The payer cannot cover the amount, the network fee, or the account reserve, or lacks the trustline | Fund the account or add the trustline, then settle again |
+| `expired` | The signing window closed before submission | Create a new settlement; do not retry this one |
+| `upstream` | Horizon or the anchor was unreachable, timed out, or rate-limited | Retry later; nothing is wrong with the request |
+| `ledger_rejected` | The network rejected the transaction, or it failed on-chain | Permanent for this envelope; create a new settlement |
+| `internal` | An unclassified failure inside the API | Retry; contact support if it persists |
+
+The set is closed and stable — a client may switch on it exhaustively. A
+settlement that failed before this field existed reports `internal` rather than
+omitting the category, so the shape is the same for every failed settlement.
+
+The same categories are assigned by both the request path and the background
+worker, from one classifier, so a given failure is reported identically no
+matter which process observed it.
 
 ### Pending is not confirmed
 
@@ -303,7 +338,9 @@ erroring.
 
 Signed or unsigned XDRs, private keys, anchor or session tokens, provider
 credentials, upstream error text, and stack traces. `failure.reason` is limited
-to the short, already-scrubbed message the worker recorded.
+to the short, already-scrubbed message the worker recorded — capped at 300
+characters, with bearer tokens, labelled secrets, bare Stellar secret seeds, and
+bare transaction envelopes removed before it is ever persisted.
 
 ---
 

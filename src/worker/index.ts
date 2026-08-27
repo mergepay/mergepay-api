@@ -46,6 +46,10 @@ import { pollForConfirmation } from "../services/horizon-confirm";
 import { settlementPaymentIntent } from "../services/settlement-xdr";
 import { checkSettlementPreflight } from "../services/settlement-preflight";
 import {
+  classifySettlementFailure,
+  type SettlementFailureCategory,
+} from "../services/settlement-failure";
+import {
   anchorService,
   AUDITABLE_ANCHOR_STATUSES,
   TERMINAL_ANCHOR_STATUSES,
@@ -219,22 +223,48 @@ async function scheduleRetry(params: {
   );
 }
 
-/** Stop retrying and leave the job visible to operators with a reason. */
+/**
+ * Stop retrying and leave the job visible to operators with a reason.
+ *
+ * Two classifications are recorded, and they answer different questions:
+ * `errorCategory` is the retry decision (transient / indeterminate /
+ * permanent), while `failureCategory` is *why* it failed, from the controlled
+ * set in src/services/settlement-failure.ts. The latter is what the status
+ * endpoint returns and what the request path records for the same failure, so
+ * the two paths cannot drift.
+ *
+ * Callers pass the original `error` where they have one; where the failure is
+ * the worker's own decision rather than a thrown error (no envelope to submit,
+ * an expired window), they pass an explicit `failureCategory` instead.
+ */
 async function failSettlement(params: {
   job: SettlementJob;
   attempt: number;
   category: JobFailureCategory;
   reason: string;
   ctx: CorrelationContext;
+  /** The thrown error, when the failure came from one. */
+  error?: unknown;
+  /** Explicit category for a failure the worker decided on its own. */
+  failureCategory?: SettlementFailureCategory;
 }): Promise<void> {
-  const { job, attempt, category, reason, ctx } = params;
+  const { job, attempt, category, reason, ctx, error, failureCategory } = params;
+
+  const resolvedFailureCategory =
+    failureCategory ??
+    (error !== undefined
+      ? classifySettlementFailure(error).category
+      : classifySettlementFailure(reason).category);
 
   await applySettlementTransition({
     settlementId: job.id,
     nextStatus: "failed",
     source: "worker",
+    // Folded into the same transition the status change goes through, so the
+    // failure and the state it explains are committed together.
     extraData: {
       failureReason: reason,
+      failureCategory: resolvedFailureCategory,
       errorCategory: category,
       retryCount: attempt,
       nextAttemptAt: null,
@@ -256,6 +286,7 @@ async function failSettlement(params: {
       attempt,
       outcome: "failed",
       category,
+      failureCategory: resolvedFailureCategory,
       reason,
     },
     "settlement failed"
@@ -361,6 +392,8 @@ async function confirmSubmission(params: {
       category: "permanent",
       reason: `Transaction ${hash} failed on Stellar`,
       ctx,
+      // The network accepted and applied it, and it failed there.
+      failureCategory: "ledger_rejected",
     });
     return;
   }
@@ -404,6 +437,8 @@ export async function processSettlementJob(
       category: "permanent",
       reason: "Settlement has no signed transaction to submit",
       ctx,
+      // Nothing was ever signed — the settlement is unusable as recorded.
+      failureCategory: "validation",
     });
     return;
   }
@@ -417,6 +452,7 @@ export async function processSettlementJob(
       category: "permanent",
       reason: "Signing window expired before the transaction was submitted",
       ctx,
+      failureCategory: "expired",
     });
     return;
   }
@@ -443,6 +479,10 @@ export async function processSettlementJob(
       category: "permanent",
       reason: preflight.message,
       ctx,
+      // Taken from the preflight's own outcome rather than re-derived from its
+      // message: an unfunded account is a funding problem, not a validation one.
+      failureCategory:
+        preflight.reason === "account_not_found" ? "validation" : "insufficient_funds",
     });
     return;
   }
@@ -525,7 +565,7 @@ if (applied?.successful) {
       }
 
       if (category === "permanent") {
-        await failSettlement({ job, attempt, category, reason, ctx });
+        await failSettlement({ job, attempt, category, reason, ctx, error });
         return;
       }
 
@@ -538,6 +578,9 @@ if (applied?.successful) {
           category: "permanent",
           reason: `${reason} (retries exhausted after ${attempt} attempts)`,
           ctx,
+          // Classified from the underlying error, not the "retries exhausted"
+          // wrapper — what finally stopped the job is still why it failed.
+          error,
         });
         return;
       }

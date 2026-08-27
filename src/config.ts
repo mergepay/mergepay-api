@@ -61,6 +61,12 @@ const schema = z.object({
   WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   // Maximum jobs of one kind pulled per cycle.
   WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
+  // How long shutdown waits for the in-flight cycle to finish before it stops
+  // waiting. Releasing a lease while its job is still submitting would let
+  // another worker claim and resubmit the same payment, so shutdown drains
+  // first. If the drain outruns this budget the leases are left to expire on
+  // their own — a job recovered late is safe, a job submitted twice is not.
+  WORKER_SHUTDOWN_DRAIN_MS: z.coerce.number().int().positive().default(30000),
   // Per-call network timeouts (ms) — every outbound Horizon/anchor request
   // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
   // a slow or hung upstream can't block a worker cycle indefinitely.

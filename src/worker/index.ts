@@ -1002,12 +1002,24 @@ export async function startWorker(): Promise<() => Promise<void>> {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
+  // The cycle currently running, if any. Shutdown waits on this before it
+  // touches leases: a job that is mid-submission still owns its lease, and
+  // clearing it early is what would let a second worker resubmit the payment.
+  let inFlight: Promise<void> | undefined;
+
   const loop = async (): Promise<void> => {
     if (stopped) return;
+    const cycle = runWorkerCycle();
+    inFlight = cycle.then(
+      () => undefined,
+      () => undefined
+    );
     try {
-      await runWorkerCycle();
+      await cycle;
     } catch (error) {
       log.error({ outcome: "error", reason: safeFailureMessage(error) }, "worker cycle failed");
+    } finally {
+      inFlight = undefined;
     }
     if (!stopped) timer = setTimeout(() => void loop(), config.WORKER_INTERVAL_MS);
   };
@@ -1017,14 +1029,39 @@ export async function startWorker(): Promise<() => Promise<void>> {
   const shutdown = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
+    // Set before draining: in-flight jobs finish the transition they started,
+    // but no new job is claimed while we wind down.
     isShuttingDown = true;
     if (timer) clearTimeout(timer);
     stopReconciliation();
 
-    log.info({ outcome: "shutdown" }, "worker shutting down, releasing claims");
+    log.info({ outcome: "shutdown" }, "worker shutting down, draining in-flight jobs");
 
-    // Release every lease this process holds so the next worker can pick the
-    // jobs up immediately instead of waiting for them to lapse.
+    // Wait for the running cycle, but not forever — a hung upstream must not
+    // hold the process open past the deployment's grace period.
+    let drained = true;
+    if (inFlight) {
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
+      const budget = new Promise<false>((resolve) => {
+        drainTimer = setTimeout(() => resolve(false), config.WORKER_SHUTDOWN_DRAIN_MS);
+      });
+      drained = await Promise.race([inFlight.then(() => true), budget]);
+      if (drainTimer) clearTimeout(drainTimer);
+    }
+
+    if (!drained) {
+      // A job is still running and still holds its lease. Releasing it now
+      // would invite a duplicate submission, so leave every lease in place and
+      // let it expire; the next worker recovers it through the normal path.
+      log.warn(
+        { outcome: "shutdown_drain_timeout" },
+        "in-flight job outran the drain budget, leaving leases to expire"
+      );
+      return;
+    }
+
+    // Nothing of ours is running now, so releasing is safe: the next worker
+    // picks these up immediately instead of waiting for them to lapse.
     await Promise.allSettled([
       prisma.settlement.updateMany({
         where: { claimedBy: WORKER_ID },

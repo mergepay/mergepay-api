@@ -9,6 +9,7 @@ import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
 import openAPIPlugin from "./plugins/openapi";
 import { validateAssetConfig } from "./services/assets";
@@ -190,6 +191,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     "/expenses/:id/settle",
     "/groups/:id/settlements",
     "/settlements/:id/confirm",
+    "/api/settlements/execute",
     "/groups/:id/treasury/deposit",
     "/groups/:id/treasury/withdraw",
     "/treasury-transactions/:id/confirm",
@@ -218,6 +220,9 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  // Registered with fastify-plugin, so `app.idempotent` is visible to every
+  // route plugin below rather than only inside this scope.
+  await app.register(idempotencyPlugin);
   await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {

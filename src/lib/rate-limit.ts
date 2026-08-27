@@ -32,6 +32,7 @@ export type RateLimitPolicyName =
   | "authVerify"
   | "settlementCreate"
   | "settlementConfirm"
+  | "settlementExecute"
   | "treasurySubmit"
   | "anchorInit"
   | "anchorPoll"
@@ -95,6 +96,16 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "settlement.confirm",
+      hook: "preHandler",
+    },
+    // Its own bucket rather than sharing settlementConfirm's: execution is the
+    // endpoint clients retry after a network timeout, so its budget has to
+    // absorb legitimate retries without spending the confirm budget too.
+    settlementExecute: {
+      max: config.RATE_LIMIT_SETTLEMENT_EXECUTE_MAX,
+      timeWindow: config.RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "settlement.execute",
       hook: "preHandler",
     },
     treasurySubmit: {

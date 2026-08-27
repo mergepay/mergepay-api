@@ -4,7 +4,16 @@ const h = vi.hoisted(() => {
   const prisma: any = {
     settlement: {
       findUnique: vi.fn(),
+      findUniqueOrThrow: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+    },
+    expenseShare: {
+      update: vi.fn(),
+    },
+    statusHistory: {
+      findFirst: vi.fn(),
+      create: vi.fn(),
     },
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
@@ -164,7 +173,8 @@ describe("classifySettlementError", () => {
 describe("applySettlementTransition", () => {
   it("applies a pending -> submitted transition and sets submittedAt", async () => {
     prisma.settlement.findUnique.mockResolvedValue(fakeSettlement());
-    prisma.settlement.update.mockResolvedValue(
+    prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    prisma.settlement.findUniqueOrThrow.mockResolvedValue(
       fakeSettlement({ status: "submitted", submittedAt: new Date() })
     );
 
@@ -176,9 +186,12 @@ describe("applySettlementTransition", () => {
 
     expect(result.changed).toBe(true);
     expect(result.settlement.status).toBe("submitted");
-    expect(prisma.settlement.update).toHaveBeenCalledWith(
+    expect(prisma.settlement.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "settle_1" },
+        where: expect.objectContaining({
+          id: "settle_1",
+          status: expect.objectContaining({ in: expect.arrayContaining(["pending"]) }),
+        }),
         data: expect.objectContaining({
           status: "submitted",
           submittedAt: expect.any(Date),
@@ -202,7 +215,8 @@ describe("applySettlementTransition", () => {
     prisma.settlement.findUnique.mockResolvedValue(
       fakeSettlement({ status: "verifying" })
     );
-    prisma.settlement.update.mockResolvedValue(
+    prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    prisma.settlement.findUniqueOrThrow.mockResolvedValue(
       fakeSettlement({ status: "confirmed", confirmedAt: new Date() })
     );
 
@@ -215,9 +229,12 @@ describe("applySettlementTransition", () => {
 
     expect(result.changed).toBe(true);
     expect(result.settlement.status).toBe("confirmed");
-    expect(prisma.settlement.update).toHaveBeenCalledWith(
+    expect(prisma.settlement.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "settle_1" },
+        where: expect.objectContaining({
+          id: "settle_1",
+          status: expect.objectContaining({ in: expect.arrayContaining(["verifying"]) }),
+        }),
         data: expect.objectContaining({
           status: "confirmed",
           confirmedAt: expect.any(Date),
@@ -237,7 +254,7 @@ describe("applySettlementTransition", () => {
         source: "user",
       })
     ).rejects.toMatchObject({ status: 409, code: "INVALID_TRANSITION" });
-    expect(prisma.settlement.update).not.toHaveBeenCalled();
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 
@@ -253,7 +270,7 @@ describe("applySettlementTransition", () => {
         source: "system",
       })
     ).rejects.toMatchObject({ status: 409 });
-    expect(prisma.settlement.update).not.toHaveBeenCalled();
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
   it("is idempotent when transitioning to the current status", async () => {
@@ -268,7 +285,7 @@ describe("applySettlementTransition", () => {
     });
 
     expect(result.changed).toBe(false);
-    expect(prisma.settlement.update).not.toHaveBeenCalled();
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 
@@ -305,7 +322,7 @@ describe("applySettlementTransition", () => {
         ownerUserId: "user_1",
       })
     ).rejects.toMatchObject({ status: 403 });
-    expect(prisma.settlement.update).not.toHaveBeenCalled();
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
   it("throws not found for a missing settlement", async () => {

@@ -269,13 +269,15 @@ async function failSettlement(params: {
 async function transitionSettlement(
   job: SettlementJob,
   nextStatus: SettlementStatus,
-  extraData?: Record<string, unknown>
+  extraData?: Record<string, unknown>,
+  settleExpenseShare = false
 ): Promise<void> {
   await applySettlementTransition({
     settlementId: job.id,
     nextStatus,
     source: "worker",
     extraData: extraData as never,
+    settleExpenseShare,
   });
 }
 
@@ -336,53 +338,18 @@ async function confirmSubmission(params: {
   const confirmation = await pollForConfirmation(hash);
 
   if (confirmation.status === "confirmed") {
-    // Verify the on-chain transaction details match what we authorized
-    // before marking the settlement as confirmed. This catches cases where
-    // the transaction succeeded but with modified details (wrong destination,
-    // amount, memo, etc.).
-    try {
-      const expectedMemo = `MP:${job.shortCode}`;
-      await verifyTransactionMemo(hash, expectedMemo);
-
-      const payments = await getTransactionPayments(hash);
-      const paymentOp = payments.find((op) => op.type === "payment");
-      if (!paymentOp) {
-        throw new Error("No payment operation found in transaction");
-      }
-      verifyPaymentOperation(paymentOp, {
-        destination: job.toPublicKey,
-        amount: job.amount,
-        assetCode: job.assetCode,
-        assetIssuer: job.assetIssuer,
-      });
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : "Transaction verification failed";
-      jobLog.error(
-        { jobType: "settlement", jobId: job.id, attempt, outcome: "verification_failed", hash, reason },
-        "settlement transaction verification failed"
-      );
-      await failSettlement({
-        job,
-        attempt,
-        category: "permanent",
-        reason: `Settlement verification failed for ${hash}: ${reason}`,
-        ctx,
-      });
-      return;
-    }
-
-    await transitionSettlement(job, "confirmed", {
-      stellarTxHash: hash,
-      retryCount: 0,
-      errorCategory: null,
-      failureReason: null,
-      nextAttemptAt: null,
-    });
-    if (job.expenseShareId) {
-      await prisma.expenseShare
-        .update({ where: { id: job.expenseShareId }, data: { status: "settled" } })
-        .catch(() => undefined);
-    }
+    await transitionSettlement(
+      job,
+      "confirmed",
+      {
+        stellarTxHash: hash,
+        retryCount: 0,
+        errorCategory: null,
+        failureReason: null,
+        nextAttemptAt: null,
+      },
+      true
+    );
     jobLog.info(
       { jobType: "settlement", jobId: job.id, attempt, outcome: "confirmed", hash },
       "settlement confirmed on Stellar"
@@ -495,34 +462,31 @@ export async function processSettlementJob(
       if (category === "indeterminate") {
         // The call may have taken effect. Check the ledger before deciding.
         const applied = await alreadyApplied(job);
-        if (applied?.successful) {
-          jobLog.warn(
-            {
-              jobType: "settlement",
-              jobId: job.id,
-              attempt,
-              outcome: "already_applied",
-              hash: applied.hash,
-            },
-            "submission response was lost but the transaction had applied"
-          );
-          await transitionSettlement(job, "confirmed", {
+if (applied?.successful) {
+        jobLog.warn(
+          {
+            jobType: "settlement",
+            jobId: job.id,
+            attempt,
+            outcome: "already_applied",
+            hash: applied.hash,
+          },
+          "submission response was lost but the transaction had applied"
+        );
+        await transitionSettlement(
+          job,
+          "confirmed",
+          {
             stellarTxHash: applied.hash,
             retryCount: 0,
             errorCategory: null,
             failureReason: null,
             nextAttemptAt: null,
-          });
-          if (job.expenseShareId) {
-            await prisma.expenseShare
-              .update({
-                where: { id: job.expenseShareId },
-                data: { status: "settled" },
-              })
-              .catch(() => undefined);
-          }
-          return;
-        }
+          },
+          true
+        );
+        return;
+      }
         if (applied && !applied.successful) {
           await failSettlement({
             job,

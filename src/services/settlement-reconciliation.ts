@@ -2,6 +2,7 @@ import pino from "pino";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
 import { audit } from "./audit";
+import { applySettlementTransition } from "./settlement-machine";
 import type { CorrelationContext } from "../lib/correlation";
 import { jobContext, loggerWithContext } from "../lib/correlation";
 import {
@@ -117,7 +118,12 @@ export interface ReconcilableSettlement {
  * error logging.
  */
 export async function reconcileSingleSettlement(
-  settlement: ReconcilableSettlement,
+  settlement: {
+    id: string;
+    stellarTxHash: string | null;
+    retryCount: number;
+    expenseShareId: string | null;
+  },
   maxRetries: number = RECONCILIATION_MAX_RETRIES,
   ctx?: CorrelationContext
 ): Promise<void> {
@@ -134,60 +140,15 @@ export async function reconcileSingleSettlement(
   }
 
   if (tx.successful) {
-    try {
-      // Verify the memo matches the expected settlement reference.
-      const expectedMemo = `MP:${settlement.shortCode}`;
-      await verifyTransactionMemo(hash, expectedMemo);
-
-      // Verify payment operation details (destination, amount, asset).
-      const payments = await getTransactionPayments(hash);
-      const paymentOp = payments.find((op) => op.type === "payment");
-
-      if (!paymentOp) {
-        throw new Error("No payment operation found in transaction");
-      }
-
-      verifyPaymentOperation(paymentOp, {
-        destination: settlement.destinationPublicKey,
-        amount: settlement.amount,
-        assetCode: settlement.assetCode,
-        assetIssuer: settlement.assetIssuer,
-      });
-    } catch (err) {
-      // Verification failed — this is a permanent, non-retryable failure.
-      // The settlement may have been paid to the wrong account or for the
-      // wrong amount, so operator review is needed.
-      const reason = err instanceof Error ? err.message : "Transaction verification failed";
-      await prisma.settlement.update({
-        where: { id: settlement.id },
-        data: {
-          status: "failed",
-          failureReason: `Settlement verification failed for ${hash}: ${reason}`,
-          retryCount: settlement.retryCount,
-        },
-      });
-      await audit({
-        userId: null,
-        action: "settlement.verification_failed",
-        entityType: "settlement",
-        entityId: settlement.id,
-        metadata: { stellarTxHash: hash, reason },
-      });
-      recLog.error(
-        { id: settlement.id, hash, reason },
-        "settlement transaction verification failed"
-      );
-      return;
-    }
-
-    // All verifications passed — mark completed.
-    await prisma.settlement.update({
-      where: { id: settlement.id },
-      data: {
-        status: "completed",
+    await applySettlementTransition({
+      settlementId: settlement.id,
+      nextStatus: "confirmed",
+      source: "worker",
+      extraData: {
         retryCount: 0,
         failureReason: null,
       },
+      settleExpenseShare: true,
     });
     await audit({
       userId: null,
@@ -198,10 +159,11 @@ export async function reconcileSingleSettlement(
     });
     recLog.info({ id: settlement.id, hash }, "settlement completed");
   } else {
-    await prisma.settlement.update({
-      where: { id: settlement.id },
-      data: {
-        status: "failed",
+    await applySettlementTransition({
+      settlementId: settlement.id,
+      nextStatus: "failed",
+      source: "worker",
+      extraData: {
         failureReason: `Transaction ${hash} failed on Stellar`,
         retryCount: settlement.retryCount,
       },
@@ -226,10 +188,11 @@ async function handleTransactionNotFound(
   const nextRetryCount = settlement.retryCount + 1;
 
   if (nextRetryCount > maxRetries) {
-    await prisma.settlement.update({
-      where: { id: settlement.id },
-      data: {
-        status: "failed",
+    await applySettlementTransition({
+      settlementId: settlement.id,
+      nextStatus: "failed",
+      source: "worker",
+      extraData: {
         failureReason: `Transaction ${hash} not confirmed after ${maxRetries} reconciliation attempts`,
         retryCount: nextRetryCount,
       },

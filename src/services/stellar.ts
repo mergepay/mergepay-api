@@ -247,11 +247,17 @@ export const stellar = {
       skipSourceSignatureCheck: true,
     });
     verifyMultisig(tx, requirement);
-    // Deliberately a single attempt, not withRetry. Horizon may have applied
-    // the transaction and lost the response, in which case a "retry" is a
-    // duplicate payment. Recovery belongs to the worker, which checks the
-    // deterministic envelope hash (stellar.hashOf) against Horizon before
-    // deciding whether anything still needs submitting.
+    // Deliberately a single attempt here, unlike submitSigned/submitToHorizon
+    // below, which retry transient submission failures (#305). A timeout on a
+    // submission leaves the outcome genuinely unknown — Horizon may have
+    // applied the transaction and lost the response — and this is the treasury
+    // path, where the caller already holds the envelope hash. Recovery
+    // therefore belongs to the worker, which checks that deterministic hash
+    // (stellar.hashOf) against Horizon before deciding whether anything still
+    // needs submitting, rather than resubmitting blind.
+    //
+    // TimeoutError and TransportError are re-thrown unmapped below precisely so
+    // that reconciliation can tell "unknown outcome" from "Horizon rejected it".
     try {
       const res = await withTimeout(
         "Horizon.submitTransaction",

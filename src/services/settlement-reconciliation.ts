@@ -4,6 +4,11 @@ import { stellar } from "./stellar";
 import { audit } from "./audit";
 import type { CorrelationContext } from "../lib/correlation";
 import { jobContext, loggerWithContext } from "../lib/correlation";
+import {
+  verifyTransactionMemo,
+  verifyPaymentOperation,
+  getTransactionPayments,
+} from "./horizonService";
 
 const log = pino({ name: "settlement-reconciliation" });
 
@@ -23,11 +28,13 @@ const reconciling = new Set<string>();
  * Reconciliation is read-only against Horizon: it calls
  * `stellar.getTransaction(hash)` and never `submitPayment`.
  *
- *   Transaction found & successful        → `completed`  (terminal)
+ *   Transaction found & successful        → verify memo + payment details
+ *                                           → `completed`  (terminal)
  *   Transaction found & failed             → `failed`     (terminal)
  *   Transaction not yet visible            → stays `pending_confirmation`,
  *                                             retryCount incremented.
  *                                             If retries exhausted → `failed`
+ *   Verification failure (mismatch)        → `failed`     (terminal)
  */
 export async function reconcileSettlements(
   maxRetries: number = RECONCILIATION_MAX_RETRIES,
@@ -37,6 +44,9 @@ export async function reconcileSettlements(
     where: {
       status: "pending_confirmation",
       stellarTxHash: { not: null },
+    },
+    include: {
+      to: { select: { stellarPublicKey: true } },
     },
     take: BATCH_SIZE,
   });
@@ -49,7 +59,20 @@ export async function reconcileSettlements(
     const recLog = loggerWithContext(log, recCtx);
 
     try {
-      await reconcileSingleSettlement(row, maxRetries, recCtx);
+      await reconcileSingleSettlement(
+        {
+          id: row.id,
+          stellarTxHash: row.stellarTxHash,
+          retryCount: row.retryCount,
+          shortCode: row.shortCode,
+          amount: String(row.amount),
+          assetCode: row.assetCode,
+          assetIssuer: row.assetIssuer,
+          destinationPublicKey: row.to.stellarPublicKey,
+        },
+        maxRetries,
+        recCtx
+      );
     } catch (err) {
       recLog.error(
         { id: row.id, hash: row.stellarTxHash, err: err instanceof Error ? err.message : String(err) },
@@ -62,17 +85,39 @@ export async function reconcileSettlements(
 }
 
 /**
+ * Parameters needed for full settlement verification against Horizon.
+ * The `stellarTxHash` is the on-chain transaction to verify; the other
+ * fields are what the API expects that transaction to contain.
+ */
+export interface ReconcilableSettlement {
+  id: string;
+  stellarTxHash: string | null;
+  retryCount: number;
+  /** Settlement short code, used to derive the expected memo (MP:<code>). */
+  shortCode: string;
+  /** Expected payment amount. */
+  amount: string;
+  /** Expected asset code (e.g. "XLM", "USDC"). */
+  assetCode: string;
+  /** Expected asset issuer (null for native XLM). */
+  assetIssuer: string | null;
+  /** Expected payment destination (the recipient's Stellar public key). */
+  destinationPublicKey: string;
+}
+
+/**
  * Reconcile a single `pending_confirmation` settlement against Horizon.
+ *
+ * When the transaction is confirmed successful, the memo and payment
+ * operation details are verified against the settlement record before
+ * marking it completed. Verification failures are terminal — the
+ * settlement is moved to `failed` with a descriptive reason.
  *
  * Exported for testing. Callers should handle concurrency gating and
  * error logging.
  */
 export async function reconcileSingleSettlement(
-  settlement: {
-    id: string;
-    stellarTxHash: string | null;
-    retryCount: number;
-  },
+  settlement: ReconcilableSettlement,
   maxRetries: number = RECONCILIATION_MAX_RETRIES,
   ctx?: CorrelationContext
 ): Promise<void> {
@@ -89,6 +134,53 @@ export async function reconcileSingleSettlement(
   }
 
   if (tx.successful) {
+    try {
+      // Verify the memo matches the expected settlement reference.
+      const expectedMemo = `MP:${settlement.shortCode}`;
+      await verifyTransactionMemo(hash, expectedMemo);
+
+      // Verify payment operation details (destination, amount, asset).
+      const payments = await getTransactionPayments(hash);
+      const paymentOp = payments.find((op) => op.type === "payment");
+
+      if (!paymentOp) {
+        throw new Error("No payment operation found in transaction");
+      }
+
+      verifyPaymentOperation(paymentOp, {
+        destination: settlement.destinationPublicKey,
+        amount: settlement.amount,
+        assetCode: settlement.assetCode,
+        assetIssuer: settlement.assetIssuer,
+      });
+    } catch (err) {
+      // Verification failed — this is a permanent, non-retryable failure.
+      // The settlement may have been paid to the wrong account or for the
+      // wrong amount, so operator review is needed.
+      const reason = err instanceof Error ? err.message : "Transaction verification failed";
+      await prisma.settlement.update({
+        where: { id: settlement.id },
+        data: {
+          status: "failed",
+          failureReason: `Settlement verification failed for ${hash}: ${reason}`,
+          retryCount: settlement.retryCount,
+        },
+      });
+      await audit({
+        userId: null,
+        action: "settlement.verification_failed",
+        entityType: "settlement",
+        entityId: settlement.id,
+        metadata: { stellarTxHash: hash, reason },
+      });
+      recLog.error(
+        { id: settlement.id, hash, reason },
+        "settlement transaction verification failed"
+      );
+      return;
+    }
+
+    // All verifications passed — mark completed.
     await prisma.settlement.update({
       where: { id: settlement.id },
       data: {

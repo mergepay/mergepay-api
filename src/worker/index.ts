@@ -39,6 +39,11 @@ import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import {
+  verifyTransactionMemo,
+  verifyPaymentOperation,
+  getTransactionPayments,
+} from "../services/horizonService";
+import {
   applySettlementTransition,
   type SettlementStatus,
 } from "../services/settlement-machine";
@@ -331,6 +336,41 @@ async function confirmSubmission(params: {
   const confirmation = await pollForConfirmation(hash);
 
   if (confirmation.status === "confirmed") {
+    // Verify the on-chain transaction details match what we authorized
+    // before marking the settlement as confirmed. This catches cases where
+    // the transaction succeeded but with modified details (wrong destination,
+    // amount, memo, etc.).
+    try {
+      const expectedMemo = `MP:${job.shortCode}`;
+      await verifyTransactionMemo(hash, expectedMemo);
+
+      const payments = await getTransactionPayments(hash);
+      const paymentOp = payments.find((op) => op.type === "payment");
+      if (!paymentOp) {
+        throw new Error("No payment operation found in transaction");
+      }
+      verifyPaymentOperation(paymentOp, {
+        destination: job.toPublicKey,
+        amount: job.amount,
+        assetCode: job.assetCode,
+        assetIssuer: job.assetIssuer,
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : "Transaction verification failed";
+      jobLog.error(
+        { jobType: "settlement", jobId: job.id, attempt, outcome: "verification_failed", hash, reason },
+        "settlement transaction verification failed"
+      );
+      await failSettlement({
+        job,
+        attempt,
+        category: "permanent",
+        reason: `Settlement verification failed for ${hash}: ${reason}`,
+        ctx,
+      });
+      return;
+    }
+
     await transitionSettlement(job, "confirmed", {
       stellarTxHash: hash,
       retryCount: 0,

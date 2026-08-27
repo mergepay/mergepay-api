@@ -39,6 +39,11 @@ import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import {
+  verifyTransactionMemo,
+  verifyPaymentOperation,
+  getTransactionPayments,
+} from "../services/horizonService";
+import {
   applySettlementTransition,
   type SettlementStatus,
 } from "../services/settlement-machine";

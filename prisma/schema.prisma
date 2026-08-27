@@ -401,6 +401,7 @@ model Sep10Challenge {
   consumedAt    DateTime @default(now()) @map("consumed_at")
 
   @@index([expiresAt])
+  @@index([consumedAt, expiresAt])
   @@map("sep10_challenges")
 }
 

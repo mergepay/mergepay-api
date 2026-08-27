@@ -62,6 +62,7 @@ import {
 } from "../services/job-retry";
 import { reconcileSettlements } from "../services/settlement-reconciliation";
 import { startReconciliation } from "./reconciliation";
+import { cleanupChallenges } from "./tasks/cleanup-challenges";
 import {
   type CorrelationContext,
   jobContext,
@@ -923,6 +924,7 @@ export async function runWorkerCycle(): Promise<void> {
     reconcileAnchors(),
     reconcileSettlements(),
     expireInvites(),
+    cleanupChallenges(),
   ]);
 }
 

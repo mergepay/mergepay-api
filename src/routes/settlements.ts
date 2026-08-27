@@ -51,6 +51,7 @@ import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
+import { calculateSimplifiedDebts } from "../services/settlement";
 import { validateAsset, validateAmount } from "../services/assets";
 import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
 import {
@@ -493,6 +494,26 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- balances + suggestions -------------------------------------------------
+  app.get("/groups/:id/settlement/preview", async (req) => {
+    const auth = requireUser(req);
+    const { id: groupId } = idParamSchema.parse(req.params);
+    await requireMembership(groupId, auth.id);
+    const { balances } = await loadGroupBalancesWithSuggestions(groupId);
+    const asset = await groupPrimaryAsset(groupId);
+    const suggestions = calculateSimplifiedDebts(
+      balances.map((balance) => ({ userId: balance.userId, net: balance.net }))
+    );
+    return {
+      assetCode: asset.assetCode,
+      assetIssuer: asset.assetIssuer,
+      operations: suggestions.map((suggestion) => ({
+        ...suggestion,
+        assetCode: asset.assetCode,
+        assetIssuer: asset.assetIssuer,
+      })),
+    };
+  });
+
   app.get("/groups/:id/balances", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);

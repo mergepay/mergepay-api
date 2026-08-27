@@ -42,7 +42,15 @@ const schema = z.object({
   ANCHOR_HOME_DOMAIN: z.string().min(1, "ANCHOR_HOME_DOMAIN is required"),
   ANCHOR_NAME: z.string().min(1, "ANCHOR_NAME is required"),
   ANCHOR_WEBHOOK_SECRET: z.string().min(1, "ANCHOR_WEBHOOK_SECRET is required"),
-  
+  // Per-anchor HMAC signing secrets for SEP-24 callbacks, as
+  // "anchorName:secret,anchorName:secret". Deployments serving a single anchor
+  // leave this empty and ANCHOR_WEBHOOK_SECRET is used for every callback.
+  SEP24_WEBHOOK_SECRETS: z.string().default(""),
+  // How far a SEP-24 callback's signing timestamp may be from the server clock
+  // before the signature is treated as a replay. Only enforced for anchors that
+  // send a timestamp header.
+  SEP24_WEBHOOK_TOLERANCE_MS: z.coerce.number().int().positive().default(300000),
+
   // Stable asset configuration
   STABLE_ASSET_CODE: z.string().min(1, "STABLE_ASSET_CODE is required"),
   STABLE_ASSET_ISSUER: stellarPublicKeySchema,

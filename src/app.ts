@@ -24,6 +24,7 @@ import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import auditLogRoutes from "./routes/audit-log";
 import userGroupsRoutes from "./routes/user-groups";
+import webhookRoutes from "./routes/webhooks";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
@@ -197,6 +198,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     "/anchors/withdraw",
     "/anchors/sessions/:id/complete",
     "/anchors/webhook",
+    "/api/webhooks/sep24",
   ]);
 
   app.addHook("onRoute", (routeOptions) => {
@@ -257,6 +259,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(uploadRoutes);
   await app.register(userGroupsRoutes);
   await app.register(auditLogRoutes);
+  await app.register(webhookRoutes);
 
   return app;
 }

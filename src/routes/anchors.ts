@@ -20,6 +20,7 @@ import {
 } from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
+import { sep24InteractiveSchema } from "../schemas/sep24";
 
 export default async function anchorRoutes(app: FastifyInstance) {
   // Every anchor route that reaches an anchor gets an explicit budget so a
@@ -79,9 +80,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // -- start deposit / withdraw -----------------------------------------------
   async function start(kind: "deposit" | "withdrawal", req: any) {
     const auth = requireUser(req);
-    const body = z
-      .object({ assetCode: z.string().min(1), anchorName: z.string().optional() })
-      .parse(req.body);
+    const body = sep24InteractiveSchema.parse(req.body);
 
     // Validate that the requested asset is supported.
     validateAsset(body.assetCode);

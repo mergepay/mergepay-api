@@ -11,7 +11,7 @@ import {
   verifyPaymentOperation,
   getTransactionPayments,
 } from "./horizonService";
-import { emitEvent } from "./event";
+import { dispatchEvent } from "./webhook";
 
 const log = pino({ name: "settlement-reconciliation" });
 
@@ -181,11 +181,8 @@ export async function reconcileSingleSettlement(
           entityId: settlement.id,
           metadata: { stellarTxHash: hash, reason: err.message },
         });
-        emitEvent({
-          eventType: "settlement.failed",
-          groupId: settlement.groupId,
-          payload: { settlementId: settlement.id, reason: err.message },
-        });
+        void dispatchEvent("settlement.failed", { settlementId: settlement.id, reason: err.message }, settlement.groupId)
+          .catch(() => undefined);
         recLog.error(
           { id: settlement.id, hash, reason: err.message },
           "settlement transaction verification failed"
@@ -212,11 +209,8 @@ export async function reconcileSingleSettlement(
       entityId: settlement.id,
       metadata: { stellarTxHash: hash },
     });
-    emitEvent({
-      eventType: "settlement.completed",
-      groupId: settlement.groupId,
-      payload: { settlementId: settlement.id, stellarTxHash: hash },
-    });
+    void dispatchEvent("settlement.confirmed", { settlementId: settlement.id, stellarTxHash: hash }, settlement.groupId)
+      .catch(() => undefined);
     recLog.info({ id: settlement.id, hash }, "settlement completed");
   } else {
     await applySettlementTransition({
@@ -235,11 +229,8 @@ export async function reconcileSingleSettlement(
       entityId: settlement.id,
       metadata: { stellarTxHash: hash, reason: "transaction_failed" },
     });
-    emitEvent({
-      eventType: "settlement.failed",
-      groupId: settlement.groupId,
-      payload: { settlementId: settlement.id, reason: "transaction_failed" },
-    });
+    void dispatchEvent("settlement.failed", { settlementId: settlement.id, reason: "transaction_failed" }, settlement.groupId)
+      .catch(() => undefined);
     recLog.error({ id: settlement.id, hash }, "settlement transaction failed on Stellar");
   }
 }

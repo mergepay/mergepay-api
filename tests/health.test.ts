@@ -15,6 +15,7 @@ vi.mock("../src/services/network", () => ({
 
 import { buildApp } from "../src/app";
 import { clearReadinessCache } from "../src/services/health";
+import { Errors } from "../src/errors";
 
 let app: Awaited<ReturnType<typeof buildApp>>;
 
@@ -80,4 +81,23 @@ describe("health routes", () => {
       checks: { stellar: "down" },
     });
   }, 3_000);
+
+  it("returns not ready when Stellar answers with an upstream error response", async () => {
+    // A 5xx Horizon response surfaces through the service boundary as an
+    // UPSTREAM_ERROR AppError, distinct from the timeout case above. The
+    // readiness response must stay safe: the upstream error text is swallowed
+    // and never echoed back.
+    h.feeStats.mockRejectedValueOnce(
+      Errors.upstream("Horizon returned 503 Service Unavailable")
+    );
+
+    const response = await app.inject({ method: "GET", url: "/health/ready" });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      status: "not_ready",
+      checks: { stellar: "down" },
+    });
+    expect(JSON.stringify(response.json())).not.toContain("503 Service Unavailable");
+  });
 });

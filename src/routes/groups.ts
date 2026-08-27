@@ -5,6 +5,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
+import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
 import {
@@ -27,6 +28,13 @@ import {
 } from "../lib/pagination";
 
 const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
+
+const GROUP_BALANCE_CACHE_TTL_MS = 30_000;
+const groupBalanceCache = new Map<string, { expiresAt: number; balances: { asset: "XLM" | "USDC"; balance: string }[] }>();
+
+export function clearGroupBalanceCache(): void {
+  groupBalanceCache.clear();
+}
 
 export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -114,6 +122,49 @@ export default async function groupRoutes(app: FastifyInstance) {
     );
 
     return { groups, meta };
+  });
+
+  // -- on-chain balance -------------------------------------------------------
+  app.get("/groups/:id/balance", async (req) => {
+    const auth = requireUser(req);
+    const { id } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
+    await requireMembership(id, auth.id);
+
+    const cached = groupBalanceCache.get(id);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { balances: cached.balances };
+    }
+    if (cached) groupBalanceCache.delete(id);
+
+    const group = await prisma.group.findUnique({
+      where: { id },
+      select: { treasuryAccountPublicKey: true },
+    });
+    if (!group?.treasuryAccountPublicKey) {
+      const balances: { asset: "XLM" | "USDC"; balance: string }[] = [];
+      groupBalanceCache.set(id, { expiresAt: Date.now() + GROUP_BALANCE_CACHE_TTL_MS, balances });
+      return { balances };
+    }
+
+    const account = await stellar.loadAccount(group.treasuryAccountPublicKey);
+    if (!account.exists) {
+      const balances: { asset: "XLM" | "USDC"; balance: string }[] = [];
+      groupBalanceCache.set(id, { expiresAt: Date.now() + GROUP_BALANCE_CACHE_TTL_MS, balances });
+      return { balances };
+    }
+
+    const balances = account.balances
+      .filter((balance) =>
+        balance.assetCode === "XLM" ||
+        (balance.assetCode === "USDC" && balance.assetIssuer === config.STABLE_ASSET_ISSUER)
+      )
+      .map((balance) => ({ asset: balance.assetCode as "XLM" | "USDC", balance: balance.balance }));
+
+    groupBalanceCache.set(id, {
+      expiresAt: Date.now() + GROUP_BALANCE_CACHE_TTL_MS,
+      balances,
+    });
+    return { balances };
   });
 
   // -- detail -----------------------------------------------------------------

@@ -65,6 +65,7 @@ export async function reconcileSettlements(
       await reconcileSingleSettlement(
         {
           id: row.id,
+          groupId: row.groupId,
           stellarTxHash: row.stellarTxHash,
           retryCount: row.retryCount,
           shortCode: row.shortCode,
@@ -94,6 +95,7 @@ export async function reconcileSettlements(
  */
 export interface ReconcilableSettlement {
   id: string;
+  groupId: string;
   stellarTxHash: string | null;
   retryCount: number;
   /** Settlement short code, used to derive the expected memo (MP:<code>). */
@@ -181,6 +183,7 @@ export async function reconcileSingleSettlement(
         });
         emitEvent({
           eventType: "settlement.failed",
+          groupId: settlement.groupId,
           payload: { settlementId: settlement.id, reason: err.message },
         });
         recLog.error(
@@ -211,6 +214,7 @@ export async function reconcileSingleSettlement(
     });
     emitEvent({
       eventType: "settlement.completed",
+      groupId: settlement.groupId,
       payload: { settlementId: settlement.id, stellarTxHash: hash },
     });
     recLog.info({ id: settlement.id, hash }, "settlement completed");
@@ -233,6 +237,7 @@ export async function reconcileSingleSettlement(
     });
     emitEvent({
       eventType: "settlement.failed",
+      groupId: settlement.groupId,
       payload: { settlementId: settlement.id, reason: "transaction_failed" },
     });
     recLog.error({ id: settlement.id, hash }, "settlement transaction failed on Stellar");

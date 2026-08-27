@@ -28,6 +28,7 @@ model User {
   approvals        TreasuryApproval[]
   auditLogs        AuditLog[]
   idempotencyKeys  IdempotencyKey[]
+  webhooks         Webhook[]
 
   @@map("users")
 }
@@ -52,6 +53,7 @@ model Group {
   invites     Invite[]
   invitations Invitation[]
   auditLogs   AuditLog[]
+  webhooks    Webhook[]
 
   @@index([createdByUserId])
   @@map("groups")
@@ -454,4 +456,69 @@ model AccountBalance {
   @@unique([accountId, assetCode])
   @@index([accountId])
   @@map("account_balances")
+}
+
+/// A registered callback endpoint. Groups and individual users can both own
+/// one, which is why `groupId` and `userId` are independently nullable: a
+/// group-wide integration sets `groupId`, a personal one sets `userId`, and a
+/// row may scope to both.
+model Webhook {
+  id        String   @id @default(cuid())
+  groupId   String?  @map("group_id")
+  userId    String?  @map("user_id")
+  url       String
+  /// Shared secret used to sign every payload sent to this endpoint. Returned
+  /// to the caller exactly once, when the webhook is created.
+  secret    String
+  /// Event types this endpoint wants. Filtering here rather than at delivery
+  /// time means an endpoint interested in one event is not woken for all of them.
+  events    String[]
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  group      Group?            @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user       User?             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([groupId])
+  @@index([userId])
+  @@index([enabled])
+  @@map("webhooks")
+}
+
+/// One attempted delivery of one event to one endpoint.
+///
+/// The row is created `pending` before the first request, so an event is never
+/// lost because a process died mid-delivery: the worker finds the row still
+/// pending and picks it up. `attempts` and `nextAttemptAt` are columns rather
+/// than process memory for the same reason.
+model WebhookDelivery {
+  id                 String    @id @default(cuid())
+  webhookId          String    @map("webhook_id")
+  eventType          String    @map("event_type")
+  /// The exact serialized body that was (or will be) signed and sent. Stored so
+  /// a retry re-sends identical bytes — a re-serialized payload would produce a
+  /// different signature than the one the receiver was told to expect.
+  payload            String
+  /// pending | delivered | failed
+  status             String    @default("pending")
+  attempts           Int       @default(0)
+  responseStatusCode Int?      @map("response_status_code")
+  responseBody       String?   @map("response_body")
+  /// When the worker may next try. Null once the delivery reaches a terminal state.
+  nextAttemptAt      DateTime? @map("next_attempt_at")
+  lastAttemptAt      DateTime? @map("last_attempt_at")
+  /// Lease columns: only one worker drives a given delivery at a time.
+  claimedBy          String?   @map("claimed_by")
+  leaseExpiresAt     DateTime? @map("lease_expires_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId])
+  @@index([status, nextAttemptAt])
+  @@index([leaseExpiresAt])
+  @@map("webhook_deliveries")
 }

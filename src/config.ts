@@ -61,6 +61,13 @@ const schema = z.object({
   WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   // Maximum jobs of one kind pulled per cycle.
   WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
+  // Delivery attempts per webhook before the record is marked failed and never
+  // retried again — see src/services/webhook.ts.
+  WEBHOOK_MAX_ATTEMPTS: z.coerce.number().int().positive().max(10).default(3),
+  // Base for the exponential backoff between delivery attempts. A receiver that
+  // is briefly down gets a fast retry; one that is genuinely broken is backed
+  // away from rather than hammered.
+  WEBHOOK_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(1000),
   // Per-call network timeouts (ms) — every outbound Horizon/anchor request
   // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
   // a slow or hung upstream can't block a worker cycle indefinitely.

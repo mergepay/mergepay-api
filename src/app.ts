@@ -23,6 +23,7 @@ import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import auditLogRoutes from "./routes/audit-log";
+import webhookRoutes from "./routes/webhooks";
 import userGroupsRoutes from "./routes/user-groups";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
@@ -263,6 +264,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(uploadRoutes);
   await app.register(userGroupsRoutes);
   await app.register(auditLogRoutes);
+  await app.register(webhookRoutes);
 
   return app;
 }

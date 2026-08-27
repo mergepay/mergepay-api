@@ -62,6 +62,7 @@ import {
 } from "../services/job-retry";
 import { reconcileSettlements } from "../services/settlement-reconciliation";
 import { startReconciliation } from "./reconciliation";
+import { cleanupChallenges } from "./tasks/cleanup-challenges";
 import {
   type CorrelationContext,
   jobContext,
@@ -265,13 +266,15 @@ async function failSettlement(params: {
 async function transitionSettlement(
   job: SettlementJob,
   nextStatus: SettlementStatus,
-  extraData?: Record<string, unknown>
+  extraData?: Record<string, unknown>,
+  settleExpenseShare = false
 ): Promise<void> {
   await applySettlementTransition({
     settlementId: job.id,
     nextStatus,
     source: "worker",
     extraData: extraData as never,
+    settleExpenseShare,
   });
 }
 
@@ -332,18 +335,18 @@ async function confirmSubmission(params: {
   const confirmation = await pollForConfirmation(hash);
 
   if (confirmation.status === "confirmed") {
-    await transitionSettlement(job, "confirmed", {
-      stellarTxHash: hash,
-      retryCount: 0,
-      errorCategory: null,
-      failureReason: null,
-      nextAttemptAt: null,
-    });
-    if (job.expenseShareId) {
-      await prisma.expenseShare
-        .update({ where: { id: job.expenseShareId }, data: { status: "settled" } })
-        .catch(() => undefined);
-    }
+    await transitionSettlement(
+      job,
+      "confirmed",
+      {
+        stellarTxHash: hash,
+        retryCount: 0,
+        errorCategory: null,
+        failureReason: null,
+        nextAttemptAt: null,
+      },
+      true
+    );
     jobLog.info(
       { jobType: "settlement", jobId: job.id, attempt, outcome: "confirmed", hash },
       "settlement confirmed on Stellar"
@@ -456,34 +459,31 @@ export async function processSettlementJob(
       if (category === "indeterminate") {
         // The call may have taken effect. Check the ledger before deciding.
         const applied = await alreadyApplied(job);
-        if (applied?.successful) {
-          jobLog.warn(
-            {
-              jobType: "settlement",
-              jobId: job.id,
-              attempt,
-              outcome: "already_applied",
-              hash: applied.hash,
-            },
-            "submission response was lost but the transaction had applied"
-          );
-          await transitionSettlement(job, "confirmed", {
+if (applied?.successful) {
+        jobLog.warn(
+          {
+            jobType: "settlement",
+            jobId: job.id,
+            attempt,
+            outcome: "already_applied",
+            hash: applied.hash,
+          },
+          "submission response was lost but the transaction had applied"
+        );
+        await transitionSettlement(
+          job,
+          "confirmed",
+          {
             stellarTxHash: applied.hash,
             retryCount: 0,
             errorCategory: null,
             failureReason: null,
             nextAttemptAt: null,
-          });
-          if (job.expenseShareId) {
-            await prisma.expenseShare
-              .update({
-                where: { id: job.expenseShareId },
-                data: { status: "settled" },
-              })
-              .catch(() => undefined);
-          }
-          return;
-        }
+          },
+          true
+        );
+        return;
+      }
         if (applied && !applied.successful) {
           await failSettlement({
             job,
@@ -936,6 +936,7 @@ export async function runWorkerCycle(): Promise<void> {
     reconcileAnchors(),
     reconcileSettlements(),
     expireInvites(),
+    cleanupChallenges(),
   ]);
 }
 

@@ -137,6 +137,10 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         .object({ groupId: z.string(), proposalId: z.string() })
         .parse(req.params);
       await requireMembership(groupId, auth.id);
+      // The service enforces the persisted proposal/group relationship. Keep
+      // authorization based on the authenticated member and requested group,
+      // without performing a second resource lookup that changes legacy error
+      // behavior for proposal-state validation.
       const body = signBodySchema.parse(req.body);
 
       // Load group members to constrain which signers are accepted.
@@ -151,6 +155,7 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         groupId,
         memberPublicKeys,
         signedXdr: body.signedXdr,
+        userId: auth.id,
       });
 
       await audit({

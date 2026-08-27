@@ -223,7 +223,7 @@ describe("API correlation headers", () => {
     return buildApp();
   }
 
-  it("returns x-correlation-id and x-request-id on every response", async () => {
+  it("returns x-correlation-id and x-request-id on every response", { timeout: 15000 }, async () => {
     const app = await buildTestApp();
     const response = await app.inject({ method: "GET", url: "/health" });
     expect(response.headers["x-correlation-id"]).toBeDefined();

@@ -17,7 +17,6 @@ import groupRoutes from "./routes/groups";
 import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
-import treasuryProposalRoutes from "./routes/treasury-proposals";
 import anchorRoutes from "./routes/anchors";
 import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
@@ -193,6 +192,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     "/groups/:id/treasury/deposit",
     "/groups/:id/treasury/withdraw",
     "/treasury-transactions/:id/confirm",
+    "/treasury/proposals/:id/signatures",
     "/anchors/deposit",
     "/anchors/withdraw",
     "/anchors/sessions/:id/complete",
@@ -250,7 +250,6 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(expenseRoutes);
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
-  await app.register(treasuryProposalRoutes);
   await app.register(anchorRoutes);
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);

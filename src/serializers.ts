@@ -136,14 +136,20 @@ export function serializeTreasuryTx(t: any) {
 }
 
 export function serializeTreasuryProposal(p: any) {
+  const signatures = Array.isArray(p.signatures) ? p.signatures : [];
   return {
     id: p.id,
     groupId: p.groupId,
     creatorId: p.creatorId,
     xdr: p.xdr,
     threshold: p.threshold,
-    signatures: p.signatures ?? [],
-    signatureCount: Array.isArray(p.signatures) ? p.signatures.length : 0,
+    signatures: signatures.map((s: any) => ({
+      publicKey: s.signerPublicKey,
+      weight: s.weight,
+      signedAt: s.createdAt ? iso(s.createdAt) : null,
+    })),
+    signatureCount: signatures.length,
+    signatureWeight: signatures.reduce((sum: number, s: any) => sum + (s.weight ?? 0), 0),
     status: p.status,
     stellarTxHash: p.stellarTxHash ?? null,
     failureReason: p.failureReason ?? null,

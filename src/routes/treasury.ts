@@ -17,7 +17,7 @@ import {
   intentValiditySchema,
   secondsUntilExpiry,
 } from "../lib/time-bounds";
-import { serializeGroup, serializeTreasuryTx } from "../serializers";
+import { serializeGroup, serializeTreasuryTx, serializeTreasuryProposal } from "../serializers";
 import {
   buildPage,
   cursorFilter,
@@ -33,6 +33,8 @@ import {
   snapshotToSignerConfig,
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
+import { treasuryService } from "../services/treasury";
+import { isPositive } from "../services/money";
 
 const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
 const stellarAmountSchema = z.string().min(1);
@@ -495,4 +497,119 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const { items, meta } = buildPage(transactions, limit, order);
     return { transactions: items.map(serializeTreasuryTx), meta };
   });
+
+  // -- multisig proposals -------------------------------------------------------
+  // Collector flow for partially-signed multisig transactions: an admin
+  // creates a proposal from an unsigned XDR, group admins each contribute a
+  // signature, and the proposal auto-submits to Horizon once the collected
+  // signer weight reaches the treasury account's threshold. See
+  // src/services/treasury.ts for signature verification and the
+  // PENDING_SIGNATURES -> READY -> SUBMITTED / FAILED lifecycle.
+
+  const createProposalBodySchema = z.object({
+    groupId: z.string().min(1),
+    destination: z.string().min(1),
+    amount: z.string().min(1),
+    assetCode: z.string().min(1),
+    assetIssuer: z.string().nullable().optional(),
+    memo: z.string().min(1).max(28).optional(),
+  });
+
+  app.post("/treasury/proposals", async (req) => {
+    const auth = requireUser(req);
+    const body = createProposalBodySchema.parse(req.body);
+    await requireAdmin(body.groupId, auth.id);
+
+    if (!isPositive(body.amount)) {
+      throw Errors.badRequest("invalid_amount", "Amount must be positive");
+    }
+    if (!StrKey.isValidEd25519PublicKey(body.destination)) {
+      throw Errors.badRequest(
+        "invalid_destination",
+        "Destination must be a valid Stellar public key"
+      );
+    }
+    if (body.assetIssuer && !StrKey.isValidEd25519PublicKey(body.assetIssuer)) {
+      throw Errors.badRequest(
+        "invalid_asset_issuer",
+        "assetIssuer must be a valid Stellar public key when supplied"
+      );
+    }
+
+    const { proposal, xdr, networkPassphrase } = await treasuryService.createProposal({
+      groupId: body.groupId,
+      creatorId: auth.id,
+      destination: body.destination,
+      amount: body.amount,
+      assetCode: body.assetCode,
+      assetIssuer: body.assetIssuer ?? null,
+      memo: body.memo ?? null,
+    });
+
+    return { proposal: serializeTreasuryProposal(proposal), xdr, networkPassphrase };
+  });
+
+  app.get("/treasury/proposals", async (req) => {
+    const auth = requireUser(req);
+    const { groupId } = z.object({ groupId: z.string().min(1) }).parse(req.query ?? {});
+    await requireMembership(groupId, auth.id);
+
+    const proposals = await prisma.treasuryProposal.findMany({
+      where: { groupId },
+      include: { signatures: true },
+      orderBy: { createdAt: "desc" },
+    });
+    return { proposals: proposals.map(serializeTreasuryProposal) };
+  });
+
+  app.get("/treasury/proposals/:id", async (req) => {
+    const auth = requireUser(req);
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+
+    const proposal = await prisma.treasuryProposal.findUnique({
+      where: { id },
+      include: { signatures: true },
+    });
+    if (!proposal) throw Errors.notFound("Treasury proposal not found");
+    await requireMembership(proposal.groupId, auth.id);
+
+    return { proposal: serializeTreasuryProposal(proposal) };
+  });
+
+  app.post(
+    "/treasury/proposals/:id/signatures",
+    rateLimited("treasurySubmit"),
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+
+      const existing = await prisma.treasuryProposal.findUnique({
+        where: { id },
+        select: { groupId: true },
+      });
+      if (!existing) throw Errors.notFound("Treasury proposal not found");
+      await requireAdmin(existing.groupId, auth.id);
+
+      const result = await treasuryService.submitSignatures({
+        proposalId: id,
+        groupId: existing.groupId,
+        submittedByUserId: auth.id,
+        signedXdr: body.signedXdr,
+      });
+
+      const proposal = await prisma.treasuryProposal.findUnique({
+        where: { id },
+        include: { signatures: true },
+      });
+
+      return {
+        proposal: serializeTreasuryProposal(proposal),
+        status: result.status,
+        signatureWeight: result.signatureWeight,
+        threshold: result.threshold,
+        stellarTxHash: result.stellarTxHash,
+      };
+    }
+  );
 }

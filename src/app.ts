@@ -23,6 +23,7 @@ import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import auditLogRoutes from "./routes/audit-log";
+import sep24Routes from "./routes/sep24";
 import userGroupsRoutes from "./routes/user-groups";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
@@ -197,6 +198,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     "/anchors/withdraw",
     "/anchors/sessions/:id/complete",
     "/anchors/webhook",
+    "/api/sep24/callback",
   ]);
 
   app.addHook("onRoute", (routeOptions) => {
@@ -263,6 +265,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(uploadRoutes);
   await app.register(userGroupsRoutes);
   await app.register(auditLogRoutes);
+  await app.register(sep24Routes);
 
   return app;
 }

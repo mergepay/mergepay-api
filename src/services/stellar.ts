@@ -439,6 +439,10 @@ export interface PaymentExpectation {
   asset: AssetSpec;
   amount: string;
   memoCode: string;
+  /** Sequence used when the server created the unsigned intent. */
+  sourceSequence?: string;
+  /** Maximum fee per operation accepted for this intent. */
+  maxFeeStroops?: number;
   /** Recorded intent expiry; when present, the envelope's bounds must agree. */
   expiresAt?: Date | null;
   /** Names the resource in the expiration error, e.g. "settlement". */
@@ -501,15 +505,20 @@ function assertMatchesIntent(tx: Transaction, expected: PaymentExpectation): voi
     throw Errors.badRequest("xdr_mismatch", "Transaction source does not match");
   }
 
+  if (expected.sourceSequence !== undefined && tx.sequence.toString() !== expected.sourceSequence) {
+    throw Errors.badRequest("xdr_mismatch", "Transaction sequence does not match");
+  }
+
   if (tx.operations.length !== 1) {
     throw Errors.badRequest("xdr_mismatch", "Expected exactly one operation");
   }
 
   const fee = Number(tx.fee);
+  const maxFee = expected.maxFeeStroops ?? MAX_FEE_STROOPS_PER_OP * tx.operations.length;
   if (
     !Number.isFinite(fee) ||
     fee < MIN_FEE_STROOPS_PER_OP * tx.operations.length ||
-    fee > MAX_FEE_STROOPS_PER_OP * tx.operations.length
+    fee > maxFee
   ) {
     throw Errors.badRequest(
       "xdr_mismatch",

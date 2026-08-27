@@ -28,6 +28,7 @@ model User {
   approvals        TreasuryApproval[]
   auditLogs        AuditLog[]
   idempotencyKeys  IdempotencyKey[]
+  refreshTokens    RefreshToken[]
 
   @@map("users")
 }
@@ -439,6 +440,34 @@ model Sep10Challenge {
   @@index([expiresAt])
   @@index([consumedAt, expiresAt])
   @@map("sep10_challenges")
+}
+
+/// A single-use refresh token in a rotating chain.
+///
+/// Only the SHA-256 hash of the token is stored: a leaked database row cannot
+/// be replayed as a credential. `familyId` ties every token issued from one
+/// SEP-10 login together, so detecting reuse of an already-rotated token can
+/// revoke the whole chain rather than just the one token presented.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique @map("token_hash")
+  familyId  String    @map("family_id")
+  userId    String    @map("user_id")
+  expiresAt DateTime  @map("expires_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  /// Set when this token is exchanged for its successor. A second exchange of
+  /// the same token is therefore detectable rather than merely idempotent.
+  rotatedAt DateTime? @map("rotated_at")
+  /// Set when the token is invalidated without being used — logout, or the
+  /// family-wide revocation triggered by detected reuse.
+  revokedAt DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
 }
 
 // Cached Stellar account balances, periodically refreshed from Horizon by

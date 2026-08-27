@@ -69,6 +69,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     // concurrent demotion/removal of `auth.id` can't bypass authorization.
     const group = await prisma.$transaction(async (tx) => {
       await requireAdmin(id, auth.id, tx);
+      // Read inside the transaction so the audit entry records the
+      // configuration this call actually replaced.
+      const existing = await tx.group.findUnique({ where: { id } });
       const updated = await tx.group.update({
         where: { id },
         data: {
@@ -79,9 +82,21 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
+        groupId: id,
         action: "treasury.enable",
         entityType: "group",
         entityId: id,
+        outcome: "success",
+        // The multisig configuration is the security-relevant part of this
+        // change: the signing threshold decides how many approvals it takes
+        // to move funds, so an audit needs to see what it was set to and what
+        // it replaced, not merely that the treasury was touched.
+        metadata: {
+          treasuryAccountPublicKey: body.publicKey,
+          previousRequiredSigners: existing?.treasuryRequiredSigners ?? null,
+          requiredSigners: body.requiredSigners ?? 1,
+          previouslyEnabled: existing?.treasuryEnabled ?? false,
+        },
       });
       return updated;
     });

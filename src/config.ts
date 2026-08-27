@@ -19,6 +19,17 @@ const schema = z.object({
   // Bound a session to this deployment: a token minted for another environment
   // or audience is rejected even when the signing secret is shared.
   JWT_ISSUER: z.string().default("mergepay-api"),
+  // Access-token lifetime. Short by design: a refresh token now covers the
+  // gap, so a stolen access token stays useful for minutes rather than hours.
+  // Expressed in seconds so it can be compared against the refresh TTL below.
+  ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().max(86400).default(900),
+  // Refresh-token lifetime. Bounds how long an idle session can be revived
+  // without the wallet signing a new SEP-10 challenge.
+  REFRESH_TOKEN_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(30 * 24 * 60 * 60 * 1000),
   JWT_AUDIENCE: z.string().default("mergepay-app"),
 
   // Stellar configuration - required
@@ -104,6 +115,10 @@ const schema = z.object({
   RATE_LIMIT_ANCHOR_POLL_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_TREASURY_SUBMIT_MAX: z.coerce.number().int().positive().max(100000).default(30),
   RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  // Treasury proposal creation writes a proposal row and starts an approval
+  // cycle, so it is bounded like the other state-changing treasury routes.
+  RATE_LIMIT_TREASURY_PROPOSE_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_TREASURY_PROPOSE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(10),
   RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().max(100000).default(10),
@@ -199,7 +214,7 @@ export const config = {
   WEB_AUTH_DOMAIN: parsed.WEB_AUTH_DOMAIN ?? apiHost,
   isTest: process.env.NODE_ENV === "test" || process.env.VITEST === "true",
   networkPassphrase,
-  jwtExpiresIn: "12h" as const,
+  jwtExpiresIn: `${parsed.ACCESS_TOKEN_TTL_SECONDS}s` as const,
 };
 
 export type Config = typeof config;

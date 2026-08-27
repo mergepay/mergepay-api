@@ -90,6 +90,18 @@ const schema = z.object({
   // How long an in-progress reservation blocks a retry with 409 before it is
   // treated as abandoned by a crashed process and may be re-claimed.
   IDEMPOTENCY_IN_PROGRESS_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
+  // Bounded retry policy for *safe* Horizon and anchor reads — see
+  // src/services/retry.ts. Deliberately conservative: three attempts bound the
+  // worst case at roughly three timeouts plus backoff, which is short enough
+  // that a request still fails predictably during an upstream outage. Payment
+  // submission and other state-changing calls are never retried here.
+  UPSTREAM_RETRY_MAX_ATTEMPTS: z.coerce.number().int().positive().max(10).default(3),
+  UPSTREAM_RETRY_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(200),
+  UPSTREAM_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(2000),
+  // Fraction of each backoff delay that may be removed as jitter. Without it,
+  // identical schedules across instances reconverge into synchronized bursts
+  // against an upstream that is already struggling.
+  UPSTREAM_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
   NODE_ENV: z.string().default("development"),
 
   // Security-sensitive endpoint policies.

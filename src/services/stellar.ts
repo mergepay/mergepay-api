@@ -24,6 +24,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
 import { withTimeout, TimeoutError, TransportError } from "./timeout";
+import { logRetryAttempt, withRetry } from "./retry";
 import {
   INTENT_VALIDITY_SECONDS,
   assertTimeBoundsMatchIntent,
@@ -38,6 +39,32 @@ function server(): Horizon.Server {
 
 function logUpstreamError(e: unknown, codes: unknown): void {
   console.error("[stellar] Upstream error:", e instanceof Error ? e.message : String(e), codes ? JSON.stringify(codes) : "");
+}
+
+/**
+ * Structured sink for retry telemetry. This module has no request context to
+ * borrow a Fastify logger from — it is called from routes and from the worker
+ * alike — so attempt metadata goes to the same console channel as the upstream
+ * errors above. It carries the operation and attempt number and nothing from
+ * the upstream's response body.
+ */
+const retryLog = {
+  warn(entry: object, message: string): void {
+    console.warn(`[stellar] ${message}`, JSON.stringify(entry));
+  },
+};
+
+/**
+ * Horizon's 404, which the read helpers translate into a domain answer
+ * ("unfunded account", "transaction not visible yet") rather than an error.
+ * Recognized before retry policy runs so a legitimate absence never consumes
+ * the attempt budget.
+ */
+function isNotFound(error: unknown): boolean {
+  const candidate = error as
+    | { response?: { status?: number }; name?: string }
+    | null;
+  return candidate?.response?.status === 404 || candidate?.name === "NotFoundError";
 }
 
 export interface AssetSpec {
@@ -84,15 +111,26 @@ export interface MultisigRequirement {
 }
 
 export const stellar = {
-  /** Load an account. Returns exists=false for unfunded accounts (404). */
+  /**
+   * Load an account. Returns exists=false for unfunded accounts (404).
+   *
+   * A read, so it is retried: repeating it returns the same account or a
+   * fresher view of it, and nothing upstream is created. The 404 is a
+   * legitimate answer rather than a failure, so it short-circuits the retry
+   * loop instead of burning attempts on an account that simply is not funded.
+   */
   async loadAccount(publicKey: string): Promise<AccountSnapshot> {
     try {
-      const acct = await withTimeout(
-        "Horizon.loadAccount",
-        config.HORIZON_ACCOUNT_TIMEOUT_MS,
-        async (signal) => {
+      const acct = await withRetry(
+        {
+          operation: "Horizon.loadAccount",
+          timeoutMs: config.HORIZON_ACCOUNT_TIMEOUT_MS,
+          isExpected: isNotFound,
+          onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
+        },
+        async () => {
           // Horizon.Server.loadAccount doesn't accept AbortSignal directly,
-          // but we wrap it so timeout still fires and rejects the promise.
+          // but the wrapper still fires and rejects the promise on timeout.
           return server().loadAccount(publicKey);
         }
       );
@@ -207,6 +245,11 @@ export const stellar = {
       skipSourceSignatureCheck: true,
     });
     verifyMultisig(tx, requirement);
+    // Deliberately a single attempt, not withRetry. Horizon may have applied
+    // the transaction and lost the response, in which case a "retry" is a
+    // duplicate payment. Recovery belongs to the worker, which checks the
+    // deterministic envelope hash (stellar.hashOf) against Horizon before
+    // deciding whether anything still needs submitting.
     try {
       const res = await withTimeout(
         "Horizon.submitTransaction",
@@ -250,15 +293,25 @@ export const stellar = {
     }
   },
 
-  /** Look up a transaction by hash. Returns null if not yet visible. */
+  /**
+   * Look up a transaction by hash. Returns null if not yet visible.
+   *
+   * Retried for the same reason as `loadAccount`, and with the same treatment
+   * of 404: a transaction that has not reached Horizon yet is an answer the
+   * caller acts on (keep polling), not a transient fault to retry through.
+   */
   async getTransaction(
     hash: string
   ): Promise<{ successful: boolean } | null> {
     try {
-      const tx = await withTimeout(
-        "Horizon.getTransaction",
-        config.HORIZON_STATUS_TIMEOUT_MS,
-        async (signal) => {
+      const tx = await withRetry(
+        {
+          operation: "Horizon.getTransaction",
+          timeoutMs: config.HORIZON_STATUS_TIMEOUT_MS,
+          isExpected: isNotFound,
+          onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
+        },
+        async () => {
           return server().transactions().transaction(hash).call();
         }
       );

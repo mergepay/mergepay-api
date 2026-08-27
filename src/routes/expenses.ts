@@ -9,6 +9,7 @@ import { normalizeAmount } from "../services/money";
 import { shortCode } from "../services/codes";
 import { auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
+import { assertParticipantsCanHoldAsset } from "../services/horizon";
 import { serializeExpense } from "../serializers";
 import { createExpenseSchema, updateExpenseSchema } from "../validations/expense";
 import {
@@ -39,7 +40,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const body = createExpenseSchema.parse(req.body);
     validateAmount(body.amount);
-    validateAsset(body.assetCode, body.assetIssuer ?? null);
+    const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
 
@@ -53,10 +54,28 @@ export default async function expenseRoutes(app: FastifyInstance) {
     const participantIds = [...new Set(computed.map((share) => share.userId))];
     const members = await prisma.groupMember.findMany({
       where: { groupId, userId: { in: participantIds } },
-      select: { userId: true },
+      select: { userId: true, user: { select: { stellarPublicKey: true } } },
     });
     if (members.length !== participantIds.length) {
       throw Errors.badRequest("invalid_split", "Every split participant must be an active group member");
+    }
+
+    // A non-native asset can only be paid to an account that has trusted it.
+    // Without this check the expense is created happily and every settlement
+    // built from it fails on submission with op_no_trust — after members have
+    // been asked to pay, which is the most expensive point to discover it.
+    //
+    // Native XLM needs no trustline, so it skips the Horizon round trip
+    // entirely rather than paying for a lookup whose answer is always yes.
+    if (asset.type !== "native") {
+      await assertParticipantsCanHoldAsset({
+        participants: members.map((member) => ({
+          userId: member.userId,
+          stellarPublicKey: member.user.stellarPublicKey,
+        })),
+        assetCode: body.assetCode,
+        assetIssuer: body.assetIssuer ?? null,
+      });
     }
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);

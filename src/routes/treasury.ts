@@ -184,6 +184,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const group = await prisma.group.findUnique({ where: { id } });
+    await requireMembership(id, auth.id);
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
@@ -263,6 +264,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     }
 
     const group = await prisma.group.findUnique({ where: { id } });
+    await requireMembership(id, auth.id);
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
@@ -334,18 +336,22 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const ttx = await prisma.treasuryTransaction.findUnique({ where: { id } });
     if (!ttx) throw Errors.notFound("Treasury transaction not found");
 
+    // Authorize from the transaction's persisted group before reading treasury
+    // configuration or accepting any signed envelope. Deposits are additionally
+    // owned by their creator; withdrawals require an administrator.
+    if (ttx.direction === "deposit") {
+      if (ttx.userId !== auth.id) {
+        throw Errors.forbidden("Only the depositor can confirm this deposit");
+      }
+      await requireMembership(ttx.groupId, auth.id);
+    } else {
+      await requireAdmin(ttx.groupId, auth.id);
+    }
     const group = await prisma.group.findUnique({ where: { id: ttx.groupId } });
     if (!group?.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
-    if (ttx.direction === "deposit") {
-      if (ttx.userId !== auth.id) {
-        throw Errors.forbidden("Only the depositor can confirm this deposit");
-      }
-    } else {
-      await requireAdmin(ttx.groupId, auth.id);
-    }
     if (ttx.status === "confirmed") {
       return { treasuryTransaction: serializeTreasuryTx(ttx) };
     }

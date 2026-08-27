@@ -321,6 +321,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       include: settlementInclude,
     });
     if (!settlementRow) throw Errors.notFound("Settlement not found");
+    await requireMembership(settlementRow.groupId, auth.id);
     if (settlementRow.fromUserId !== auth.id) {
       throw Errors.forbidden("Only the payer can confirm this settlement");
     }

@@ -11,6 +11,7 @@ import {
   verifyPaymentOperation,
   getTransactionPayments,
 } from "./horizonService";
+import { emitEvent } from "./event";
 
 const log = pino({ name: "settlement-reconciliation" });
 
@@ -178,6 +179,10 @@ export async function reconcileSingleSettlement(
           entityId: settlement.id,
           metadata: { stellarTxHash: hash, reason: err.message },
         });
+        emitEvent({
+          eventType: "settlement.failed",
+          payload: { settlementId: settlement.id, reason: err.message },
+        });
         recLog.error(
           { id: settlement.id, hash, reason: err.message },
           "settlement transaction verification failed"
@@ -204,6 +209,10 @@ export async function reconcileSingleSettlement(
       entityId: settlement.id,
       metadata: { stellarTxHash: hash },
     });
+    emitEvent({
+      eventType: "settlement.completed",
+      payload: { settlementId: settlement.id, stellarTxHash: hash },
+    });
     recLog.info({ id: settlement.id, hash }, "settlement completed");
   } else {
     await applySettlementTransition({
@@ -221,6 +230,10 @@ export async function reconcileSingleSettlement(
       entityType: "settlement",
       entityId: settlement.id,
       metadata: { stellarTxHash: hash, reason: "transaction_failed" },
+    });
+    emitEvent({
+      eventType: "settlement.failed",
+      payload: { settlementId: settlement.id, reason: "transaction_failed" },
     });
     recLog.error({ id: settlement.id, hash }, "settlement transaction failed on Stellar");
   }

@@ -43,6 +43,10 @@ const h = vi.hoisted(() => {
       findMany: vi.fn(async () => []),
       update: vi.fn(),
     },
+    treasuryApproval: {
+      create: vi.fn(),
+      findMany: vi.fn(async () => []),
+    },
     invite: model(),
     invitation: model(),
     anchorSession: model(),
@@ -124,6 +128,11 @@ function makeUnsignedXdr(params: {
     .toXDR();
 }
 
+/** Compute the tx hash of an unsigned XDR. */
+function txHash(xdr: string): string {
+  return new Transaction(xdr, NET).hash().toString("hex");
+}
+
 beforeEach(async () => {
   vi.clearAllMocks();
   if (!app) app = await buildApp();
@@ -166,9 +175,18 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
     expect(res.statusCode).toBe(403);
   });
 
-  it("creates an unsigned proposal and returns it", async () => {
+  it("creates an unsigned proposal and returns it with txHash", async () => {
     const user = fakeUser();
     const treasury = Keypair.random();
+    const dest = Keypair.random().publicKey();
+
+    // Build a real XDR so the service can compute the txHash.
+    const realXdr = makeUnsignedXdr({
+      source: treasury,
+      destination: dest,
+      amount: "5",
+    });
+
     const group = {
       id: "group_1",
       name: "Trip",
@@ -185,13 +203,14 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
       userId: user.id,
       role: "admin",
     });
-    // The service ALSO calls group.findUnique — make the mock persistent.
     prisma.group.findUnique.mockResolvedValue(group);
+    const expectedHash = txHash(realXdr);
     prisma.treasuryProposal.create.mockResolvedValueOnce({
       id: "prop_1",
       groupId: group.id,
       creatorId: user.id,
-      xdr: "AAAA-unsigned",
+      xdr: realXdr,
+      txHash: expectedHash,
       threshold: 2,
       signatures: [],
       status: "awaiting_signatures",
@@ -202,14 +221,14 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
     });
     prisma.auditLog.create.mockResolvedValueOnce({});
     const { stellar } = await import("../src/services/stellar");
-    vi.mocked(stellar.buildPayment).mockReturnValue("AAAA-unsigned" as any);
+    vi.mocked(stellar.buildPayment).mockReturnValue(realXdr as any);
 
     const res = await app.inject({
       method: "POST",
       url: "/groups/group_1/treasury/proposals",
       headers: authHeader(user),
       payload: {
-        destination: Keypair.random().publicKey(),
+        destination: dest,
         amount: "5",
         assetCode: "XLM",
       },
@@ -218,7 +237,13 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
     const body = res.json();
     expect(body.proposal.id).toBe("prop_1");
     expect(body.proposal.threshold).toBe(2);
-    expect(body.xdr).toBe("AAAA-unsigned");
+    expect(body.xdr).toBe(realXdr);
+    // Verify txHash was computed and stored
+    expect(prisma.treasuryProposal.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ txHash: expectedHash }),
+      })
+    );
   });
 
   it("rejects a non-Stellar destination", async () => {
@@ -308,6 +333,7 @@ describe("GET /groups/:groupId/treasury/proposals", () => {
         groupId: "group_1",
         creatorId: user.id,
         xdr: "AAAA",
+        txHash: "abc123",
         threshold: 2,
         signatures: [
           { publicKey: "GAAA", signedAt: new Date().toISOString() },
@@ -362,7 +388,7 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       role: "member",
     });
     prisma.groupMember.findMany.mockResolvedValueOnce([
-      { user: { stellarPublicKey: Keypair.random().publicKey() } },
+      { userId: "u_other", user: { stellarPublicKey: Keypair.random().publicKey() } },
     ]);
     prisma.treasuryProposal.findUnique.mockResolvedValueOnce({
       id: "prop_1",
@@ -371,6 +397,7 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       signatures: [],
       status: "confirmed",
       xdr: "AAAA-confirmed",
+      txHash: "abc123",
     });
 
     const res = await app.inject({
@@ -402,7 +429,7 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       role: "member",
     });
     prisma.groupMember.findMany.mockResolvedValueOnce([
-      { user: { stellarPublicKey: signerKp.publicKey() } },
+      { userId: "u_signer", user: { stellarPublicKey: signerKp.publicKey() } },
     ]);
     prisma.treasuryProposal.findUnique.mockResolvedValueOnce({
       id: "prop_1",
@@ -411,10 +438,10 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       signatures: [],
       status: "awaiting_signatures",
       xdr: proposalXdr,
+      txHash: txHash(proposalXdr),
     });
 
     // Sign a DIFFERENT envelope so the hash won't match.
-    const other = Keypair.random();
     const rogueSourceKp = Keypair.random();
     const rogue = new Transaction(
       makeUnsignedXdr({
@@ -446,13 +473,15 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       destination: Keypair.random().publicKey(),
       amount: "5",
     });
+    const proposalHash = txHash(proposalXdr);
     const pendingProposal = {
       id: "prop_1",
       groupId: "group_1",
       creatorId: "u_creator",
       xdr: proposalXdr,
+      txHash: proposalHash,
       threshold: 1,
-      signatures: [],
+      signatures: [] as any[],
       status: "pending",
       stellarTxHash: null,
       failureReason: null,
@@ -474,14 +503,25 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       role: "member",
     });
     prisma.groupMember.findMany.mockResolvedValueOnce([
-      { user: { stellarPublicKey: treasury.publicKey() } },
+      { userId: "u_treasury", user: { stellarPublicKey: treasury.publicKey() } },
     ]);
-    // The first two findUnique calls expect a still-pending proposal; the
-    // route's post-submission read expects the confirmed record.
+    prisma.treasuryApproval.findMany.mockResolvedValueOnce([]);
+
+    // findUnique chain: (1) locked row in $transaction, (2) re-read in mergeAndSubmit, (3) route post-read
     prisma.treasuryProposal.findUnique
       .mockResolvedValueOnce(pendingProposal)
       .mockResolvedValueOnce(pendingProposal)
       .mockResolvedValueOnce(finalProposal);
+
+    prisma.treasuryApproval.create.mockResolvedValueOnce({
+      id: "approval_1",
+      proposalId: "prop_1",
+      userId: "u_treasury",
+      txHash: proposalHash,
+      signature: "sig",
+      signedAt: new Date(),
+      createdAt: new Date(),
+    });
 
     const signed = new Transaction(proposalXdr, NET);
     signed.sign(treasury);
@@ -508,6 +548,121 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
     expect(body.threshold).toBe(1);
     expect(body.stellarTxHash).toBe("hash_xyz");
     expect(body.status).toBe("confirmed");
+  });
+
+  it("rejects duplicate approval from the same signer idempotently", async () => {
+    const user = fakeUser({ id: "u_signatory" });
+    const treasury = Keypair.random();
+
+    const proposalXdr = makeUnsignedXdr({
+      source: treasury,
+      destination: Keypair.random().publicKey(),
+      amount: "5",
+    });
+    const proposalHash = txHash(proposalXdr);
+
+    // Proposal with threshold 2, already has 1 signature from treasury.
+    const pendingProposal = {
+      id: "prop_1",
+      groupId: "group_1",
+      creatorId: "u_creator",
+      xdr: proposalXdr,
+      txHash: proposalHash,
+      threshold: 2,
+      signatures: [
+        { publicKey: treasury.publicKey(), signedAt: new Date().toISOString() },
+      ] as any[],
+      status: "awaiting_signatures",
+      stellarTxHash: null,
+      failureReason: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "member",
+    });
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: "u_treasury", user: { stellarPublicKey: treasury.publicKey() } },
+    ]);
+    // Treasury has already approved.
+    prisma.treasuryApproval.findMany.mockResolvedValueOnce([
+      { userId: "u_treasury", txHash: proposalHash },
+    ]);
+    prisma.treasuryProposal.findUnique
+      .mockResolvedValueOnce(pendingProposal)
+      .mockResolvedValueOnce(pendingProposal);
+    prisma.treasuryProposal.update.mockResolvedValueOnce(pendingProposal);
+
+    // Sign with the same treasury key again (duplicate).
+    const signed = new Transaction(proposalXdr, NET);
+    signed.sign(treasury);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals/prop_1/sign",
+      headers: authHeader(user),
+      payload: { signedXdr: signed.toXDR() },
+    });
+    // Should succeed (200) but not increase the approval count.
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.signatureCount).toBe(1); // Still 1, not 2
+    expect(body.status).toBe("awaiting_signatures");
+  });
+
+  it("rejects signature for a changed transaction intent", async () => {
+    const user = fakeUser({ id: "u_signatory" });
+    const treasury = Keypair.random();
+    const signerKp = Keypair.random();
+
+    const proposalXdr = makeUnsignedXdr({
+      source: treasury,
+      destination: Keypair.random().publicKey(),
+      amount: "5",
+      memo: "MP:ORIGINAL",
+    });
+    const proposalHash = txHash(proposalXdr);
+
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "member",
+    });
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: "u_signer", user: { stellarPublicKey: signerKp.publicKey() } },
+    ]);
+    prisma.treasuryApproval.findMany.mockResolvedValueOnce([]);
+    prisma.treasuryProposal.findUnique.mockResolvedValueOnce({
+      id: "prop_1",
+      groupId: "group_1",
+      threshold: 2,
+      signatures: [],
+      status: "awaiting_signatures",
+      xdr: proposalXdr,
+      txHash: proposalHash,
+    });
+
+    // Build a modified XDR (different destination) and sign it.
+    const modifiedXdr = makeUnsignedXdr({
+      source: treasury,
+      destination: Keypair.random().publicKey(), // Changed!
+      amount: "5",
+      memo: "MP:ORIGINAL",
+    });
+    const signed = new Transaction(modifiedXdr, NET);
+    signed.sign(signerKp);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals/prop_1/sign",
+      headers: authHeader(user),
+      payload: { signedXdr: signed.toXDR() },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("XDR_MISMATCH");
   });
 });
 

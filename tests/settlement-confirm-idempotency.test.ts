@@ -12,6 +12,7 @@ const h = vi.hoisted(() => {
   });
   const prisma: any = {
     settlement: model(),
+    groupMember: model(),
     idempotencyKey: model(),
     statusHistory: model(),
     auditLog: { create: vi.fn() },
@@ -104,6 +105,7 @@ beforeEach(async () => {
   if (!app) app = await buildApp();
 
   prisma.settlement.findUnique.mockResolvedValue(pendingSettlement());
+  prisma.groupMember.findUnique.mockResolvedValue({ groupId: "group_1", userId: "user_1", role: "member" });
   prisma.settlement.findUniqueOrThrow.mockResolvedValue(pendingSettlement());
   prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
   prisma.idempotencyKey.create.mockResolvedValue({});

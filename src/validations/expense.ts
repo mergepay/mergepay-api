@@ -6,7 +6,7 @@ export type SplitType = z.infer<typeof SplitType>;
 
 const shareInput = z.object({
   userId: z.string().min(1),
-  amount: z.string().optional(),
+  amount: z.string().regex(/^\d+(?:\.\d{1,7})?$/, "Amount must have at most 7 decimal places").optional(),
   percent: z.number().min(0).max(100).optional(),
 });
 
@@ -14,7 +14,7 @@ export const createExpenseSchema = z
   .object({
     title: z.string().min(1).max(80),
     description: z.string().max(500).optional(),
-    amount: z.string().regex(/^\d+(\.\d+)?$/),
+    amount: z.string().regex(/^\d+(?:\.\d{1,7})?$/, "Amount must have at most 7 decimal places"),
     assetCode: z.string().min(1).max(12),
     assetIssuer: z.string().nullable().optional(),
     splitType: SplitType,

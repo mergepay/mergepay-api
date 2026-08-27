@@ -25,6 +25,7 @@ model User {
   anchorSessions   AnchorSession[]
   withdrawals      Withdrawal[]
   proposals        TreasuryProposal[]   @relation("ProposalCreator")
+  approvals        TreasuryApproval[]
   auditLogs        AuditLog[]
   idempotencyKeys  IdempotencyKey[]
 
@@ -177,6 +178,10 @@ model TreasuryTransaction {
   stellarTxHash String?  @map("stellar_tx_hash")
   status        String   @default("pending")
   memo          String?
+  /// Hash of the unsigned transaction envelope built at intent creation time.
+  /// The confirm endpoint validates the submitted signed XDR against this hash
+  /// to ensure the approval is bound to the exact intended transaction.
+  intendedTxHash String? @map("intended_tx_hash")
   // Server-controlled signing deadline for the unsigned XDR — same contract as
   // Settlement.expiresAt. See src/lib/time-bounds.ts.
   expiresAt     DateTime? @map("expires_at")
@@ -298,6 +303,9 @@ model TreasuryProposal {
   /// Unsigned transaction envelope (XDR). The field is named `xdr` per the
   /// issue spec; values are always pre-signature when this row is created.
   xdr        String   @map("xdr")
+  /// Hash of the unsigned XDR, used to bind approvals to this specific
+  /// transaction intent. Computed server-side when the proposal is created.
+  txHash     String   @map("tx_hash")
   threshold  Int      @default(1)
   /// Array of `{ publicKey, signature }` records explicitly verified by
   /// the backend. Stored as JSON for simplicity (signatures are bounded
@@ -307,15 +315,43 @@ model TreasuryProposal {
   stellarTxHash String? @map("stellar_tx_hash")
   failureReason  String? @map("failure_reason")
   createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
 
-  group   Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
-  creator User  @relation("ProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  group     Group             @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  creator   User              @relation("ProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  approvals TreasuryApproval[]
 
   @@index([groupId])
   @@index([status])
   @@index([creatorId])
   @@map("treasury_proposals")
+}
+
+/// Individual signer approval record for a treasury proposal. Each row
+/// represents one verified signer's approval of a specific transaction intent.
+/// The unique constraint on (proposalId, userId) enforces one approval per
+/// signer per proposal at the database level, preventing duplicate approvals
+/// even under concurrent requests.
+model TreasuryApproval {
+  id         String   @id @default(cuid())
+  proposalId String   @map("proposal_id")
+  userId     String   @map("user_id")
+  /// Hash of the unsigned transaction envelope this approval is bound to.
+  /// Must match the proposal's txHash — prevents replaying an approval on
+  /// a modified transaction.
+  txHash     String   @map("tx_hash")
+  /// Base64-encoded ed25519 signature.
+  signature  String
+  signedAt   DateTime @default(now()) @map("signed_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  proposal TreasuryProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([proposalId, userId])
+  @@index([proposalId])
+  @@index([userId])
+  @@map("treasury_approvals")
 }
 
 model IdempotencyKey {
@@ -401,6 +437,7 @@ model Sep10Challenge {
   consumedAt    DateTime @default(now()) @map("consumed_at")
 
   @@index([expiresAt])
+  @@index([consumedAt, expiresAt])
   @@map("sep10_challenges")
 }
 

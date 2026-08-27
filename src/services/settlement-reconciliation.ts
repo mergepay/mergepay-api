@@ -95,7 +95,7 @@ export async function reconcileSettlements(
  */
 export interface ReconcilableSettlement {
   id: string;
-  groupId: string;
+  groupId?: string;
   stellarTxHash: string | null;
   retryCount: number;
   /** Settlement short code, used to derive the expected memo (MP:<code>). */

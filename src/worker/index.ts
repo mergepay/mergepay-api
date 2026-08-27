@@ -39,6 +39,11 @@ import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import {
+  verifyTransactionMemo,
+  verifyPaymentOperation,
+  getTransactionPayments,
+} from "../services/horizonService";
+import {
   applySettlementTransition,
   type SettlementStatus,
 } from "../services/settlement-machine";
@@ -61,6 +66,7 @@ import {
   type JobFailureCategory,
 } from "../services/job-retry";
 import { reconcileSettlements } from "../services/settlement-reconciliation";
+import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
 import { cleanupChallenges } from "./tasks/cleanup-challenges";
 import {
@@ -922,6 +928,7 @@ export async function runWorkerCycle(): Promise<void> {
     processSubmittedSettlements(),
     reconcileAnchors(),
     reconcileSettlements(),
+    reconcileAllTreasuryBalances(),
     expireInvites(),
     cleanupChallenges(),
   ]);

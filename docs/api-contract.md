@@ -318,3 +318,44 @@ A 429 uses the standard error envelope with `error: "RATE_LIMITED"` and, where
 available, `details.retryAfterSeconds`, alongside the usual `Retry-After` and
 `X-RateLimit-*` headers. It reveals nothing about the caller's identity or
 whether a wallet account is known to the API.
+
+---
+
+## Health endpoints
+
+Operational probes for deployments and load balancers. They require no
+authentication and are not subject to application business authorization — a
+monitoring probe must work without a session. See also
+[../HEALTH.md](../HEALTH.md) for the deployment-facing view.
+
+| Endpoint | Type | Behavior |
+| --- | --- | --- |
+| `GET /health` · `GET /health/live` | Liveness | `200` with `{ "status": "ok", "timestamp": "…" }` while the process can accept requests. Contacts nothing external. |
+| `GET /health/ready` | Readiness | `200` with `{ "status": "ok", "checks": {…} }` when every required dependency is available; `503` with `{ "status": "not_ready", "checks": {…} }` otherwise. |
+
+### Readiness checks
+
+`GET /health/ready` verifies the dependencies the API needs to submit and
+inspect transactions, using only read-only requests — never a state-changing
+call:
+
+| Check | What it verifies | How |
+| --- | --- | --- |
+| `stellar` | The configured Horizon endpoint answers a read-only fee-stats request, proving the Stellar network configuration is usable end to end | `getFeeStats()` in `src/services/network.ts` — the shared Horizon client built from `config.HORIZON_URL`, no duplicated configuration |
+| `database` | Prisma can run `SELECT 1` | Read-only query on the shared Prisma client |
+| `anchor` | The configured anchor's `stellar.toml` is reachable | Read-only request; reported `disabled` when no anchor is configured |
+
+Each check has its own 1.5-second timeout and results are cached for five
+seconds, so an unavailable upstream never hangs a probe or thrashes Horizon.
+A `down` status on any required check makes the whole response `not_ready`
+with HTTP `503`, which lets a load balancer drain the instance.
+
+Responses contain only the status vocabulary (`up`/`down`/`disabled`,
+`ok`/`not_ready`) and a timestamp — never connection strings, Horizon URLs,
+credentials, tokens, or upstream error text.
+
+**Invalid Stellar configuration fails fast, before the API can report ready.**
+`STELLAR_NETWORK` and `HORIZON_URL` are validated together at process start in
+`src/config.ts`: a testnet URL with a `public` network (or vice versa) exits the
+process with a clear error instead of serving a readiness endpoint that could
+only ever report a broken dependency.

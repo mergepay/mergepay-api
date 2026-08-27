@@ -59,6 +59,9 @@ const h = vi.hoisted(() => {
     prisma,
     submitPayment: vi.fn(),
     getTransaction: vi.fn(),
+    verifyTransactionMemo: vi.fn(),
+    getTransactionPayments: vi.fn(),
+    verifyPaymentOperation: vi.fn(),
     audit: vi.fn(),
   };
 });
@@ -76,6 +79,11 @@ vi.mock("../src/services/audit", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/services/audit")>();
   return { ...actual, audit: h.audit };
 });
+vi.mock("../src/services/horizonService", () => ({
+  verifyTransactionMemo: h.verifyTransactionMemo,
+  getTransactionPayments: h.getTransactionPayments,
+  verifyPaymentOperation: h.verifyPaymentOperation,
+}));
 vi.mock("../src/services/settlement-reconciliation", () => ({
   reconcileSettlements: vi.fn(),
 }));
@@ -248,6 +256,20 @@ describe("processSubmittedSettlements", () => {
     const s = { ...baseSettlement, ...over };
     currentSettlementState = { ...s };
     h.prisma.settlement.findMany.mockResolvedValue([s]);
+    // Default mocks for horizon verification
+    h.verifyTransactionMemo.mockReturnValue(null);
+    h.getTransactionPayments.mockResolvedValue([
+      {
+        id: "op_1",
+        type: "payment",
+        to: "GTO",
+        asset_type: "credit_alphanum4",
+        asset_code: "USDC",
+        asset_issuer: null,
+        amount: "10.00",
+      },
+    ]);
+    h.verifyPaymentOperation.mockReturnValue(null);
     return s;
   }
 

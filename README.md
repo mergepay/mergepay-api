@@ -294,6 +294,7 @@ exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signe
 | GET/POST | `/anchors` · `/anchors/deposit` · `/anchors/withdraw` · `/anchors/sessions/:id/complete` · `/anchors/sessions` · `/anchors/webhook` | Anchors |
 | GET | `/history` | Cross-group history |
 | POST/GET | `/uploads/receipt` · `/uploads/:file` | Receipts |
+| GET | `/health` · `/health/live` · `/health/ready` | Liveness & readiness probes (see [HEALTH.md](HEALTH.md)) |
 
 All request bodies are validated with Zod; every group action checks membership
 (and admin rights where required). The full contract — error envelope and codes,

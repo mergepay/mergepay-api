@@ -168,13 +168,14 @@ describe("worker lease claiming", () => {
       const nextAttemptAt = new Date(Date.now() + delay);
 
       const updateSpy = vi.spyOn(prisma.settlement, "update").mockResolvedValue({} as any);
+      const leaseExpiresAt = new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS);
 
       await prisma.settlement.update({
         where: { id: settlementId },
         data: {
           retryCount: attempt,
           nextAttemptAt,
-          leaseExpiresAt: new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS),
+          leaseExpiresAt,
         },
       });
 
@@ -183,7 +184,7 @@ describe("worker lease claiming", () => {
         data: {
           retryCount: attempt,
           nextAttemptAt,
-          leaseExpiresAt: new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS),
+          leaseExpiresAt,
         },
       });
     });

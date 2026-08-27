@@ -27,6 +27,7 @@ const h = vi.hoisted(() => {
   });
   const prisma: any = {
     settlement: model(),
+    groupMember: model(),
     idempotencyKey: model(),
     statusHistory: model(),
     auditLog: { create: vi.fn() },
@@ -124,6 +125,7 @@ let app: Awaited<ReturnType<typeof buildApp>>;
 beforeEach(async () => {
   vi.clearAllMocks();
   if (!app) app = await buildApp();
+  prisma.groupMember.findUnique.mockResolvedValue({ groupId: "group_1", userId: "user_1", role: "member" });
 });
 
 describe("POST /settlements/:id/confirm — XDR intent validation", () => {

@@ -177,6 +177,10 @@ model TreasuryTransaction {
   stellarTxHash String?  @map("stellar_tx_hash")
   status        String   @default("pending")
   memo          String?
+  /// Hash of the unsigned transaction envelope built at intent creation time.
+  /// The confirm endpoint validates the submitted signed XDR against this hash
+  /// to ensure the approval is bound to the exact intended transaction.
+  intendedTxHash String? @map("intended_tx_hash")
   // Server-controlled signing deadline for the unsigned XDR — same contract as
   // Settlement.expiresAt. See src/lib/time-bounds.ts.
   expiresAt     DateTime? @map("expires_at")
@@ -307,7 +311,7 @@ model TreasuryProposal {
   stellarTxHash String? @map("stellar_tx_hash")
   failureReason  String? @map("failure_reason")
   createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
 
   group      Group               @relation(fields: [groupId], references: [id], onDelete: Cascade)
   creator    User                @relation("ProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
@@ -423,6 +427,7 @@ model Sep10Challenge {
   consumedAt    DateTime @default(now()) @map("consumed_at")
 
   @@index([expiresAt])
+  @@index([consumedAt, expiresAt])
   @@map("sep10_challenges")
 }
 

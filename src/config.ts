@@ -68,6 +68,12 @@ const schema = z.object({
   // is briefly down gets a fast retry; one that is genuinely broken is backed
   // away from rather than hammered.
   WEBHOOK_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(1000),
+  // How long a treasury proposal may sit unsigned before the worker marks it
+  // expired (see src/worker/cleanupProposals.ts). A long-abandoned proposal is
+  // already unsubmittable — its envelope's time bounds lapse and the treasury
+  // account's sequence number moves on — so this is when Mergepay records the
+  // state the chain has effectively already put it in.
+  TREASURY_PROPOSAL_EXPIRY_DAYS: z.coerce.number().int().positive().max(365).default(7),
   // Per-call network timeouts (ms) — every outbound Horizon/anchor request
   // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
   // a slow or hung upstream can't block a worker cycle indefinitely.

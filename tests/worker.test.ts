@@ -4,16 +4,30 @@ let currentSettlementState: Record<string, any> | null = null;
 let currentAnchorState: Record<string, any> | null = null;
 
 const h = vi.hoisted(() => {
+  let updateManyCount = 1;
   const settlement = {
     findMany: vi.fn(),
     findUnique: vi.fn(() => currentSettlementState),
+    findUniqueOrThrow: vi.fn(() => currentSettlementState),
     update: vi.fn(async ({ data }: any) => {
       if (currentSettlementState) {
         currentSettlementState = { ...currentSettlementState, ...data };
       }
       return currentSettlementState;
     }),
-    updateMany: vi.fn(async () => ({ count: 1 })),
+    updateMany: vi.fn(async ({ where, data }: any) => {
+      // Simulate conditional update: only update if status matches
+      if (currentSettlementState && where.status?.in?.includes(currentSettlementState.status)) {
+        updateManyCount = 1;
+        if (currentSettlementState && data) {
+          currentSettlementState = { ...currentSettlementState, ...data };
+        }
+        return { count: 1 };
+      }
+      updateManyCount = 0;
+      return { count: 0 };
+    }),
+    getUpdateManyCount: () => updateManyCount,
   };
   const anchorSession = {
     findMany: vi.fn(),
@@ -21,11 +35,20 @@ const h = vi.hoisted(() => {
     update: vi.fn(async () => undefined),
     updateMany: vi.fn(async () => ({ count: 1 })),
   };
+  const expenseShare = {
+    update: vi.fn(),
+  };
   const auditLog = { create: vi.fn() };
+  const statusHistory = {
+    findFirst: vi.fn(),
+    create: vi.fn(),
+  };
   const prisma: any = {
     settlement,
     anchorSession,
+    expenseShare,
     auditLog,
+    statusHistory,
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
@@ -274,8 +297,8 @@ describe("processSubmittedSettlements", () => {
     await promise;
 
     expect(currentSettlementState?.status).toBe("confirmed");
-    const updateCalls = h.prisma.settlement.update.mock.calls;
-    const statuses = updateCalls.map((c: any[]) => c[0].data.status);
+    const updateManyCalls = h.prisma.settlement.updateMany.mock.calls;
+    const statuses = updateManyCalls.map((c: any[]) => c[0].data?.status);
     expect(statuses).toContain("verifying");
     expect(statuses).toContain("confirmed");
     expect(statuses.indexOf("verifying")).toBeLessThan(statuses.indexOf("confirmed"));
@@ -367,9 +390,9 @@ describe("processSubmittedSettlements", () => {
 
     expect(h.submitPayment).toHaveBeenCalledTimes(SETTLEMENT_MAX_RETRIES);
     // The final update should mark it as failed with permanent category (retries exhausted)
-    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "settle_1" },
+        where: expect.objectContaining({ id: "settle_1" }),
         data: expect.objectContaining({
           status: "failed",
           failureReason: expect.any(String),
@@ -466,9 +489,9 @@ describe("processSubmittedSettlements", () => {
     // classifySettlementError, so the worker must not burn retries on an
     // XDR that will never become valid.
     expect(h.submitPayment).toHaveBeenCalledTimes(1);
-    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "settle_6" },
+        where: expect.objectContaining({ id: "settle_6" }),
         data: expect.objectContaining({ status: "failed" }),
       })
     );

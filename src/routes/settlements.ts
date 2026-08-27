@@ -83,6 +83,17 @@ const settlementIdParamSchema = z.object({
     .regex(/^[A-Za-z0-9_-]+$/, "Not a valid settlement identifier"),
 });
 
+/**
+ * Execution takes the settlement id in the body rather than the path. The
+ * idempotency reservation hashes the body, so putting every field that defines
+ * the request there is what makes "same key, different request" detectable at
+ * all — a path parameter would sit outside the hash.
+ */
+const executeBodySchema = z.object({
+  settlementId: z.string().min(1).max(64),
+  signedXdr: z.string().min(1),
+});
+
 const settlementStatusQuerySchema = z.object({
   /**
    * Whether to consult Horizon for on-chain confirmation. On by default —
@@ -107,6 +118,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // user rather than falling back to IP.
   const createLimit = rateLimited("settlementCreate");
   const confirmLimit = rateLimited("settlementConfirm");
+  const executeLimit = rateLimited("settlementExecute");
 
   // -- settle a specific expense share ----------------------------------------
   app.post("/expenses/:id/settle", createLimit, async (req) => {
@@ -422,6 +434,143 @@ export default async function settlementRoutes(app: FastifyInstance) {
       },
     });
   });
+
+  // -- execute (idempotent submission) ----------------------------------------
+  //
+  // The same effect as `POST /settlements/:id/confirm` — hand a signed envelope
+  // toward Horizon — but with idempotency enforced at the HTTP layer rather
+  // than around the transaction.
+  //
+  // The distinction matters for retries. `runIdempotent` replays the
+  // *operation's return value*; this route replays the *response the first
+  // attempt sent*, status code included, because a client that retried after a
+  // 202 and got back a 200 would draw a different conclusion about what
+  // happened to its payment. The `X-Idempotency-Key` preHandler (see
+  // src/plugins/idempotency.ts) reserves the key before the handler runs, so
+  // two concurrent retries resolve at the database's unique constraint and only
+  // one of them ever builds or submits a transaction.
+  //
+  // The key is mandatory here. This is the request that ends in money moving,
+  // and network latency between a client and this API is exactly the condition
+  // that produces an unacknowledged retry.
+  app.post(
+    "/api/settlements/execute",
+    {
+      ...executeLimit,
+      preHandler: app.idempotent({
+        scope: "settlement.execute",
+        required: true,
+      }),
+    },
+    async (req, reply) => {
+      const auth = requireUser(req);
+      const body = executeBodySchema.parse(req.body);
+
+      const settlementRow = await prisma.settlement.findUnique({
+        where: { id: body.settlementId },
+        include: settlementInclude,
+      });
+      if (!settlementRow) throw Errors.notFound("Settlement not found");
+      await requireMembership(settlementRow.groupId, auth.id);
+      if (settlementRow.fromUserId !== auth.id) {
+        throw Errors.forbidden("Only the payer can execute this settlement");
+      }
+
+      // Validate the envelope against the original intent before any state
+      // changes, so a transaction that does not match what the API authorized
+      // is rejected before it can be persisted or reach the worker — and so a
+      // validation failure is never cached as an idempotent success.
+      try {
+        validateSettlementXdr(body.signedXdr, settlementRow);
+      } catch (err) {
+        await audit({
+          userId: auth.id,
+          groupId: settlementRow.groupId,
+          action: "settlement.execute.validation_failed",
+          entityType: "settlement",
+          entityId: settlementRow.id,
+          outcome: "failure",
+          metadata: {
+            // The service's own stable text, never the envelope itself.
+            reason: err instanceof Error ? err.message : "validation failed",
+          },
+        });
+        throw err;
+      }
+
+      const result = await prisma.$transaction(async (tx) => {
+        const settlement = await tx.settlement.findUnique({
+          where: { id: body.settlementId },
+          include: settlementInclude,
+        });
+        if (!settlement) throw Errors.notFound("Settlement not found");
+
+        // Already accepted. Returning current state rather than re-submitting
+        // keeps a retry that lost its idempotency key safe too: the key is the
+        // first line of defence against a duplicate submission, not the only
+        // one.
+        if (
+          settlement.status === "completed" ||
+          settlement.status === "confirmed" ||
+          settlement.status === "submitted"
+        ) {
+          return {
+            settlement: serializeSettlement(settlement),
+            accepted: false,
+          };
+        }
+
+        // Conditional update, not a read-then-write: if a concurrent request
+        // moved the settlement off a submittable status between the read above
+        // and here, this affects zero rows and the winning state is returned
+        // instead of being clobbered.
+        const { count } = await tx.settlement.updateMany({
+          where: { id: settlement.id, status: { in: ["pending", "failed"] } },
+          data: {
+            transactionXdr: body.signedXdr,
+            status: "submitted",
+            submittedAt: new Date(),
+            retryCount: 0,
+            failureReason: null,
+          },
+        });
+
+        if (count > 0) {
+          await recordStatusTransitionInTransaction(tx, {
+            entityType: "settlement",
+            entityId: settlement.id,
+            newStatus: "submitted",
+            source: "api",
+          });
+          await auditTx(tx, {
+            userId: auth.id,
+            groupId: settlement.groupId,
+            action: "settlement.execute",
+            entityType: "settlement",
+            entityId: settlement.id,
+            metadata: { status: "submitted" },
+          });
+        }
+
+        const finalSettlement = await tx.settlement.findUniqueOrThrow({
+          where: { id: settlement.id },
+          include: settlementInclude,
+        });
+
+        return {
+          settlement: serializeSettlement(finalSettlement),
+          accepted: count > 0,
+        };
+      });
+
+      // 202 for a submission this request accepted, 200 for one that was
+      // already in flight. Both are cached against the idempotency key exactly
+      // as sent, so a retry cannot observe the status flipping underneath it.
+      return reply
+        .code(result.accepted ? 202 : 200)
+        .send({ settlement: result.settlement });
+    }
+  );
 
   // -- status -----------------------------------------------------------------
   //

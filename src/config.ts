@@ -83,6 +83,13 @@ const schema = z.object({
   ANCHOR_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   CONFIRM_POLL_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
   CONFIRM_POLL_DELAY_MS: z.coerce.number().int().positive().default(1500),
+  // How long a completed idempotency reservation replays before it is swept.
+  // Past this window the key is free to be reused — a documented contract, not
+  // an accident: an unbounded key space is a table that only grows.
+  IDEMPOTENCY_TTL_MS: z.coerce.number().int().positive().default(24 * 60 * 60 * 1000),
+  // How long an in-progress reservation blocks a retry with 409 before it is
+  // treated as abandoned by a crashed process and may be re-claimed.
+  IDEMPOTENCY_IN_PROGRESS_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   NODE_ENV: z.string().default("development"),
 
   // Security-sensitive endpoint policies.
@@ -107,6 +114,8 @@ const schema = z.object({
   RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_SETTLEMENT_CONFIRM_MAX: z.coerce.number().int().positive().max(100000).default(20),
   RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_EXECUTE_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
   SEP24_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_GROUP: z.coerce.number().int().positive().max(100000).default(10),

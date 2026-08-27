@@ -66,6 +66,7 @@ import {
   type JobFailureCategory,
 } from "../services/job-retry";
 import { reconcileSettlements } from "../services/settlement-reconciliation";
+import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
 import { cleanupChallenges } from "./tasks/cleanup-challenges";
 import {
@@ -927,6 +928,7 @@ export async function runWorkerCycle(): Promise<void> {
     processSubmittedSettlements(),
     reconcileAnchors(),
     reconcileSettlements(),
+    reconcileAllTreasuryBalances(),
     expireInvites(),
     cleanupChallenges(),
   ]);

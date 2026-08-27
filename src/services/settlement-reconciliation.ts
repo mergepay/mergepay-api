@@ -118,12 +118,7 @@ export interface ReconcilableSettlement {
  * error logging.
  */
 export async function reconcileSingleSettlement(
-  settlement: {
-    id: string;
-    stellarTxHash: string | null;
-    retryCount: number;
-    expenseShareId: string | null;
-  },
+  settlement: ReconcilableSettlement,
   maxRetries: number = RECONCILIATION_MAX_RETRIES,
   ctx?: CorrelationContext
 ): Promise<void> {

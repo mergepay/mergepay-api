@@ -2,6 +2,7 @@ import pino from "pino";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
 import { audit } from "./audit";
+import { applySettlementTransition } from "./settlement-machine";
 import type { CorrelationContext } from "../lib/correlation";
 import { jobContext, loggerWithContext } from "../lib/correlation";
 
@@ -72,6 +73,7 @@ export async function reconcileSingleSettlement(
     id: string;
     stellarTxHash: string | null;
     retryCount: number;
+    expenseShareId: string | null;
   },
   maxRetries: number = RECONCILIATION_MAX_RETRIES,
   ctx?: CorrelationContext
@@ -89,13 +91,15 @@ export async function reconcileSingleSettlement(
   }
 
   if (tx.successful) {
-    await prisma.settlement.update({
-      where: { id: settlement.id },
-      data: {
-        status: "completed",
+    await applySettlementTransition({
+      settlementId: settlement.id,
+      nextStatus: "confirmed",
+      source: "worker",
+      extraData: {
         retryCount: 0,
         failureReason: null,
       },
+      settleExpenseShare: true,
     });
     await audit({
       userId: null,
@@ -106,10 +110,11 @@ export async function reconcileSingleSettlement(
     });
     recLog.info({ id: settlement.id, hash }, "settlement completed");
   } else {
-    await prisma.settlement.update({
-      where: { id: settlement.id },
-      data: {
-        status: "failed",
+    await applySettlementTransition({
+      settlementId: settlement.id,
+      nextStatus: "failed",
+      source: "worker",
+      extraData: {
         failureReason: `Transaction ${hash} failed on Stellar`,
         retryCount: settlement.retryCount,
       },
@@ -134,10 +139,11 @@ async function handleTransactionNotFound(
   const nextRetryCount = settlement.retryCount + 1;
 
   if (nextRetryCount > maxRetries) {
-    await prisma.settlement.update({
-      where: { id: settlement.id },
-      data: {
-        status: "failed",
+    await applySettlementTransition({
+      settlementId: settlement.id,
+      nextStatus: "failed",
+      source: "worker",
+      extraData: {
         failureReason: `Transaction ${hash} not confirmed after ${maxRetries} reconciliation attempts`,
         retryCount: nextRetryCount,
       },

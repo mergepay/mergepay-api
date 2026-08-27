@@ -34,7 +34,9 @@ vi.mock("../src/services/stellar", () => ({
     loadAccount: vi.fn(async () => ({
       exists: true,
       sequence: "1",
-      balances: [],
+      // Funded past the payment, envelope fee, and base reserve so settlement
+      // preflight passes and these tests exercise idempotency alone.
+      balances: [{ assetCode: "XLM", assetIssuer: null, balance: "1000.0000000" }],
       signers: [],
       thresholds: { low: 0, med: 0, high: 0 },
     })),

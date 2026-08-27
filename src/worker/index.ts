@@ -44,6 +44,7 @@ import {
 } from "../services/settlement-machine";
 import { pollForConfirmation } from "../services/horizon-confirm";
 import { settlementPaymentIntent } from "../services/settlement-xdr";
+import { checkSettlementPreflight } from "../services/settlement-preflight";
 import {
   anchorService,
   AUDITABLE_ANCHOR_STATUSES,
@@ -415,6 +416,32 @@ export async function processSettlementJob(
       attempt: job.retryCount,
       category: "permanent",
       reason: "Signing window expired before the transaction was submitted",
+      ctx,
+    });
+    return;
+  }
+
+  // The same preflight the settlement route ran when it issued the envelope,
+  // re-run against the account as it stands now. Balances move between signing
+  // and submission — a payer can spend elsewhere in that window — and
+  // submitting a transaction the account can no longer fund only produces
+  // op_underfunded after burning an attempt.
+  //
+  // An unreachable Horizon is deliberately *not* a failure here: it says
+  // nothing about the balance, so the job proceeds and the submission path's
+  // own retry classification handles the outage.
+  const preflight = await checkSettlementPreflight({
+    sourcePublicKey: job.fromPublicKey,
+    assetCode: job.assetCode,
+    assetIssuer: job.assetIssuer,
+    amount: job.amount,
+  });
+  if (!preflight.ok && preflight.reason !== "upstream_unavailable") {
+    await failSettlement({
+      job,
+      attempt: job.retryCount,
+      category: "permanent",
+      reason: preflight.message,
       ctx,
     });
     return;

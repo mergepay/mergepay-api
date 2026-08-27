@@ -37,6 +37,14 @@ export const ErrorCode = {
   PAYER_SHARE: "PAYER_SHARE",
   SELF_SETTLE: "SELF_SETTLE",
   ACCOUNT_UNFUNDED: "ACCOUNT_UNFUNDED",
+  /**
+   * Settlement preflight outcomes (see src/services/settlement-preflight.ts).
+   * Kept distinct because the remedies differ: establish a trustline, acquire
+   * more of the asset, or top up XLM for the fee and account reserve.
+   */
+  MISSING_TRUSTLINE: "MISSING_TRUSTLINE",
+  INSUFFICIENT_BALANCE: "INSUFFICIENT_BALANCE",
+  INSUFFICIENT_FEE_BALANCE: "INSUFFICIENT_FEE_BALANCE",
   TREASURY_DISABLED: "TREASURY_DISABLED",
   TREASURY_UNFUNDED: "TREASURY_UNFUNDED",
   INVITE_EXPIRED: "INVITE_EXPIRED",

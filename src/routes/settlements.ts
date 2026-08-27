@@ -64,6 +64,10 @@ import {
   toPublicStatus,
 } from "../services/settlement-status";
 import { recordStatusTransitionInTransaction } from "../services/status-history";
+import {
+  assertPreflightResult,
+  evaluatePreflight,
+} from "../services/settlement-preflight";
 
 const settlementInclude = { from: true, to: true, statusHistory: true } as const;
 
@@ -629,13 +633,31 @@ async function buildSettlementXdr(params: {
   memoCode: string;
   validitySeconds: number;
 }): Promise<string> {
-  const account = await stellar.loadAccount(params.fromPublicKey);
-  if (!account.exists) {
-    throw Errors.badRequest(
-      "account_unfunded",
-      "Your Stellar account is not funded yet. Fund it before settling."
+  // One account load serves both the preflight and the sequence number the
+  // envelope is built on, so the balance check and the transaction describe the
+  // same observation of the account rather than two Horizon reads apart.
+  let account;
+  try {
+    account = await stellar.loadAccount(params.fromPublicKey);
+  } catch {
+    throw Errors.upstream(
+      "Could not reach the Stellar network to check your balance. Try again shortly."
     );
   }
+
+  // Refuse before building an envelope the account cannot pay for. This does
+  // not replace signed-XDR validation — that still runs on whatever the wallet
+  // returns — and Horizon state can move between here and submission, so the
+  // worker's submission errors are still handled.
+  assertPreflightResult(
+    evaluatePreflight(account, {
+      sourcePublicKey: params.fromPublicKey,
+      assetCode: params.assetCode,
+      assetIssuer: params.assetIssuer,
+      amount: params.amount,
+    })
+  );
+
   return stellar.buildPayment({
     sourcePublicKey: params.fromPublicKey,
     sourceSequence: account.sequence,

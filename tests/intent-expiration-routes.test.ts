@@ -222,8 +222,11 @@ beforeEach(async () => {
   h.loadAccount.mockResolvedValue({
     exists: true,
     sequence: "1",
-    balances: [],
-    signers: [],
+    // Funded well above the payment, the envelope fee, and the base reserve so
+    // settlement preflight (src/services/settlement-preflight.ts) passes and
+    // these tests exercise intent expiry rather than affordability.
+    balances: [{ assetCode: "XLM", assetIssuer: null, balance: "1000.0000000" }],
+    signers: [{ key: PAYER_KEY, weight: 1 }],
     thresholds: { low: 0, med: 0, high: 0 },
   });
   h.buildPayment.mockImplementation((params: any) =>

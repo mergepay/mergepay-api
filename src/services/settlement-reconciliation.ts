@@ -2,6 +2,7 @@ import pino from "pino";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
 import { audit } from "./audit";
+import { Errors } from "../errors";
 import { applySettlementTransition } from "./settlement-machine";
 import type { CorrelationContext } from "../lib/correlation";
 import { jobContext, loggerWithContext } from "../lib/correlation";
@@ -135,6 +136,57 @@ export async function reconcileSingleSettlement(
   }
 
   if (tx.successful) {
+    try {
+      const expectedMemo = `MP:${settlement.shortCode}`;
+      await verifyTransactionMemo(hash, expectedMemo);
+
+      const payments = await getTransactionPayments(hash);
+      const paymentOp = payments.find((op) => op.type === "payment");
+      if (!paymentOp) {
+        throw Errors.badRequest(
+          "settlement_verification_failed",
+          "No payment operation found in transaction"
+        );
+      }
+      verifyPaymentOperation(paymentOp, {
+        destination: settlement.destinationPublicKey,
+        amount: settlement.amount,
+        assetCode: settlement.assetCode,
+        assetIssuer: settlement.assetIssuer,
+      });
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        (err.message.includes("verification_failed") ||
+          err.message.includes("does not match") ||
+          err.message.includes("No payment operation") ||
+          err.message.includes("Horizon request failed"))
+      ) {
+        await applySettlementTransition({
+          settlementId: settlement.id,
+          nextStatus: "failed",
+          source: "worker",
+          extraData: {
+            failureReason: err.message,
+            retryCount: settlement.retryCount,
+          },
+        });
+        await audit({
+          userId: null,
+          action: "settlement.verification_failed",
+          entityType: "settlement",
+          entityId: settlement.id,
+          metadata: { stellarTxHash: hash, reason: err.message },
+        });
+        recLog.error(
+          { id: settlement.id, hash, reason: err.message },
+          "settlement transaction verification failed"
+        );
+        return;
+      }
+      throw err;
+    }
+
     await applySettlementTransition({
       settlementId: settlement.id,
       nextStatus: "confirmed",

@@ -11,14 +11,7 @@ import { auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
 import { createExpenseSchema, updateExpenseSchema } from "../validations/expense";
-import {
-  buildPage,
-  cursorFilter,
-  cursorOrderBy,
-  paginationQuerySchema,
-  requireCursor,
-  takeForPage,
-} from "../lib/pagination";
+import { expenseListQuerySchema, listGroupExpenses } from "../services/expenses";
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });
@@ -105,21 +98,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const query = expenseListQuerySchema.parse(req.query ?? {});
     // Membership is checked before any row is read, and the `groupId` filter
-    // below is what scopes the page — never the cursor.
+    // the service applies is what scopes the page — never the cursor.
     await requireMembership(groupId, auth.id);
 
-    const position = requireCursor(cursor);
+    const { items, meta } = await listGroupExpenses(groupId, query, expenseInclude);
 
-    const expenses = await prisma.expense.findMany({
-      where: { groupId, ...cursorFilter(position, order) },
-      include: expenseInclude,
-      orderBy: cursorOrderBy(order),
-      take: takeForPage(limit),
-    });
-
-    const { items, meta } = buildPage(expenses, limit, order);
     return { expenses: items.map(serializeExpense), meta };
   });
 

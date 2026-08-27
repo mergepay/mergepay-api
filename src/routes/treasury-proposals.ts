@@ -151,6 +151,7 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         groupId,
         memberPublicKeys,
         signedXdr: body.signedXdr,
+        userId: auth.id,
       });
 
       await audit({

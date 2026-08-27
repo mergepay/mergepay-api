@@ -1,6 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
+import { StrKey, Transaction } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
@@ -198,6 +198,22 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       operation: async () => {
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
+        const xdr = stellar.buildPayment({
+          sourcePublicKey: auth.stellarPublicKey,
+          sourceSequence: (await stellar.loadAccount(auth.stellarPublicKey)).sequence,
+          destination: treasuryKey,
+          asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
+          amount: body.amount,
+          memoCode: code,
+          validitySeconds,
+        });
+
+        // Compute the transaction hash so the confirm endpoint can validate
+        // the submitted signed XDR is for this exact intent.
+        const intendedTxHash = new Transaction(xdr, config.networkPassphrase)
+          .hash()
+          .toString("hex");
+
         const ttx = await prisma.treasuryTransaction.create({
           data: {
             shortCode: code,
@@ -211,22 +227,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             status: "pending",
             memo: memoText(code),
             expiresAt,
+            intendedTxHash,
           },
           include: { user: true },
-        });
-
-        const account = await stellar.loadAccount(auth.stellarPublicKey);
-        if (!account.exists) {
-          throw Errors.badRequest("account_unfunded", "Your account is not funded yet");
-        }
-        const xdr = stellar.buildPayment({
-          sourcePublicKey: auth.stellarPublicKey,
-          sourceSequence: account.sequence,
-          destination: treasuryKey,
-          asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
-          amount: body.amount,
-          memoCode: code,
-          validitySeconds,
         });
 
         return {
@@ -279,6 +282,26 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       operation: async () => {
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
+        const account = await stellar.loadAccount(treasuryKey);
+        if (!account.exists) {
+          throw Errors.badRequest("treasury_unfunded", "Treasury account is not funded");
+        }
+        const xdr = stellar.buildPayment({
+          sourcePublicKey: treasuryKey,
+          sourceSequence: account.sequence,
+          destination: body.destination,
+          asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
+          amount: body.amount,
+          memoCode: code,
+          validitySeconds,
+        });
+
+        // Compute the transaction hash so the confirm endpoint can validate
+        // the submitted signed XDR is for this exact intent.
+        const intendedTxHash = new Transaction(xdr, config.networkPassphrase)
+          .hash()
+          .toString("hex");
+
         const ttx = await prisma.treasuryTransaction.create({
           data: {
             shortCode: code,
@@ -292,22 +315,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             status: requiresMulti ? "awaiting_signatures" : "pending",
             memo: memoText(code),
             expiresAt,
+            intendedTxHash,
           },
           include: { user: true },
-        });
-
-        const account = await stellar.loadAccount(treasuryKey);
-        if (!account.exists) {
-          throw Errors.badRequest("treasury_unfunded", "Treasury account is not funded");
-        }
-        const xdr = stellar.buildPayment({
-          sourcePublicKey: treasuryKey,
-          sourceSequence: account.sequence,
-          destination: body.destination,
-          asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
-          amount: body.amount,
-          memoCode: code,
-          validitySeconds,
         });
 
         return {
@@ -388,6 +398,25 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         if (!fresh) throw Errors.notFound("Treasury transaction not found");
         if (fresh.status === "confirmed") {
           return { treasuryTransaction: serializeTreasuryTx(fresh) };
+        }
+
+        // Validate the submitted signed XDR is for the exact intended
+        // transaction. This prevents a signer from submitting a signature
+        // for a modified (attacker-changed) transaction.
+        if (fresh.intendedTxHash) {
+          try {
+            const submittedTx = new Transaction(body.signedXdr, config.networkPassphrase);
+            const submittedHash = submittedTx.hash().toString("hex");
+            if (submittedHash !== fresh.intendedTxHash) {
+              throw Errors.badRequest(
+                "xdr_mismatch",
+                "Submitted signed XDR does not match the intended transaction"
+              );
+            }
+          } catch (e) {
+            if (e instanceof AppError) throw e;
+            throw Errors.badRequest("xdr_malformed", "Could not parse signed XDR");
+          }
         }
 
         let hash: string;

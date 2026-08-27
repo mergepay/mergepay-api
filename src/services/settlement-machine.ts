@@ -2,11 +2,13 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 import { AppError, Errors } from "../errors";
 import { auditTx } from "./audit";
+import { recordStatusTransitionInTransaction } from "./status-history";
 
 export type SettlementStatus =
   | "pending"
   | "submitted"
   | "verifying"
+  | "pending_confirmation"
   | "confirmed"
   | "failed"
   | "needs_review";
@@ -17,6 +19,7 @@ export const SETTLEMENT_STATUSES: readonly SettlementStatus[] = [
   "pending",
   "submitted",
   "verifying",
+  "pending_confirmation",
   "confirmed",
   "failed",
   "needs_review",
@@ -26,6 +29,7 @@ const ALLOWED_TRANSITIONS: Record<SettlementStatus, readonly SettlementStatus[]>
   pending: ["submitted", "failed"],
   submitted: ["verifying", "failed"],
   verifying: ["confirmed", "failed", "needs_review", "submitted"],
+  pending_confirmation: ["confirmed", "failed"],
   confirmed: [],
   failed: [],
   needs_review: ["confirmed", "failed"],
@@ -55,18 +59,41 @@ export interface SettlementTransitionResult<T> {
   changed: boolean;
 }
 
-export async function applySettlementTransition(params: {
+export interface ApplySettlementTransitionParams {
   settlementId: string;
   nextStatus: SettlementStatus;
   source: SettlementTransitionSource;
   extraData?: Prisma.SettlementUncheckedUpdateInput;
   ownerUserId?: string;
   tx?: Prisma.TransactionClient;
-}): Promise<SettlementTransitionResult<{ id: string; status: string }>> {
-  const { settlementId, nextStatus, source, extraData, ownerUserId, tx } = params;
+  /** If true and transitioning to confirmed, also mark the linked expenseShare as settled. */
+  settleExpenseShare?: boolean;
+}
+
+export async function applySettlementTransition(params: ApplySettlementTransitionParams): Promise<
+  SettlementTransitionResult<{ id: string; status: string; expenseShareId: string | null }>
+> {
+  const {
+    settlementId,
+    nextStatus,
+    source,
+    extraData,
+    ownerUserId,
+    tx,
+    settleExpenseShare = false,
+  } = params;
 
   async function execute(client: Prisma.TransactionClient) {
-    const settlement = await client.settlement.findUnique({ where: { id: settlementId } });
+    const settlement = await client.settlement.findUnique({
+      where: { id: settlementId },
+      select: {
+        id: true,
+        status: true,
+        fromUserId: true,
+        expenseShareId: true,
+        retryCount: true,
+      },
+    });
     if (!settlement) {
       throw Errors.notFound("Settlement not found");
     }
@@ -99,9 +126,29 @@ export async function applySettlementTransition(params: {
     if (nextStatus === "submitted") timestamps.submittedAt = now;
     if (nextStatus === "confirmed") timestamps.confirmedAt = now;
 
-    const updated = await client.settlement.update({
-      where: { id: settlementId },
+    const allowedFromStatuses = Object.entries(ALLOWED_TRANSITIONS)
+      .filter(([, tos]) => tos.includes(nextStatus))
+      .map(([from]) => from);
+
+    const updateResult = await client.settlement.updateMany({
+      where: {
+        id: settlementId,
+        status: { in: allowedFromStatuses as SettlementStatus[] },
+      },
       data: { ...extraData, ...timestamps, status: nextStatus },
+    });
+
+    if (updateResult.count === 0) {
+      const currentSettlement = await client.settlement.findUniqueOrThrow({
+        where: { id: settlementId },
+        select: { id: true, status: true, expenseShareId: true },
+      });
+      return { settlement: currentSettlement, changed: false };
+    }
+
+    const updated = await client.settlement.findUniqueOrThrow({
+      where: { id: settlementId },
+      select: { id: true, status: true, expenseShareId: true },
     });
 
     await auditTx(client, {
@@ -116,6 +163,20 @@ export async function applySettlementTransition(params: {
         retryCount: settlement.retryCount,
       },
     });
+
+    await recordStatusTransitionInTransaction(client, {
+      entityType: "settlement",
+      entityId: settlementId,
+      newStatus: nextStatus,
+      source,
+    });
+
+    if (settleExpenseShare && settlement.expenseShareId && nextStatus === "confirmed") {
+      await client.expenseShare.update({
+        where: { id: settlement.expenseShareId },
+        data: { status: "settled" },
+      });
+    }
 
     return { settlement: updated, changed: true };
   }

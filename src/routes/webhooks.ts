@@ -6,6 +6,7 @@ import { requireUser } from "../plugins/auth";
 import { requireAdmin, requireMembership } from "../services/access";
 import { WEBHOOK_EVENT_TYPES } from "../services/event";
 import { createWebhookSecret, dispatchWebhook } from "../services/webhook";
+import { auditTx } from "../services/audit";
 
 const paramsSchema = z.object({ groupId: z.string().min(1) });
 const webhookParamsSchema = paramsSchema.extend({
@@ -61,15 +62,26 @@ export default async function webhookRoutes(app: FastifyInstance) {
       );
     }
 
-    const webhook = await (prisma as any).webhook.create({
-      data: {
+    const webhook = await prisma.$transaction(async (tx) => {
+      const created = await (tx as any).webhook.create({
+        data: {
+          groupId,
+          userId: null,
+          url: body.url,
+          secret: createWebhookSecret(),
+          events: body.events,
+          enabled: true,
+        },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
         groupId,
-        userId: null,
-        url: body.url,
-        secret: createWebhookSecret(),
-        events: body.events,
-        enabled: true,
-      },
+        action: "group.webhook_create",
+        entityType: "webhook",
+        entityId: created.id,
+        metadata: { eventCount: body.events.length },
+      });
+      return created;
     });
 
     return { webhook: publicWebhook(webhook, true) };
@@ -98,7 +110,16 @@ export default async function webhookRoutes(app: FastifyInstance) {
     });
     if (!webhook) throw Errors.notFound("Webhook not found");
 
-    await (prisma as any).webhook.delete({ where: { id: webhookId } });
+    await prisma.$transaction(async (tx) => {
+      await (tx as any).webhook.delete({ where: { id: webhookId } });
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId,
+        action: "group.webhook_delete",
+        entityType: "webhook",
+        entityId: webhookId,
+      });
+    });
     return { deleted: true };
   });
 
@@ -120,6 +141,17 @@ export default async function webhookRoutes(app: FastifyInstance) {
       requestedBy: auth.id,
       groupId,
     }).catch(() => undefined);
+
+    await prisma.$transaction(async (tx) => {
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId,
+        action: "group.webhook_test",
+        entityType: "webhook",
+        entityId: webhookId,
+        metadata: { event: "expense.created" },
+      });
+    });
 
     return { queued: true };
   });

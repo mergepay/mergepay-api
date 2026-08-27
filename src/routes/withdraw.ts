@@ -6,7 +6,7 @@ import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService } from "../services/anchor";
 import { stellar } from "../services/stellar";
-import { audit } from "../services/audit";
+import { audit, auditTx } from "../services/audit";
 import { isPositive } from "../services/money";
 
 const SUPPORTED_ASSET_CODES = ["USDC", "XLM"] as const;
@@ -147,9 +147,19 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           assetCode: withdrawal.assetCode,
           account: auth.stellarPublicKey,
         });
-        const updated = await withdrawalModel.update({
-          where: { id },
-          data: { anchorTxId: result.id, status: "pending" },
+        const updated = await prisma.$transaction(async (tx) => {
+          const changed = await (tx as any).withdrawal.update({
+            where: { id },
+            data: { anchorTxId: result.id, status: "pending" },
+          });
+          await auditTx(tx, {
+            userId: auth.id,
+            action: "withdrawal.confirm",
+            entityType: "withdrawal",
+            entityId: id,
+            metadata: { outcome: "success" },
+          });
+          return changed;
         });
         return {
           ...serializeWithdrawal(updated),
@@ -157,9 +167,19 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           transaction_id: result.id,
         };
       } catch (error) {
-        await withdrawalModel.update({
-          where: { id },
-          data: { status: "failed" },
+        await prisma.$transaction(async (tx) => {
+          await (tx as any).withdrawal.update({
+            where: { id },
+            data: { status: "failed" },
+          });
+          await auditTx(tx, {
+            userId: auth.id,
+            action: "withdrawal.confirm",
+            entityType: "withdrawal",
+            entityId: id,
+            outcome: "failure",
+            metadata: { reason: error instanceof AppError ? error.code : "upstream_error" },
+          });
         });
         if (error instanceof AppError) throw error;
         throw Errors.upstream("Withdrawal confirmation failed");

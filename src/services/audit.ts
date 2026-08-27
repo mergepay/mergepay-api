@@ -1,6 +1,29 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 
+const SENSITIVE_KEYS = new Set([
+  "privatekey",
+  "secretkey",
+  "signedxdr",
+  "transactionxdr",
+  "xdr",
+  "token",
+  "jwt",
+  "authorization",
+  "password",
+  "secret",
+]);
+
+function sanitize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitize);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !SENSITIVE_KEYS.has(key.toLowerCase()))
+      .map(([key, item]) => [key, sanitize(item)])
+  );
+}
+
 /** Whether the audited action succeeded, for operator-facing filtering. */
 export type AuditOutcome = "success" | "failure";
 
@@ -24,7 +47,7 @@ export function auditData(params: AuditParams) {
     entityType: params.entityType,
     entityId: params.entityId,
     metadata: {
-      ...(params.metadata ?? {}),
+      ...(sanitize(params.metadata ?? {}) as Record<string, unknown>),
       ...(params.outcome ? { outcome: params.outcome } : {}),
     } as any,
   };

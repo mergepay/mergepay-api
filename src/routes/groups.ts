@@ -6,7 +6,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { inviteCode } from "../services/codes";
-import { audit, auditTx } from "../services/audit";
+import { auditTx } from "../services/audit";
 import {
   serializeGroup,
   serializeInvitation,
@@ -399,15 +399,17 @@ export default async function groupRoutes(app: FastifyInstance) {
       }
     }
 
-    await prisma.groupMember.delete({
-      where: { groupId_userId: { groupId: id, userId: memberId } },
-    });
-    await audit({
-      userId: auth.id,
-      action: "group.member_remove",
-      entityType: "group",
-      entityId: id,
-      metadata: { removedUserId: memberId },
+    await prisma.$transaction(async (tx) => {
+      await tx.groupMember.delete({
+        where: { groupId_userId: { groupId: id, userId: memberId } },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "group.member_remove",
+        entityType: "group",
+        entityId: id,
+        metadata: { removedUserId: memberId },
+      });
     });
     return { ok: true };
   });

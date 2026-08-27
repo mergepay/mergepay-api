@@ -101,14 +101,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
         include: expenseInclude,
       });
 
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.create",
-          entityType: "expense",
-          entityId: created.id,
-          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
-        },
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId,
+        action: "expense.create",
+        entityType: "expense",
+        entityId: created.id,
+        metadata: { amount: body.amount, assetCode: body.assetCode },
       });
 
       return created;
@@ -180,13 +179,12 @@ export default async function expenseRoutes(app: FastifyInstance) {
         include: expenseInclude,
       });
 
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.update",
-          entityType: "expense",
-          entityId: id,
-        },
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: expense.groupId,
+        action: "expense.update",
+        entityType: "expense",
+        entityId: id,
       });
 
       return result;
@@ -222,13 +220,12 @@ export default async function expenseRoutes(app: FastifyInstance) {
       }
 
       await tx.expense.delete({ where: { id } });
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.delete",
-          entityType: "expense",
-          entityId: id,
-        },
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: found.groupId,
+        action: "expense.delete",
+        entityType: "expense",
+        entityId: id,
       });
     });
     return { ok: true };

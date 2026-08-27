@@ -344,6 +344,40 @@ bare transaction envelopes removed before it is ever persisted.
 
 ---
 
+## Request size limits
+
+Every size limit is explicit and configurable, and each has its own error code
+so a client can tell what to change. All are answered as `413` — the request was
+well-formed, just too large — except a body that is not multipart at all, which
+is `415`.
+
+| Limit | Environment variable | Default | Code when exceeded |
+| --- | --- | --- | --- |
+| JSON body (global) | `JSON_BODY_LIMIT_BYTES` | 1 MB | `REQUEST_TOO_LARGE` |
+| JSON body (auth, settlement, treasury, anchor routes) | `AUTH_BODY_LIMIT_BYTES` | 256 KB | `REQUEST_TOO_LARGE` |
+| Uploaded file size | `MULTIPART_FILE_SIZE_BYTES` | 5 MB | `FILE_TOO_LARGE` |
+| Files per request | `MULTIPART_MAX_FILES` | 1 | `TOO_MANY_FILES` |
+| Single form field size | `MULTIPART_FIELD_SIZE_BYTES` | 64 KB | `FIELD_TOO_LARGE` |
+| Total multipart parts | `MULTIPART_MAX_FIELDS` | 20 | `TOO_MANY_PARTS` |
+
+A malformed multipart body is `400 BAD_REQUEST` with a fixed message; the
+parser's own text is never echoed, because it can quote the malformed input.
+
+Limits are applied at the narrowest scope that works. The multipart limits reach
+only `POST /uploads/receipt`, the sole multipart route — the SEP-24 anchor flow
+is JSON end to end — so ordinary JSON routes keep their own body limit and are
+unaffected.
+
+### Uploads never leave partial state
+
+`POST /uploads/receipt` streams the file to a staging directory outside the
+served path and renames it into place only once it has been fully received and
+accepted. Nothing is buffered whole in memory, every rejection path removes the
+partial file, and no URL is returned for a file that is not complete. A client
+that aborts mid-upload leaves nothing behind.
+
+---
+
 ## Rate limiting
 
 Every route is covered by a global budget; SEP-10 authentication, signed

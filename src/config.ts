@@ -47,11 +47,22 @@ const schema = z.object({
   STABLE_ASSET_CODE: z.string().min(1, "STABLE_ASSET_CODE is required"),
   STABLE_ASSET_ISSUER: stellarPublicKeySchema,
   
-  // File storage
+  // File storage and request limits. See src/lib/request-limits.ts for how each
+  // of these is enforced and what a client is told when one trips.
   UPLOADS_DIR: z.string().default("./uploads"),
   JSON_BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(1024 * 1024),
   MULTIPART_MAX_FILES: z.coerce.number().int().positive().default(1),
+  // Total multipart parts (fields + files) accepted in one request.
   MULTIPART_MAX_FIELDS: z.coerce.number().int().positive().default(20),
+  // Largest single non-file form field. The upload route takes only a file, so
+  // this is bounded tightly: a large *field* has no legitimate use here, and
+  // busboy buffers field values in memory rather than streaming them.
+  MULTIPART_FIELD_SIZE_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(1024 * 1024)
+    .default(64 * 1024),
 
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),

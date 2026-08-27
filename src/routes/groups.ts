@@ -7,7 +7,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
-import { audit, auditTx } from "../services/audit";
+import { ADMIN_AUDIT_ACTIONS, audit, auditTx } from "../services/audit";
 import {
   serializeGroup,
   serializeInvitation,
@@ -417,6 +417,32 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- remove member ---------------------------------------------------------
+  app.patch("/groups/:id/members/:memberId", async (req) => {
+    const auth = requireUser(req);
+    const { id, memberId } = z.object({ id: z.string(), memberId: z.string() }).parse(req.params);
+    const body = z.object({ role: z.enum(["admin", "member"]) }).parse(req.body);
+    const updated = await prisma.$transaction(async (tx) => {
+      await requireAdmin(id, auth.id, tx);
+      const member = await tx.groupMember.findUnique({ where: { groupId_userId: { groupId: id, userId: memberId } } });
+      if (!member) throw Errors.notFound("Member not found in this group");
+      const result = await tx.groupMember.update({
+        where: { groupId_userId: { groupId: id, userId: memberId } },
+        data: { role: body.role },
+        include: { user: true },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: id,
+        action: ADMIN_AUDIT_ACTIONS.MEMBER_ROLE_UPDATED,
+        entityType: "group_member",
+        entityId: memberId,
+        metadata: { previousRole: member.role, role: body.role },
+      });
+      return result;
+    });
+    return { member: serializeMember(updated) };
+  });
+
   app.delete("/groups/:id/members/:memberId", async (req) => {
     const auth = requireUser(req);
     const { id, memberId } = z
@@ -450,15 +476,16 @@ export default async function groupRoutes(app: FastifyInstance) {
       }
     }
 
-    await prisma.groupMember.delete({
-      where: { groupId_userId: { groupId: id, userId: memberId } },
-    });
-    await audit({
-      userId: auth.id,
-      action: "group.member_remove",
-      entityType: "group",
-      entityId: id,
-      metadata: { removedUserId: memberId },
+    await prisma.$transaction(async (tx) => {
+      await tx.groupMember.delete({ where: { groupId_userId: { groupId: id, userId: memberId } } });
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: id,
+        action: ADMIN_AUDIT_ACTIONS.MEMBER_REMOVED,
+        entityType: "group_member",
+        entityId: memberId,
+        metadata: { removedUserId: memberId },
+      });
     });
     return { ok: true };
   });

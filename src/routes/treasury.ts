@@ -8,7 +8,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
-import { audit, auditTx } from "../services/audit";
+import { ADMIN_AUDIT_ACTIONS, audit, auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { rateLimited } from "../lib/rate-limit";
 import {
@@ -79,7 +79,8 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
-        action: "treasury.enable",
+        groupId: id,
+        action: ADMIN_AUDIT_ACTIONS.MULTISIG_CONFIG_CHANGED,
         entityType: "group",
         entityId: id,
       });

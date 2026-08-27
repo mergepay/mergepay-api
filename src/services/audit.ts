@@ -4,6 +4,12 @@ import { prisma } from "../db";
 /** Whether the audited action succeeded, for operator-facing filtering. */
 export type AuditOutcome = "success" | "failure";
 
+export const ADMIN_AUDIT_ACTIONS = {
+  MEMBER_ROLE_UPDATED: "MEMBER_ROLE_UPDATED",
+  MEMBER_REMOVED: "MEMBER_REMOVED",
+  MULTISIG_CONFIG_CHANGED: "MULTISIG_CONFIG_CHANGED",
+} as const;
+
 export interface AuditParams {
   userId?: string | null;
   groupId?: string | null;

@@ -261,4 +261,25 @@ describe("GET /groups/:id/audit-log", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ events: [], nextCursor: null });
   });
+
+  it("allows an active member to use the new filtered paginated endpoint", async () => {
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: "user_1",
+      role: "member",
+      status: "active",
+    });
+    prisma.auditLog.findMany.mockResolvedValueOnce([fakeEvent({ id: "a1" }), fakeEvent({ id: "a2" })]);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/groups/group_1/audit-logs?limit=1&action=expense.create",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().events).toHaveLength(1);
+    expect(res.json().nextCursor).toBe("a1");
+    expect(prisma.auditLog.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 2 }));
+  });
 });

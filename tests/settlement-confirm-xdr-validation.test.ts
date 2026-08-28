@@ -27,9 +27,12 @@ const h = vi.hoisted(() => {
   });
   const prisma: any = {
     settlement: model(),
+    groupMember: model(),
     idempotencyKey: model(),
     statusHistory: model(),
     auditLog: { create: vi.fn() },
+    groupMember: model(),
+    group: model(),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
@@ -124,6 +127,9 @@ let app: Awaited<ReturnType<typeof buildApp>>;
 beforeEach(async () => {
   vi.clearAllMocks();
   if (!app) app = await buildApp();
+  // Membership check for requireMembership
+  prisma.groupMember.findUnique.mockResolvedValue({ groupId: "group_1", userId: "user_1", role: "member" });
+  prisma.group.findUnique.mockResolvedValue({ id: "group_1" });
 });
 
 describe("POST /settlements/:id/confirm — XDR intent validation", () => {

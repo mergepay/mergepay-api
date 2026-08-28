@@ -51,7 +51,6 @@ import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
-import { validateAsset, validateAmount } from "../services/assets";
 import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
 import {
   intentExpiry,
@@ -63,6 +62,7 @@ import {
   resolveSettlementStatus,
   toPublicStatus,
 } from "../services/settlement-status";
+import { applySettlementTransition } from "../services/settlement-machine";
 import { recordStatusTransitionInTransaction } from "../services/status-history";
 
 const settlementInclude = { from: true, to: true, statusHistory: true } as const;
@@ -162,6 +162,28 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.conflict("already_settled", "Your share is already settled");
         }
 
+        // Database-level duplicate guard: even if the request-level idempotency
+        // service is bypassed (e.g. no key, or a test double), the unique
+        // constraint on (expenseShareId, idempotencyKey) catches duplicates.
+        if (idempotencyKey) {
+          const existing = await tx.settlement.findFirst({
+            where: {
+              expenseShareId: myShare.id,
+              idempotencyKey,
+              status: { notIn: ["failed"] },
+            },
+            select: { id: true, shortCode: true, status: true },
+          });
+          if (existing) {
+            return {
+              settlement: serializeSettlement(existing),
+              xdr: null,
+              networkPassphrase: config.networkPassphrase,
+              duplicate: true,
+            };
+          }
+        }
+
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({
@@ -175,6 +197,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
             assetIssuer,
             status: "pending",
             memo: memoText(code),
+            idempotencyKey: idempotencyKey ?? undefined,
             expenseId: expense.id,
             expenseShareId: myShare.id,
             expiresAt,
@@ -192,6 +215,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
         await tx.expenseShare.update({
           where: { id: myShare.id },
           data: { status: "settling" },
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: expense.groupId,
+          action: "settlement.create",
+          entityType: "settlement",
+          entityId: settlement.id,
+          metadata: {
+            from: auth.id,
+            to: expense.payerUserId,
+            amount: myShare.shareAmount,
+            assetCode,
+          },
         });
 
         const xdr = await buildSettlementXdr({
@@ -232,9 +269,6 @@ export default async function settlementRoutes(app: FastifyInstance) {
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
-    validateAmount(body.amount);
-    validateAsset(body.assetCode, body.assetIssuer ?? null);
-
     if (body.toUserId === auth.id) {
       throw Errors.badRequest("self_settle", "You cannot settle with yourself");
     }
@@ -264,6 +298,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
             assetIssuer: body.assetIssuer ?? null,
             status: "pending",
             memo: memoText(code),
+            idempotencyKey: idempotencyKey ?? undefined,
             expiresAt,
           },
           include: settlementInclude,
@@ -274,6 +309,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
           entityId: settlement.id,
           newStatus: "pending",
           source: "api",
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId,
+          action: "settlement.create",
+          entityType: "settlement",
+          entityId: settlement.id,
+          metadata: {
+            from: auth.id,
+            to: body.toUserId,
+            amount: body.amount,
+            assetCode: body.assetCode,
+          },
         });
 
         const xdr = await buildSettlementXdr({
@@ -359,13 +408,63 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.forbidden("Only the payer can confirm this settlement");
         }
 
-        // Already accepted — return the current state rather than re-submitting
-        // or erroring, so a retry without the original key is still safe.
+        // Already accepted or in-flight — return the current state rather
+        // than re-submitting or erroring, so a retry without the original key
+        // is still safe. When a transaction hash exists, the worker already
+        // submitted to Horizon and is tracking the outcome; the confirm
+        // endpoint must not interfere.
         if (
           settlement.status === "completed" ||
           settlement.status === "confirmed" ||
-          settlement.status === "submitted"
+          settlement.status === "submitted" ||
+          settlement.status === "verifying" ||
+          settlement.status === "needs_review"
         ) {
+          // Safe Stellar timeout reconciliation: if the user's confirmation
+          // response was lost (network timeout, process crash), the settlement
+          // may already be on-chain. Verify the ledger before returning so the
+          // client gets an accurate picture rather than a stale "submitted".
+          if (settlement.stellarTxHash) {
+            try {
+              const onChain = await stellar.getTransaction(settlement.stellarTxHash);
+              if (onChain?.successful) {
+                await applySettlementTransition({
+                  settlementId: settlement.id,
+                  nextStatus: "confirmed",
+                  source: "system",
+                  extraData: {
+                    retryCount: 0,
+                    errorCategory: null,
+                    failureReason: null,
+                  },
+                  settleExpenseShare: true,
+                });
+                const refreshed = await tx.settlement.findUnique({
+                  where: { id },
+                  include: settlementInclude,
+                });
+                return { settlement: serializeSettlement(refreshed!) };
+              }
+              if (onChain && !onChain.successful) {
+                await applySettlementTransition({
+                  settlementId: settlement.id,
+                  nextStatus: "failed",
+                  source: "system",
+                  extraData: {
+                    failureReason: `Transaction ${settlement.stellarTxHash} failed on Stellar`,
+                  },
+                });
+                const refreshed = await tx.settlement.findUnique({
+                  where: { id },
+                  include: settlementInclude,
+                });
+                return { settlement: serializeSettlement(refreshed!) };
+              }
+            } catch {
+              // Horizon unreachable — return persisted state, not an error.
+              // The worker's reconciliation will keep watching the hash.
+            }
+          }
           return { settlement: serializeSettlement(settlement) };
         }
 
@@ -374,6 +473,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           // retry bookkeeping is reset below so the worker picks it up fresh.
           await auditTx(tx, {
             userId: auth.id,
+            groupId: settlement.groupId,
             action: "settlement.confirm.retry",
             entityType: "settlement",
             entityId: id,
@@ -406,6 +506,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           });
           await auditTx(tx, {
             userId: auth.id,
+            groupId: settlement.groupId,
             action: "settlement.confirm",
             entityType: "settlement",
             entityId: id,

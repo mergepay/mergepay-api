@@ -9,6 +9,8 @@ export const ADMIN_AUDIT_ACTIONS = {
   MEMBER_REMOVED: "MEMBER_REMOVED",
   MULTISIG_CONFIG_CHANGED: "MULTISIG_CONFIG_CHANGED",
 } as const;
+/** Actor type for distinguishing authenticated users from automated system actions. */
+export type AuditActorType = "user" | "worker" | "system";
 
 export interface AuditParams {
   userId?: string | null;
@@ -17,6 +19,7 @@ export interface AuditParams {
   entityType: string;
   entityId: string;
   outcome?: AuditOutcome;
+  actorType?: AuditActorType;
   /** Safe, structured detail only — never private keys, bearer tokens, or signed XDRs. */
   metadata?: Record<string, unknown>;
 }
@@ -32,6 +35,7 @@ export function auditData(params: AuditParams) {
     metadata: {
       ...(params.metadata ?? {}),
       ...(params.outcome ? { outcome: params.outcome } : {}),
+      ...(params.actorType ? { actorType: params.actorType } : {}),
     } as any,
   };
 }

@@ -158,4 +158,31 @@ describe("Pagination routes", () => {
     expect(res.json().meta.hasMore).toBe(false);
     expect(res.json().meta.nextCursor).toBeNull();
   });
+
+  it("returns a bounded first page with default limit when pagination is omitted", async () => {
+    const expenses = Array.from({ length: 3 }, (_, i) => ({
+      id: `exp_${i}`,
+      createdAt: new Date(`2026-03-0${i + 1}T00:00:00Z`),
+      amount: `${(i + 1) * 10}`,
+      payer: { id: "user_1", stellarPublicKey: "ABC", createdAt: new Date() },
+      shares: [],
+    }));
+    prisma.expense.findMany.mockResolvedValueOnce(expenses as any);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/groups/${groupId}/expenses`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.meta.limit).toBe(50);
+    expect(body.meta.order).toBe("desc");
+    expect(body.meta.hasMore).toBe(false);
+    expect(body.meta.nextCursor).toBeNull();
+
+    const callArgs = prisma.expense.findMany.mock.calls[0]?.[0] as any;
+    expect(callArgs.take).toBe(51);
+    expect(callArgs.where.groupId).toBe(groupId);
+  });
 });

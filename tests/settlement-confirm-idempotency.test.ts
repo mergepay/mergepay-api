@@ -16,6 +16,8 @@ const h = vi.hoisted(() => {
     idempotencyKey: model(),
     statusHistory: model(),
     auditLog: { create: vi.fn() },
+    groupMember: model(),
+    group: model(),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
@@ -109,6 +111,9 @@ beforeEach(async () => {
   prisma.settlement.findUniqueOrThrow.mockResolvedValue(pendingSettlement());
   prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
   prisma.idempotencyKey.create.mockResolvedValue({});
+  // Membership check for requireMembership
+  prisma.groupMember.findUnique.mockResolvedValue({ groupId: "group_1", userId: "user_1", role: "member" });
+  prisma.group.findUnique.mockResolvedValue({ id: "group_1" });
 });
 
 describe("POST /settlements/:id/confirm — idempotency", () => {

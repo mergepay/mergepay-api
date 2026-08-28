@@ -6,7 +6,8 @@ import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService } from "../services/anchor";
 import { stellar } from "../services/stellar";
-import { audit } from "../services/audit";
+import { auditTx } from "../services/audit";
+import { applyWithdrawalTransition } from "../services/withdrawal-status";
 import { isPositive } from "../services/money";
 
 const SUPPORTED_ASSET_CODES = ["USDC", "XLM"] as const;
@@ -91,23 +92,25 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
       `&account=${encodeURIComponent(auth.stellarPublicKey)}` +
       `&amount=${encodeURIComponent(body.amount)}`;
 
-    const withdrawal = await withdrawalModel.create({
-      data: {
+    const withdrawal = await prisma.$transaction(async (tx) => {
+      const created = await (tx as any).withdrawal.create({
+        data: {
+          userId: auth.id,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          memo: body.memo ?? null,
+          interactiveUrl,
+          status: "pending",
+        },
+      });
+      await auditTx(tx, {
         userId: auth.id,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        memo: body.memo ?? null,
-        interactiveUrl,
-        status: "pending",
-      },
-    });
-
-    await audit({
-      userId: auth.id,
-      action: "withdrawal.start",
-      entityType: "withdrawal",
-      entityId: withdrawal.id,
-      metadata: { amount: body.amount, assetCode: body.assetCode },
+        action: "withdrawal.start",
+        entityType: "withdrawal",
+        entityId: created.id,
+        metadata: { amount: body.amount, assetCode: body.assetCode },
+      });
+      return created;
     });
 
     return {
@@ -130,6 +133,10 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
       if (!withdrawal || withdrawal.userId !== auth.id) {
         throw Errors.notFound("Withdrawal not found");
       }
+      // Fast path only — avoids a wasted round trip to the anchor for the
+      // common case of a retried confirm call. The actual correctness
+      // guarantee against a concurrent duplicate is the guarded update
+      // inside applyWithdrawalTransition below.
       if (withdrawal.status !== "pending") {
         return serializeWithdrawal(withdrawal);
       }
@@ -147,9 +154,12 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           assetCode: withdrawal.assetCode,
           account: auth.stellarPublicKey,
         });
-        const updated = await withdrawalModel.update({
-          where: { id },
-          data: { anchorTxId: result.id, status: "pending" },
+        const { withdrawal: updated } = await applyWithdrawalTransition({
+          withdrawalId: id,
+          nextStatus: "processing",
+          source: "user",
+          ownerUserId: auth.id,
+          extraData: { anchorTxId: result.id } as never,
         });
         return {
           ...serializeWithdrawal(updated),
@@ -157,9 +167,11 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           transaction_id: result.id,
         };
       } catch (error) {
-        await withdrawalModel.update({
-          where: { id },
-          data: { status: "failed" },
+        await applyWithdrawalTransition({
+          withdrawalId: id,
+          nextStatus: "failed",
+          source: "user",
+          ownerUserId: auth.id,
         });
         if (error instanceof AppError) throw error;
         throw Errors.upstream("Withdrawal confirmation failed");

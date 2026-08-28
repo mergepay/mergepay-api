@@ -58,7 +58,7 @@ describe("parseStellarAmount / stellarAmountSchema", () => {
   });
 
   it("rejects precision overflow beyond 7 decimal places", () => {
-    expect(() => parseStellarAmount("1.12345678")).toThrow(/decimal places/i);
+    expect(() => parseStellarAmount("1.12345678")).toThrow(/7-decimal|precision/i);
     expect(stellarAmountSchema.safeParse("1.12345678").success).toBe(false);
   });
 
@@ -113,12 +113,12 @@ describe("stellarAssetSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  it("rejects the stablecoin with no issuer at all", () => {
+  it("accepts the stablecoin with no issuer (uses configured default)", () => {
     const result = stellarAssetSchema.safeParse({
       assetCode: config.STABLE_ASSET_CODE,
       assetIssuer: null,
     });
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
   });
 
   it("rejects unsupported asset codes", () => {

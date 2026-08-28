@@ -146,7 +146,6 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         userId: auth.id,
         memberPublicKeys,
         signedXdr: body.signedXdr,
-        userId: auth.id,
       });
 
       // Signing, submission, and submission failure are each audited inside

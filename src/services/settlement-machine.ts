@@ -1,7 +1,8 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 import { AppError, Errors } from "../errors";
-import { auditTx } from "./audit";
+import { auditTx, type AuditActorType } from "./audit";
+import { AuditAction } from "./audit-actions";
 import { recordStatusTransitionInTransaction } from "./status-history";
 import { emitEvent, type WebhookEventType } from "./event";
 

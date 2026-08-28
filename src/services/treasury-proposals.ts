@@ -131,6 +131,7 @@ export const treasuryProposalsService = {
           groupId: params.groupId,
           creatorId: params.creatorId,
           xdr,
+          txHash,
           threshold,
           signatures: [] as any,
           status: initialStatus,
@@ -139,13 +140,18 @@ export const treasuryProposalsService = {
       await auditTx(tx, {
         userId: params.creatorId,
         groupId: params.groupId,
-        creatorId: params.creatorId,
-        xdr,
-        txHash,
-        threshold,
-        signatures: [] as any,
-        status: initialStatus,
-      },
+        actorType: "user",
+        action: AuditAction.TREASURY_PROPOSAL_CREATED,
+        entityType: "treasury_proposal",
+        entityId: created.id,
+        metadata: {
+          destination: params.destination,
+          amount: params.amount,
+          assetCode: params.assetCode,
+          threshold,
+        },
+      });
+      return created;
     });
 
     return { proposal, xdr, networkPassphrase: config.networkPassphrase };
@@ -168,8 +174,6 @@ export const treasuryProposalsService = {
     memberPublicKeys: string[];
     /** Base64 of a (possibly partially) signed XDR the wallet produced. */
     signedXdr: string;
-    /** The authenticated user ID submitting the signature. */
-    userId: string;
   }): Promise<{
     status: string;
     signatureCount: number;
@@ -398,7 +402,7 @@ export const treasuryProposalsService = {
         }
 
         // Merge all verified signatures onto the base envelope, then submit.
-        return await this.mergeAndSubmit(tx, proposal.id, verified);
+        return await this.mergeAndSubmit(tx, proposal.id, verified, { userId: args.userId, groupId: args.groupId });
       },
       { timeout: 15_000 }
     );
@@ -443,13 +447,25 @@ export const treasuryProposalsService = {
     }
     const signedXdr = baseTx.toXDR();
 
-    let hash: string;
     try {
       const hash = await stellar.submitSigned(signedXdr);
       await tx.treasuryProposal.update({
         where: { id: proposal.id },
         data: {
           status: STATUS.confirmed,
+          stellarTxHash: hash,
+        },
+      });
+      await auditTx(tx, {
+        userId: actor.userId,
+        groupId: actor.groupId,
+        actorType: "user",
+        action: AuditAction.TREASURY_PROPOSAL_SUBMITTED,
+        entityType: "treasury_proposal",
+        entityId: proposal.id,
+        metadata: {
+          signatureCount: storedSignatures.length,
+          threshold: proposal.threshold,
           stellarTxHash: hash,
         },
       });
@@ -465,35 +481,21 @@ export const treasuryProposalsService = {
         where: { id: proposal.id },
         data: { status: STATUS.failed, failureReason: msg },
       });
-      throw Errors.upstream(`Stellar rejected the multisig transaction: ${msg}`);
-    }
-
-    await prisma.$transaction(async (tx) => {
-      await tx.treasuryProposal.update({
-        where: { id: proposal.id },
-        data: { status: STATUS.confirmed, stellarTxHash: hash },
-      });
       await auditTx(tx, {
         userId: actor.userId,
         groupId: actor.groupId,
         actorType: "user",
-        action: AuditAction.TREASURY_PROPOSAL_SUBMITTED,
+        action: AuditAction.TREASURY_PROPOSAL_FAILED,
         entityType: "treasury_proposal",
         entityId: proposal.id,
         metadata: {
           signatureCount: storedSignatures.length,
           threshold: proposal.threshold,
-          stellarTxHash: hash,
+          reason: msg,
         },
       });
-    });
-
-    return {
-      status: STATUS.confirmed,
-      signatureCount: storedSignatures.length,
-      threshold: proposal.threshold,
-      stellarTxHash: hash,
-    };
+      throw Errors.upstream(`Stellar rejected the multisig transaction: ${msg}`);
+    }
   },
 
   /** Memo-helper exposed for reuse by routes. */

@@ -33,6 +33,7 @@ export type RateLimitPolicyName =
   | "settlementCreate"
   | "settlementConfirm"
   | "treasurySubmit"
+  | "treasuryPropose"
   | "anchorInit"
   | "anchorPoll"
   | "anchorWebhook"
@@ -102,6 +103,13 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       timeWindow: config.RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "treasury.submit",
+      hook: "preHandler",
+    },
+    treasuryPropose: {
+      max: config.RATE_LIMIT_TREASURY_PROPOSE_MAX,
+      timeWindow: config.RATE_LIMIT_TREASURY_PROPOSE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "treasury.propose",
       hook: "preHandler",
     },
     anchorInit: {

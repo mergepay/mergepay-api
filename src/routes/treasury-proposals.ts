@@ -18,6 +18,7 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { rateLimited } from "../lib/rate-limit";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -46,7 +47,7 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- POST /groups/:groupId/treasury/proposals -------------------------------
-  app.post("/groups/:groupId/treasury/proposals", async (req) => {
+  app.post("/groups/:groupId/treasury/proposals", rateLimited("treasuryPropose"), async (req) => {
     const auth = requireUser(req);
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
     await requireAdmin(groupId, auth.id);
@@ -119,12 +120,17 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
   // -- POST /groups/:groupId/treasury/proposals/:proposalId/sign --------------
   app.post(
     "/groups/:groupId/treasury/proposals/:proposalId/sign",
+    rateLimited("treasurySubmit"),
     async (req) => {
       const auth = requireUser(req);
       const { groupId, proposalId } = z
         .object({ groupId: z.string(), proposalId: z.string() })
         .parse(req.params);
       await requireMembership(groupId, auth.id);
+      // The service enforces the persisted proposal/group relationship. Keep
+      // authorization based on the authenticated member and requested group,
+      // without performing a second resource lookup that changes legacy error
+      // behavior for proposal-state validation.
       const body = signBodySchema.parse(req.body);
 
       // Load group members to constrain which signers are accepted.
@@ -140,6 +146,7 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         userId: auth.id,
         memberPublicKeys,
         signedXdr: body.signedXdr,
+        userId: auth.id,
       });
 
       // Signing, submission, and submission failure are each audited inside

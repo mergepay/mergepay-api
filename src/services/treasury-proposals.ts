@@ -30,6 +30,8 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
+import { audit, auditTx } from "./audit";
+import { AuditAction } from "./audit-actions";
 
 export interface CreateProposalParams {
   groupId: string;
@@ -98,15 +100,31 @@ export const treasuryProposalsService = {
     const initialStatus =
       threshold > 1 ? STATUS.awaitingSignatures : STATUS.pending;
 
-    const proposal = await prisma.treasuryProposal.create({
-      data: {
+    const proposal = await prisma.$transaction(async (tx) => {
+      const created = await tx.treasuryProposal.create({
+        data: {
+          groupId: params.groupId,
+          creatorId: params.creatorId,
+          xdr,
+          threshold,
+          signatures: [] as any,
+          status: initialStatus,
+        },
+      });
+      await auditTx(tx, {
+        userId: params.creatorId,
         groupId: params.groupId,
-        creatorId: params.creatorId,
-        xdr,
-        threshold,
-        signatures: [] as any,
-        status: initialStatus,
-      },
+        action: AuditAction.TREASURY_PROPOSAL_CREATED,
+        entityType: "treasury_proposal",
+        entityId: created.id,
+        metadata: {
+          destination: params.destination,
+          amount: params.amount,
+          assetCode: params.assetCode,
+          threshold,
+        },
+      });
+      return created;
     });
 
     return { proposal, xdr, networkPassphrase: config.networkPassphrase };
@@ -232,6 +250,12 @@ export const treasuryProposalsService = {
     // Only set "submitted"/"confirmed" after we know we meet the threshold.
     const meetsThreshold = verified.length >= proposal.threshold;
 
+    // Find which public keys were newly verified in this request.
+    const newSignatureCount = verified.length - stored.length;
+    const newSignerPublicKeys = verified
+      .slice(stored.length)
+      .map((s) => s.publicKey);
+
     await prisma.treasuryProposal.update({
       where: { id: proposal.id },
       data: {
@@ -239,6 +263,22 @@ export const treasuryProposalsService = {
         status: meetsThreshold ? STATUS.submitted : STATUS.awaitingSignatures,
       },
     });
+
+    // Audit each new signature (best-effort: if the proposal update above
+    // succeeded but an audit write fails, the signature is still stored).
+    for (const pk of newSignerPublicKeys) {
+      await audit({
+        groupId: proposal.groupId,
+        action: AuditAction.TREASURY_PROPOSAL_SIGNED,
+        entityType: "treasury_proposal",
+        entityId: proposal.id,
+        metadata: {
+          signerPublicKey: pk,
+          signatureCount: verified.length,
+          threshold: proposal.threshold,
+        },
+      });
+    }
 
     if (!meetsThreshold) {
       return {
@@ -287,12 +327,25 @@ export const treasuryProposalsService = {
 
     try {
       const hash = await stellar.submitSigned(signedXdr);
-      await prisma.treasuryProposal.update({
-        where: { id: proposal.id },
-        data: {
-          status: STATUS.confirmed,
-          stellarTxHash: hash,
-        },
+      await prisma.$transaction(async (tx) => {
+        await tx.treasuryProposal.update({
+          where: { id: proposal.id },
+          data: {
+            status: STATUS.confirmed,
+            stellarTxHash: hash,
+          },
+        });
+        await auditTx(tx, {
+          groupId: proposal.groupId,
+          action: AuditAction.TREASURY_PROPOSAL_SUBMITTED,
+          entityType: "treasury_proposal",
+          entityId: proposal.id,
+          metadata: {
+            signatureCount: storedSignatures.length,
+            threshold: proposal.threshold,
+            stellarTxHash: hash,
+          },
+        });
       });
       return {
         status: STATUS.confirmed,
@@ -302,9 +355,23 @@ export const treasuryProposalsService = {
       };
     } catch (e: any) {
       const msg = e?.message ?? "submit failed";
-      await prisma.treasuryProposal.update({
-        where: { id: proposal.id },
-        data: { status: STATUS.failed, failureReason: msg },
+      await prisma.$transaction(async (tx) => {
+        await tx.treasuryProposal.update({
+          where: { id: proposal.id },
+          data: { status: STATUS.failed, failureReason: msg },
+        });
+        await auditTx(tx, {
+          groupId: proposal.groupId,
+          action: AuditAction.TREASURY_PROPOSAL_FAILED,
+          entityType: "treasury_proposal",
+          entityId: proposal.id,
+          outcome: "failure",
+          metadata: {
+            signatureCount: storedSignatures.length,
+            threshold: proposal.threshold,
+            reason: msg,
+          },
+        });
       });
       throw Errors.upstream(`Stellar rejected the multisig transaction: ${msg}`);
     }

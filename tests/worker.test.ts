@@ -347,6 +347,82 @@ describe("processSubmittedSettlements", () => {
 
     expect(currentSettlementState?.status).toBe("failed");
     expect(currentSettlementState?.failureReason).toBeTruthy();
+    // A transaction the network applied and that failed there is a ledger
+    // rejection, not a validation or funding problem.
+    expect(currentSettlementState?.failureCategory).toBe("ledger_rejected");
+  });
+
+  it("records an expired signing window as its own failure category", async () => {
+    setupSettlement({
+      status: "submitted",
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.failureCategory).toBe("expired");
+    // An expired envelope must never reach Horizon.
+    expect(h.submitPayment).not.toHaveBeenCalled();
+  });
+
+  it("records a settlement with no signed envelope as a validation failure", async () => {
+    setupSettlement({ status: "submitted", transactionXdr: null });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.failureCategory).toBe("validation");
+  });
+
+  it("classifies a permanent submission error from the error itself", async () => {
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(
+      new Error("Stellar rejected the transaction: op_underfunded")
+    );
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(currentSettlementState?.status).toBe("failed");
+    // op_underfunded is a funding problem even though the message also reads
+    // as a rejection — the payer's remedy is to add funds.
+    expect(currentSettlementState?.failureCategory).toBe("insufficient_funds");
+  });
+
+  it("keeps a failed settlement failed across a worker restart", async () => {
+    // A terminal failure is durable state, not process memory: a restarted
+    // worker must not pick the row back up and report it as pending.
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(
+      new Error("Stellar rejected the transaction: tx_bad_seq")
+    );
+
+    const first = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await first;
+
+    expect(currentSettlementState?.status).toBe("failed");
+    const recordedCategory = currentSettlementState?.failureCategory;
+    expect(recordedCategory).toBe("ledger_rejected");
+
+    // Restart: the worker queries only submittable statuses, so a failed row
+    // is not returned at all and its recorded failure stands.
+    h.prisma.settlement.findMany.mockResolvedValue([]);
+    h.submitPayment.mockClear();
+
+    const second = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await second;
+
+    expect(h.submitPayment).not.toHaveBeenCalled();
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.failureCategory).toBe(recordedCategory);
   });
 
   it("marks as needs_review when Horizon verification times out", async () => {

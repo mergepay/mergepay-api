@@ -2,6 +2,7 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
+import { toRequestLimitError } from "../lib/request-limits";
 
 export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
@@ -37,6 +38,20 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         body.details = err.details;
       }
       return reply.code(err.status).send(body);
+    }
+
+    // Size and shape limits rejected by Fastify or @fastify/multipart before a
+    // handler ever ran. Without this they fall through to the generic 4xx
+    // branch below, which echoes the framework's own wording and leaves clients
+    // no stable code to branch on. See src/lib/request-limits.ts.
+    const limitError = toRequestLimitError(err);
+    if (limitError) {
+      return reply.code(limitError.status).send({
+        code: limitError.code,
+        error: limitError.code,
+        message: limitError.message,
+        requestId,
+      });
     }
 
     if ((err as any).statusCode === 429) {

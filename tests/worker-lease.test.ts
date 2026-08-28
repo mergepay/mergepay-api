@@ -168,6 +168,10 @@ describe("worker lease claiming", () => {
       const nextAttemptAt = new Date(Date.now() + delay);
 
       const updateSpy = vi.spyOn(prisma.settlement, "update").mockResolvedValue({} as any);
+
+      // Pinned rather than recomputed: the assertion below compares against
+      // this same value, and a second `Date.now()` call drifts by a millisecond
+      // often enough to fail the run under a loaded suite.
       const leaseExpiresAt = new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS);
 
       await prisma.settlement.update({

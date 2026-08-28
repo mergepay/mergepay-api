@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from "vitest";
 import {
   isValidCorrelationId,
   generateCorrelationId,
@@ -218,13 +218,24 @@ describe("loggerWithContext", () => {
 // ---------------------------------------------------------------------------
 
 describe("API correlation headers", () => {
-  async function buildTestApp() {
-    const { buildApp } = await import("../src/app");
-    return buildApp();
-  }
+  // Built once for the whole block. Every test here only reads response
+  // headers from a stateless GET, so a fresh instance per test bought no
+  // isolation while paying the full Fastify start-up cost eleven times --
+  // enough, under a loaded suite, to blow the 5s budget on whichever test
+  // happened to run first.
+  let app: Awaited<ReturnType<typeof buildApp>>;
+  let buildApp: (typeof import("../src/app"))["buildApp"];
+
+  beforeAll(async () => {
+    ({ buildApp } = await import("../src/app"));
+    app = await buildApp();
+  });
+
+  afterAll(async () => {
+    await app?.close();
+  });
 
   it("returns x-correlation-id and x-request-id on every response", { timeout: 15000 }, async () => {
-    const app = await buildTestApp();
     const response = await app.inject({ method: "GET", url: "/health" });
     expect(response.headers["x-correlation-id"]).toBeDefined();
     expect(response.headers["x-request-id"]).toBeDefined();
@@ -233,7 +244,6 @@ describe("API correlation headers", () => {
   });
 
   it("echoes a valid incoming x-correlation-id header", async () => {
-    const app = await buildTestApp();
     const myId = "my-custom-id-123";
     const response = await app.inject({
       method: "GET",
@@ -245,7 +255,6 @@ describe("API correlation headers", () => {
   });
 
   it("echoes a valid incoming x-request-id header as fallback", async () => {
-    const app = await buildTestApp();
     const myId = "fallback-request-456";
     const response = await app.inject({
       method: "GET",
@@ -258,7 +267,6 @@ describe("API correlation headers", () => {
   });
 
   it("replaces an invalid correlation header with a generated ID", async () => {
-    const app = await buildTestApp();
     const response = await app.inject({
       method: "GET",
       url: "/health",
@@ -271,7 +279,6 @@ describe("API correlation headers", () => {
   });
 
   it("replaces an oversized correlation header with a generated ID", async () => {
-    const app = await buildTestApp();
     const long = "x".repeat(CORRELATION_ID_MAX_LENGTH + 1);
     const response = await app.inject({
       method: "GET",
@@ -285,7 +292,6 @@ describe("API correlation headers", () => {
   });
 
   it("replaces an empty correlation header with a generated ID", async () => {
-    const app = await buildTestApp();
     const response = await app.inject({
       method: "GET",
       url: "/health",
@@ -297,7 +303,6 @@ describe("API correlation headers", () => {
   });
 
   it("includes correlation ID in error response body", async () => {
-    const app = await buildTestApp();
     const response = await app.inject({ method: "GET", url: "/nonexistent" });
     const body = response.json();
     expect(body.requestId).toBeDefined();
@@ -307,7 +312,6 @@ describe("API correlation headers", () => {
   });
 
   it("includes correlation ID in validation error response", async () => {
-    const app = await buildTestApp();
     const response = await app.inject({
       method: "POST",
       url: "/auth/challenge",
@@ -319,7 +323,6 @@ describe("API correlation headers", () => {
   });
 
   it("returns a unique correlation ID for each request", async () => {
-    const app = await buildTestApp();
     const res1 = await app.inject({ method: "GET", url: "/health" });
     const res2 = await app.inject({ method: "GET", url: "/health" });
     expect(res1.headers["x-correlation-id"]).not.toBe(
@@ -328,7 +331,6 @@ describe("API correlation headers", () => {
   });
 
   it("prefers x-correlation-id over x-request-id when both are present", async () => {
-    const app = await buildTestApp();
     const response = await app.inject({
       method: "GET",
       url: "/health",

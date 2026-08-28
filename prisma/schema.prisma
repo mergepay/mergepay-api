@@ -141,6 +141,14 @@ model Settlement {
   claimedAt      DateTime? @map("claimed_at")
   leaseExpiresAt DateTime? @map("lease_expires_at")
   failureReason  String?   @map("failure_reason")
+  // Stable failure category for a terminal failure, from the controlled set in
+  // src/services/settlement-failure.ts ("validation", "insufficient_funds",
+  // "expired", "upstream", "ledger_rejected", "internal"). Distinct from
+  // `errorCategory`, which is the worker's *retry* decision (transient /
+  // indeterminate / permanent) and answers a different question: whether to try
+  // again, not what went wrong. Nullable — rows that never failed, and rows
+  // predating this column, have none.
+  failureCategory String?  @map("failure_category")
   // Server-controlled expiry for the unsigned intent (nullable: rows created
   // before expiration tracking existed have no recorded deadline).
   expiresAt      DateTime? @map("expires_at")

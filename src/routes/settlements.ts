@@ -60,10 +60,15 @@ import {
 import {
   isTerminalSettlementStatus,
   resolveSettlementStatus,
+  toFailureInfo,
   toPublicStatus,
 } from "../services/settlement-status";
 import { applySettlementTransition } from "../services/settlement-machine";
 import { recordStatusTransitionInTransaction } from "../services/status-history";
+import {
+  assertPreflightResult,
+  evaluatePreflight,
+} from "../services/settlement-preflight";
 
 const settlementInclude = { from: true, to: true, statusHistory: true } as const;
 
@@ -505,7 +510,11 @@ export default async function settlementRoutes(app: FastifyInstance) {
             status: "submitted",
             submittedAt: new Date(),
             retryCount: 0,
+            // A re-signed settlement starts clean: leaving the previous
+            // attempt's category behind would report a live submission as
+            // having failed for a reason that no longer applies.
             failureReason: null,
+            failureCategory: null,
           },
         });
 
@@ -706,19 +715,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
 
     // Skipping the provider lookup is opt-in via `refresh=false`, for a client
     // that wants only the persisted state (e.g. rendering a list).
+    const persistedStatus = toPublicStatus(settlement);
     const resolved = refresh
       ? await resolveSettlementStatus(settlement)
       : {
-          status: toPublicStatus(settlement),
+          status: persistedStatus,
           onChain: {
             checked: false,
             found: false,
             successful: null,
             transactionHash: settlement.stellarTxHash ?? null,
           },
-          failure: settlement.failureReason
-            ? { reason: settlement.failureReason }
-            : null,
+          // Same helper the refreshing path uses, so skipping the Horizon
+          // lookup changes what is *known*, never how a failure is reported.
+          failure: toFailureInfo(settlement, persistedStatus),
           expiresAt: settlement.expiresAt
             ? settlement.expiresAt.toISOString()
             : null,
@@ -879,13 +889,31 @@ async function buildSettlementXdr(params: {
   memoCode: string;
   validitySeconds: number;
 }): Promise<string> {
-  const account = await stellar.loadAccount(params.fromPublicKey);
-  if (!account.exists) {
-    throw Errors.badRequest(
-      "account_unfunded",
-      "Your Stellar account is not funded yet. Fund it before settling."
+  // One account load serves both the preflight and the sequence number the
+  // envelope is built on, so the balance check and the transaction describe the
+  // same observation of the account rather than two Horizon reads apart.
+  let account;
+  try {
+    account = await stellar.loadAccount(params.fromPublicKey);
+  } catch {
+    throw Errors.upstream(
+      "Could not reach the Stellar network to check your balance. Try again shortly."
     );
   }
+
+  // Refuse before building an envelope the account cannot pay for. This does
+  // not replace signed-XDR validation — that still runs on whatever the wallet
+  // returns — and Horizon state can move between here and submission, so the
+  // worker's submission errors are still handled.
+  assertPreflightResult(
+    evaluatePreflight(account, {
+      sourcePublicKey: params.fromPublicKey,
+      assetCode: params.assetCode,
+      assetIssuer: params.assetIssuer,
+      amount: params.amount,
+    })
+  );
+
   return stellar.buildPayment({
     sourcePublicKey: params.fromPublicKey,
     sourceSequence: account.sequence,

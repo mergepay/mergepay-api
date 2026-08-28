@@ -31,7 +31,8 @@ import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
-
+import { getReadiness } from "./services/health";
+import { installMultipartGuard } from "./lib/multipart-guard";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -55,6 +56,10 @@ function globalRateLimitKey(request: FastifyRequest): string {
 
 export async function buildApp(): Promise<FastifyInstance> {
   validateAssetConfig();
+
+  // Contains a @fastify/busboy defect that turns a truncated multipart body
+  // into an uncaught exception. See src/lib/multipart-guard.ts.
+  installMultipartGuard();
 
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
@@ -175,12 +180,24 @@ export async function buildApp(): Promise<FastifyInstance> {
       requestId: request.id,
     }),
   });
+  // Multipart limits, all explicit. Only /uploads/receipt consumes a multipart
+  // body (the SEP-24 anchor flow is JSON end to end), so these bound that one
+  // route without touching the JSON routes, which keep their own bodyLimit.
+  //
+  // `throwFileSizeLimit` makes an oversized file an error the route can answer
+  // rather than a silently truncated stream — a truncated receipt would other-
+  // wise be written to disk as though it were complete. Each limit maps to its
+  // own client error in src/lib/request-limits.ts.
   await app.register(multipart, {
     limits: {
       fileSize: config.MULTIPART_FILE_SIZE_BYTES,
       files: config.MULTIPART_MAX_FILES,
+      // Bounds a single non-file field. busboy buffers field values in memory,
+      // so without this a form field is an unbounded allocation.
+      fieldSize: config.MULTIPART_FIELD_SIZE_BYTES,
       parts: config.MULTIPART_MAX_FIELDS,
     },
+    throwFileSizeLimit: true,
   });
 
   // Cap the request body on routes that take signed envelopes or credentials,

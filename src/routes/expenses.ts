@@ -5,12 +5,8 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
-import { normalizeAmount } from "../services/money";
 import { shortCode } from "../services/codes";
-import { auditTx } from "../services/audit";
-import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
-import { createExpenseSchema, updateExpenseSchema } from "../validations/expense";
 import {
   buildPage,
   cursorFilter,
@@ -19,6 +15,11 @@ import {
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
+import { auditTx } from "../services/audit";
+import { validateAsset, validateAmount } from "../services/assets";
+import { assertParticipantsCanHoldAsset } from "../services/horizon";
+import { createExpenseSchema, updateExpenseSchema } from "../validations/expense";
+import { expenseListQuerySchema, listGroupExpenses } from "../services/expenses";
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });
@@ -39,7 +40,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const body = createExpenseSchema.parse(req.body);
     validateAmount(body.amount);
-    validateAsset(body.assetCode, body.assetIssuer ?? null);
+    const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
 
@@ -53,10 +54,28 @@ export default async function expenseRoutes(app: FastifyInstance) {
     const participantIds = [...new Set(computed.map((share) => share.userId))];
     const members = await prisma.groupMember.findMany({
       where: { groupId, userId: { in: participantIds } },
-      select: { userId: true },
+      select: { userId: true, user: { select: { stellarPublicKey: true } } },
     });
     if (members.length !== participantIds.length) {
       throw Errors.badRequest("invalid_split", "Every split participant must be an active group member");
+    }
+
+    // A non-native asset can only be paid to an account that has trusted it.
+    // Without this check the expense is created happily and every settlement
+    // built from it fails on submission with op_no_trust — after members have
+    // been asked to pay, which is the most expensive point to discover it.
+    //
+    // Native XLM needs no trustline, so it skips the Horizon round trip
+    // entirely rather than paying for a lookup whose answer is always yes.
+    if (asset.type !== "native") {
+      await assertParticipantsCanHoldAsset({
+        participants: members.map((member) => ({
+          userId: member.userId,
+          stellarPublicKey: member.user.stellarPublicKey,
+        })),
+        assetCode: body.assetCode,
+        assetIssuer: body.assetIssuer ?? null,
+      });
     }
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
@@ -85,14 +104,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
         include: expenseInclude,
       });
 
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.create",
-          entityType: "expense",
-          entityId: created.id,
-          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
-        },
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId,
+        action: "expense.create",
+        entityType: "expense",
+        entityId: created.id,
+        metadata: { amount: body.amount, assetCode: body.assetCode },
       });
 
       return created;
@@ -105,21 +123,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const query = expenseListQuerySchema.parse(req.query ?? {});
     // Membership is checked before any row is read, and the `groupId` filter
-    // below is what scopes the page — never the cursor.
+    // the service applies is what scopes the page — never the cursor.
     await requireMembership(groupId, auth.id);
 
-    const position = requireCursor(cursor);
+    const { items, meta } = await listGroupExpenses(groupId, query, expenseInclude);
 
-    const expenses = await prisma.expense.findMany({
-      where: { groupId, ...cursorFilter(position, order) },
-      include: expenseInclude,
-      orderBy: cursorOrderBy(order),
-      take: takeForPage(limit),
-    });
-
-    const { items, meta } = buildPage(expenses, limit, order);
     return { expenses: items.map(serializeExpense), meta };
   });
 
@@ -164,13 +174,12 @@ export default async function expenseRoutes(app: FastifyInstance) {
         include: expenseInclude,
       });
 
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.update",
-          entityType: "expense",
-          entityId: id,
-        },
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: expense.groupId,
+        action: "expense.update",
+        entityType: "expense",
+        entityId: id,
       });
 
       return result;
@@ -206,13 +215,12 @@ export default async function expenseRoutes(app: FastifyInstance) {
       }
 
       await tx.expense.delete({ where: { id } });
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.delete",
-          entityType: "expense",
-          entityId: id,
-        },
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: found.groupId,
+        action: "expense.delete",
+        entityType: "expense",
+        entityId: id,
       });
     });
     return { ok: true };

@@ -44,7 +44,7 @@ const h = vi.hoisted(() => {
   return {
     prisma,
     loadAccount: vi.fn(),
-    buildPayment: vi.fn(() => "unsigned-xdr"),
+    buildPayment: vi.fn(),
     submitPayment: vi.fn(async () => "hash_abc"),
   };
 });
@@ -78,6 +78,35 @@ function authHeader(userId = USER_ID) {
   return {
     authorization: `Bearer ${signToken({ id: userId, stellarPublicKey: PAYER_KEY })}`,
   };
+}
+
+/**
+ * Build a real unsigned payment XDR for use in buildPayment mocks.
+ * Needed because the deposit/withdraw routes now compute txHash from the XDR.
+ */
+function makeRealUnsignedXdr(params: {
+  source: string;
+  destination: string;
+  amount: string;
+  memoCode?: string;
+  validitySeconds?: number;
+}): string {
+  const source = new Account(params.source, "1");
+  return new TransactionBuilder(source, {
+    fee: String(Number(BASE_FEE) * 2),
+    networkPassphrase: config.networkPassphrase,
+  })
+    .addOperation(
+      Operation.payment({
+        destination: params.destination,
+        asset: Asset.native(),
+        amount: params.amount,
+      })
+    )
+    .addMemo(Memo.text(params.memoCode ? `MP:${params.memoCode}` : "MP:TEST"))
+    .setTimeout(params.validitySeconds ?? INTENT_VALIDITY_SECONDS)
+    .build()
+    .toXDR();
 }
 
 /**
@@ -197,7 +226,15 @@ beforeEach(async () => {
     signers: [],
     thresholds: { low: 0, med: 0, high: 0 },
   });
-  h.buildPayment.mockReturnValue("unsigned-xdr");
+  h.buildPayment.mockImplementation((params: any) =>
+    makeRealUnsignedXdr({
+      source: params.sourcePublicKey ?? PAYER_KEY,
+      destination: params.destination,
+      amount: params.amount,
+      memoCode: params.memoCode,
+      validitySeconds: params.validitySeconds,
+    })
+  );
   h.submitPayment.mockResolvedValue("hash_abc");
   // Serves both the membership check and the recipient lookup (which includes
   // the user relation).

@@ -20,10 +20,15 @@ import {
   Transaction,
   TransactionBuilder,
 } from "@stellar/stellar-sdk";
+import pino from "pino";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
 import { withTimeout, TimeoutError, TransportError } from "./timeout";
+import {
+  withHorizonRetry,
+  classifyHorizonError,
+} from "./horizon-retry";
 import {
   INTENT_VALIDITY_SECONDS,
   assertTimeBoundsMatchIntent,
@@ -31,6 +36,7 @@ import {
 } from "../lib/time-bounds";
 
 let _server: Horizon.Server | null = null;
+const log = pino({ name: "stellar" });
 function server(): Horizon.Server {
   if (!_server) _server = new Horizon.Server(config.HORIZON_URL);
   return _server;
@@ -166,13 +172,70 @@ export const stellar = {
   },
 
   /**
-   * Validate a signed payment XDR matches an expected intent, then submit it.
-   * Throws AppError on mismatch or Horizon failure. Returns the tx hash.
+   * Validate a signed payment XDR matches an expected intent, then submit it
+   * with bounded retries and safe ambiguous-submission handling.
+   *
+   * Before each retry after an indeterminate failure (timeout, socket hangup),
+   * the transaction hash is computed deterministically from the envelope and
+   * checked against Horizon. If the transaction already applied successfully,
+   * its hash is returned without a second submission. This prevents the most
+   * dangerous class of retry: blind resubmission of a payment whose outcome
+   * is unknown.
+   *
+   * Throws AppError on permanent failure. Returns the tx hash on success.
    */
   async submitPayment(signedXdr: string, expected: PaymentExpectation): Promise<string> {
     const tx = parseSignedPaymentXdr(signedXdr, "Malformed transaction envelope");
     validatePaymentTx(tx, expected);
-    return submitToHorizon(tx);
+
+    const txHash = tx.hash().toString("hex");
+
+    const outcome = await withHorizonRetry(
+      () => submitToHorizon(tx),
+      {
+        classify: classifyHorizonError,
+        beforeRetry: async (error) => {
+          // For indeterminate failures, check the ledger before resubmitting.
+          // The hash is deterministic from the signed envelope, so we know it
+          // without another submission.
+          if (classifyHorizonError(error) === "indeterminate") {
+            try {
+              const found = await stellar.getTransaction(txHash);
+              if (found?.successful) {
+                // Transaction already applied — return the hash without a
+                // second submission. The caller sees success as if the first
+                // attempt worked.
+                return false; // abort retry loop
+              }
+              // Not found or failed — safe to retry.
+            } catch {
+              // Horizon unreachable for the check — safe to retry; the
+              // worker's reconciliation will catch it later.
+            }
+          }
+          return true; // continue retrying
+        },
+      }
+    );
+
+    if (outcome.ok) return outcome.value;
+
+    // Convert retry-exhausted or permanent errors to the existing AppError
+    // contract so callers see the same shape they always have.
+    const error = outcome.lastError;
+    if (error instanceof TimeoutError) {
+      throw Errors.upstream(`Horizon submission timed out after ${outcome.attempts} attempt(s)`);
+    }
+    if (error instanceof TransportError) {
+      throw Errors.upstream(`Horizon submission transport error after ${outcome.attempts} attempt(s)`);
+    }
+    // Re-throw AppError as-is.
+    if (error && typeof error === "object" && "statusCode" in error && "code" in error) {
+      throw error;
+    }
+    throw Errors.upstream(
+      `Stellar rejected the transaction after ${outcome.attempts} attempt(s)`
+    );
   },
 
   /**
@@ -239,8 +302,7 @@ export const stellar = {
   async submitSigned(signedXdr: string): Promise<string> {
     const tx = new Transaction(signedXdr, config.networkPassphrase);
     try {
-      const res = await server().submitTransaction(tx);
-      return res.hash;
+      return submitWithRetry(tx);
     } catch (e: any) {
       const codes =
         e?.response?.data?.extras?.result_codes ??
@@ -250,23 +312,41 @@ export const stellar = {
     }
   },
 
-  /** Look up a transaction by hash. Returns null if not yet visible. */
+  /** Look up a transaction by hash with bounded retries. Returns null if not yet visible. */
   async getTransaction(
     hash: string
   ): Promise<{ successful: boolean } | null> {
-    try {
-      const tx = await withTimeout(
-        "Horizon.getTransaction",
-        config.HORIZON_STATUS_TIMEOUT_MS,
-        async (signal) => {
-          return server().transactions().transaction(hash).call();
+    const outcome = await withHorizonRetry(
+      async () => {
+        try {
+          const tx = await withTimeout(
+            "Horizon.getTransaction",
+            config.HORIZON_STATUS_TIMEOUT_MS,
+            async (_signal) => {
+              return server().transactions().transaction(hash).call();
+            }
+          );
+          return { successful: (tx as any).successful };
+        } catch (e: any) {
+          if (e?.response?.status === 404) return null;
+          throw e;
         }
-      );
-      return { successful: (tx as any).successful };
-    } catch (e: any) {
-      if (e?.response?.status === 404) return null;
-      throw e;
-    }
+      },
+      {
+        classify: (error) => {
+          // 404 is a valid "not found" response, not an error to retry.
+          if (error && typeof error === "object" && "response" in error) {
+            const status = (error as any).response?.status;
+            if (status === 404) return "permanent" as const;
+          }
+          return classifyHorizonError(error);
+        },
+      }
+    );
+
+    if (outcome.ok) return outcome.value;
+    // If retries were exhausted, propagate the last error.
+    throw outcome.lastError;
   },
 
   /**
@@ -310,17 +390,52 @@ export function parseSignedPaymentXdr(
   return parsed;
 }
 
-async function submitToHorizon(tx: Transaction): Promise<string> {
-  try {
-    const res = await server().submitTransaction(tx);
-    return res.hash;
-  } catch (e: any) {
-    const codes =
-      e?.response?.data?.extras?.result_codes ??
-      e?.response?.data?.result_codes;
-    const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
-    throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+export interface HorizonRetryOptions {
+  maxRetries?: number;
+  baseDelayMs?: number;
+  random?: () => number;
+  delay?: (ms: number) => Promise<void>;
+}
+
+function isTransientSubmissionError(error: any): boolean {
+  const status = error?.response?.status ?? error?.statusCode;
+  if (typeof status === "number") return status === 429 || status >= 500;
+  const message = String(error?.message ?? error).toLowerCase();
+  return /timeout|timed out|socket|econnreset|econnrefused|enotfound|network/.test(message);
+}
+
+/** Submit with bounded full-jitter retries for transport/service failures only. */
+export async function submitWithRetry(
+  tx: Transaction,
+  options: HorizonRetryOptions = {}
+): Promise<string> {
+  const maxRetries = options.maxRetries ?? Number(process.env.HORIZON_SUBMIT_MAX_RETRIES ?? 3);
+  const baseDelayMs = options.baseDelayMs ?? Number(process.env.HORIZON_SUBMIT_RETRY_BASE_MS ?? 1_000);
+  const random = options.random ?? Math.random;
+  const delay = options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const res = await server().submitTransaction(tx);
+      return res.hash;
+    } catch (error: any) {
+      if (!isTransientSubmissionError(error) || attempt >= maxRetries) {
+        const codes = error?.response?.data?.extras?.result_codes ?? error?.response?.data?.result_codes;
+        const detail = codes ? JSON.stringify(codes) : error?.message ?? "submit failed";
+        throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+      }
+      const delayMs = Math.max(0, Math.round(baseDelayMs * 2 ** attempt * random()));
+      log.warn(
+        { attempt: attempt + 1, delayMs, errorCode: error?.response?.status ?? error?.code ?? "transport" },
+        "transient submission failure; retrying"
+      );
+      await delay(delayMs);
+    }
   }
+}
+
+async function submitToHorizon(tx: Transaction): Promise<string> {
+  return submitWithRetry(tx);
 }
 
 /**

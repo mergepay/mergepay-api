@@ -44,8 +44,60 @@ function publicWebhook(webhook: any, includeSecret = false) {
   };
 }
 
+/**
+ * Registration body for `POST /api/webhooks`.
+ *
+ * `groupId` is optional: omitted, the endpoint is personal to the caller and
+ * receives only their own events. Supplied, it is a group integration — and
+ * membership is enforced before the row is written, so a caller cannot
+ * subscribe to a group's activity by naming its id.
+ */
+const registerSchema = createSchema.extend({
+  groupId: z.string().min(1).max(64).optional(),
+});
+
 export default async function webhookRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
+
+  // -- register ---------------------------------------------------------------
+  //
+  // The secret is generated server-side and returned exactly once, here. It is
+  // never included in any subsequent read: a caller who loses it registers a
+  // new endpoint rather than recovering the old one, which keeps a leaked
+  // response body from being enough to forge signed payloads later.
+  app.post("/api/webhooks", async (req, reply) => {
+    const auth = requireUser(req);
+    const body = registerSchema.parse(req.body);
+
+    if (body.groupId) {
+      await requireMembership(body.groupId, auth.id);
+
+      const count = await prisma.webhook.count({
+        where: { groupId: body.groupId },
+      });
+      if (count >= 10) {
+        throw Errors.badRequest(
+          "webhook_limit_reached",
+          "A group can have at most 10 webhooks"
+        );
+      }
+    }
+
+    const webhook = await prisma.webhook.create({
+      data: {
+        groupId: body.groupId ?? null,
+        // A group registration belongs to the group, not to whoever created
+        // it, so it keeps working after that member leaves.
+        userId: body.groupId ? null : auth.id,
+        url: body.url,
+        secret: createWebhookSecret(),
+        events: body.events,
+        enabled: true,
+      },
+    });
+
+    return reply.code(201).send({ webhook: publicWebhook(webhook, true) });
+  });
 
   app.post("/groups/:groupId/webhooks", async (req) => {
     const auth = requireUser(req);

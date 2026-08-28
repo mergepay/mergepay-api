@@ -41,7 +41,6 @@ describe("createExpenseSchema", () => {
     const result = createExpenseSchema.safeParse({
       ...validBase,
       description: "Team dinner",
-      assetIssuer: "GAAAA...",
       payerUserId: "user_1",
       memo: "abc123",
       receiptUrl: "https://example.com/receipt.jpg",

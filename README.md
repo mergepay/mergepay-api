@@ -124,6 +124,20 @@ See [.env.example](.env.example). Key ones:
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
 
+#### Horizon read retries
+
+Read-only Horizon calls (currently fee statistics) retry transient failures —
+timeouts, connection resets, and selected 5xx responses — with bounded,
+configurable backoff so a temporary upstream blip does not immediately fail a
+recoverable read. Transaction submission is **never** transparently retried by
+this helper.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `HORIZON_READ_RETRY_MAX_ATTEMPTS` | 3 | Total attempts (including the first) for a transiently failing read |
+| `HORIZON_READ_RETRY_INITIAL_DELAY_MS` | 250 | Backoff before the first retry |
+| `HORIZON_READ_RETRY_MAX_DELAY_MS` | 2000 | Cap on the exponential backoff |
+
 ### Rate limiting
 
 Every route is covered by a global default limit
@@ -200,19 +214,37 @@ validator runs efficiently.
 
 ### Worker job tracking and recovery
 
-The background worker tracks job claims and retry attempts for settlement
-submissions and anchor polling. In the event of a worker crash or deployment
-interruption, stale jobs (claimed for longer than 15 minutes) are automatically
-recovered and re-eligible for processing. Job state is tracked via:
+The background worker drives settlement submission and SEP-24 anchor polling
+with the same claim-based rules (see `src/worker/index.ts`):
 
-- `jobAttemptCount`: Number of times the job has been claimed for processing
-- `jobClaimedAt`: Timestamp when the job was last claimed (null if released)
-- `jobEligibleAt`: Earliest time the job is eligible for the next retry attempt
-- `jobErrorSummary`: Truncated error message from the last attempt (for operator review)
+- **Claim before work.** A job is claimed with a conditional update that writes
+  a lease (`claimedBy`, `leaseExpiresAt`). Two workers can never drive the same
+  transition. A crashed process leaves its lease behind; at the top of every
+  cycle `recoverStaleSettlements()`/`recoverStaleAnchorSessions()` free
+  expired leases (default lease timeout: `WORKER_LEASE_TIMEOUT_MS`, 60s), so a
+  restart resumes work without duplicating it.
+- **Classify before retrying.** Every failure is categorised by
+  `src/services/job-retry.ts` into `transient` (rate limits, outages — safe to
+  retry), `indeterminate` (timeout, dropped socket — the worker checks Horizon
+  by the envelope's deterministic hash *before* resubmitting, so an already
+  applied transaction is never submitted twice), and `permanent` (rejected
+  transaction, expired intent, authorization — no retry, the job fails).
+- **Persist the job state.** Attempts, the next eligible time, the failure
+  category, and the final reason are columns on the row (`retryCount`,
+  `nextAttemptAt`, `errorCategory`, `failureReason`), never process memory.
+  An exhausted job stops retrying and is marked `failed` with a sanitized
+  reason; retries and failures are also recorded in the audit log / status
+  history.
 
-Terminal failures (exhausted retries, permanent errors) are marked with status
-`failed` and retain an error summary for support investigation. Each job has
-a maximum of 5 attempts with exponential backoff (5s, 30s, 5m, 30m, 60m).
+Retry budgets are exponential with jitter and fully configurable via env vars
+(see `.env.example`):
+
+- `WORKER_SETTLEMENT_MAX_ATTEMPTS` (default 3), `WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS`
+  (default 1000), `WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS` (default 30000),
+  `WORKER_SETTLEMENT_RETRY_JITTER_RATIO` (default 0.25)
+- `WORKER_ANCHOR_MAX_ATTEMPTS` (default 5), `WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS`
+  (default 5000), `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` (default 120000),
+  `WORKER_ANCHOR_RETRY_JITTER_RATIO` (default 0.25)
 
 ## How it works
 

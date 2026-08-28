@@ -3,6 +3,7 @@ import { prisma } from "../db";
 import { AppError, Errors } from "../errors";
 import { auditTx } from "./audit";
 import { recordStatusTransitionInTransaction } from "./status-history";
+import { emitEvent, type WebhookEventType } from "./event";
 
 export type SettlementStatus =
   | "pending"
@@ -181,8 +182,81 @@ export async function applySettlementTransition(params: ApplySettlementTransitio
     return { settlement: updated, changed: true };
   }
 
+  // The caller owns `tx` and it has not committed yet, so no event is emitted
+  // on that path — announcing from inside an open transaction risks telling an
+  // integration about a change that is later rolled back.
   if (tx) return execute(tx);
-  return prisma.$transaction((client) => execute(client));
+
+  const result = await prisma.$transaction((client) => execute(client));
+
+  if (result.changed) {
+    notifySettlementTransition(settlementId, nextStatus);
+  }
+
+  return result;
+}
+
+/** Settlement statuses external integrations are told about. */
+const NOTIFIED_STATUSES: Partial<Record<SettlementStatus, WebhookEventType>> = {
+  confirmed: "settlement.completed",
+  failed: "settlement.failed",
+};
+
+/**
+ * Announce a committed settlement transition on the event bus, which the
+ * webhook service turns into queued deliveries.
+ *
+ * Only terminal outcomes are published. An integration cares that a settlement
+ * completed or failed, not that it passed through an intermediate submission
+ * state, and publishing every step would spend a receiver's retry budget on
+ * transitions it has no action for.
+ */
+function notifySettlementTransition(
+  settlementId: string,
+  nextStatus: SettlementStatus
+): void {
+  const eventType = NOTIFIED_STATUSES[nextStatus];
+  if (!eventType) return;
+
+  // Deliberately not awaited: queueing must never turn an already-committed
+  // settlement transition into a failed request.
+  void (async () => {
+    try {
+      const row = await prisma.settlement.findUnique({
+        where: { id: settlementId },
+        select: {
+          id: true,
+          groupId: true,
+          shortCode: true,
+          amount: true,
+          assetCode: true,
+          assetIssuer: true,
+          status: true,
+          stellarTxHash: true,
+          failureReason: true,
+        },
+      });
+      if (!row) return;
+
+      emitEvent({
+        eventType,
+        groupId: row.groupId,
+        payload: {
+          settlementId: row.id,
+          shortCode: row.shortCode,
+          groupId: row.groupId,
+          status: row.status,
+          amount: String(row.amount),
+          assetCode: row.assetCode,
+          assetIssuer: row.assetIssuer,
+          stellarTxHash: row.stellarTxHash,
+          failureReason: row.failureReason,
+        },
+      });
+    } catch {
+      // A failed announcement must not surface as a settlement error.
+    }
+  })();
 }
 
 export type ErrorClassification = "transient" | "permanent";

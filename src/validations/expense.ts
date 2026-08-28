@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { canonicalAmountSchema, refineValidatedAsset } from "../lib/money";
 
 export const SplitType = z.enum(["equal", "custom", "percentage"]);
 
@@ -14,7 +15,7 @@ export const createExpenseSchema = z
   .object({
     title: z.string().min(1).max(80),
     description: z.string().max(500).optional(),
-    amount: z.string().regex(/^\d+(?:\.\d{1,7})?$/, "Amount must have at most 7 decimal places"),
+    amount: canonicalAmountSchema,
     assetCode: z.string().min(1).max(12),
     assetIssuer: z.string().nullable().optional(),
     splitType: SplitType,
@@ -23,19 +24,28 @@ export const createExpenseSchema = z
     memo: z.string().max(24).optional(),
     receiptUrl: z.string().nullable().optional(),
   })
-  .refine(
-    (data) => {
-      if (data.splitType === "custom") {
-        return data.shares.every((s) => s.amount !== undefined && s.amount !== "");
+  .superRefine((val, ctx) => {
+    refineValidatedAsset(ctx, val.assetCode, val.assetIssuer);
+    if (val.splitType === "custom") {
+      if (!val.shares.every((s) => s.amount !== undefined && s.amount !== "")) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Invalid split configuration",
+          path: ["shares"],
+        });
       }
-      if (data.splitType === "percentage") {
-        const total = data.shares.reduce((sum, s) => sum + (s.percent ?? 0), 0);
-        return Math.abs(total - 100) < 0.01;
+    }
+    if (val.splitType === "percentage") {
+      const total = val.shares.reduce((sum, s) => sum + (s.percent ?? 0), 0);
+      if (Math.abs(total - 100) >= 0.01) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Invalid split configuration",
+          path: ["shares"],
+        });
       }
-      return true;
-    },
-    { message: "Invalid split configuration", path: ["shares"] }
-  );
+    }
+  });
 
 export type CreateExpenseInput = z.infer<typeof createExpenseSchema>;
 

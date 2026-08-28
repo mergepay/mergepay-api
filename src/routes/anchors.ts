@@ -7,6 +7,10 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { applyAnchorSessionTransition } from "../services/anchor-status";
+import {
+  applyWithdrawalTransition,
+  mapAnchorStatusToWithdrawalStatus,
+} from "../services/withdrawal-status";
 import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
 import { ipKey } from "../services/rate-limit-keys";
@@ -240,6 +244,21 @@ export default async function anchorRoutes(app: FastifyInstance) {
           await applyAnchorSessionTransition({
             sessionId: session.id,
             nextStatus: mappedStatus,
+            source: "webhook",
+          });
+        }
+
+        // The simpler `Withdrawal` record (POST /withdraw) is a separate
+        // table keyed by the same anchor transaction id — see
+        // src/services/withdrawal-status.ts for why it has its own status
+        // vocabulary and transition map.
+        const withdrawal = await (prisma as any).withdrawal.findUnique({
+          where: { anchorTxId: externalId },
+        });
+        if (withdrawal) {
+          await applyWithdrawalTransition({
+            withdrawalId: withdrawal.id,
+            nextStatus: mapAnchorStatusToWithdrawalStatus(mappedStatus),
             source: "webhook",
           });
         }

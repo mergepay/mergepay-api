@@ -1,6 +1,17 @@
 import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "../config";
-import { withTimeout } from "./timeout";
+import { retryRead, withTimeout } from "./timeout";
+
+/**
+ * Retry bounds for the fee-stats read. Horizon is a read-only, idempotent
+ * request that is safe to retry on transient network/server failures; the
+ * bounds come from the same application configuration as every other timeout.
+ */
+const READ_RETRY_POLICY = {
+  maxAttempts: config.HORIZON_READ_RETRY_MAX_ATTEMPTS,
+  initialDelayMs: config.HORIZON_READ_RETRY_INITIAL_DELAY_MS,
+  maxDelayMs: config.HORIZON_READ_RETRY_MAX_DELAY_MS,
+};
 
 export interface FeeStats {
   minAcceptedFee: number;
@@ -49,15 +60,28 @@ function normalize(raw: Record<string, unknown>): FeeStats {
 }
 
 async function fetchFeeStats(): Promise<FeeStats> {
-  const response = await withTimeout(
-    "Horizon.feeStats",
-    config.HORIZON_FEE_TIMEOUT_MS,
-    async (_signal) => {
-      // Horizon.Server.feeStats doesn't accept AbortSignal directly,
-      // but we wrap it so timeout still fires and rejects the promise.
-      return horizon().feeStats();
+  const response = await retryRead("Horizon.feeStats", READ_RETRY_POLICY, async (attempt) => {
+    try {
+      return await withTimeout(
+        "Horizon.feeStats",
+        config.HORIZON_FEE_TIMEOUT_MS,
+        async (_signal) => {
+          // Horizon.Server.feeStats doesn't accept AbortSignal directly,
+          // but we wrap it so timeout still fires and rejects the promise.
+          return horizon().feeStats();
+        }
+      );
+    } catch (error) {
+      // The inner withTimeout already classifies the failure; log the attempt
+      // count as an operational breadcrumb without echoing any payload or
+      // credentials, then let retryRead decide whether to retry or re-throw.
+      console.error(
+        `[network] Horizon.feeStats attempt ${attempt}/${READ_RETRY_POLICY.maxAttempts} failed`,
+        error instanceof Error ? error.message : String(error)
+      );
+      throw error;
     }
-  );
+  });
   const stats = normalize(response as unknown as Record<string, unknown>);
   cached = {
     stats,

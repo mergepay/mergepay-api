@@ -1,4 +1,5 @@
 import { FastifyInstance } from "fastify";
+import { z } from "zod";
 import { prisma } from "../db";
 import { requireUser } from "../plugins/auth";
 
@@ -8,7 +9,7 @@ export default async function accountRoutes(app: FastifyInstance) {
   // GET /accounts/:id/balances - Get cached balances for an account
   app.get("/accounts/:id/balances", async (req) => {
     const auth = requireUser(req);
-    const { id } = req.params as { id: string };
+    const { id } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
 
     // First, try to find a group by ID
     const group = await prisma.group.findFirst({

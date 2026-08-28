@@ -7,7 +7,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
-import { audit, auditTx } from "../services/audit";
+import { auditTx } from "../services/audit";
 import {
   serializeGroup,
   serializeInvitation,
@@ -431,36 +431,124 @@ export default async function groupRoutes(app: FastifyInstance) {
       );
     }
 
-    const target = await prisma.groupMember.findUnique({
-      where: { groupId_userId: { groupId: id, userId: memberId } },
-    });
-    if (!target) {
-      throw Errors.notFound("Member not found in this group");
-    }
-
-    if (target.role === "admin") {
-      const adminCount = await prisma.groupMember.count({
-        where: { groupId: id, role: "admin" },
+    // The lookup, the last-admin guard, the delete, and the audit record run
+    // in one transaction. Previously they did not: two concurrent removals
+    // could each see two admins and both proceed, leaving the group with
+    // none, and the audit write happened after the commit where a failure
+    // would lose the record of a removal that had already happened.
+    await prisma.$transaction(async (tx) => {
+      const target = await tx.groupMember.findUnique({
+        where: { groupId_userId: { groupId: id, userId: memberId } },
       });
-      if (adminCount <= 1) {
-        throw Errors.conflict(
-          "last_admin",
-          "Cannot remove the last admin from the group"
-        );
+      if (!target) {
+        throw Errors.notFound("Member not found in this group");
       }
-    }
 
-    await prisma.groupMember.delete({
-      where: { groupId_userId: { groupId: id, userId: memberId } },
+      if (target.role === "admin") {
+        const adminCount = await tx.groupMember.count({
+          where: { groupId: id, role: "admin" },
+        });
+        if (adminCount <= 1) {
+          throw Errors.conflict(
+            "last_admin",
+            "Cannot remove the last admin from the group"
+          );
+        }
+      }
+
+      await tx.groupMember.delete({
+        where: { groupId_userId: { groupId: id, userId: memberId } },
+      });
+
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: id,
+        action: "group.member_remove",
+        entityType: "group",
+        entityId: id,
+        outcome: "success",
+        metadata: { removedUserId: memberId, removedRole: target.role },
+      });
     });
-    await audit({
-      userId: auth.id,
-      action: "group.member_remove",
-      entityType: "group",
-      entityId: id,
-      metadata: { removedUserId: memberId },
-    });
+
     return { ok: true };
+  });
+
+  /**
+   * Change a member's role.
+   *
+   * The membership read, the last-admin guard, the update, and the audit
+   * record all run in one transaction. That matters in both directions: a
+   * concurrent demotion cannot slip past the guard and leave a group with no
+   * admin, and the audit entry cannot survive a rolled-back change (or be
+   * lost while the change commits). `auditTx` deliberately does not swallow
+   * errors, so a failed audit write rolls the role change back with it.
+   */
+  app.post("/groups/:id/members/role", async (req) => {
+    const auth = requireUser(req);
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const body = z
+      .object({
+        userId: z.string().min(1).max(64),
+        role: z.enum(["admin", "member"]),
+      })
+      .parse(req.body);
+
+    const updated = await prisma.$transaction(async (tx) => {
+      // Authorization is re-checked inside the transaction so a concurrent
+      // demotion of the caller cannot let an ex-admin land one last write.
+      await requireAdmin(id, auth.id, tx);
+
+      const target = await tx.groupMember.findUnique({
+        where: { groupId_userId: { groupId: id, userId: body.userId } },
+      });
+      if (!target) {
+        throw Errors.notFound("Member not found in this group");
+      }
+
+      if (target.role === body.role) {
+        // Nothing changed, so there is nothing to audit. Returning the current
+        // membership keeps the endpoint idempotent for a retried request.
+        return target;
+      }
+
+      // Demoting the last admin would leave the group unadministrable, with
+      // no one able to promote anyone back.
+      if (target.role === "admin" && body.role !== "admin") {
+        const adminCount = await tx.groupMember.count({
+          where: { groupId: id, role: "admin" },
+        });
+        if (adminCount <= 1) {
+          throw Errors.conflict(
+            "last_admin",
+            "Cannot demote the last admin of the group"
+          );
+        }
+      }
+
+      const result = await tx.groupMember.update({
+        where: { groupId_userId: { groupId: id, userId: body.userId } },
+        data: { role: body.role },
+      });
+
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: id,
+        action: "group.member_role_change",
+        entityType: "group_member",
+        entityId: body.userId,
+        outcome: "success",
+        metadata: {
+          targetUserId: body.userId,
+          previousRole: target.role,
+          newRole: body.role,
+        },
+      });
+
+      return result;
+    });
+
+    return { member: { userId: updated.userId, role: updated.role } };
   });
 
   // -- archive ----------------------------------------------------------------

@@ -9,44 +9,13 @@ import { normalizeAmount } from "../services/money";
 import { shortCode } from "../services/codes";
 import { auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
+import { assertParticipantsCanHoldAsset } from "../services/horizon";
 import { serializeExpense } from "../serializers";
-import {
-  buildPage,
-  cursorFilter,
-  cursorOrderBy,
-  paginationQuerySchema,
-  requireCursor,
-  takeForPage,
-} from "../lib/pagination";
+import { createExpenseSchema, updateExpenseSchema } from "../validations/expense";
+import { expenseListQuerySchema, listGroupExpenses } from "../services/expenses";
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });
-
-const shareInput = z.object({
-  userId: z.string(),
-  amount: z.string().optional(),
-  percent: z.number().optional(),
-});
-
-const createExpenseSchema = z.object({
-  title: z.string().min(1).max(80),
-  description: z.string().max(500).optional(),
-  amount: z.string().min(1),
-  assetCode: z.string().min(1).max(12),
-  assetIssuer: z.string().nullable().optional(),
-  splitType: z.enum(["equal", "custom", "percentage"]),
-  shares: z.array(shareInput).min(1),
-  payerUserId: z.string().optional(),
-  memo: z.string().max(24).optional(),
-  receiptUrl: z.string().nullable().optional(),
-});
-
-const updateExpenseSchema = z.object({
-  title: z.string().min(1).max(80).optional(),
-  description: z.string().max(500).nullable().optional(),
-  memo: z.string().max(24).optional(),
-  receiptUrl: z.string().nullable().optional(),
-});
 
 const expenseInclude = {
   payer: true,
@@ -64,7 +33,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const body = createExpenseSchema.parse(req.body);
     validateAmount(body.amount);
-    validateAsset(body.assetCode, body.assetIssuer ?? null);
+    const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
 
@@ -73,6 +42,33 @@ export default async function expenseRoutes(app: FastifyInstance) {
       computed = computeShares(body.amount, body.splitType as SplitType, body.shares);
     } catch (e: any) {
       throw Errors.badRequest("invalid_split", e?.message ?? "Invalid split");
+    }
+
+    const participantIds = [...new Set(computed.map((share) => share.userId))];
+    const members = await prisma.groupMember.findMany({
+      where: { groupId, userId: { in: participantIds } },
+      select: { userId: true, user: { select: { stellarPublicKey: true } } },
+    });
+    if (members.length !== participantIds.length) {
+      throw Errors.badRequest("invalid_split", "Every split participant must be an active group member");
+    }
+
+    // A non-native asset can only be paid to an account that has trusted it.
+    // Without this check the expense is created happily and every settlement
+    // built from it fails on submission with op_no_trust — after members have
+    // been asked to pay, which is the most expensive point to discover it.
+    //
+    // Native XLM needs no trustline, so it skips the Horizon round trip
+    // entirely rather than paying for a lookup whose answer is always yes.
+    if (asset.type !== "native") {
+      await assertParticipantsCanHoldAsset({
+        participants: members.map((member) => ({
+          userId: member.userId,
+          stellarPublicKey: member.user.stellarPublicKey,
+        })),
+        assetCode: body.assetCode,
+        assetIssuer: body.assetIssuer ?? null,
+      });
     }
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
@@ -121,21 +117,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get("/groups/:id/expenses", async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const query = expenseListQuerySchema.parse(req.query ?? {});
     // Membership is checked before any row is read, and the `groupId` filter
-    // below is what scopes the page — never the cursor.
+    // the service applies is what scopes the page — never the cursor.
     await requireMembership(groupId, auth.id);
 
-    const position = requireCursor(cursor);
+    const { items, meta } = await listGroupExpenses(groupId, query, expenseInclude);
 
-    const expenses = await prisma.expense.findMany({
-      where: { groupId, ...cursorFilter(position, order) },
-      include: expenseInclude,
-      orderBy: cursorOrderBy(order),
-      take: takeForPage(limit),
-    });
-
-    const { items, meta } = buildPage(expenses, limit, order);
     return { expenses: items.map(serializeExpense), meta };
   });
 

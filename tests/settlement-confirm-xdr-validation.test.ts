@@ -27,6 +27,7 @@ const h = vi.hoisted(() => {
   });
   const prisma: any = {
     settlement: model(),
+    groupMember: model(),
     idempotencyKey: model(),
     statusHistory: model(),
     auditLog: { create: vi.fn() },

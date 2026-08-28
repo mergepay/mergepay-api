@@ -103,6 +103,12 @@ const schema = z.object({
   HORIZON_SUBMIT_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
   HORIZON_STATUS_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   HORIZON_FEE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  // Bounds for retrying *read-only* Horizon calls that failed with a transient
+  // network or server error. Submission calls are never retried transparently;
+  // these knobs apply only to safe read operations (see src/services/timeout.ts).
+  HORIZON_READ_RETRY_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
+  HORIZON_READ_RETRY_INITIAL_DELAY_MS: z.coerce.number().int().min(0).default(250),
+  HORIZON_READ_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(2000),
   ANCHOR_TOML_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   ANCHOR_CHALLENGE_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   ANCHOR_TOKEN_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),

@@ -124,6 +124,20 @@ See [.env.example](.env.example). Key ones:
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
 
+#### Horizon read retries
+
+Read-only Horizon calls (currently fee statistics) retry transient failures —
+timeouts, connection resets, and selected 5xx responses — with bounded,
+configurable backoff so a temporary upstream blip does not immediately fail a
+recoverable read. Transaction submission is **never** transparently retried by
+this helper.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `HORIZON_READ_RETRY_MAX_ATTEMPTS` | 3 | Total attempts (including the first) for a transiently failing read |
+| `HORIZON_READ_RETRY_INITIAL_DELAY_MS` | 250 | Backoff before the first retry |
+| `HORIZON_READ_RETRY_MAX_DELAY_MS` | 2000 | Cap on the exponential backoff |
+
 ### Rate limiting
 
 Every route is covered by a global default limit

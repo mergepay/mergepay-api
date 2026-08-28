@@ -26,6 +26,7 @@ import auditLogRoutes from "./routes/audit-log";
 import sep24Routes from "./routes/sep24";
 import webhookRoutes from "./routes/webhooks";
 import userGroupsRoutes from "./routes/user-groups";
+import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
@@ -234,11 +235,12 @@ export async function buildApp(): Promise<FastifyInstance> {
     });
   });
 
+  await app.register(healthRoutes);
+
   const liveness = async () => ({
     status: "ok",
     timestamp: new Date().toISOString(),
   });
-  app.get("/health", liveness);
   app.get("/health/live", liveness);
 
   const { getReadiness, getDeepHealth } = await import("./services/health.js");

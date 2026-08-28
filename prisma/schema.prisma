@@ -25,8 +25,11 @@ model User {
   anchorSessions   AnchorSession[]
   withdrawals      Withdrawal[]
   proposals        TreasuryProposal[]   @relation("ProposalCreator")
+  approvals        TreasuryApproval[]
   auditLogs        AuditLog[]
   idempotencyKeys  IdempotencyKey[]
+  webhooks         Webhook[]
+  refreshTokens    RefreshToken[]
 
   @@map("users")
 }
@@ -51,6 +54,7 @@ model Group {
   invites     Invite[]
   invitations Invitation[]
   auditLogs   AuditLog[]
+  webhooks    Webhook[]
 
   @@index([createdByUserId])
   @@map("groups")
@@ -143,6 +147,11 @@ model Settlement {
   submittedAt    DateTime? @map("submitted_at")
   confirmedAt    DateTime? @map("confirmed_at")
   memo           String?
+  /// Client-provided idempotency key for the creation request. Stored on the
+  /// settlement itself so a partial-unique index can enforce that the same
+  /// expense share is never settled twice, even across separate API requests
+  /// that bypass the request-level idempotency service.
+  idempotencyKey String?   @map("idempotency_key")
   expenseId      String?   @map("expense_id")
   expenseShareId String?   @map("expense_share_id")
   createdAt      DateTime  @default(now()) @map("created_at")
@@ -161,6 +170,7 @@ model Settlement {
   @@index([status, nextAttemptAt]) // For picking up eligible worker jobs
   @@index([leaseExpiresAt]) // For recovering leases from crashed workers
   @@index([expiresAt])
+  @@unique([expenseShareId, idempotencyKey], name: "settlement_expense_share_idempotency")
   @@map("settlements")
 }
 
@@ -177,6 +187,10 @@ model TreasuryTransaction {
   stellarTxHash String?  @map("stellar_tx_hash")
   status        String   @default("pending")
   memo          String?
+  /// Hash of the unsigned transaction envelope built at intent creation time.
+  /// The confirm endpoint validates the submitted signed XDR against this hash
+  /// to ensure the approval is bound to the exact intended transaction.
+  intendedTxHash String? @map("intended_tx_hash")
   // Server-controlled signing deadline for the unsigned XDR — same contract as
   // Settlement.expiresAt. See src/lib/time-bounds.ts.
   expiresAt     DateTime? @map("expires_at")
@@ -283,7 +297,12 @@ model Withdrawal {
 
   @@index([userId])
   @@index([status])
-  @@index([anchorTxId])
+  // Unique (not just indexed): the anchor's transaction id is the
+  // idempotency key for webhook/poll reconciliation — two Withdrawal rows
+  // must never be able to claim the same anchor transaction. Postgres
+  // allows any number of NULL anchor_tx_id rows (pre-confirm withdrawals)
+  // under a unique index, so this doesn't constrain row creation.
+  @@unique([anchorTxId])
   @@map("withdrawals")
 }
 
@@ -298,6 +317,9 @@ model TreasuryProposal {
   /// Unsigned transaction envelope (XDR). The field is named `xdr` per the
   /// issue spec; values are always pre-signature when this row is created.
   xdr        String   @map("xdr")
+  /// Hash of the unsigned XDR, used to bind approvals to this specific
+  /// transaction intent. Computed server-side when the proposal is created.
+  txHash     String   @map("tx_hash")
   threshold  Int      @default(1)
   /// Array of `{ publicKey, signature }` records explicitly verified by
   /// the backend. Stored as JSON for simplicity (signatures are bounded
@@ -307,15 +329,43 @@ model TreasuryProposal {
   stellarTxHash String? @map("stellar_tx_hash")
   failureReason  String? @map("failure_reason")
   createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
 
-  group   Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
-  creator User  @relation("ProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  group     Group             @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  creator   User              @relation("ProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  approvals TreasuryApproval[]
 
   @@index([groupId])
   @@index([status])
   @@index([creatorId])
   @@map("treasury_proposals")
+}
+
+/// Individual signer approval record for a treasury proposal. Each row
+/// represents one verified signer's approval of a specific transaction intent.
+/// The unique constraint on (proposalId, userId) enforces one approval per
+/// signer per proposal at the database level, preventing duplicate approvals
+/// even under concurrent requests.
+model TreasuryApproval {
+  id         String   @id @default(cuid())
+  proposalId String   @map("proposal_id")
+  userId     String   @map("user_id")
+  /// Hash of the unsigned transaction envelope this approval is bound to.
+  /// Must match the proposal's txHash — prevents replaying an approval on
+  /// a modified transaction.
+  txHash     String   @map("tx_hash")
+  /// Base64-encoded ed25519 signature.
+  signature  String
+  signedAt   DateTime @default(now()) @map("signed_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  proposal TreasuryProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([proposalId, userId])
+  @@index([proposalId])
+  @@index([userId])
+  @@map("treasury_approvals")
 }
 
 model IdempotencyKey {
@@ -401,7 +451,36 @@ model Sep10Challenge {
   consumedAt    DateTime @default(now()) @map("consumed_at")
 
   @@index([expiresAt])
+  @@index([consumedAt, expiresAt])
   @@map("sep10_challenges")
+}
+
+/// A single-use refresh token in a rotating chain.
+///
+/// Only the SHA-256 hash of the token is stored: a leaked database row cannot
+/// be replayed as a credential. `familyId` ties every token issued from one
+/// SEP-10 login together, so detecting reuse of an already-rotated token can
+/// revoke the whole chain rather than just the one token presented.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique @map("token_hash")
+  familyId  String    @map("family_id")
+  userId    String    @map("user_id")
+  expiresAt DateTime  @map("expires_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  /// Set when this token is exchanged for its successor. A second exchange of
+  /// the same token is therefore detectable rather than merely idempotent.
+  rotatedAt DateTime? @map("rotated_at")
+  /// Set when the token is invalidated without being used — logout, or the
+  /// family-wide revocation triggered by detected reuse.
+  revokedAt DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
 }
 
 // Cached Stellar account balances, periodically refreshed from Horizon by
@@ -417,4 +496,69 @@ model AccountBalance {
   @@unique([accountId, assetCode])
   @@index([accountId])
   @@map("account_balances")
+}
+
+/// A registered callback endpoint. Groups and individual users can both own
+/// one, which is why `groupId` and `userId` are independently nullable: a
+/// group-wide integration sets `groupId`, a personal one sets `userId`, and a
+/// row may scope to both.
+model Webhook {
+  id        String   @id @default(cuid())
+  groupId   String?  @map("group_id")
+  userId    String?  @map("user_id")
+  url       String
+  /// Shared secret used to sign every payload sent to this endpoint. Returned
+  /// to the caller exactly once, when the webhook is created.
+  secret    String
+  /// Event types this endpoint wants. Filtering here rather than at delivery
+  /// time means an endpoint interested in one event is not woken for all of them.
+  events    String[]
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  group      Group?            @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user       User?             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([groupId])
+  @@index([userId])
+  @@index([enabled])
+  @@map("webhooks")
+}
+
+/// One attempted delivery of one event to one endpoint.
+///
+/// The row is created `pending` before the first request, so an event is never
+/// lost because a process died mid-delivery: the worker finds the row still
+/// pending and picks it up. `attempts` and `nextAttemptAt` are columns rather
+/// than process memory for the same reason.
+model WebhookDelivery {
+  id                 String    @id @default(cuid())
+  webhookId          String    @map("webhook_id")
+  eventType          String    @map("event_type")
+  /// The exact serialized body that was (or will be) signed and sent. Stored so
+  /// a retry re-sends identical bytes — a re-serialized payload would produce a
+  /// different signature than the one the receiver was told to expect.
+  payload            String
+  /// pending | delivered | failed
+  status             String    @default("pending")
+  attempts           Int       @default(0)
+  responseStatusCode Int?      @map("response_status_code")
+  responseBody       String?   @map("response_body")
+  /// When the worker may next try. Null once the delivery reaches a terminal state.
+  nextAttemptAt      DateTime? @map("next_attempt_at")
+  lastAttemptAt      DateTime? @map("last_attempt_at")
+  /// Lease columns: only one worker drives a given delivery at a time.
+  claimedBy          String?   @map("claimed_by")
+  leaseExpiresAt     DateTime? @map("lease_expires_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId])
+  @@index([status, nextAttemptAt])
+  @@index([leaseExpiresAt])
+  @@map("webhook_deliveries")
 }

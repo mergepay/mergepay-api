@@ -19,6 +19,8 @@
  *                  and stays visible to operators.
  */
 
+import { config } from "../config";
+
 export type JobFailureCategory = "transient" | "indeterminate" | "permanent";
 
 export interface RetryPolicy {
@@ -30,18 +32,22 @@ export interface RetryPolicy {
   jitterRatio: number;
 }
 
+/**
+ * Bounded retry budgets, tunable via environment variables (see
+ * src/config.ts). Defaults preserve the pre-configuration behavior.
+ */
 export const SETTLEMENT_RETRY_POLICY: RetryPolicy = {
-  maxAttempts: 3,
-  initialDelayMs: 1_000,
-  maxDelayMs: 30_000,
-  jitterRatio: 0.25,
+  maxAttempts: config.WORKER_SETTLEMENT_MAX_ATTEMPTS,
+  initialDelayMs: config.WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS,
+  maxDelayMs: config.WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS,
+  jitterRatio: config.WORKER_SETTLEMENT_RETRY_JITTER_RATIO,
 };
 
 export const ANCHOR_RETRY_POLICY: RetryPolicy = {
-  maxAttempts: 5,
-  initialDelayMs: 5_000,
-  maxDelayMs: 120_000,
-  jitterRatio: 0.25,
+  maxAttempts: config.WORKER_ANCHOR_MAX_ATTEMPTS,
+  initialDelayMs: config.WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS,
+  maxDelayMs: config.WORKER_ANCHOR_RETRY_MAX_DELAY_MS,
+  jitterRatio: config.WORKER_ANCHOR_RETRY_JITTER_RATIO,
 };
 
 /**

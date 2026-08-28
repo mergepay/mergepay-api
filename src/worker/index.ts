@@ -38,6 +38,13 @@ import { prisma } from "../db";
 import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { processPendingWebhookDeliveries } from "../services/webhook";
+import { expireStaleProposals } from "./cleanupProposals";
+import {
+  verifyTransactionMemo,
+  verifyPaymentOperation,
+  getTransactionPayments,
+} from "../services/horizonService";
 import {
   applySettlementTransition,
   type SettlementStatus,
@@ -61,7 +68,9 @@ import {
   type JobFailureCategory,
 } from "../services/job-retry";
 import { reconcileSettlements } from "../services/settlement-reconciliation";
+import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
+import { cleanupChallenges } from "./tasks/cleanup-challenges";
 import {
   type CorrelationContext,
   jobContext,
@@ -264,13 +273,15 @@ async function failSettlement(params: {
 async function transitionSettlement(
   job: SettlementJob,
   nextStatus: SettlementStatus,
-  extraData?: Record<string, unknown>
+  extraData?: Record<string, unknown>,
+  settleExpenseShare = false
 ): Promise<void> {
   await applySettlementTransition({
     settlementId: job.id,
     nextStatus,
     source: "worker",
     extraData: extraData as never,
+    settleExpenseShare,
   });
 }
 
@@ -331,18 +342,18 @@ async function confirmSubmission(params: {
   const confirmation = await pollForConfirmation(hash);
 
   if (confirmation.status === "confirmed") {
-    await transitionSettlement(job, "confirmed", {
-      stellarTxHash: hash,
-      retryCount: 0,
-      errorCategory: null,
-      failureReason: null,
-      nextAttemptAt: null,
-    });
-    if (job.expenseShareId) {
-      await prisma.expenseShare
-        .update({ where: { id: job.expenseShareId }, data: { status: "settled" } })
-        .catch(() => undefined);
-    }
+    await transitionSettlement(
+      job,
+      "confirmed",
+      {
+        stellarTxHash: hash,
+        retryCount: 0,
+        errorCategory: null,
+        failureReason: null,
+        nextAttemptAt: null,
+      },
+      true
+    );
     jobLog.info(
       { jobType: "settlement", jobId: job.id, attempt, outcome: "confirmed", hash },
       "settlement confirmed on Stellar"
@@ -455,34 +466,31 @@ export async function processSettlementJob(
       if (category === "indeterminate") {
         // The call may have taken effect. Check the ledger before deciding.
         const applied = await alreadyApplied(job);
-        if (applied?.successful) {
-          jobLog.warn(
-            {
-              jobType: "settlement",
-              jobId: job.id,
-              attempt,
-              outcome: "already_applied",
-              hash: applied.hash,
-            },
-            "submission response was lost but the transaction had applied"
-          );
-          await transitionSettlement(job, "confirmed", {
+if (applied?.successful) {
+        jobLog.warn(
+          {
+            jobType: "settlement",
+            jobId: job.id,
+            attempt,
+            outcome: "already_applied",
+            hash: applied.hash,
+          },
+          "submission response was lost but the transaction had applied"
+        );
+        await transitionSettlement(
+          job,
+          "confirmed",
+          {
             stellarTxHash: applied.hash,
             retryCount: 0,
             errorCategory: null,
             failureReason: null,
             nextAttemptAt: null,
-          });
-          if (job.expenseShareId) {
-            await prisma.expenseShare
-              .update({
-                where: { id: job.expenseShareId },
-                data: { status: "settled" },
-              })
-              .catch(() => undefined);
-          }
-          return;
-        }
+          },
+          true
+        );
+        return;
+      }
         if (applied && !applied.successful) {
           await failSettlement({
             job,
@@ -913,6 +921,46 @@ export async function expireInvites(): Promise<void> {
   });
 }
 
+/**
+ * Send queued webhook deliveries. Sending lives here rather than in the request
+ * path so a slow or unreachable receiver cannot hold an API request open for
+ * the length of its own backoff.
+ */
+export async function deliverPendingWebhooks(): Promise<void> {
+  const { delivered, failed, attempted } = await processPendingWebhookDeliveries();
+
+  if (attempted > 0) {
+    log.info(
+      { job: "webhook_delivery", outcome: "ok", attempted, delivered, failed },
+      "processed webhook deliveries"
+    );
+  }
+}
+
+/**
+ * Sweep treasury proposals that were never signed to threshold. The transition
+ * and its audit record are written together in src/worker/cleanupProposals.ts;
+ * this wrapper exists to log the outcome on the worker's own logger, the same
+ * way every other job in this cycle reports.
+ */
+export async function expireStaleTreasuryProposals(): Promise<void> {
+  const { expired, olderThan } = await expireStaleProposals();
+
+  // Only speak up when something actually changed. A quiet sweep is the normal
+  // case and logging it every cycle would bury the runs that mattered.
+  if (expired > 0) {
+    log.info(
+      {
+        job: "treasury_proposal_expiry",
+        outcome: "ok",
+        expired,
+        olderThan: olderThan.toISOString(),
+      },
+      "expired stale treasury proposals"
+    );
+  }
+}
+
 export async function runWorkerCycle(): Promise<void> {
   // Recover first: a restart should adopt the previous process's work before
   // looking for new jobs.
@@ -922,7 +970,11 @@ export async function runWorkerCycle(): Promise<void> {
     processSubmittedSettlements(),
     reconcileAnchors(),
     reconcileSettlements(),
+    reconcileAllTreasuryBalances(),
     expireInvites(),
+    deliverPendingWebhooks(),
+    expireStaleTreasuryProposals(),
+    cleanupChallenges(),
   ]);
 }
 

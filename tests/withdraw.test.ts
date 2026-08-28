@@ -32,6 +32,7 @@ const h = vi.hoisted(() => {
       create: vi.fn(),
       findUnique: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(async () => ({ count: 1 })),
     },
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
@@ -57,6 +58,7 @@ vi.mock("../src/services/stellar", () => ({
 vi.mock("../src/services/anchor", () => ({
   anchorService: {
     getToml: vi.fn(),
+    getToken: vi.fn(),
     startInteractive: vi.fn(),
   },
   mapAnchorStatus: vi.fn((s: string) => s),
@@ -239,6 +241,138 @@ describe("POST /withdraw", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe("ACCOUNT_UNFUNDED");
+  });
+});
+
+describe("POST /withdraw/:id/confirm", () => {
+  const pendingWithdrawal = (over: Partial<any> = {}) => ({
+    id: "wth_1",
+    userId: "user_1",
+    amount: "5",
+    assetCode: "XLM",
+    assetIssuer: null,
+    memo: null,
+    anchorTxId: null,
+    interactiveUrl: "https://testanchor.stellar.org/sep24/withdraw",
+    status: "pending",
+    failureReason: null,
+    createdAt: new Date("2026-04-01T00:00:00.000Z"),
+    updatedAt: new Date("2026-04-01T00:00:00.000Z"),
+    ...over,
+  });
+
+  it("moves a pending withdrawal to processing and stores the anchor tx id", async () => {
+    const user = fakeUser();
+    const { anchorService } = await import("../src/services/anchor");
+    vi.mocked(anchorService.getToken).mockResolvedValueOnce("anchor-jwt");
+    vi.mocked(anchorService.startInteractive).mockResolvedValueOnce({
+      url: "https://testanchor.stellar.org/sep24/interactive/abc",
+      id: "ANCH-TX-1",
+    });
+
+    prisma.withdrawal.findUnique
+      .mockResolvedValueOnce(pendingWithdrawal())
+      .mockResolvedValueOnce(pendingWithdrawal())
+      .mockResolvedValueOnce(
+        pendingWithdrawal({ status: "processing", anchorTxId: "ANCH-TX-1" })
+      );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw/wth_1/confirm",
+      headers: authHeader(user),
+      payload: { signedXdr: "AAAA..." },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe("processing");
+    expect(body.transaction_id).toBe("ANCH-TX-1");
+    expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
+      where: { id: "wth_1", status: "pending" },
+      data: { anchorTxId: "ANCH-TX-1", status: "processing" },
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "withdrawal.status_changed",
+        entityType: "withdrawal",
+        entityId: "wth_1",
+        metadata: { from: "pending", to: "processing", source: "user" },
+      }),
+    });
+  });
+
+  it("marks the withdrawal failed when the anchor call errors, without leaking the error upstream", async () => {
+    const user = fakeUser();
+    const { anchorService } = await import("../src/services/anchor");
+    vi.mocked(anchorService.getToken).mockRejectedValueOnce(new Error("network down"));
+
+    prisma.withdrawal.findUnique
+      .mockResolvedValueOnce(pendingWithdrawal())
+      .mockResolvedValueOnce(pendingWithdrawal())
+      .mockResolvedValueOnce(pendingWithdrawal({ status: "failed" }));
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw/wth_1/confirm",
+      headers: authHeader(user),
+      payload: { signedXdr: "AAAA..." },
+    });
+
+    expect(res.statusCode).toBe(502);
+    expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
+      where: { id: "wth_1", status: "pending" },
+      data: { status: "failed" },
+    });
+  });
+
+  it("is idempotent for a repeated confirm on an already non-pending withdrawal", async () => {
+    const user = fakeUser();
+    const { anchorService } = await import("../src/services/anchor");
+    prisma.withdrawal.findUnique.mockResolvedValueOnce(
+      pendingWithdrawal({ status: "processing", anchorTxId: "ANCH-TX-1" })
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw/wth_1/confirm",
+      headers: authHeader(user),
+      payload: { signedXdr: "AAAA..." },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("processing");
+    expect(anchorService.getToken).not.toHaveBeenCalled();
+    expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for an unknown withdrawal id", async () => {
+    prisma.withdrawal.findUnique.mockResolvedValueOnce(null);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw/missing/confirm",
+      headers: authHeader(),
+      payload: { signedXdr: "AAAA..." },
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 404 rather than confirming a withdrawal owned by another user", async () => {
+    prisma.withdrawal.findUnique.mockResolvedValueOnce(
+      pendingWithdrawal({ userId: "someone_else" })
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw/wth_1/confirm",
+      headers: authHeader(fakeUser({ id: "user_1" })),
+      payload: { signedXdr: "AAAA..." },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
   });
 });
 

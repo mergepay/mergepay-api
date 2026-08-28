@@ -2,6 +2,34 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { Keypair, Transaction } from "@stellar/stellar-sdk";
 
 const h = vi.hoisted(() => {
+  // Fingerprint -> expiry (ms). Stands in for the `sep10_challenges` table's
+  // unique fingerprint index; cleared between tests.
+  const sep10Challenges = new Map<string, number>();
+  // Drives the real conditional-insert replay path in src/services/sep10.ts
+  // (`$executeRaw` "INSERT ... ON CONFLICT DO NOTHING"). The synchronous
+  // check-and-set mirrors the database's unique index, so concurrent
+  // verification resolves to one winner rather than being mocked away.
+  const executeRaw = vi.fn(async (sql: { strings: string[]; values: unknown[] }) => {
+    const text = sql.strings.join("?");
+    if (text.includes("INSERT INTO")) {
+      const [fingerprint, expiresAt] = sql.values as [string, Date];
+      if (sep10Challenges.has(fingerprint)) return 0; // ON CONFLICT DO NOTHING
+      sep10Challenges.set(fingerprint, expiresAt.getTime());
+      return 1;
+    }
+    if (text.includes("DELETE FROM")) {
+      const now = Date.now();
+      let deleted = 0;
+      for (const [fingerprint, expiresAt] of sep10Challenges) {
+        if (expiresAt <= now) {
+          sep10Challenges.delete(fingerprint);
+          deleted += 1;
+        }
+      }
+      return deleted;
+    }
+    return 0;
+  });
   const model = () => ({
     create: vi.fn(),
     createMany: vi.fn(),
@@ -28,15 +56,17 @@ const h = vi.hoisted(() => {
     anchorSession: model(),
     auditLog: model(),
     idempotencyKey: model(),
-    $queryRaw: vi.fn(async () => [{ "?column?": 1 }]),
+    refreshToken: model(),
+    $queryRawUnsafe: vi.fn(async () => [{ "?column?": 1 }]),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
     $queryRaw: vi.fn(),
+    $executeRaw: executeRaw,
     $disconnect: vi.fn(),
   };
   const mockFetchBaseFee = vi.fn();
-  return { prisma, mockFetchBaseFee };
+  return { prisma, mockFetchBaseFee, sep10Challenges };
 });
 
 vi.mock("../src/db", () => ({ prisma: h.prisma }));
@@ -65,6 +95,7 @@ vi.mock("@stellar/stellar-sdk", async (importActual) => {
     Horizon: {
       Server: vi.fn().mockImplementation(() => ({
         fetchBaseFee: h.mockFetchBaseFee,
+        feeStats: h.mockFetchBaseFee,
       })),
     },
   };
@@ -88,6 +119,7 @@ const prisma = h.prisma;
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  h.sep10Challenges.clear();
   // Reset $transaction to default behavior (passes prisma mock to callback)
   h.prisma.$transaction.mockImplementation(async (arg: any) =>
     typeof arg === "function" ? arg(h.prisma) : Promise.all(arg)
@@ -104,11 +136,14 @@ function authHeader(user = fakeUser()) {
 
 describe("auth routes", () => {
   it("GET /health is open", async () => {
-    h.prisma.$queryRaw.mockResolvedValueOnce([{ 1: 1 }]);
+    // The health service uses $queryRawUnsafe and getFeeStats (Horizon).
+    h.prisma.$queryRawUnsafe.mockResolvedValueOnce([{ "?column?": 1 }]);
     h.mockFetchBaseFee.mockResolvedValueOnce(100);
     const res = await app.inject({ method: "GET", url: "/health" });
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("ok");
+    expect(res.json().database.connected).toBe(true);
+    expect(res.json().stellar.reachable).toBe(true);
   });
 
   it("POST /auth/challenge returns a transaction + passphrase", async () => {
@@ -155,6 +190,91 @@ describe("auth routes", () => {
     const body = res.json();
     expect(body.token).toBeTruthy();
     expect(body.user.stellarPublicKey).toBe(client.publicKey());
+  });
+
+  it("POST /auth/verify does not issue a JWT when the challenge fails validation", async () => {
+    // A challenge that fails SEP-10 validation must collapse to the standard
+    // opaque 401 — no token, no user upsert, no audit entry, and no detail
+    // about *why* it failed (wrong network, wrong server, replay, expiry, …).
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload: { transaction: "not-a-valid-challenge-xdr" },
+    });
+    expect(res.statusCode).toBe(401);
+    const body = res.json();
+    expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.message).toBe("Invalid or expired authentication challenge");
+    expect(body.requestId).toBeTruthy();
+    expect(body.token).toBeUndefined();
+    expect(prisma.user.upsert).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("POST /auth/verify rejects replaying an already-consumed challenge", async () => {
+    const client = Keypair.random();
+    const user = fakeUser({ stellarPublicKey: client.publicKey() });
+    prisma.user.upsert.mockResolvedValueOnce(user);
+
+    const { transaction, networkPassphrase } = buildChallenge(client.publicKey());
+    const tx = new Transaction(transaction, networkPassphrase);
+    tx.sign(client);
+    const payload = { transaction: tx.toXDR() };
+
+    const first = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload,
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().token).toBeTruthy();
+
+    // The exact same signed challenge, exchanged again: the durable replay
+    // store must reject it with the same opaque 401 and issue no JWT.
+    const second = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload,
+    });
+    expect(second.statusCode).toBe(401);
+    const body = second.json();
+    expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.message).toBe("Invalid or expired authentication challenge");
+    expect(body.token).toBeUndefined();
+
+    // No second session or user was minted.
+    expect(prisma.user.upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST /auth/verify issues exactly one JWT under concurrent use of the same challenge", async () => {
+    const client = Keypair.random();
+    const user = fakeUser({ stellarPublicKey: client.publicKey() });
+    prisma.user.upsert.mockResolvedValueOnce(user);
+
+    const { transaction, networkPassphrase } = buildChallenge(client.publicKey());
+    const tx = new Transaction(transaction, networkPassphrase);
+    tx.sign(client);
+    const payload = { transaction: tx.toXDR() };
+
+    // Three simultaneous verifications of the identical envelope. The replay
+    // store's unique index is the arbiter: exactly one may win.
+    const responses = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        app.inject({ method: "POST", url: "/auth/verify", payload })
+      )
+    );
+
+    const ok = responses.filter((r) => r.statusCode === 200);
+    const rejected = responses.filter((r) => r.statusCode === 401);
+
+    expect(ok).toHaveLength(1);
+    expect(rejected).toHaveLength(2);
+    expect(ok[0].json().token).toBeTruthy();
+    for (const r of rejected) {
+      expect(r.json().code).toBe("UNAUTHORIZED");
+      expect(r.json().token).toBeUndefined();
+    }
+    expect(prisma.user.upsert).toHaveBeenCalledTimes(1);
   });
 
   it("GET /me requires a token", async () => {
@@ -427,14 +547,21 @@ describe("group routes", () => {
       expect(prisma.groupMember.delete).toHaveBeenCalledWith({
         where: { groupId_userId: { groupId: "group_1", userId: targetUser.id } },
       });
+      // The record now carries the group it belongs to — it was written with
+      // groupId: null before, so group-scoped audit queries never saw member
+      // removals — along with the role the removed member held.
       expect(prisma.auditLog.create).toHaveBeenCalledWith({
         data: {
           userId: admin.id,
-          groupId: null,
+          groupId: "group_1",
           action: "group.member_remove",
           entityType: "group",
           entityId: "group_1",
-          metadata: { removedUserId: targetUser.id },
+          metadata: {
+            removedUserId: targetUser.id,
+            removedRole: "member",
+            outcome: "success",
+          },
         },
       });
     });

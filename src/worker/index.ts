@@ -38,6 +38,8 @@ import { prisma } from "../db";
 import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { processPendingWebhookDeliveries } from "../services/webhook";
+import { expireStaleProposals } from "./cleanupProposals";
 import {
   verifyTransactionMemo,
   verifyPaymentOperation,
@@ -919,6 +921,46 @@ export async function expireInvites(): Promise<void> {
   });
 }
 
+/**
+ * Send queued webhook deliveries. Sending lives here rather than in the request
+ * path so a slow or unreachable receiver cannot hold an API request open for
+ * the length of its own backoff.
+ */
+export async function deliverPendingWebhooks(): Promise<void> {
+  const { delivered, failed, attempted } = await processPendingWebhookDeliveries();
+
+  if (attempted > 0) {
+    log.info(
+      { job: "webhook_delivery", outcome: "ok", attempted, delivered, failed },
+      "processed webhook deliveries"
+    );
+  }
+}
+
+/**
+ * Sweep treasury proposals that were never signed to threshold. The transition
+ * and its audit record are written together in src/worker/cleanupProposals.ts;
+ * this wrapper exists to log the outcome on the worker's own logger, the same
+ * way every other job in this cycle reports.
+ */
+export async function expireStaleTreasuryProposals(): Promise<void> {
+  const { expired, olderThan } = await expireStaleProposals();
+
+  // Only speak up when something actually changed. A quiet sweep is the normal
+  // case and logging it every cycle would bury the runs that mattered.
+  if (expired > 0) {
+    log.info(
+      {
+        job: "treasury_proposal_expiry",
+        outcome: "ok",
+        expired,
+        olderThan: olderThan.toISOString(),
+      },
+      "expired stale treasury proposals"
+    );
+  }
+}
+
 export async function runWorkerCycle(): Promise<void> {
   // Recover first: a restart should adopt the previous process's work before
   // looking for new jobs.
@@ -930,6 +972,8 @@ export async function runWorkerCycle(): Promise<void> {
     reconcileSettlements(),
     reconcileAllTreasuryBalances(),
     expireInvites(),
+    deliverPendingWebhooks(),
+    expireStaleTreasuryProposals(),
     cleanupChallenges(),
   ]);
 }

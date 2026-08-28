@@ -111,6 +111,15 @@ describe("createExpenseSchema", () => {
       });
       expect(result.success).toBe(false);
     });
+
+    it("rejects amounts with more than seven decimal places", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        splitType: "custom",
+        shares: [{ userId: "a", amount: "10.00000001" }],
+      });
+      expect(result.success).toBe(false);
+    });
   });
 
   describe("percentage split validation", () => {

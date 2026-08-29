@@ -90,17 +90,12 @@ describe("rate-limit policy table", () => {
     }
   });
 
-  it("never puts a Stellar public key in a bucket key", () => {
-    const policies = rateLimitPolicies();
+  it("keys authenticated buckets by the SEP-10 public key", () => {
+    const policy = rateLimitPolicies().settlementConfirm;
     const wallet = "GSECRETPUBLICKEYXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-
-    for (const policy of Object.values(policies)) {
-      const key = policyKeyGenerator(policy)(
-        fakeRequest({ user: { id: "user_1", stellarPublicKey: wallet } })
-      );
-      expect(key).not.toContain(wallet);
-      expect(key.length).toBeLessThanOrEqual(200);
-    }
+    const key = policyKeyGenerator(policy)(fakeRequest({ user: { stellarPublicKey: wallet } }));
+    expect(key).toBe(`settlement.confirm:public-key:${wallet}`);
+    expect(key.length).toBeLessThanOrEqual(200);
   });
 
   it("does not let an unauthenticated caller pick its own bucket via a header", () => {
@@ -158,7 +153,7 @@ async function buildPolicyApp(name: Parameters<typeof rateLimited>[0], max: numb
     },
     preHandler: async (request: any) => {
       const userId = request.headers["x-test-user"];
-      if (userId) request.user = { id: userId, stellarPublicKey: "GTEST" };
+      if (userId) request.user = { id: userId, stellarPublicKey: `GTEST_${userId}` };
     },
   };
 

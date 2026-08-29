@@ -13,6 +13,9 @@ const schema = z.object({
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   PORT: z.coerce.number().int().positive().default(4000),
   API_PUBLIC_URL: urlSchema,
+  LOG_LEVEL: z
+    .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
+    .default("info"),
   // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
   WEB_URL: z.string().default("*"),
   JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
@@ -166,6 +169,10 @@ const schema = z.object({
   // against an upstream that is already struggling.
   UPSTREAM_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
   NODE_ENV: z.string().default("development"),
+  RECONCILIATION_INTERVAL: z.coerce.number().int().positive().default(30000),
+  CONFIRMATION_THRESHOLD: z.coerce.number().int().positive().default(1),
+  TX_TIMEOUT: z.coerce.number().int().positive().default(300000),
+  MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
 
   // Security-sensitive endpoint policies.
   RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
@@ -252,7 +259,9 @@ function safeErrorMessage(error: unknown): string {
   return String(error);
 }
 
-let parsed: z.infer<typeof schema>;
+export type Env = z.infer<typeof schema>;
+
+let parsed: Env;
 try {
   parsed = schema.parse(process.env);
 } catch (error) {
@@ -261,6 +270,8 @@ try {
   console.error("Please check your environment variables and try again.\n");
   process.exit(1);
 }
+
+export const env = parsed;
 
 function hostOf(url: string): string {
   try {
@@ -276,17 +287,17 @@ const networkPassphrase =
   parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET;
 
 export const config = {
-  ...parsed,
-  HORIZON_ENDPOINTS: (parsed.HORIZON_URLS ?? parsed.HORIZON_URL)
+  ...env,
+  HORIZON_ENDPOINTS: (env.HORIZON_URLS ?? env.HORIZON_URL)
     .split(",")
     .map((url) => url.trim())
     .filter(Boolean),
-  API_URL: parsed.API_PUBLIC_URL,
-  SEP10_HOME_DOMAIN: parsed.SEP10_HOME_DOMAIN ?? apiHost,
-  WEB_AUTH_DOMAIN: parsed.WEB_AUTH_DOMAIN ?? apiHost,
-  isTest: process.env.NODE_ENV === "test" || process.env.VITEST === "true",
+  API_URL: env.API_PUBLIC_URL,
+  SEP10_HOME_DOMAIN: env.SEP10_HOME_DOMAIN ?? apiHost,
+  WEB_AUTH_DOMAIN: env.WEB_AUTH_DOMAIN ?? apiHost,
+  isTest: env.NODE_ENV === "test" || process.env.VITEST === "true",
   networkPassphrase,
-  jwtExpiresIn: `${parsed.ACCESS_TOKEN_TTL_SECONDS}s` as const,
+  jwtExpiresIn: `${env.ACCESS_TOKEN_TTL_SECONDS}s` as const,
 };
 
 export type Config = typeof config;

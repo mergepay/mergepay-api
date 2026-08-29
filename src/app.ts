@@ -73,7 +73,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     logger: config.isTest
       ? false
       : {
-          level: process.env.LOG_LEVEL ?? "info",
+          level: config.LOG_LEVEL,
           redact: {
             paths: [
               "req.headers.authorization",

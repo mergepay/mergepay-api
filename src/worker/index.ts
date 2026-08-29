@@ -33,7 +33,7 @@
  */
 import { randomUUID } from "node:crypto";
 import pino from "pino";
-import { config } from "../config";
+import { config, env } from "../config";
 import { prisma } from "../db";
 import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
@@ -1148,7 +1148,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
   return shutdown;
 }
 
-if (process.env.NODE_ENV !== "test") {
+if (env.NODE_ENV !== "test") {
   // Config validation already ran at module load; this catches a worker started
   // against an environment missing the external endpoints it depends on.
   if (!config.DATABASE_URL || !config.HORIZON_URL || !config.ANCHOR_HOME_DOMAIN) {

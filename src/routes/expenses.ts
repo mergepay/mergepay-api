@@ -32,197 +32,423 @@ const expenseInclude = {
 export default async function expenseRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-  // -- create -----------------------------------------------------------------
-  app.post("/groups/:id/expenses", async (req) => {
-    const auth = requireUser(req);
-    const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
-
-    const body = createExpenseSchema.parse(req.body);
-    validateAmount(body.amount);
-    const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
-
-    const payerUserId = body.payerUserId ?? auth.id;
-
-    let computed;
-    try {
-      computed = computeShares(body.amount, body.splitType as SplitType, body.shares);
-    } catch (e: any) {
-      throw Errors.badRequest("invalid_split", e?.message ?? "Invalid split");
-    }
-
-    const participantIds = [...new Set(computed.map((share) => share.userId))];
-    const members = await prisma.groupMember.findMany({
-      where: { groupId, userId: { in: participantIds } },
-      select: { userId: true, user: { select: { stellarPublicKey: true } } },
-    });
-    if (members.length !== participantIds.length) {
-      throw Errors.badRequest("invalid_split", "Every split participant must be an active group member");
-    }
-
-    // A non-native asset can only be paid to an account that has trusted it.
-    // Without this check the expense is created happily and every settlement
-    // built from it fails on submission with op_no_trust — after members have
-    // been asked to pay, which is the most expensive point to discover it.
-    //
-    // Native XLM needs no trustline, so it skips the Horizon round trip
-    // entirely rather than paying for a lookup whose answer is always yes.
-    if (asset.type !== "native") {
-      await assertParticipantsCanHoldAsset({
-        participants: members.map((member) => ({
-          userId: member.userId,
-          stellarPublicKey: member.user.stellarPublicKey,
-        })),
-        assetCode: body.assetCode,
-        assetIssuer: body.assetIssuer ?? null,
-      });
-    }
-
-    const memo = body.memo?.trim() || shortCode().slice(0, 8);
-
-    const expense = await prisma.$transaction(async (tx) => {
-      const created = await tx.expense.create({
-        data: {
-          groupId,
-          payerUserId,
-          title: body.title,
-          description: body.description,
-          amount: body.amount,
-          assetCode: body.assetCode,
-          assetIssuer: body.assetIssuer ?? null,
-          splitType: body.splitType,
-          memo,
-          receiptUrl: body.receiptUrl ?? null,
-          shares: {
-            create: computed.map((c) => ({
-              userId: c.userId,
-              shareAmount: c.shareAmount,
-              status: c.userId === payerUserId ? "settled" : "pending",
-            })),
+  app.post(
+    "/groups/:id/expenses",
+    {
+      schema: {
+        tags: ["expenses"],
+        summary: "Create an expense",
+        description: "Create a group expense with a payer, split configuration, and asset metadata, and calculate the resulting share allocations.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          required: ["title", "amount", "assetCode", "splitType", "shares"],
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 80 },
+            description: { type: ["string", "null"], maxLength: 500 },
+            amount: { type: "string" },
+            assetCode: { type: "string", minLength: 1 },
+            assetIssuer: { type: ["string", "null"] },
+            splitType: { type: "string", enum: ["equal", "exact", "percent", "shares"] },
+            payerUserId: { type: ["string", "null"] },
+            memo: { type: ["string", "null"], maxLength: 24 },
+            receiptUrl: { type: ["string", "null"] },
+            shares: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["userId"],
+                properties: {
+                  userId: { type: "string" },
+                  shareAmount: { type: ["string", "number", "null"] },
+                  percent: { type: ["number", "null"] },
+                },
+              },
+            },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              expense: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  groupId: { type: "string" },
+                  payerUserId: { type: "string" },
+                  title: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  amount: { type: "string" },
+                  assetCode: { type: "string" },
+                  assetIssuer: { type: ["string", "null"] },
+                  splitType: { type: "string" },
+                  memo: { type: ["string", "null"] },
+                  receiptUrl: { type: ["string", "null"] },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
           },
         },
-        include: expenseInclude,
-      });
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id: groupId } = idParamSchema.parse(req.params);
+      await requireMembership(groupId, auth.id);
 
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId,
-        action: "expense.create",
-        entityType: "expense",
-        entityId: created.id,
-        metadata: { amount: body.amount, assetCode: body.assetCode },
-      });
+      const body = createExpenseSchema.parse(req.body);
+      validateAmount(body.amount);
+      const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
-      return created;
-    });
+      const payerUserId = body.payerUserId ?? auth.id;
 
-    return { expense: serializeExpense(expense) };
-  });
-
-  // -- list -------------------------------------------------------------------
-  app.get("/groups/:id/expenses", async (req) => {
-    const auth = requireUser(req);
-    const { id: groupId } = idParamSchema.parse(req.params);
-    const query = expenseListQuerySchema.parse(req.query ?? {});
-    // Membership is checked before any row is read, and the `groupId` filter
-    // the service applies is what scopes the page — never the cursor.
-    await requireMembership(groupId, auth.id);
-
-    const { items, meta } = await listGroupExpenses(groupId, query, expenseInclude);
-
-    return { expenses: items.map(serializeExpense), meta };
-  });
-
-  // -- get one ----------------------------------------------------------------
-  app.get("/expenses/:id", async (req) => {
-    const auth = requireUser(req);
-    const { id } = idParamSchema.parse(req.params);
-    const expense = await prisma.expense.findUnique({
-      where: { id },
-      include: expenseInclude,
-    });
-    if (!expense) throw Errors.notFound("Expense not found");
-    await requireMembership(expense.groupId, auth.id);
-    return { expense: serializeExpense(expense) };
-  });
-
-  // -- update (metadata only) -------------------------------------------------
-  app.patch("/expenses/:id", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = updateExpenseSchema.parse(req.body);
-
-    // The membership/role check and the update run in one transaction: a
-    // concurrent removal or demotion of `auth.id` between the check and the
-    // write cannot slip an unauthorized edit through.
-    const updated = await prisma.$transaction(async (tx) => {
-      const expense = await tx.expense.findUnique({ where: { id } });
-      if (!expense) throw Errors.notFound("Expense not found");
-      const ctx = await requireMembership(expense.groupId, auth.id, tx);
-      if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
-        throw Errors.forbidden("Only the payer or an admin can edit this expense");
+      let computed;
+      try {
+        computed = computeShares(body.amount, body.splitType as SplitType, body.shares);
+      } catch (e: any) {
+        throw Errors.badRequest("invalid_split", e?.message ?? "Invalid split");
       }
 
-      const result = await tx.expense.update({
-        where: { id },
-        data: {
-          ...(body.title !== undefined && { title: body.title }),
-          ...(body.description !== undefined && { description: body.description }),
-          ...(body.memo !== undefined && { memo: body.memo }),
-          ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
+      const participantIds = [...new Set(computed.map((share) => share.userId))];
+      const members = await prisma.groupMember.findMany({
+        where: { groupId, userId: { in: participantIds } },
+        select: { userId: true, user: { select: { stellarPublicKey: true } } },
+      });
+      if (members.length !== participantIds.length) {
+        throw Errors.badRequest("invalid_split", "Every split participant must be an active group member");
+      }
+
+      if (asset.type !== "native") {
+        await assertParticipantsCanHoldAsset({
+          participants: members.map((member) => ({
+            userId: member.userId,
+            stellarPublicKey: member.user.stellarPublicKey,
+          })),
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+        });
+      }
+
+      const memo = body.memo?.trim() || shortCode().slice(0, 8);
+
+      const expense = await prisma.$transaction(async (tx) => {
+        const created = await tx.expense.create({
+          data: {
+            groupId,
+            payerUserId,
+            title: body.title,
+            description: body.description,
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            splitType: body.splitType,
+            memo,
+            receiptUrl: body.receiptUrl ?? null,
+            shares: {
+              create: computed.map((c) => ({
+                userId: c.userId,
+                shareAmount: c.shareAmount,
+                status: c.userId === payerUserId ? "settled" : "pending",
+              })),
+            },
+          },
+          include: expenseInclude,
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId,
+          action: "expense.create",
+          entityType: "expense",
+          entityId: created.id,
+          metadata: { amount: body.amount, assetCode: body.assetCode },
+        });
+
+        return created;
+      });
+
+      return { expense: serializeExpense(expense) };
+    }
+  );
+
+  app.get(
+    "/groups/:id/expenses",
+    {
+      schema: {
+        tags: ["expenses"],
+        summary: "List group expenses",
+        description: "Return the paginated, filterable list of expenses for a group, including optional totals and status filtering.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
+          additionalProperties: false,
         },
+        querystring: {
+          type: "object",
+          properties: {
+            cursor: { type: "string" },
+            limit: { type: "integer", minimum: 1, maximum: 50 },
+            order: { type: "string", enum: ["asc", "desc"] },
+            asset: { type: ["string", "null"] },
+            status: { type: ["string", "null"], enum: ["SETTLED", "PENDING", "OVERDUE"] },
+            startDate: { type: ["string", "null"], format: "date-time" },
+            endDate: { type: ["string", "null"], format: "date-time" },
+            includeTotal: { type: ["boolean", "string", "null"] },
+          },
+          additionalProperties: true,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              expenses: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    groupId: { type: "string" },
+                    payerUserId: { type: "string" },
+                    title: { type: "string" },
+                    description: { type: ["string", "null"] },
+                    amount: { type: "string" },
+                    assetCode: { type: "string" },
+                    assetIssuer: { type: ["string", "null"] },
+                    splitType: { type: "string" },
+                    memo: { type: ["string", "null"] },
+                    receiptUrl: { type: ["string", "null"] },
+                    createdAt: { type: "string", format: "date-time" },
+                  },
+                },
+              },
+              meta: {
+                type: "object",
+                properties: {
+                  nextCursor: { type: ["string", "null"] },
+                  hasMore: { type: "boolean" },
+                  total: { type: ["integer", "null"] },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id: groupId } = idParamSchema.parse(req.params);
+      const query = expenseListQuerySchema.parse(req.query ?? {});
+
+      await requireMembership(groupId, auth.id);
+
+      const { items, meta } = await listGroupExpenses(groupId, query, expenseInclude);
+      return { expenses: items.map(serializeExpense), meta };
+    }
+  );
+
+  app.get(
+    "/expenses/:id",
+    {
+      schema: {
+        tags: ["expenses"],
+        summary: "Get an expense by id",
+        description: "Fetch one expense and its participant shares after verifying the caller is a group member.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              expense: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  groupId: { type: "string" },
+                  payerUserId: { type: "string" },
+                  title: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  amount: { type: "string" },
+                  assetCode: { type: "string" },
+                  assetIssuer: { type: ["string", "null"] },
+                  splitType: { type: "string" },
+                  memo: { type: ["string", "null"] },
+                  receiptUrl: { type: ["string", "null"] },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = idParamSchema.parse(req.params);
+      const expense = await prisma.expense.findUnique({
+        where: { id },
         include: expenseInclude,
       });
+      if (!expense) throw Errors.notFound("Expense not found");
+      await requireMembership(expense.groupId, auth.id);
+      return { expense: serializeExpense(expense) };
+    }
+  );
 
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId: expense.groupId,
-        action: "expense.update",
-        entityType: "expense",
-        entityId: id,
+  app.patch(
+    "/expenses/:id",
+    {
+      schema: {
+        tags: ["expenses"],
+        summary: "Update expense metadata",
+        description: "Update editable expense fields such as title, description, memo, or receipt URL, restricted to the payer or an admin.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 80 },
+            description: { type: ["string", "null"], maxLength: 500 },
+            memo: { type: ["string", "null"], maxLength: 24 },
+            receiptUrl: { type: ["string", "null"] },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              expense: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  groupId: { type: "string" },
+                  payerUserId: { type: "string" },
+                  title: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  amount: { type: "string" },
+                  assetCode: { type: "string" },
+                  assetIssuer: { type: ["string", "null"] },
+                  splitType: { type: "string" },
+                  memo: { type: ["string", "null"] },
+                  receiptUrl: { type: ["string", "null"] },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const body = updateExpenseSchema.parse(req.body);
+
+      const updated = await prisma.$transaction(async (tx) => {
+        const expense = await tx.expense.findUnique({ where: { id } });
+        if (!expense) throw Errors.notFound("Expense not found");
+        const ctx = await requireMembership(expense.groupId, auth.id, tx);
+        if (expense.payerUserId !== auth.id && ctx.role !== "admin") {
+          throw Errors.forbidden("Only the payer or an admin can edit this expense");
+        }
+
+        const result = await tx.expense.update({
+          where: { id },
+          data: {
+            ...(body.title !== undefined && { title: body.title }),
+            ...(body.description !== undefined && { description: body.description }),
+            ...(body.memo !== undefined && { memo: body.memo }),
+            ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
+          },
+          include: expenseInclude,
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: expense.groupId,
+          action: "expense.update",
+          entityType: "expense",
+          entityId: id,
+        });
+
+        return result;
       });
+      return { expense: serializeExpense(updated) };
+    }
+  );
 
-      return result;
-    });
-    return { expense: serializeExpense(updated) };
-  });
+  app.delete(
+    "/expenses/:id",
+    {
+      schema: {
+        tags: ["expenses"],
+        summary: "Delete an expense",
+        description: "Delete an expense after confirming the caller has rights and the expense has no settled shares that would make deletion unsafe.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: { ok: { type: "boolean" } },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = idParamSchema.parse(req.params);
 
-  // -- delete -----------------------------------------------------------------
-  app.delete("/expenses/:id", async (req) => {
-    const auth = requireUser(req);
-    const { id } = idParamSchema.parse(req.params);
-
-    // Same atomicity concern as the update route above: check and delete
-    // happen in one transaction.
-    await prisma.$transaction(async (tx) => {
-      const found = await tx.expense.findUnique({
-        where: { id },
-        include: { shares: true },
-      });
-      if (!found) throw Errors.notFound("Expense not found");
-      const ctx = await requireMembership(found.groupId, auth.id, tx);
-      if (found.payerUserId !== auth.id && ctx.role !== "admin") {
-        throw Errors.forbidden("Only the payer or an admin can delete this expense");
-      }
-      const hasSettled = found.shares.some(
-        (s) => s.status === "settled" && s.userId !== found.payerUserId
-      );
-      if (hasSettled) {
-        throw Errors.conflict(
-          "expense_settled",
-          "Cannot delete an expense that already has settled shares"
+      await prisma.$transaction(async (tx) => {
+        const found = await tx.expense.findUnique({
+          where: { id },
+          include: { shares: true },
+        });
+        if (!found) throw Errors.notFound("Expense not found");
+        const ctx = await requireMembership(found.groupId, auth.id, tx);
+        if (found.payerUserId !== auth.id && ctx.role !== "admin") {
+          throw Errors.forbidden("Only the payer or an admin can delete this expense");
+        }
+        const hasSettled = found.shares.some(
+          (s) => s.status === "settled" && s.userId !== found.payerUserId
         );
-      }
+        if (hasSettled) {
+          throw Errors.conflict(
+            "expense_settled",
+            "Cannot delete an expense that already has settled shares"
+          );
+        }
 
-      await tx.expense.delete({ where: { id } });
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId: found.groupId,
-        action: "expense.delete",
-        entityType: "expense",
-        entityId: id,
+        await tx.expense.delete({ where: { id } });
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: found.groupId,
+          action: "expense.delete",
+          entityType: "expense",
+          entityId: id,
+        });
       });
-    });
-    return { ok: true };
-  });
+      return { ok: true };
+    }
+  );
 }

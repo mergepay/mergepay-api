@@ -338,3 +338,17 @@ describe("GET /health/deep", () => {
     });
   });
 });
+
+describe("OpenAPI docs", () => {
+  it("exposes Swagger UI and JSON spec", async () => {
+    const uiResponse = await app.inject({ method: "GET", url: "/docs" });
+    expect(uiResponse.statusCode).toBe(200);
+    expect(uiResponse.headers["content-type"]).toContain("text/html");
+
+    const specResponse = await app.inject({ method: "GET", url: "/docs/json" });
+    expect(specResponse.statusCode).toBe(200);
+    expect(specResponse.headers["content-type"]).toContain("application/json");
+    expect(specResponse.json().openapi).toBe("3.0.0");
+    expect(specResponse.json().paths).toBeDefined();
+  });
+});

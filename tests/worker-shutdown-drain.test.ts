@@ -34,6 +34,7 @@ vi.mock("../src/db", () => ({
     settlement: h.settlement,
     anchorSession: h.anchorSession,
     groupInvite: h.groupInvite,
+    $executeRaw: vi.fn(async () => 1),
   },
 }));
 

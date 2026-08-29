@@ -76,6 +76,7 @@ import { reconcileSettlements } from "../services/settlement-reconciliation";
 import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
 import { cleanupChallenges } from "./tasks/cleanup-challenges";
+import { acquireWorkerLease, releaseWorkerLease } from "../services/worker-lock";
 import {
   type CorrelationContext,
   jobContext,
@@ -1032,6 +1033,17 @@ export async function expireStaleTreasuryProposals(): Promise<void> {
 }
 
 export async function runWorkerCycle(): Promise<void> {
+  const lease = await acquireWorkerLease(
+    "mergepay:worker-cycle",
+    config.WORKER_LEASE_TIMEOUT_MS,
+    WORKER_ID
+  );
+  if (!lease) {
+    log.debug({ outcome: "skipped_locked" }, "worker cycle already owned by another process");
+    return;
+  }
+
+  try {
   // Recover first: a restart should adopt the previous process's work before
   // looking for new jobs.
   await Promise.allSettled([recoverStaleSettlements(), recoverStaleAnchorSessions()]);
@@ -1046,6 +1058,9 @@ export async function runWorkerCycle(): Promise<void> {
     expireStaleTreasuryProposals(),
     cleanupChallenges(),
   ]);
+  } finally {
+    await releaseWorkerLease(lease);
+  }
 }
 
 export async function startWorker(): Promise<() => Promise<void>> {

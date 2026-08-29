@@ -32,11 +32,44 @@ import {
   readTimeBounds,
 } from "../lib/time-bounds";
 
-let _server: Horizon.Server | null = null;
+let _servers: Horizon.Server[] | null = null;
+let activeServer = 0;
+const failedUntil = new Map<number, number>();
 const log = pino({ name: "stellar" });
+
+function servers(): Horizon.Server[] {
+  if (!_servers) _servers = config.HORIZON_ENDPOINTS.map((url) => new Horizon.Server(url));
+  return _servers;
+}
 function server(): Horizon.Server {
-  if (!_server) _server = new Horizon.Server(config.HORIZON_URL);
-  return _server;
+  const now = Date.now();
+  const available = servers().map((_, i) => i).filter((i) => (failedUntil.get(i) ?? 0) <= now);
+  activeServer = available.find((i) => i === activeServer) ?? available[0] ?? activeServer;
+  return servers()[activeServer];
+}
+function isRetryableHorizonError(error: any): boolean {
+  const status = error?.response?.status;
+  return status === undefined || status === 408 || status === 429 || status >= 500;
+}
+export async function withHorizonFailover<T>(operation: (horizon: Horizon.Server) => Promise<T>): Promise<T> {
+  const tried = new Set<number>();
+  let lastError: unknown;
+  for (let attempt = 0; attempt < servers().length; attempt++) {
+    const index = activeServer;
+    tried.add(index);
+    try {
+      return await operation(server());
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableHorizonError(error)) throw error;
+      failedUntil.set(index, Date.now() + 30_000);
+      const next = servers().findIndex((_, i) => !tried.has(i) && (failedUntil.get(i) ?? 0) <= Date.now());
+      if (next < 0) break;
+      activeServer = next;
+      console.warn(`[stellar] Horizon endpoint failed; rotating to endpoint ${next + 1}`);
+    }
+  }
+  throw lastError;
 }
 
 function logUpstreamError(e: unknown, codes: unknown): void {
@@ -134,6 +167,8 @@ export const stellar = {
           // Horizon.Server.loadAccount doesn't accept AbortSignal directly,
           // but the wrapper still fires and rejects the promise on timeout.
           return server().loadAccount(publicKey);
+          // but we wrap it so timeout still fires and rejects the promise.
+          return withHorizonFailover((horizon) => horizon.loadAccount(publicKey));
         }
       );
       return {
@@ -265,7 +300,7 @@ export const stellar = {
         async (signal) => {
           // Horizon.Server.submitTransaction doesn't accept AbortSignal directly,
           // but we wrap it so timeout still fires and rejects the promise.
-          return server().submitTransaction(tx);
+          return withHorizonFailover((horizon) => horizon.submitTransaction(tx));
         }
       );
       return res.hash;
@@ -290,7 +325,8 @@ export const stellar = {
   async submitSigned(signedXdr: string): Promise<string> {
     const tx = new Transaction(signedXdr, config.networkPassphrase);
     try {
-      return submitWithRetry(tx);
+      const res = await withHorizonFailover((horizon) => horizon.submitTransaction(tx));
+      return res.hash;
     } catch (e: any) {
       const codes =
         e?.response?.data?.extras?.result_codes ??
@@ -317,6 +353,32 @@ export const stellar = {
           timeoutMs: config.HORIZON_STATUS_TIMEOUT_MS,
           isExpected: isNotFound,
           onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
+    const outcome = await withHorizonRetry(
+      async () => {
+        try {
+          const tx = await withTimeout(
+            "Horizon.getTransaction",
+            config.HORIZON_STATUS_TIMEOUT_MS,
+            async (_signal) => {
+              return withHorizonFailover((horizon) =>
+                horizon.transactions().transaction(hash).call()
+              );
+            }
+          );
+          return { successful: (tx as any).successful };
+        } catch (e: any) {
+          if (e?.response?.status === 404) return null;
+          throw e;
+        }
+      },
+      {
+        classify: (error) => {
+          // 404 is a valid "not found" response, not an error to retry.
+          if (error && typeof error === "object" && "response" in error) {
+            const status = (error as any).response?.status;
+            if (status === 404) return "permanent" as const;
+          }
+          return classifyHorizonError(error);
         },
         async () => {
           return server().transactions().transaction(hash).call();
@@ -370,52 +432,17 @@ export function parseSignedPaymentXdr(
   return parsed;
 }
 
-export interface HorizonRetryOptions {
-  maxRetries?: number;
-  baseDelayMs?: number;
-  random?: () => number;
-  delay?: (ms: number) => Promise<void>;
-}
-
-function isTransientSubmissionError(error: any): boolean {
-  const status = error?.response?.status ?? error?.statusCode;
-  if (typeof status === "number") return status === 429 || status >= 500;
-  const message = String(error?.message ?? error).toLowerCase();
-  return /timeout|timed out|socket|econnreset|econnrefused|enotfound|network/.test(message);
-}
-
-/** Submit with bounded full-jitter retries for transport/service failures only. */
-export async function submitWithRetry(
-  tx: Transaction,
-  options: HorizonRetryOptions = {}
-): Promise<string> {
-  const maxRetries = options.maxRetries ?? Number(process.env.HORIZON_SUBMIT_MAX_RETRIES ?? 3);
-  const baseDelayMs = options.baseDelayMs ?? Number(process.env.HORIZON_SUBMIT_RETRY_BASE_MS ?? 1_000);
-  const random = options.random ?? Math.random;
-  const delay = options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      const res = await server().submitTransaction(tx);
-      return res.hash;
-    } catch (error: any) {
-      if (!isTransientSubmissionError(error) || attempt >= maxRetries) {
-        const codes = error?.response?.data?.extras?.result_codes ?? error?.response?.data?.result_codes;
-        const detail = codes ? JSON.stringify(codes) : error?.message ?? "submit failed";
-        throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
-      }
-      const delayMs = Math.max(0, Math.round(baseDelayMs * 2 ** attempt * random()));
-      log.warn(
-        { attempt: attempt + 1, delayMs, errorCode: error?.response?.status ?? error?.code ?? "transport" },
-        "transient submission failure; retrying"
-      );
-      await delay(delayMs);
-    }
-  }
-}
-
 async function submitToHorizon(tx: Transaction): Promise<string> {
-  return submitWithRetry(tx);
+  try {
+    const res = await withHorizonFailover((horizon) => horizon.submitTransaction(tx));
+    return res.hash;
+  } catch (e: any) {
+    const codes =
+      e?.response?.data?.extras?.result_codes ??
+      e?.response?.data?.result_codes;
+    const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
+    throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+  }
 }
 
 /**

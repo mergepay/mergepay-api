@@ -49,6 +49,7 @@ const h = vi.hoisted(() => {
     expenseShare,
     auditLog,
     statusHistory,
+    $executeRaw: vi.fn(async () => 1),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),

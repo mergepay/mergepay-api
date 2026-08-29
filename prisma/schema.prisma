@@ -570,3 +570,16 @@ model WebhookDelivery {
   @@index([leaseExpiresAt])
   @@map("webhook_deliveries")
 }
+
+// Distributed worker-cycle lock. The database is the source of truth so
+// separate worker processes cannot run the same singleton cycle concurrently.
+model WorkerLock {
+  key       String   @id
+  owner     String
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([expiresAt])
+  @@map("worker_locks")
+}

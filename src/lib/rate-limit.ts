@@ -20,8 +20,8 @@
  *  - `ip` — strictly the client IP, for routes that have no authenticated user
  *    yet (SEP-10) or are authenticated by a shared secret (anchor webhook).
  *
- * A key never contains a Stellar public key, so a 429 can't be used to probe
- * whether a given wallet account is known to the API.
+ * Authenticated buckets use the SEP-10 public key so separate wallets cannot
+ * exhaust one another's sensitive-route budget.
  */
 import { config } from "../config";
 import { ipKey, userOrIpKey } from "../services/rate-limit-keys";

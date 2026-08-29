@@ -166,8 +166,6 @@ export const stellar = {
         async () => {
           // Horizon.Server.loadAccount doesn't accept AbortSignal directly,
           // but the wrapper still fires and rejects the promise on timeout.
-          return server().loadAccount(publicKey);
-          // but we wrap it so timeout still fires and rejects the promise.
           return withHorizonFailover((horizon) => horizon.loadAccount(publicKey));
         }
       );
@@ -353,35 +351,11 @@ export const stellar = {
           timeoutMs: config.HORIZON_STATUS_TIMEOUT_MS,
           isExpected: isNotFound,
           onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
-    const outcome = await withHorizonRetry(
-      async () => {
-        try {
-          const tx = await withTimeout(
-            "Horizon.getTransaction",
-            config.HORIZON_STATUS_TIMEOUT_MS,
-            async (_signal) => {
-              return withHorizonFailover((horizon) =>
-                horizon.transactions().transaction(hash).call()
-              );
-            }
-          );
-          return { successful: (tx as any).successful };
-        } catch (e: any) {
-          if (e?.response?.status === 404) return null;
-          throw e;
-        }
-      },
-      {
-        classify: (error) => {
-          // 404 is a valid "not found" response, not an error to retry.
-          if (error && typeof error === "object" && "response" in error) {
-            const status = (error as any).response?.status;
-            if (status === 404) return "permanent" as const;
-          }
-          return classifyHorizonError(error);
         },
         async () => {
-          return server().transactions().transaction(hash).call();
+          return withHorizonFailover((horizon) =>
+            horizon.transactions().transaction(hash).call()
+          );
         }
       );
       return { successful: (tx as any).successful };

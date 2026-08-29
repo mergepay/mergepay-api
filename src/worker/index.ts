@@ -1073,6 +1073,8 @@ export async function startWorker(): Promise<() => Promise<void>> {
   // clearing it early is what would let a second worker resubmit the payment.
   let inFlight: Promise<void> | undefined;
 
+  log.info({ workerId: WORKER_ID, intervalMs: config.WORKER_INTERVAL_MS }, "listening");
+
   const loop = async (): Promise<void> => {
     if (stopped) return;
     const cycle = runWorkerCycle();
@@ -1092,7 +1094,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
 
   void loop();
 
-  const shutdown = async (): Promise<void> => {
+  const shutdown = async (signal: NodeJS.Signals = "SIGINT"): Promise<void> => {
     if (stopped) return;
     stopped = true;
     // Set before draining: in-flight jobs finish the transition they started,
@@ -1101,51 +1103,66 @@ export async function startWorker(): Promise<() => Promise<void>> {
     if (timer) clearTimeout(timer);
     stopReconciliation();
 
-    log.info({ outcome: "shutdown" }, "worker shutting down, draining in-flight jobs");
+    const timeoutMs = Math.max(config.SHUTDOWN_TIMEOUT_MS, config.WORKER_SHUTDOWN_DRAIN_MS);
+    const timeoutHandle = setTimeout(() => {
+      log.error({ signal, timeoutMs }, "shutdown timed out, forcing exit");
+      process.exit(1);
+    }, timeoutMs);
 
-    // Wait for the running cycle, but not forever — a hung upstream must not
-    // hold the process open past the deployment's grace period.
-    let drained = true;
-    if (inFlight) {
-      let drainTimer: ReturnType<typeof setTimeout> | undefined;
-      const budget = new Promise<false>((resolve) => {
-        drainTimer = setTimeout(() => resolve(false), config.WORKER_SHUTDOWN_DRAIN_MS);
-      });
-      drained = await Promise.race([inFlight.then(() => true), budget]);
-      if (drainTimer) clearTimeout(drainTimer);
+    try {
+      log.info({ signal, timeoutMs, outcome: "shutdown" }, "shutting down");
+
+      // Wait for the running cycle, but not forever — a hung upstream must not
+      // hold the process open past the deployment's grace period.
+      let drained = true;
+      if (inFlight) {
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
+        const budget = new Promise<false>((resolve) => {
+          drainTimer = setTimeout(() => resolve(false), config.WORKER_SHUTDOWN_DRAIN_MS);
+        });
+        drained = await Promise.race([inFlight.then(() => true), budget]);
+        if (drainTimer) clearTimeout(drainTimer);
+      }
+
+      if (!drained) {
+        // A job is still running and still holds its lease. Releasing it now
+        // would invite a duplicate submission, so leave every lease in place and
+        // let it expire; the next worker recovers it through the normal path.
+        log.warn(
+          { outcome: "shutdown_drain_timeout" },
+          "in-flight job outran the drain budget, leaving leases to expire"
+        );
+        return;
+      }
+
+      // Nothing of ours is running now, so releasing is safe: the next worker
+      // picks these up immediately instead of waiting for them to lapse.
+      await Promise.allSettled([
+        prisma.settlement.updateMany({
+          where: { claimedBy: WORKER_ID },
+          data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+        }),
+        prisma.anchorSession.updateMany({
+          where: { claimedBy: WORKER_ID },
+          data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+        }),
+      ]);
+      await prisma.$disconnect();
+
+      log.info({ signal, outcome: "shutdown_complete" }, "worker claims released");
+    } catch (error) {
+      log.error({ signal, reason: safeFailureMessage(error) }, "worker shutdown failed");
+      throw error;
+    } finally {
+      clearTimeout(timeoutHandle);
+      process.exit(0);
     }
-
-    if (!drained) {
-      // A job is still running and still holds its lease. Releasing it now
-      // would invite a duplicate submission, so leave every lease in place and
-      // let it expire; the next worker recovers it through the normal path.
-      log.warn(
-        { outcome: "shutdown_drain_timeout" },
-        "in-flight job outran the drain budget, leaving leases to expire"
-      );
-      return;
-    }
-
-    // Nothing of ours is running now, so releasing is safe: the next worker
-    // picks these up immediately instead of waiting for them to lapse.
-    await Promise.allSettled([
-      prisma.settlement.updateMany({
-        where: { claimedBy: WORKER_ID },
-        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
-      }),
-      prisma.anchorSession.updateMany({
-        where: { claimedBy: WORKER_ID },
-        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
-      }),
-    ]);
-
-    log.info({ outcome: "shutdown_complete" }, "worker claims released");
   };
 
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
-  return shutdown;
+  return () => shutdown("SIGINT");
 }
 
 if (env.NODE_ENV !== "test") {

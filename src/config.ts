@@ -12,6 +12,7 @@ const schema = z.object({
   // Required core configuration
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   PORT: z.coerce.number().int().positive().default(4000),
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   API_PUBLIC_URL: urlSchema,
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])

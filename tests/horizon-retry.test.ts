@@ -67,6 +67,19 @@ describe("classifyHorizonError", () => {
     expect(classifyHorizonError(error)).toBe("permanent");
   });
 
+  it("classifies array-shaped Horizon tx_bad_seq as permanent", () => {
+    const error = {
+      response: {
+        data: {
+          extras: {
+            result_codes: ["tx_bad_seq"],
+          },
+        },
+      },
+    };
+    expect(classifyHorizonError(error)).toBe("permanent");
+  });
+
   it("classifies Horizon op_underfunded as permanent", () => {
     const error = {
       response: {

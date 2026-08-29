@@ -73,7 +73,31 @@ export async function withHorizonFailover<T>(operation: (horizon: Horizon.Server
 }
 
 function logUpstreamError(e: unknown, codes: unknown): void {
-  console.error("[stellar] Upstream error:", e instanceof Error ? e.message : String(e), codes ? JSON.stringify(codes) : "");
+  const normalizedCodes = normalizeResultCodes(codes);
+  log.warn(
+    {
+      error: e instanceof Error ? e.message : String(e),
+      status: (e as any)?.response?.status ?? (e as any)?.status ?? undefined,
+      resultCodes: normalizedCodes.length > 0 ? normalizedCodes : undefined,
+    },
+    "stellar horizon submission rejected"
+  );
+}
+
+function normalizeResultCodes(resultCodes: unknown): string[] {
+  if (Array.isArray(resultCodes)) {
+    return resultCodes.filter((code): code is string => typeof code === "string");
+  }
+  if (resultCodes && typeof resultCodes === "object") {
+    const codes = resultCodes as { [key: string]: unknown };
+    const values = [
+      codes.transaction_result_code,
+      ...(Array.isArray(codes.operations) ? codes.operations : []),
+      ...(Array.isArray(codes.operation_results) ? codes.operation_results : []),
+    ];
+    return values.filter((code): code is string => typeof code === "string");
+  }
+  return [];
 }
 
 /**

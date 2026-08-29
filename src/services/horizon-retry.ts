@@ -67,9 +67,9 @@ export function classifyHorizonError(error: unknown): HorizonErrorCategory {
   // Horizon SDK error shapes — the response body may carry result_codes.
   const response = extractResponse(error);
   if (response) {
-    const resultCodes = response.extras?.result_codes;
-    if (resultCodes) {
-      const txCode = resultCodes.transaction_result_code;
+    const resultCodes = normalizeResultCodes(response.extras?.result_codes ?? response.result_codes);
+    if (resultCodes.length > 0) {
+      const txCode = resultCodes.find((code) => code.startsWith("tx_"));
       // These Stellar transaction codes are permanent — the transaction
       // itself is invalid and retrying with the same envelope won't help.
       const permanentTxCodes = [
@@ -86,7 +86,7 @@ export function classifyHorizonError(error: unknown): HorizonErrorCategory {
 
       // Operation-level errors may be transient (e.g. underfunded can happen
       // when a concurrent payment consumed the balance).
-      const opCodes = resultCodes.operations ?? [];
+      const opCodes = resultCodes.filter((code) => code.startsWith("op_"));
       const permanentOpCodes = [
         "op_no_destination",
         "op_no_trust",
@@ -112,6 +112,22 @@ export function classifyHorizonError(error: unknown): HorizonErrorCategory {
   // Fallback: treat as transient to allow one more attempt, but the bounded
   // retry count ensures this never spins indefinitely.
   return "transient";
+}
+
+function normalizeResultCodes(resultCodes: unknown): string[] {
+  if (Array.isArray(resultCodes)) {
+    return resultCodes.filter((code): code is string => typeof code === "string");
+  }
+  if (resultCodes && typeof resultCodes === "object") {
+    const codes = resultCodes as { [key: string]: unknown };
+    const values = [
+      codes.transaction_result_code,
+      ...(Array.isArray(codes.operations) ? codes.operations : []),
+      ...(Array.isArray(codes.operation_results) ? codes.operation_results : []),
+    ];
+    return values.filter((code): code is string => typeof code === "string");
+  }
+  return [];
 }
 
 function extractResponse(

@@ -298,6 +298,10 @@ describe("POST /settlements/:id/confirm — 20 req/min per user/IP", () => {
   it("keyed per user — different authenticated users get independent buckets", async () => {
     const app = Fastify({ logger: false });
     const policy = rateLimitPolicies().settlementConfirm;
+    app.addHook("preHandler", async (req) => {
+      const userId = req.headers["x-test-user"] as string | undefined;
+      if (userId) (req as any).user = { id: userId, stellarPublicKey: `GTEST_${userId}` };
+    });
     await app.register(rateLimit, {
       max: 1,
       timeWindow: 60_000,
@@ -306,12 +310,7 @@ describe("POST /settlements/:id/confirm — 20 req/min per user/IP", () => {
     });
     app.post(
       "/settlements/:id/confirm",
-      {
-        preHandler: async (req) => {
-          const userId = req.headers["x-test-user"] as string | undefined;
-          if (userId) (req as any).user = { id: userId, stellarPublicKey: "GTEST" };
-        },
-      },
+      {},
       async () => ({ ok: true })
     );
     await app.ready();

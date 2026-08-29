@@ -151,6 +151,14 @@ export default async function settlementRoutes(app: FastifyInstance) {
     if (!expense) throw Errors.notFound("Expense not found");
     await requireMembership(expense.groupId, auth.id);
 
+    const payerMembership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId: expense.groupId, userId: expense.payerUserId } },
+      select: { userId: true },
+    });
+    if (!payerMembership) {
+      throw Errors.badRequest("invalid_payer", "Expense payer is no longer an active group member");
+    }
+
     const myShare = expense.shares.find((s) => s.userId === auth.id);
     if (!myShare) throw Errors.badRequest("no_share", "You have no share in this expense");
     if (myShare.status === "settled") {

@@ -185,7 +185,7 @@ const schema = z.object({
   // cycle, so it is bounded like the other state-changing treasury routes.
   RATE_LIMIT_TREASURY_PROPOSE_MAX: z.coerce.number().int().positive().max(100000).default(20),
   RATE_LIMIT_TREASURY_PROPOSE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
-  RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(20),
   RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().max(100000).default(10),
   RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: z.coerce.number().int().positive().default(60000),

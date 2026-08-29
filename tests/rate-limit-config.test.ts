@@ -9,8 +9,10 @@ describe("rate limit configuration", () => {
     expect(config.RATE_LIMIT_AUTH_VERIFY_MAX).not.toBe(undefined);
     // Challenge requests are cheap and legitimately retried while a wallet
     // extension is still open; verify is the actual auth step and should be
-    // tighter or equal, never looser than challenge by default.
-    expect(config.RATE_LIMIT_AUTH_VERIFY_MAX).toBeLessThanOrEqual(
+    // tighter than challenge by default.
+    expect(config.RATE_LIMIT_AUTH_CHALLENGE_MAX).toBe(20);
+    expect(config.RATE_LIMIT_AUTH_VERIFY_MAX).toBe(10);
+    expect(config.RATE_LIMIT_AUTH_VERIFY_MAX).toBeLessThan(
       config.RATE_LIMIT_AUTH_CHALLENGE_MAX
     );
   });

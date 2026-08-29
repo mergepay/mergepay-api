@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -26,8 +27,6 @@ import {
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
-
-const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
 
 const GROUP_BALANCE_CACHE_TTL_MS = 30_000;
 const groupBalanceCache = new Map<string, { expiresAt: number; balances: { asset: "XLM" | "USDC"; balance: string }[] }>();
@@ -233,7 +232,7 @@ export default async function groupRoutes(app: FastifyInstance) {
     ) {
       const body = z
         .object({
-          publicKey: stellarPublicKeySchema,
+          publicKey: stellarAccountIdSchema,
         })
         .parse(req.body);
 

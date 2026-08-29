@@ -43,10 +43,22 @@ function isValidStellarAmount(raw: string): boolean {
 }
 
 /** A Stellar ed25519 public key ("G..."), checksum-validated. */
-export const stellarPublicKeySchema = z
+export const stellarAccountIdSchema = z
   .string()
   .refine((v) => StrKey.isValidEd25519PublicKey(v), {
-    message: "Invalid Stellar public key",
+    message: "Invalid Stellar account ID. Expected a valid public key beginning with 'G' and matching Stellar's ed25519 rules.",
+  });
+
+export const stellarPublicKeySchema = stellarAccountIdSchema;
+
+/** A Mergepay memo string in the form `MP:<code>` constrained to Stellar MEMO_TEXT size limits. */
+export const mpMemoSchema = z
+  .string()
+  .refine((v) => v.startsWith("MP:"), {
+    message: "Mergepay memo must start with 'MP:'.",
+  })
+  .refine((v) => Buffer.byteLength(v, "utf8") <= 28, {
+    message: "Mergepay memo must be 28 UTF-8 bytes or fewer to fit in a Stellar MEMO_TEXT.",
   });
 
 /** A positive, precision-safe decimal amount string, within Stellar's Int64 range. */

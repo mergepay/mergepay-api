@@ -1,7 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { Errors } from "../errors";
 import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
@@ -36,10 +36,7 @@ export default async function authRoutes(app: FastifyInstance) {
     "/auth/challenge",
     challengeLimit,
     async (req) => {
-      const body = z.object({ account: z.string() }).parse(req.body);
-      if (!StrKey.isValidEd25519PublicKey(body.account)) {
-        throw Errors.badRequest("invalid_account", "Not a valid Stellar public key");
-      }
+      const body = z.object({ account: stellarAccountIdSchema }).parse(req.body);
       return buildChallenge(body.account);
     }
   );

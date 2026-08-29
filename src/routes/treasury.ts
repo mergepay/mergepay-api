@@ -2,6 +2,7 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { StrKey, Transaction } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -35,7 +36,6 @@ import {
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
 
-const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
 const stellarAmountSchema = z.string().min(1);
 
 export default async function treasuryRoutes(app: FastifyInstance) {
@@ -47,7 +47,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z
       .object({
-        publicKey: stellarPublicKeySchema,
+        publicKey: stellarAccountIdSchema,
         requiredSigners: z.number().int().min(1).max(20).optional(),
       })
       .parse(req.body);

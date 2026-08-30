@@ -205,7 +205,9 @@ const schema = z.object({
   SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
   SEP24_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_GROUP: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_GROUP_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_HISTORY: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_HISTORY_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   // trusted proxies: only trust X-Forwarded-For if the direct peer is in this
   // comma-separated list; otherwise Fastify falls back to req.ip = socket remote.
   TRUSTED_PROXY_IPS: z.string().default(""),

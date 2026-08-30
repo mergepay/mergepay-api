@@ -32,6 +32,7 @@ import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
+import { stellarErrorSerializer } from "./lib/stellar-serializer";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
@@ -75,6 +76,9 @@ export async function buildApp(): Promise<FastifyInstance> {
       ? false
       : {
           level: config.LOG_LEVEL,
+          serializers: {
+            err: stellarErrorSerializer as any,
+          },
           redact: {
             paths: [
               "req.headers.authorization",

@@ -115,6 +115,7 @@ model ExpenseShare {
 
   @@index([expenseId])
   @@index([userId])
+  @@index([expenseId, userId])
   @@map("expense_shares")
 }
 
@@ -181,6 +182,7 @@ model Settlement {
   @@index([status, nextAttemptAt]) // For picking up eligible worker jobs
   @@index([leaseExpiresAt]) // For recovering leases from crashed workers
   @@index([expiresAt])
+  @@index([expenseShareId])
   @@unique([expenseShareId, idempotencyKey], name: "settlement_expense_share_idempotency")
   @@map("settlements")
 }

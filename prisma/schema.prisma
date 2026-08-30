@@ -26,6 +26,8 @@ model User {
   withdrawals      Withdrawal[]
   proposals        TreasuryProposal[]   @relation("ProposalCreator")
   approvals        TreasuryApproval[]
+  treasuryTxProposals TreasuryTxProposal[] @relation("TreasuryTxProposalCreator")
+  treasurySignatures  TreasurySignature[]
   auditLogs        AuditLog[]
   idempotencyKeys  IdempotencyKey[]
   webhooks         Webhook[]
@@ -51,6 +53,7 @@ model Group {
   settlements Settlement[]
   treasuryTxs TreasuryTransaction[]
   proposals   TreasuryProposal[]
+  treasuryTxProposals TreasuryTxProposal[]
   invites     Invite[]
   invitations Invitation[]
   auditLogs   AuditLog[]
@@ -374,6 +377,69 @@ model TreasuryApproval {
   @@index([proposalId])
   @@index([userId])
   @@map("treasury_approvals")
+}
+
+/// Multisig transaction proposal built from a caller-supplied unsigned XDR —
+/// as opposed to `TreasuryProposal`, which always builds its own payment XDR
+/// server-side. This backs the external-coordination signing flow: an admin
+/// builds an arbitrary treasury-account transaction elsewhere (Stellar
+/// Laboratory, a CLI, a co-signer's wallet), the server stores it, and other
+/// admins sign it independently until the group's on-chain signer weight
+/// threshold is met. See src/services/treasury-signatures.ts.
+model TreasuryTxProposal {
+  id        String   @id @default(cuid())
+  groupId   String   @map("group_id")
+  creatorId String   @map("creator_id")
+  /// Unsigned transaction envelope (base64 XDR) exactly as submitted.
+  xdr       String   @map("xdr")
+  /// Hash of the unsigned envelope. Every signature is verified against it,
+  /// and a submitted envelope that hashes differently is rejected outright.
+  txHash    String   @map("tx_hash")
+  /// The multisig account this envelope spends from/authorizes for.
+  sourceAccount String @map("source_account")
+  /// Snapshot of the source account's signing threshold when the proposal
+  /// was created, for display only — the authoritative check made on every
+  /// signature submission re-reads the live account from Horizon.
+  requiredWeight Int   @map("required_weight")
+  /// PENDING_SIGNATURES -> READY -> SUBMITTED / FAILED
+  status        String   @default("PENDING_SIGNATURES")
+  stellarTxHash String?  @map("stellar_tx_hash")
+  failureReason String?  @map("failure_reason")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  group      Group               @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  creator    User                @relation("TreasuryTxProposalCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  signatures TreasurySignature[]
+
+  @@index([groupId])
+  @@index([status])
+  @@index([creatorId])
+  @@map("treasury_tx_proposals")
+}
+
+/// One verified admin signer's signature over a `TreasuryTxProposal`'s
+/// envelope. `weight` snapshots that signer's on-chain weight at the moment
+/// the signature was verified, so the proposal's total signed weight can be
+/// recomputed by summing this column alone.
+model TreasurySignature {
+  id              String   @id @default(cuid())
+  proposalId      String   @map("proposal_id")
+  signerUserId    String   @map("signer_user_id")
+  signerPublicKey String   @map("signer_public_key")
+  /// Base64-encoded ed25519 signature.
+  signature String
+  weight    Int
+  createdAt DateTime @default(now()) @map("created_at")
+
+  proposal TreasuryTxProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  signer   User               @relation(fields: [signerUserId], references: [id], onDelete: Cascade)
+
+  // One signature per signer per proposal — a signer who re-submits the same
+  // envelope does not get to double their contributed weight.
+  @@unique([proposalId, signerUserId])
+  @@index([proposalId])
+  @@map("treasury_signatures")
 }
 
 model IdempotencyKey {

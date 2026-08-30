@@ -36,6 +36,7 @@ import { stellarErrorSerializer } from "./lib/stellar-serializer";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
+import { nanoid } from "nanoid";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -65,13 +66,19 @@ export async function buildApp(): Promise<FastifyInstance> {
   installMultipartGuard();
 
   const app = Fastify({
-    // Disable Fastify's unvalidated request-id header handling. The incoming
-    // values are validated by genReqId before becoming request.id.
-    requestIdHeader: false,
-    genReqId: (request) =>
-      getCorrelationId(
-        request.headers["x-correlation-id"] ?? request.headers["x-request-id"]
-      ),
+    requestIdHeader: "x-request-id",
+    genReqId: (request) => {
+      const incomingRequestId = request.headers["x-request-id"];
+      const incomingCorrelationId = request.headers["x-correlation-id"];
+      const preferred =
+        typeof incomingRequestId === "string" && incomingRequestId.trim()
+          ? incomingRequestId
+          : typeof incomingCorrelationId === "string" && incomingCorrelationId.trim()
+            ? incomingCorrelationId
+            : `req-${nanoid(16)}`;
+
+      return getCorrelationId(preferred);
+    },
     logger: config.isTest
       ? false
       : {
@@ -110,18 +117,23 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   app.addHook("onRequest", async (request, reply) => {
-    const correlationId = getCorrelationId(request.id);
-    reply.header("x-request-id", correlationId);
+    const requestId = request.id;
+    const correlationId = getCorrelationId(requestId);
+    reply.header("x-request-id", requestId);
     reply.header("x-correlation-id", correlationId);
-    request.log.info({ correlationId }, "request received");
+    request.log = request.log.child({ reqId: requestId, correlationId });
+    request.log.info({ requestId, correlationId }, "request received");
   });
 
   app.addHook("onResponse", async (request, reply) => {
-    const correlationId = getCorrelationId(request.id);
-    reply.header("x-request-id", correlationId);
+    const requestId = request.id;
+    const correlationId = getCorrelationId(requestId);
+    reply.header("x-request-id", requestId);
     reply.header("x-correlation-id", correlationId);
+    request.log = request.log.child({ reqId: requestId, correlationId });
     request.log.info(
       {
+        requestId,
         correlationId,
         statusCode: reply.statusCode,
         method: request.method,
@@ -274,13 +286,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
   app.get("/health/live", liveness);
 
-  const { getReadiness, getDeepHealth } = await import("./services/health.js");
-  app.get("/health/ready", async (request, reply) => {
-    const readiness = await getReadiness();
-    const statusCode = readiness.status === "ok" ? 200 : 503;
-    return reply.code(statusCode).send(readiness);
-  });
-
+  const { getDeepHealth } = await import("./services/health.js");
   app.get("/health/deep", async (request, reply) => {
     const deepHealth = await getDeepHealth();
     const statusCode = deepHealth.status === "ok" ? 200 : 503;

@@ -87,6 +87,8 @@ its own SEP-10 signing key.
 
 ## Setup
 
+For the quickest local dev path against Stellar testnet, see [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
+
 ```bash
 git clone https://github.com/mergepay/mergepay-api.git
 cd mergepay-api

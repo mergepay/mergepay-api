@@ -27,7 +27,7 @@ vi.mock("../../src/services/anchor", async (importActual) => {
 
 import { buildApp } from "../../src/app";
 import { config } from "../../src/config";
-import { verifyAnchorToken } from "../../src/services/sep24";
+import { verifyAnchorToken } from "../../src/services/sep24-anchor-token";
 
 const prisma = h.prisma;
 const getToml = h.getToml;

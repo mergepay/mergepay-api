@@ -1,10 +1,17 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { config } from "../config";
 import { prisma } from "../db";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireAdmin, requireMembership } from "../services/access";
 import { WEBHOOK_EVENT_TYPES } from "../services/event";
+import { ipKey } from "../services/rate-limit-keys";
+import {
+  applySep24Callback,
+  sep24CallbackSchema,
+  verifySep24Signature,
+} from "../services/sep24";
 import { createWebhookSecret, dispatchWebhook } from "../services/webhook";
 
 const paramsSchema = z.object({ groupId: z.string().min(1) });
@@ -45,6 +52,91 @@ function publicWebhook(webhook: any, includeSecret = false) {
 }
 
 /**
+ * Inbound SEP-24 anchor callbacks.
+ *
+ * Registered in its own encapsulated scope for two reasons that both matter:
+ *
+ *  - **No authenticate hook.** The management routes below run behind
+ *    `app.authenticate`; an anchor has no Mergepay session and never will. Its
+ *    only credential is the HMAC signature over the body, so this route must
+ *    not inherit that hook.
+ *  - **Raw body.** The signature covers the exact bytes the anchor sent. A
+ *    scoped content type parser keeps the buffer intact and parses JSON only
+ *    after the signature has been verified — re-serializing a parsed object
+ *    would produce different bytes and fail every legitimate signature.
+ */
+async function sep24CallbackRoute(app: FastifyInstance) {
+  // Scoped to this plugin only: the rest of the API keeps Fastify's default
+  // JSON parsing. `parseAs: "buffer"` hands the handler untouched bytes.
+  app.addContentTypeParser(
+    "application/json",
+    { parseAs: "buffer" },
+    (_req, body, done) => {
+      done(null, body);
+    }
+  );
+
+  app.post(
+    "/api/webhooks/sep24",
+    {
+      config: {
+        rateLimit: {
+          max: config.SEP24_RATE_LIMIT_MAX,
+          timeWindow: config.SEP24_RATE_LIMIT_WINDOW_MS,
+          keyGenerator: ipKey("sep24.webhook"),
+        },
+      },
+    },
+    async (req, reply) => {
+      const rawBody = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(typeof req.body === "string" ? req.body : "");
+
+      const verification = verifySep24Signature({
+        rawBody,
+        headers: req.headers as Record<string, unknown>,
+      });
+
+      if (!verification.valid) {
+        // The reason is logged, never returned: telling a caller whether the
+        // signature was malformed, stale, or simply wrong hands an attacker a
+        // free oracle for probing the secret.
+        req.log.warn(
+          { reason: verification.reason, route: "/api/webhooks/sep24" },
+          "rejected SEP-24 callback"
+        );
+        throw Errors.unauthorized("Invalid webhook signature");
+      }
+
+      // Parsing happens only after verification, so an unauthenticated caller
+      // can never reach the schema, the database, or the audit log.
+      let payload: unknown;
+      try {
+        payload = JSON.parse(rawBody.toString("utf8"));
+      } catch {
+        throw Errors.badRequest(
+          "invalid_webhook_body",
+          "Webhook body must be valid JSON"
+        );
+      }
+
+      const callback = sep24CallbackSchema.parse(payload);
+      const result = await applySep24Callback(callback);
+
+      // 200 regardless of whether a session matched or the transition applied:
+      // anchors retry non-2xx responses, and re-delivering a callback that was
+      // correctly processed as a no-op only amplifies load.
+      return reply.code(200).send({
+        received: true,
+        status: result.status,
+        matched: result.matched,
+        updated: result.updated,
+      });
+    }
+  );
+}
+
+/**
  * Registration body for `POST /api/webhooks`.
  *
  * `groupId` is optional: omitted, the endpoint is personal to the caller and
@@ -57,6 +149,11 @@ const registerSchema = createSchema.extend({
 });
 
 export default async function webhookRoutes(app: FastifyInstance) {
+  await app.register(sep24CallbackRoute);
+  await app.register(webhookManagementRoutes);
+}
+
+async function webhookManagementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- register ---------------------------------------------------------------

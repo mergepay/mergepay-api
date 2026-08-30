@@ -1,0 +1,23 @@
+-- Stable failure category for terminally failed settlements.
+--
+-- `failure_reason` already carried a sanitized human-readable string, but
+-- nothing machine-readable: a client could display a failure and still not know
+-- whether the remedy was to add funds, request a fresh envelope, or simply wait
+-- out an upstream outage. This column records that decision as one of a small
+-- controlled set — "validation", "insufficient_funds", "expired", "upstream",
+-- "ledger_rejected", "internal" — assigned by src/services/settlement-failure.ts.
+--
+-- Distinct from the existing `error_category`, which is the worker's *retry*
+-- decision (transient / indeterminate / permanent). That answers whether to try
+-- again; this answers what went wrong. Both are kept.
+--
+-- Nullable, with no backfill. Existing rows — including settlements that failed
+-- before this column existed — stay readable and keep their `failure_reason`;
+-- a null category simply means "not recorded", which the status endpoint
+-- reports by omitting the category rather than inventing one. Successful and
+-- pending settlements are untouched.
+-- No index: failure triage reaches these rows through the existing `status`
+-- index (a failure category is only ever set on a failed settlement), and an
+-- unused index on a column that is null for almost every row would cost writes
+-- without earning a read.
+ALTER TABLE "settlements" ADD COLUMN IF NOT EXISTS "failure_category" TEXT;

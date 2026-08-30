@@ -9,6 +9,7 @@ import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
 import openAPIPlugin from "./plugins/openapi";
 import { validateAssetConfig } from "./services/assets";
@@ -18,6 +19,7 @@ import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
 import treasuryProposalRoutes from "./routes/treasury-proposals";
+import treasurySignatureRoutes from "./routes/treasury-signatures";
 import anchorRoutes from "./routes/anchors";
 import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
@@ -25,12 +27,14 @@ import uploadRoutes from "./routes/uploads";
 import auditLogRoutes from "./routes/audit-log";
 import sep24Routes from "./routes/sep24";
 import webhookRoutes from "./routes/webhooks";
+import exchangeRateRoutes from "./routes/exchange-rates";
 import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
-
+import { getReadiness } from "./services/health";
+import { installMultipartGuard } from "./lib/multipart-guard";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -55,6 +59,10 @@ function globalRateLimitKey(request: FastifyRequest): string {
 export async function buildApp(): Promise<FastifyInstance> {
   validateAssetConfig();
 
+  // Contains a @fastify/busboy defect that turns a truncated multipart body
+  // into an uncaught exception. See src/lib/multipart-guard.ts.
+  installMultipartGuard();
+
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
     // values are validated by genReqId before becoming request.id.
@@ -66,7 +74,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     logger: config.isTest
       ? false
       : {
-          level: process.env.LOG_LEVEL ?? "info",
+          level: config.LOG_LEVEL,
           redact: {
             paths: [
               "req.headers.authorization",
@@ -174,12 +182,24 @@ export async function buildApp(): Promise<FastifyInstance> {
       requestId: request.id,
     }),
   });
+  // Multipart limits, all explicit. Only /uploads/receipt consumes a multipart
+  // body (the SEP-24 anchor flow is JSON end to end), so these bound that one
+  // route without touching the JSON routes, which keep their own bodyLimit.
+  //
+  // `throwFileSizeLimit` makes an oversized file an error the route can answer
+  // rather than a silently truncated stream — a truncated receipt would other-
+  // wise be written to disk as though it were complete. Each limit maps to its
+  // own client error in src/lib/request-limits.ts.
   await app.register(multipart, {
     limits: {
       fileSize: config.MULTIPART_FILE_SIZE_BYTES,
       files: config.MULTIPART_MAX_FILES,
+      // Bounds a single non-file field. busboy buffers field values in memory,
+      // so without this a form field is an unbounded allocation.
+      fieldSize: config.MULTIPART_FIELD_SIZE_BYTES,
       parts: config.MULTIPART_MAX_FIELDS,
     },
+    throwFileSizeLimit: true,
   });
 
   // Cap the request body on routes that take signed envelopes or credentials,
@@ -193,13 +213,17 @@ export async function buildApp(): Promise<FastifyInstance> {
     "/expenses/:id/settle",
     "/groups/:id/settlements",
     "/settlements/:id/confirm",
+    "/api/settlements/execute",
     "/groups/:id/treasury/deposit",
     "/groups/:id/treasury/withdraw",
     "/treasury-transactions/:id/confirm",
+    "/api/treasury/proposals",
+    "/api/treasury/proposals/:id/signatures",
     "/anchors/deposit",
     "/anchors/withdraw",
     "/anchors/sessions/:id/complete",
     "/anchors/webhook",
+    "/api/webhooks/sep24",
     "/api/sep24/callback",
   ]);
 
@@ -222,6 +246,9 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  // Registered with fastify-plugin, so `app.idempotent` is visible to every
+  // route plugin below rather than only inside this scope.
+  await app.register(idempotencyPlugin);
   await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {
@@ -262,6 +289,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
   await app.register(treasuryProposalRoutes);
+  await app.register(treasurySignatureRoutes);
   await app.register(anchorRoutes);
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
@@ -270,6 +298,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(auditLogRoutes);
   await app.register(sep24Routes);
   await app.register(webhookRoutes);
+  await app.register(exchangeRateRoutes);
 
   return app;
 }

@@ -34,6 +34,7 @@ import {
   snapshotToSignerConfig,
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
+import { treasurySignerConfigSchema } from "../validations/treasury";
 
 const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
 const stellarAmountSchema = z.string().min(1);
@@ -133,21 +134,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireAdmin(id, auth.id);
     
-    const body = z
-      .object({
-        signers: z.array(
-          z.object({
-            publicKey: z.string(),
-            weight: z.number().int().min(0).max(255),
-          })
-        ),
-        thresholds: z.object({
-          low: z.number().int().min(0).max(255),
-          med: z.number().int().min(0).max(255),
-          high: z.number().int().min(0).max(255),
-        }),
-      })
-      .parse(req.body);
+    const body = treasurySignerConfigSchema.parse(req.body);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {

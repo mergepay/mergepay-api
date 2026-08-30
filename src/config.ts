@@ -11,14 +11,35 @@ const stellarPublicKeySchema = z.string().regex(/^G[A-Z0-9]{55}$/, "Invalid Stel
 const schema = z.object({
   // Required core configuration
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  // Optional query timeout for Prisma client (ms). Default: 10 seconds.
+  // Prevents hung queries from blocking Fastify request workers indefinitely.
+  DATABASE_QUERY_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   PORT: z.coerce.number().int().positive().default(4000),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   API_PUBLIC_URL: urlSchema,
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
-  // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
-  WEB_URL: z.string().default("*"),
+  // CORS configuration. Comma-separated list of allowed origins.
+  // Empty (default) means no cross-origin requests allowed — set explicitly for production.
+  // Use "*" to allow all origins (development only).
+  // Example: "https://app.example.com,https://staging.example.com"
+  WEB_URL: z.string().default(""),
+  // Allow credentials (cookies, auth headers) in CORS requests.
+  // Defaults to false for security; enable only if your frontend requires it.
+  CORS_ALLOW_CREDENTIALS: z.coerce.boolean().default(false),
+  // Comma-separated list of allowed HTTP methods for CORS.
+  // Defaults to standard REST methods.
+  CORS_ALLOW_METHODS: z.string().default("GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS"),
+  // Comma-separated list of allowed headers for CORS.
+  // Defaults to common headers needed for API clients.
+  CORS_ALLOW_HEADERS: z.string().default("Content-Type,Authorization,X-Requested-With,Idempotency-Key"),
+  // Comma-separated list of headers exposed to the client.
+  // Defaults to headers useful for debugging and pagination.
+  CORS_EXPOSE_HEADERS: z.string().default("X-Request-ID,X-Correlation-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,Retry-After"),
+  // Max age (seconds) for CORS preflight cache.
+  // Defaults to 24 hours to reduce preflight requests.
+  CORS_MAX_AGE: z.coerce.number().int().positive().default(86400),
   JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
   // Bound a session to this deployment: a token minted for another environment
   // or audience is rejected even when the signing secret is shared.

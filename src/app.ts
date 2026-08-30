@@ -157,6 +157,9 @@ export async function buildApp(): Promise<FastifyInstance> {
     .map((o) => o.trim().replace(/\/+$/, ""))
     .filter(Boolean);
   const allowVercelPreviews = allowed.some((o) => o.endsWith(".vercel.app"));
+  const allowMethods = config.CORS_ALLOW_METHODS.split(",").map((m) => m.trim().toUpperCase());
+  const allowHeaders = config.CORS_ALLOW_HEADERS.split(",").map((h) => h.trim());
+  const exposeHeaders = config.CORS_EXPOSE_HEADERS.split(",").map((h) => h.trim());
   await app.register(cors, {
     origin: allowAll
       ? true
@@ -169,7 +172,11 @@ export async function buildApp(): Promise<FastifyInstance> {
           }
           return cb(null, false);
         },
-    credentials: false,
+    credentials: config.CORS_ALLOW_CREDENTIALS,
+    methods: allowMethods,
+    allowedHeaders: allowHeaders,
+    exposedHeaders: exposeHeaders,
+    maxAge: config.CORS_MAX_AGE,
   });
   // Global default limit. Sensitive routes (SEP-10 auth, settlement and
   // treasury submission, anchor initiation and polling) override this with

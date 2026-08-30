@@ -37,7 +37,11 @@ vi.mock("../src/services/stellar", () => ({
     loadAccount: vi.fn(async () => ({
       exists: true,
       sequence: "1",
-      balances: [],
+      // Funded: the settle route runs a fee-and-balance preflight before it
+      // creates anything, so an account with no balances is rejected with
+      // INSUFFICIENT_BALANCE and never reaches the idempotency behaviour
+      // these tests are about.
+      balances: [{ assetCode: "XLM", assetIssuer: null, balance: "1000.0000000" }],
       signers: [],
       thresholds: { low: 0, med: 0, high: 0 },
     })),

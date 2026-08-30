@@ -255,7 +255,13 @@ interface SettlementStatusResponse {
     successful: boolean | null;        // Horizon's own flag; null if not found
     transactionHash: string | null;
   };
-  failure: { reason: string } | null;  // scrubbed; no upstream text or stack
+  // Present only when `status` is "failed"; null otherwise, including while a
+  // settlement is still being retried. `category` is the stable value to
+  // branch on; `reason` is scrubbed — no upstream text, XDR, or stack.
+  failure: {
+    category: SettlementFailureCategory;
+    reason: string;
+  } | null;
   expiresAt: string | null;            // ISO 8601
   expiresInSeconds: number | null;     // negative once lapsed
   createdAt: string;                   // ISO 8601
@@ -280,11 +286,40 @@ type SettlementStatus =
 | `awaiting_signature` | no | Unsigned XDR issued; no signed envelope returned yet | Sign it before `expiresAt` |
 | `submitted` | no | A signed envelope was accepted and is being submitted; not yet confirmed on-chain | Keep polling |
 | `confirmed` | yes | The payment succeeded on-chain | Done |
-| `failed` | yes | Submission was rejected, or the transaction failed on-chain | Read `failure.reason` |
+| `failed` | yes | Submission was rejected, or the transaction failed on-chain | Branch on `failure.category` |
 | `expired` | yes | The signing window closed before submission | Create a new settlement |
 
 An unrecognised internal status maps to `awaiting_signature` — conservative, and
 never reported as paid.
+
+### Failure categories
+
+```ts
+type SettlementFailureCategory =
+  | "validation"
+  | "insufficient_funds"
+  | "expired"
+  | "upstream"
+  | "ledger_rejected"
+  | "internal";
+```
+
+| Category | Meaning | Client action |
+| --- | --- | --- |
+| `validation` | The request or signed envelope was wrong (malformed XDR, intent mismatch, authorization) | Fix the request; retrying the same input fails identically |
+| `insufficient_funds` | The payer cannot cover the amount, the network fee, or the account reserve, or lacks the trustline | Fund the account or add the trustline, then settle again |
+| `expired` | The signing window closed before submission | Create a new settlement; do not retry this one |
+| `upstream` | Horizon or the anchor was unreachable, timed out, or rate-limited | Retry later; nothing is wrong with the request |
+| `ledger_rejected` | The network rejected the transaction, or it failed on-chain | Permanent for this envelope; create a new settlement |
+| `internal` | An unclassified failure inside the API | Retry; contact support if it persists |
+
+The set is closed and stable — a client may switch on it exhaustively. A
+settlement that failed before this field existed reports `internal` rather than
+omitting the category, so the shape is the same for every failed settlement.
+
+The same categories are assigned by both the request path and the background
+worker, from one classifier, so a given failure is reported identically no
+matter which process observed it.
 
 ### Pending is not confirmed
 
@@ -303,7 +338,43 @@ erroring.
 
 Signed or unsigned XDRs, private keys, anchor or session tokens, provider
 credentials, upstream error text, and stack traces. `failure.reason` is limited
-to the short, already-scrubbed message the worker recorded.
+to the short, already-scrubbed message the worker recorded — capped at 300
+characters, with bearer tokens, labelled secrets, bare Stellar secret seeds, and
+bare transaction envelopes removed before it is ever persisted.
+
+---
+
+## Request size limits
+
+Every size limit is explicit and configurable, and each has its own error code
+so a client can tell what to change. All are answered as `413` — the request was
+well-formed, just too large — except a body that is not multipart at all, which
+is `415`.
+
+| Limit | Environment variable | Default | Code when exceeded |
+| --- | --- | --- | --- |
+| JSON body (global) | `JSON_BODY_LIMIT_BYTES` | 1 MB | `REQUEST_TOO_LARGE` |
+| JSON body (auth, settlement, treasury, anchor routes) | `AUTH_BODY_LIMIT_BYTES` | 256 KB | `REQUEST_TOO_LARGE` |
+| Uploaded file size | `MULTIPART_FILE_SIZE_BYTES` | 5 MB | `FILE_TOO_LARGE` |
+| Files per request | `MULTIPART_MAX_FILES` | 1 | `TOO_MANY_FILES` |
+| Single form field size | `MULTIPART_FIELD_SIZE_BYTES` | 64 KB | `FIELD_TOO_LARGE` |
+| Total multipart parts | `MULTIPART_MAX_FIELDS` | 20 | `TOO_MANY_PARTS` |
+
+A malformed multipart body is `400 BAD_REQUEST` with a fixed message; the
+parser's own text is never echoed, because it can quote the malformed input.
+
+Limits are applied at the narrowest scope that works. The multipart limits reach
+only `POST /uploads/receipt`, the sole multipart route — the SEP-24 anchor flow
+is JSON end to end — so ordinary JSON routes keep their own body limit and are
+unaffected.
+
+### Uploads never leave partial state
+
+`POST /uploads/receipt` streams the file to a staging directory outside the
+served path and renames it into place only once it has been fully received and
+accepted. Nothing is buffered whole in memory, every rejection path removes the
+partial file, and no URL is returned for a file that is not complete. A client
+that aborts mid-upload leaves nothing behind.
 
 ---
 

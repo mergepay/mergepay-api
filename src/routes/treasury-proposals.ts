@@ -31,6 +31,14 @@ import {
   serializeTreasuryProposal,
 } from "../serializers";
 import { treasuryProposalsService } from "../services/treasury-proposals";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 
 const createBodySchema = z.object({
   destination: z.string().min(1),
@@ -117,16 +125,32 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
   });
 
   // -- GET /groups/:groupId/treasury/proposals --------------------------------
+  //
+  // Paginated on the shared cursor convention (src/lib/pagination.ts). A
+  // treasury accumulates proposals indefinitely — every payment a group has
+  // ever proposed, signed or abandoned — so an unbounded read grew without
+  // limit with the group's age and loaded the whole history to render a screen
+  // that shows the most recent few.
+  //
+  // Membership is checked before any row is read, and the `groupId` filter is
+  // what scopes the page. The cursor only moves where a page starts inside
+  // that already-authorized scope; it never widens it.
   app.get("/groups/:groupId/treasury/proposals", async (req) => {
     const auth = requireUser(req);
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
     await requireMembership(groupId, auth.id);
 
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const position = requireCursor(cursor);
+
     const proposals = await prisma.treasuryProposal.findMany({
-      where: { groupId },
-      orderBy: { createdAt: "desc" },
+      where: { groupId, ...cursorFilter(position, order) },
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
     });
-    return { proposals: proposals.map(serializeTreasuryProposal) };
+
+    const { items, meta } = buildPage(proposals, limit, order);
+    return { proposals: items.map(serializeTreasuryProposal), meta };
   });
 
   // -- POST /groups/:groupId/treasury/proposals/:proposalId/sign --------------

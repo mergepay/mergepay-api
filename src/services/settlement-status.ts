@@ -41,6 +41,10 @@
  */
 import { stellar } from "./stellar";
 import { isIntentExpired, secondsUntilExpiry } from "../lib/time-bounds";
+import {
+  isSettlementFailureCategory,
+  type SettlementFailureCategory,
+} from "./settlement-failure";
 
 /** The documented, stable set of public statuses. */
 export const SETTLEMENT_STATUSES = [
@@ -74,6 +78,11 @@ export interface SettlementStatusInput {
   stellarTxHash: string | null;
   transactionXdr?: string | null;
   failureReason: string | null;
+  /**
+   * Stable failure category. Optional so a row read before this column existed
+   * — or by a caller selecting a narrower shape — still satisfies the type.
+   */
+  failureCategory?: string | null;
   expiresAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -89,13 +98,57 @@ export interface OnChainStatus {
   transactionHash: string | null;
 }
 
+/**
+ * Why a settlement failed. Present only on a failed settlement.
+ *
+ * `category` is the stable, machine-readable half — clients branch on it.
+ * `reason` is the sanitized human-readable half, already scrubbed of XDRs,
+ * credentials, and upstream payloads before it was persisted.
+ */
+export interface SettlementFailureInfo {
+  category: SettlementFailureCategory;
+  reason: string;
+}
+
 export interface SettlementStatusResult {
   status: SettlementStatus;
   onChain: OnChainStatus;
-  failure: { reason: string } | null;
+  failure: SettlementFailureInfo | null;
   expiresAt: string | null;
   expiresInSeconds: number | null;
   checkedAt: string;
+}
+
+/**
+ * Build the client-visible failure block for a settlement.
+ *
+ * Two rules, both deliberate:
+ *
+ *  - **Only for failures.** A settlement carries a `failureReason` while it is
+ *    still retrying — the worker records each attempt's reason before deciding
+ *    whether to try again. Surfacing that on a `submitted` settlement would
+ *    report a payment as broken while it is still perfectly likely to succeed.
+ *    The public status, not the persisted column, decides.
+ *  - **Always a category.** A row that failed before the category column
+ *    existed still returns a usable shape; an unrecognised or absent value
+ *    reads as "internal" rather than being passed through, so a client can
+ *    exhaustively switch on the documented set.
+ */
+export function toFailureInfo(
+  settlement: SettlementStatusInput,
+  publicStatus: SettlementStatus
+): SettlementFailureInfo | null {
+  if (publicStatus !== "failed") return null;
+
+  const reason = settlement.failureReason?.trim();
+  const category = isSettlementFailureCategory(settlement.failureCategory)
+    ? settlement.failureCategory
+    : "internal";
+
+  return {
+    category,
+    reason: reason && reason.length > 0 ? reason : "Settlement failed",
+  };
 }
 
 /**
@@ -198,7 +251,9 @@ export async function resolveSettlementStatus(
   return {
     status,
     onChain,
-    failure: settlement.failureReason ? { reason: settlement.failureReason } : null,
+    // Resolved against the *final* status, so a settlement the Horizon lookup
+    // just moved to failed reports its reason in the same response.
+    failure: toFailureInfo(settlement, status),
     expiresAt: settlement.expiresAt ? settlement.expiresAt.toISOString() : null,
     expiresInSeconds: settlement.expiresAt
       ? secondsUntilExpiry(settlement.expiresAt, now)

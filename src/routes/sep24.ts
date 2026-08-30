@@ -3,8 +3,14 @@
  *
  * Registered outside the authenticated route scopes: an anchor has no Mergepay
  * session and never will. Its credential is the JWT it signs with its SEP-10
- * key, verified in src/services/sep24.ts against the key published in that
- * anchor's own stellar.toml.
+ * key, verified in src/services/sep24-anchor-token.ts against the key
+ * published in that anchor's own stellar.toml.
+ *
+ * This is not the only SEP-24 callback surface. `POST /api/webhooks/sep24`
+ * (src/routes/webhooks.ts) accepts the same events from anchors that
+ * authenticate with a pre-shared HMAC secret rather than a SEP-10 JWT. The
+ * two exist side by side because anchors differ in which scheme they support;
+ * each verifies its own credential and both converge on session state.
  */
 import type { FastifyInstance } from "fastify";
 import { config } from "../config";
@@ -13,7 +19,7 @@ import {
   applySep24Callback,
   sep24CallbackSchema,
   verifyAnchorToken,
-} from "../services/sep24";
+} from "../services/sep24-anchor-token";
 
 export default async function sep24Routes(app: FastifyInstance) {
   // Rate limiting here is abuse protection for an endpoint that is

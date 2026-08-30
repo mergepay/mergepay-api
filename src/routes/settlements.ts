@@ -20,6 +20,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
+import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -99,6 +100,29 @@ const executeBodySchema = z.object({
   signedXdr: z.string().min(1),
 });
 
+/** Request-body schemas used for OpenAPI documentation of the settlement
+ * creation routes (both routes validate the payload with Zod in-handler; the
+ * schemas here render the accepted shapes in the Swagger UI). */
+const settleBodyDocSchema = z.object({
+  assetCode: z.string().max(12).optional(),
+  assetIssuer: z.string().nullable().optional(),
+  // `.min(MIN)` rather than `.positive()`: under OpenAPI 3, zod-to-json-schema
+  // renders `.positive()` as the draft-04 `exclusiveMinimum: true` form, which
+  // @fastify/swagger rejects on a route schema. Bounds mirror
+  // `intentValiditySchema` (src/lib/time-bounds.ts) so the documented shape
+  // matches what the handler enforces.
+  validitySeconds: z.number().int().min(30).max(300).optional(),
+});
+
+const freeformSettleBodyDocSchema = z.object({
+  toUserId: z.string(),
+  amount: z.string(),
+  assetCode: z.string().max(12),
+  assetIssuer: z.string().nullable().optional(),
+  // Mirrors `intentValiditySchema` bounds (30-300s); see settleBodyDocSchema.
+  validitySeconds: z.number().int().min(30).max(300).optional(),
+});
+
 const settlementStatusQuerySchema = z.object({
   /**
    * Whether to consult Horizon for on-chain confirmation. On by default —
@@ -126,7 +150,19 @@ export default async function settlementRoutes(app: FastifyInstance) {
   const executeLimit = rateLimited("settlementExecute");
 
   // -- settle a specific expense share ----------------------------------------
-  app.post("/expenses/:id/settle", createLimit, async (req) => {
+  app.post(
+    "/expenses/:id/settle",
+    {
+      ...createLimit,
+      schema: {
+        tags: ["Settlements"],
+        summary: "Settle your share of an expense",
+        params: openApiIdParams(),
+        body: openApiBody(settleBodyDocSchema),
+        response: openApiEnvelope("settlement"),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: expenseId } = idParamSchema.parse(req.params);
     const body = z
@@ -270,7 +306,19 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- freeform settle-up against net balance ---------------------------------
-  app.post("/groups/:id/settlements", createLimit, async (req) => {
+  app.post(
+    "/groups/:id/settlements",
+    {
+      ...createLimit,
+      schema: {
+        tags: ["Settlements"],
+        summary: "Settle up against a group's net balance",
+        params: openApiIdParams(),
+        body: openApiBody(freeformSettleBodyDocSchema),
+        response: openApiEnvelope("settlement"),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);

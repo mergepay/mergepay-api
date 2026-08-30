@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
+import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
@@ -33,7 +34,20 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- create -----------------------------------------------------------------
-  app.post("/groups/:id/expenses", async (req) => {
+  app.post(
+    "/groups/:id/expenses",
+    {
+      schema: {
+        tags: ["Expenses"],
+        summary: "Create an expense in a group",
+        description:
+          "Records a group expense and its payment split. The payer's share is settled immediately; every other participant's share is owed.",
+        params: openApiIdParams(),
+        body: openApiBody(createExpenseSchema),
+        response: openApiEnvelope("expense"),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
@@ -120,7 +134,16 @@ export default async function expenseRoutes(app: FastifyInstance) {
   });
 
   // -- list -------------------------------------------------------------------
-  app.get("/groups/:id/expenses", async (req) => {
+  app.get(
+    "/groups/:id/expenses",
+    {
+      schema: {
+        tags: ["Expenses"],
+        summary: "List a group's expenses",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
     const query = expenseListQuerySchema.parse(req.query ?? {});

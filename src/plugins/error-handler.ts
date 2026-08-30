@@ -27,6 +27,28 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
       });
     }
 
+    // A request that failed Fastify's own JSON-schema validation (from a
+    // route's `schema` / OpenAPI body-schema annotation) is a validation
+    // error like any other, so it returns the same VALIDATION_ERROR contract
+    // the Zod-based handlers use. Failing that — falling into the generic 4xx
+    // branch below — would let two identical mistakes on two routes surface
+    // with two different codes.
+    if ((err as any).code === "FST_ERR_VALIDATION") {
+      const details = Array.isArray((err as any).validation)
+        ? (err as any).validation.map((v: any) => ({
+            field: (v?.instancePath ?? "").replace(/^\//, "") || undefined,
+            message: v?.message ?? "Validation failed",
+          }))
+        : undefined;
+      return reply.code(400).send({
+        code: "VALIDATION_ERROR",
+        error: "VALIDATION_ERROR",
+        message: "Validation failed",
+        requestId,
+        details,
+      });
+    }
+
     if (err instanceof AppError) {
       const body: Record<string, unknown> = {
         code: err.code,

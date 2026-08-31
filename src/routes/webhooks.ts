@@ -13,7 +13,6 @@ import {
   verifySep24Signature,
 } from "../services/sep24";
 import { createWebhookSecret, dispatchWebhook } from "../services/webhook";
-import { auditTx } from "../services/audit";
 
 const paramsSchema = z.object({ groupId: z.string().min(1) });
 const webhookParamsSchema = paramsSchema.extend({
@@ -211,26 +210,15 @@ async function webhookManagementRoutes(app: FastifyInstance) {
       );
     }
 
-    const webhook = await prisma.$transaction(async (tx) => {
-      const created = await (tx as any).webhook.create({
-        data: {
-          groupId,
-          userId: null,
-          url: body.url,
-          secret: createWebhookSecret(),
-          events: body.events,
-          enabled: true,
-        },
-      });
-      await auditTx(tx, {
-        userId: auth.id,
+    const webhook = await (prisma as any).webhook.create({
+      data: {
         groupId,
-        action: "group.webhook_create",
-        entityType: "webhook",
-        entityId: created.id,
-        metadata: { eventCount: body.events.length },
-      });
-      return created;
+        userId: null,
+        url: body.url,
+        secret: createWebhookSecret(),
+        events: body.events,
+        enabled: true,
+      },
     });
 
     return { webhook: publicWebhook(webhook, true) };
@@ -259,16 +247,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     });
     if (!webhook) throw Errors.notFound("Webhook not found");
 
-    await prisma.$transaction(async (tx) => {
-      await (tx as any).webhook.delete({ where: { id: webhookId } });
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId,
-        action: "group.webhook_delete",
-        entityType: "webhook",
-        entityId: webhookId,
-      });
-    });
+    await (prisma as any).webhook.delete({ where: { id: webhookId } });
     return { deleted: true };
   });
 
@@ -291,16 +270,6 @@ async function webhookManagementRoutes(app: FastifyInstance) {
       groupId,
     }).catch(() => undefined);
 
-    await prisma.$transaction(async (tx) => {
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId,
-        action: "group.webhook_test",
-        entityType: "webhook",
-        entityId: webhookId,
-        metadata: { event: "expense.created" },
-      });
-    });
 
     return { queued: true };
   });

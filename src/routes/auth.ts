@@ -6,7 +6,7 @@ import { Errors } from "../errors";
 import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
-import { audit, auditTx } from "../services/audit";
+import { audit } from "../services/audit";
 import {
   RefreshTokenError,
   issueRefreshToken,
@@ -191,25 +191,12 @@ export default async function authRoutes(app: FastifyInstance) {
           avatarUrl: z.string().url().nullable().optional(),
         })
         .parse(req.body);
-      const user = await prisma.$transaction(async (tx) => {
-        const updated = await tx.user.update({
-          where: { id: auth.id },
-          data: {
-            ...(body.displayName !== undefined && { displayName: body.displayName }),
-            ...(body.avatarUrl !== undefined && { avatarUrl: body.avatarUrl }),
-          },
-        });
-        await auditTx(tx, {
-          userId: auth.id,
-          action: "user.profile_update",
-          entityType: "user",
-          entityId: auth.id,
-          metadata: {
-            displayNameChanged: body.displayName !== undefined,
-            avatarChanged: body.avatarUrl !== undefined,
-          },
-        });
-        return updated;
+      const user = await prisma.user.update({
+        where: { id: auth.id },
+        data: {
+          ...(body.displayName !== undefined && { displayName: body.displayName }),
+          ...(body.avatarUrl !== undefined && { avatarUrl: body.avatarUrl }),
+        },
       });
       return { user: serializeUser(user) };
     }

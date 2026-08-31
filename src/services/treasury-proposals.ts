@@ -83,7 +83,22 @@ const STATUS = {
 } as const;
 
 export const treasuryProposalsService = {
-  /** Build and persist a new unsigned multisig proposal. */
+  /**
+   * Build and persist a new unsigned multisig proposal.
+   *
+   * @param params - Proposal inputs describing the payment the treasury should
+   *   make: `groupId`, `creatorId`, `creatorPublicKey`, `destination`, `amount`,
+   *   `assetCode`, `assetIssuer`, and optional `memo`.
+   * @param threshold - Number of distinct co-signer approvals required before
+   *   the envelope may be submitted (typically the treasury account's `high`
+   *   threshold). When `1`, the proposal is created in a directly-submittable
+   *   state; otherwise it starts `awaiting_signatures`.
+   * @returns The created `TreasuryProposal` row, the base64 unsigned XDR for the
+   *   creator's wallet to sign first, and the `networkPassphrase` it was built
+   *   against.
+   * @throws {AppError} `treasury_disabled` / `treasury_unfunded` when the group
+   *   treasury is not enabled or has no funded Stellar account.
+   */
   async create(params: CreateProposalParams, threshold: number) {
     // Build the unsigned payment XDR sourcing from the treasury account.
     const treasury = await prisma.group.findUnique({
@@ -165,6 +180,16 @@ export const treasuryProposalsService = {
    *   - The proposal row is locked for the duration (PostgreSQL `SELECT ... FOR UPDATE`)
    *   - Two concurrent signers cannot both pass the duplicate check
    *   - The approval count and threshold decision are consistent
+   *
+   * @param args - `{ proposalId, groupId, memberPublicKeys, signedXdr, userId }`.
+   *   `memberPublicKeys` is the set of group members eligible to sign; `signedXdr`
+   *   is the wallet-produced (possibly partially) signed envelope; `userId` is the
+   *   authenticated submitter.
+   * @returns The resulting proposal state: `status`, `signatureCount`,
+   *   `threshold`, and `stellarTxHash` (non-null once submitted).
+   * @throws {AppError} `not_found` / `conflict` for unknown or terminal proposals,
+   *   `bad_request` for an XDR that hashes to a different transaction or carries an
+   *   unverifiable signature.
    */
   async submitSignatures(args: {
     proposalId: string;
@@ -427,6 +452,15 @@ export const treasuryProposalsService = {
   /**
    * Combine every verified signature onto the unsigned envelope and submit
    * the result to Stellar. Updates the proposal's `status` and `stellarTxHash`.
+   *
+   * @param tx - The active Prisma transaction client (row-locked on the proposal).
+   * @param proposalId - The `TreasuryProposal` id whose signatures should be merged.
+   * @param storedSignatures - Verified `(publicKey, signature)` pairs to attach to
+   *   a fresh copy of the stored unsigned envelope.
+   * @returns The proposal state after submission: `status` (`confirmed` on success),
+   *   `signatureCount`, `threshold`, and the resulting `stellarTxHash`.
+   * @throws {AppError} `upstream` when Stellar rejects the merged transaction; the
+   *   proposal is then left in a `failed` state with the reason recorded.
    */
   async mergeAndSubmit(
     tx: Prisma.TransactionClient,

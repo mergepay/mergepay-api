@@ -1101,7 +1101,9 @@ export async function startWorker(): Promise<() => Promise<void>> {
     const timeoutMs = Math.max(config.SHUTDOWN_TIMEOUT_MS, config.WORKER_SHUTDOWN_DRAIN_MS);
     const timeoutHandle = setTimeout(() => {
       log.error({ jobType: "worker_cycle", signal, timeoutMs }, "shutdown timed out, forcing exit");
-      process.exit(1);
+      if (!config.isTest) {
+        process.exit(1);
+      }
     }, timeoutMs);
 
     try {
@@ -1150,7 +1152,9 @@ export async function startWorker(): Promise<() => Promise<void>> {
       throw error;
     } finally {
       clearTimeout(timeoutHandle);
-      process.exit(0);
+      if (!config.isTest) {
+        process.exit(0);
+      }
     }
 
   };

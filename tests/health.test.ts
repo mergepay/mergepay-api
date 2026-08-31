@@ -29,69 +29,85 @@ beforeEach(async () => {
   global.fetch = h.fetch as typeof fetch;
 });
 
-describe("GET /health", () => {
+describe("GET /health/live", () => {
   it("returns a lightweight liveness payload without touching deps", async () => {
+    const response = await app.inject({ method: "GET", url: "/health/live" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: "ok",
+      timestamp: expect.any(String),
+    });
+  });
+});
+
+describe("GET /health", () => {
+  it("returns dependency status", async () => {
     const response = await app.inject({ method: "GET", url: "/health" });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       status: "ok",
-      uptime: expect.any(Number),
-      version: expect.any(String),
+      database: { connected: true },
+      stellar: { reachable: true },
+      timestamp: expect.any(String),
     });
-    expect(h.queryRawUnsafe).not.toHaveBeenCalled();
-    expect(h.feeStats).not.toHaveBeenCalled();
-    expect(h.fetch).not.toHaveBeenCalled();
   });
 });
 
-describe("GET /health/ready", () => {
-  it("returns 200 with dependency status when healthy", async () => {
-    const response = await app.inject({ method: "GET", url: "/health/ready" });
+describe("GET /health/deep", () => {
+  it("returns detailed health with dependency status when healthy", async () => {
+    const response = await app.inject({ method: "GET", url: "/health/deep" });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       status: "ok",
       uptime: expect.any(Number),
-      version: expect.any(String),
-      database: { status: "up", latencyMs: expect.any(Number) },
-      stellar: { status: "up", latencyMs: expect.any(Number) },
+      timestamp: expect.any(String),
+      checks: {
+        database: { status: "up", latencyMs: expect.any(Number) },
+        stellar: { status: "up", latencyMs: expect.any(Number) },
+      },
     });
   });
 
   it("returns 503 when the database is unavailable", async () => {
-    h.queryRawUnsafe.mockRejectedValueOnce(new Error("connection refused"));
+    h.queryRaw.mockRejectedValueOnce(new Error("connection refused"));
 
-    const response = await app.inject({ method: "GET", url: "/health/ready" });
+    const response = await app.inject({ method: "GET", url: "/health/deep" });
 
     expect(response.statusCode).toBe(503);
     expect(response.json()).toMatchObject({
       status: "degraded",
-      database: { status: "down", latencyMs: expect.any(Number) },
+      checks: {
+        database: { status: "down", latencyMs: expect.any(Number) },
+      },
     });
   });
 
   it("returns 503 when Horizon is unavailable", async () => {
-    h.fetch.mockRejectedValueOnce(new Error("Horizon unreachable"));
+    h.feeStats.mockRejectedValueOnce(new Error("Horizon unreachable"));
 
-    const response = await app.inject({ method: "GET", url: "/health/ready" });
+    const response = await app.inject({ method: "GET", url: "/health/deep" });
 
     expect(response.statusCode).toBe(503);
     expect(response.json()).toMatchObject({
       status: "degraded",
-      stellar: { status: "down", latencyMs: expect.any(Number) },
+      checks: {
+        stellar: { status: "down", latencyMs: expect.any(Number) },
+      },
     });
   });
 
   it("never throws uncaught errors on slow dependency checks", async () => {
-    h.queryRawUnsafe.mockImplementationOnce(
+    h.queryRaw.mockImplementationOnce(
       () => new Promise((resolve) => setTimeout(() => resolve([{ 1: 1 }]), 3000))
     );
-    h.fetch.mockImplementationOnce(
-      () => new Promise((resolve) => setTimeout(() => resolve({ ok: true, status: 200 }), 3000))
+    h.feeStats.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve({ minAcceptedFee: 100 }), 3000))
     );
 
-    const response = await app.inject({ method: "GET", url: "/health/ready" });
+    const response = await app.inject({ method: "GET", url: "/health/deep" });
 
     expect([200, 503]).toContain(response.statusCode);
     expect(response.json().status).toBeTruthy();

@@ -33,6 +33,7 @@ import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
 import { stellarErrorSerializer } from "./lib/stellar-serializer";
+import { reqSerializer, resSerializer } from "./lib/serializers";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
@@ -85,6 +86,8 @@ export async function buildApp(): Promise<FastifyInstance> {
           level: config.LOG_LEVEL,
           serializers: {
             err: stellarErrorSerializer as any,
+            req: reqSerializer as any,
+            res: resSerializer as any,
           },
           redact: {
             paths: [

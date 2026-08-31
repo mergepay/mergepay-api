@@ -1,15 +1,20 @@
 /**
  * Shared Pino logger factory.
  *
- * Every logger created through this module includes a custom serializer for
- * Stellar SDK error objects, so Horizon errors are consistently represented
- * across the API server (Fastify) and background workers.
+ * Every logger created through this module includes custom serializers for:
+ *  - Stellar SDK error objects (`err`) — so Horizon errors are consistently
+ *    represented across the API server and background workers.
+ *  - Request objects (`req`) — sensitive headers (Authorization, Cookie) are
+ *    redacted while method, URL, query, and telemetry headers are preserved.
+ *  - Response objects (`res`) — the `set-cookie` header is redacted while
+ *    statusCode and non-sensitive headers are preserved.
  *
  * Workers and services that create their own `pino()` instances directly
- * should migrate to this factory to get the serializer automatically.
+ * should migrate to this factory to get the serializers automatically.
  */
 import pino from "pino";
 import { stellarErrorSerializer } from "./stellar-serializer";
+import { reqSerializer, resSerializer } from "./serializers";
 
 /** Options accepted by the logger factory. */
 export interface LoggerOptions {
@@ -22,11 +27,15 @@ export interface LoggerOptions {
 }
 
 /**
- * Create a Pino logger with the Stellar error serializer registered.
+ * Create a Pino logger with custom serializers for Stellar errors, request
+ * headers, and response headers.
  *
- * The serializer is attached under `serializers.err` so that any `err` field
- * passed to `.error()` / `.warn()` is automatically transformed — callers
- * do not need to do anything special.
+ * The `err` serializer is attached under `serializers.err` so that any `err`
+ * field passed to `.error()` / `.warn()` is automatically transformed.
+ *
+ * The `req` and `res` serializers redact sensitive headers (Authorization,
+ * Cookie, Set-Cookie) while preserving method, URL, query, request IDs, and
+ * standard telemetry fields.
  */
 export function createLogger(options: LoggerOptions): pino.Logger {
   return pino({
@@ -34,6 +43,8 @@ export function createLogger(options: LoggerOptions): pino.Logger {
     level: options.level,
     serializers: {
       err: stellarErrorSerializer,
+      req: reqSerializer,
+      res: resSerializer,
     },
     ...options.opts,
   });

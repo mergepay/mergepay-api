@@ -14,6 +14,9 @@
  * Prisma client), never from anything the caller sends.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { Keypair } from "@stellar/stellar-sdk";
+
+const VALID_PUBLIC_KEY = Keypair.random().publicKey();
 
 const h = vi.hoisted(() => {
   const model = () => ({
@@ -75,12 +78,10 @@ const adminId = "admin_1";
 const memberId = "member_1";
 const strangerId = "stranger_1";
 
-const VALID_PUBLIC_KEY = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
 function authHeader(userId: string) {
   const token = signToken({
     id: userId,
-    stellarPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    stellarPublicKey: VALID_PUBLIC_KEY,
   });
   return { authorization: `Bearer ${token}` };
 }

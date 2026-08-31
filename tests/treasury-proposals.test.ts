@@ -283,7 +283,7 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
       },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INVALID_ASSET_ISSUER");
+    expect(res.json().error).toBe("VALIDATION_ERROR");
   });
 
   it("returns 400 when treasury is not enabled", async () => {

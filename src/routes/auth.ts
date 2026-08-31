@@ -15,6 +15,7 @@ import {
   unauthorizedForRefresh,
 } from "../services/refresh-token";
 import { rateLimited } from "../lib/rate-limit";
+import { sep10VerifyRequestSchema } from "../validations/sep10";
 
 function shortName(pk: string): string {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
@@ -45,7 +46,7 @@ export default async function authRoutes(app: FastifyInstance) {
     "/auth/verify",
     verifyLimit,
     async (req) => {
-      const body = z.object({ transaction: z.string() }).parse(req.body);
+      const body = sep10VerifyRequestSchema.parse(req.body);
       const publicKey = await verifyChallenge(body.transaction);
 
       const user = await prisma.user.upsert({

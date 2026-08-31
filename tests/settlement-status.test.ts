@@ -385,18 +385,49 @@ describe("GET /settlements/:id/status — each public state", () => {
     expect(body.onChain.successful).toBe(false);
   });
 
-  it("failed: a persisted failure surfaces its scrubbed reason", async () => {
+  it("failed: a persisted failure surfaces its scrubbed reason and category", async () => {
     const body = await statusFor({
       status: "failed",
       stellarTxHash: null,
       failureReason: "Stellar rejected the transaction: tx_insufficient_balance",
+      failureCategory: "ledger_rejected",
     });
 
     expect(body.status).toBe("failed");
     expect(body.terminal).toBe(true);
     expect(body.failure).toEqual({
+      category: "ledger_rejected",
       reason: "Stellar rejected the transaction: tx_insufficient_balance",
     });
+  });
+
+  it("failed: a row predating the category column still answers usefully", async () => {
+    const body = await statusFor({
+      status: "failed",
+      stellarTxHash: null,
+      failureReason: "Stellar rejected the transaction: tx_insufficient_balance",
+      failureCategory: null,
+    });
+
+    expect(body.failure).toEqual({
+      category: "internal",
+      reason: "Stellar rejected the transaction: tx_insufficient_balance",
+    });
+  });
+
+  it("withholds a retry reason from a settlement that has not failed", async () => {
+    // The worker records each attempt's reason before deciding to retry.
+    // Reporting it on an in-flight settlement would call a live payment broken.
+    h.getTransaction.mockResolvedValue(null);
+    const body = await statusFor({
+      status: "submitted",
+      stellarTxHash: "hash_pending",
+      failureReason: "attempt 1 timed out",
+      failureCategory: "upstream",
+    });
+
+    expect(body.status).toBe("submitted");
+    expect(body.failure).toBeNull();
   });
 
   it("expired: the signing window closed before submission", async () => {

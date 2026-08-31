@@ -41,7 +41,6 @@ describe("createExpenseSchema", () => {
     const result = createExpenseSchema.safeParse({
       ...validBase,
       description: "Team dinner",
-      assetIssuer: "GAAAA...",
       payerUserId: "user_1",
       memo: "abc123",
       receiptUrl: "https://example.com/receipt.jpg",
@@ -108,6 +107,15 @@ describe("createExpenseSchema", () => {
         ...validBase,
         splitType: "custom",
         shares: [{ userId: "user_1", amount: "" }, { userId: "user_2", amount: "40" }],
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects amounts with more than seven decimal places", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        splitType: "custom",
+        shares: [{ userId: "a", amount: "10.00000001" }],
       });
       expect(result.success).toBe(false);
     });

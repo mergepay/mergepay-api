@@ -36,6 +36,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { fetchWithTimeout } from "./timeout";
 import { anchorCircuit } from "./anchor-circuit";
+import { logRetryAttempt, upstreamCauseOf, withRetry } from "./retry";
 
 export interface AnchorToml {
   homeDomain: string;
@@ -132,10 +133,86 @@ const sep24TransactionResponseSchema = z.object({
   }),
 });
 
+// ─── Retry policy for anchor reads ──────────────────────────
+
+/**
+ * Structured sink for retry telemetry. Anchor calls run from routes and from
+ * the reconciliation worker alike, so there is no request logger to borrow;
+ * attempt metadata goes to the console with the operation and attempt number
+ * and nothing from the anchor's response body.
+ */
+const retryLog = {
+  warn(entry: object, message: string): void {
+    console.warn(`[anchor] ${message}`, JSON.stringify(entry));
+  },
+};
+
+/**
+ * A non-OK anchor response, raised so the retry policy can classify it by
+ * status. `fetch` resolves for 4xx and 5xx alike, so without this the policy
+ * would see a successful attempt and a 503 would never be retried.
+ *
+ * The status is all that crosses this boundary — the anchor's body is not
+ * attached, since it reaches the client only as a stable UPSTREAM_ERROR.
+ */
+class AnchorHttpError extends Error {
+  readonly status: number;
+  /**
+   * `withTimeout` passes an error through untouched only when it carries both
+   * `statusCode` and `code` — its test for an intentional application error.
+   * Without them this would be rewrapped as a `TransportError` and a 4xx would
+   * be retried as though the connection had failed.
+   */
+  readonly statusCode: number;
+  readonly code = "UPSTREAM_ERROR";
+
+  constructor(operation: string, status: number) {
+    super(`Anchor "${operation}" responded with HTTP ${status}`);
+    this.name = "AnchorHttpError";
+    this.status = status;
+    this.statusCode = status;
+  }
+}
+
+/**
+ * Fetch an anchor **read** endpoint with a per-attempt timeout and bounded
+ * retries. 5xx and transport failures are repeated with backoff; 4xx — 429
+ * included — surface immediately. See `src/services/retry.ts` for the rules
+ * governing which calls may use this and which must not.
+ */
+async function fetchReadWithRetry(
+  url: string,
+  operation: string,
+  timeoutMs: number,
+  init?: RequestInit
+): Promise<Response> {
+  return withRetry(
+    {
+      operation,
+      timeoutMs,
+      onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
+    },
+    async (signal) => {
+      const response = await fetch(url, { ...init, signal });
+      // Surface the status as a throw so retry classification can see it; the
+      // caller still gets the Response back when the attempt succeeds.
+      if (!response.ok) throw new AnchorHttpError(operation, response.status);
+      return response;
+    }
+  );
+}
+
 // ─── Service implementation ─────────────────────────────────────────────────
 
 export const anchorService = {
-  /** Fetch & parse the anchor's stellar.toml (cached 5 min). */
+  /**
+   * Fetch & parse the anchor's stellar.toml (cached 5 min).
+   *
+   * A read, so transient failures are retried before the circuit breaker sees
+   * a failure: one dropped connection to an otherwise healthy anchor should
+   * not count toward opening the circuit. Only an exhausted attempt budget —
+   * or a permanent 4xx — records a failure against the provider.
+   */
   async getToml(homeDomain: string): Promise<AnchorToml> {
     const cached = tomlCache.get(homeDomain);
     if (cached && Date.now() - cached.at < TOML_TTL) return cached.value;
@@ -148,14 +225,10 @@ export const anchorService = {
     const url = `https://${homeDomain}/.well-known/stellar.toml`;
     let res: Response;
     try {
-      res = await fetchWithTimeout(url, "Anchor.getToml", config.ANCHOR_TOML_TIMEOUT_MS);
+      res = await fetchReadWithRetry(url, "Anchor.getToml", config.ANCHOR_TOML_TIMEOUT_MS);
     } catch (err) {
       anchorCircuit.recordFailure(provider);
       throw err;
-    }
-    if (!res.ok) {
-      anchorCircuit.recordFailure(provider);
-      throw Errors.upstream(`Could not load stellar.toml for ${homeDomain}`);
     }
     let parsed: any;
     try {
@@ -198,14 +271,22 @@ export const anchorService = {
     return this.getToml(config.ANCHOR_HOME_DOMAIN);
   },
 
-  /** Step 1: get a SEP-10 challenge from the anchor for the user account. */
+  /**
+   * Step 1: get a SEP-10 challenge from the anchor for the user account.
+   *
+   * A read: the challenge is issued fresh per request and an abandoned one
+   * simply expires unused, so repeating the call creates no lasting state.
+   */
   async getChallenge(
     webAuthEndpoint: string,
     account: string
   ): Promise<{ transaction: string; networkPassphrase: string }> {
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
-    const res = await fetchWithTimeout(url, "Anchor.getChallenge", config.ANCHOR_CHALLENGE_TIMEOUT_MS);
-    if (!res.ok) throw Errors.upstream("Anchor SEP-10 challenge request failed");
+    const res = await fetchReadWithRetry(
+      url,
+      "Anchor.getChallenge",
+      config.ANCHOR_CHALLENGE_TIMEOUT_MS
+    );
     const data = parseJson(challengeResponseSchema, await res.json());
     return {
       transaction: data.transaction,
@@ -213,7 +294,14 @@ export const anchorService = {
     };
   },
 
-  /** Step 2: exchange the signed challenge for an anchor JWT. */
+  /**
+   * Step 2: exchange the signed challenge for an anchor JWT.
+   *
+   * Deliberately a single attempt. The challenge is single-use: an anchor that
+   * consumed it and lost the response will reject the repeat as a replay, so a
+   * retry turns a recoverable timeout into a hard authentication failure. The
+   * caller restarts from `getChallenge` instead.
+   */
   async getToken(webAuthEndpoint: string, signedXdr: string): Promise<string> {
     const res = await fetchWithTimeout(
       webAuthEndpoint,
@@ -229,7 +317,13 @@ export const anchorService = {
     return parseJson(tokenResponseSchema, await res.json()).token;
   },
 
-  /** Start a SEP-24 interactive deposit or withdrawal flow. */
+  /**
+   * Start a SEP-24 interactive deposit or withdrawal flow.
+   *
+   * Deliberately a single attempt. This creates a transaction record on the
+   * anchor side; repeating it after a lost response leaves the user with two
+   * open anchor sessions for one intent, only one of which we track.
+   */
   async startInteractive(params: {
     transferServer: string;
     token: string;
@@ -264,6 +358,11 @@ export const anchorService = {
    *
    * Returns a raw status string or null if the anchor responded with a
    * non-OK status or the transaction was not found.
+   *
+   * A read, so transient failures are retried within the call. The circuit
+   * breaker only records a failure once the attempt budget is exhausted —
+   * counting each individual attempt would open the circuit after a single
+   * bad poll rather than after a genuinely unhealthy anchor.
    */
   async getTransactionStatus(params: {
     transferServer: string;
@@ -280,16 +379,14 @@ export const anchorService = {
     )}`;
     let res: Response;
     try {
-      res = await fetchWithTimeout(url, "Anchor.getTransactionStatus", config.ANCHOR_POLL_TIMEOUT_MS, {
-        headers: { Authorization: `Bearer ${params.token}` },
-      });
+      res = await fetchReadWithRetry(
+        url,
+        "Anchor.getTransactionStatus",
+        config.ANCHOR_POLL_TIMEOUT_MS,
+        { headers: { Authorization: `Bearer ${params.token}` } }
+      );
       anchorCircuit.recordSuccess(provider);
     } catch {
-      anchorCircuit.recordFailure(provider);
-      return null;
-    }
-
-    if (!res.ok) {
       anchorCircuit.recordFailure(provider);
       return null;
     }
@@ -310,6 +407,12 @@ export const anchorService = {
    * This is the primary method the worker should call. It wraps
    * getTransactionStatus with a timeout, parses the full transaction
    * response, and returns a normalised PollResult.
+   *
+   * A read, so transient failures are retried inside the call before a
+   * `PollResult` with `isError` is returned. The worker's own retry schedule
+   * therefore governs genuinely unavailable anchors rather than momentary
+   * blips, and the circuit breaker counts one failure per exhausted budget
+   * rather than one per attempt.
    */
   async pollTransaction(params: {
     transferServer: string;
@@ -332,27 +435,24 @@ export const anchorService = {
 
     let response: Response;
     try {
-      response = await fetchWithTimeout(url, "Anchor.pollTransaction", timeoutMs, {
+      response = await fetchReadWithRetry(url, "Anchor.pollTransaction", timeoutMs, {
         headers: { Authorization: `Bearer ${params.token}` },
       });
       anchorCircuit.recordSuccess(provider);
     } catch (err: unknown) {
       anchorCircuit.recordFailure(provider);
-      const message = err instanceof Error ? err.message : String(err);
+      // The retry wrapper maps every failure to a stable upstream error, so the
+      // anchor's HTTP status is read back off the preserved cause to keep the
+      // previous poll-result message intact.
+      const cause = upstreamCauseOf(err);
+      const message =
+        cause instanceof AnchorHttpError
+          ? `Anchor returned HTTP ${cause.status}`
+          : `Anchor poll failed: ${err instanceof Error ? err.message : String(err)}`;
       return {
         rawStatus: null,
         status: "pending_anchor",
-        message: `Anchor poll failed: ${message}`,
-        isError: true,
-      };
-    }
-
-    if (!response.ok) {
-      anchorCircuit.recordFailure(provider);
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: `Anchor returned HTTP ${response.status}`,
+        message,
         isError: true,
       };
     }

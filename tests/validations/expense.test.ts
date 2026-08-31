@@ -48,11 +48,12 @@ describe("createExpenseSchema", () => {
     expect(result.success).toBe(true);
   });
 
-  it("rejects missing title", () => {
+  it("rejects missing title with a descriptive message", () => {
     const result = createExpenseSchema.safeParse({ ...validBase, title: "" });
     expect(result.success).toBe(false);
     if (!result.success) {
-      expect(result.error.errors.some((e) => e.path.includes("title"))).toBe(true);
+      const issue = result.error.errors.find((e) => e.path.includes("title"));
+      expect(issue?.message).toContain("at least 1 character");
     }
   });
 
@@ -87,6 +88,74 @@ describe("createExpenseSchema", () => {
       shares: [{ userId: "" }],
     });
     expect(result.success).toBe(false);
+  });
+
+  it("rejects an invalid splitType", () => {
+    const result = createExpenseSchema.safeParse({ ...validBase, splitType: "evenly" });
+    expect(result.success).toBe(false);
+  });
+
+  describe("amount validation", () => {
+    it("rejects a zero amount with a descriptive message", () => {
+      const result = createExpenseSchema.safeParse({ ...validBase, amount: "0" });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.errors.find((e) => e.path.includes("amount"));
+        expect(issue?.message).toContain("greater than zero");
+      }
+    });
+
+    it("rejects an amount with more than seven decimal places", () => {
+      const result = createExpenseSchema.safeParse({ ...validBase, amount: "10.00000001" });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.errors.find((e) => e.path.includes("amount"));
+        expect(issue?.message).toContain("7-decimal precision");
+      }
+    });
+
+    it("rejects an amount in exponent notation", () => {
+      const result = createExpenseSchema.safeParse({ ...validBase, amount: "1e3" });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe("asset validation", () => {
+    it("rejects an unsupported asset code with a descriptive message", () => {
+      const result = createExpenseSchema.safeParse({ ...validBase, assetCode: "BADCOIN" });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.errors.find((e) => e.path.includes("assetCode"));
+        expect(issue?.message).toContain("Unsupported asset code");
+      }
+    });
+
+    it("rejects XLM with an issuer", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        assetCode: "XLM",
+        assetIssuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.errors.find((e) => e.path.includes("assetIssuer"));
+        expect(issue?.message).toContain("native asset");
+      }
+    });
+
+    it("accepts USDC without an issuer (uses the configured issuer)", () => {
+      const result = createExpenseSchema.safeParse({ ...validBase, assetCode: "USDC" });
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts USDC with the configured issuer", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        assetCode: "USDC",
+        assetIssuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      });
+      expect(result.success).toBe(true);
+    });
   });
 
   describe("custom split validation", () => {

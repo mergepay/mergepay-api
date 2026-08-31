@@ -35,6 +35,10 @@ vi.mock("../src/db", () => ({
     anchorSession: h.anchorSession,
     groupInvite: h.groupInvite,
     $executeRaw: vi.fn(async () => 1),
+    $transaction: vi.fn(async (arg: any) =>
+      typeof arg === "function" ? arg({ settlement: h.settlement, anchorSession: h.anchorSession }) : Promise.all(arg)
+    ),
+    $disconnect: vi.fn(async () => {}),
   },
 }));
 

@@ -154,7 +154,39 @@ export async function buildApp(): Promise<FastifyInstance> {
     );
   });
 
-  await app.register(helmet, { contentSecurityPolicy: false });
+  // Security headers via @fastify/helmet. CSP is left permissive for a JSON API:
+  // there is no rendered HTML, so we only lock down the vectors that matter for
+  // an API backend (frame embedding, MIME sniffing, referrer leakage) and let
+  // the SPA on Vercel own its own CSP for its own documents. `frameguard` denies
+  // embedding entirely — the API is never loaded in an <iframe>. `contentSecurityPolicy`
+  // is enabled with a baseline `default-src 'none'` so any accidental inline
+  // content is inert, without breaking JSON clients that only read headers/body.
+  const cspDirectives: Record<string, string[]> = {
+    defaultSrc: ["'none'"],
+    frameAncestors: ["'none'"],
+  };
+  await app.register(helmet, {
+    contentSecurityPolicy: {
+      directives: cspDirectives,
+    },
+    frameguard: { action: "deny" },
+    // Disabled on purpose: `require-corp` (helmet's default) would force the
+    // SPA's fetch() clients to negotiate CORP headers and break API calls.
+    crossOriginEmbedderPolicy: false,
+    // API responses are always JSON; never let a browser MIME-sniff them.
+    noSniff: true,
+    // Don't leak the full URL in the Referer header to third parties.
+    referrerPolicy: { policy: "no-referrer" },
+    // Block the page from being used as a cross-origin opener.
+    crossOriginOpenerPolicy: { policy: "same-origin" },
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    // Harden the connection by opting into HTTPS upgrades where supported.
+    hsts: {
+      maxAge: 60 * 60 * 24 * 365,
+      includeSubDomains: true,
+      preload: true,
+    },
+  });
   const allowAll = config.WEB_URL === "*";
   const allowed = config.WEB_URL
     .split(",")

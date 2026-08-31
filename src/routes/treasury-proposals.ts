@@ -16,7 +16,6 @@
 
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { mpMemoSchema, stellarAccountIdSchema } from "../lib/stellar-validation";
 import { rateLimited } from "../lib/rate-limit";
@@ -45,7 +44,7 @@ const createBodySchema = z.object({
   destination: stellarAccountIdSchema,
   amount: z.string().min(1),
   assetCode: z.string().min(1),
-  assetIssuer: z.string().nullable().optional(),
+  assetIssuer: stellarAccountIdSchema.nullable().optional(),
   memo: mpMemoSchema.optional(),
 });
 
@@ -65,14 +64,6 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
 
     if (!isPositive(body.amount)) {
       throw Errors.badRequest("invalid_amount", "Amount must be positive");
-    }
-
-    // Validate asset issuer separately so we can return the specific
-    // INVALID_ASSET_ISSUER code (not a generic VALIDATION_ERROR).
-    if (body.assetIssuer) {
-      if (!StrKey.isValidEd25519PublicKey(body.assetIssuer)) {
-        throw Errors.badRequest("INVALID_ASSET_ISSUER", `"${body.assetIssuer}" is not a valid Stellar public key`);
-      }
     }
 
     const group = await prisma.group.findUnique({ where: { id: groupId } });

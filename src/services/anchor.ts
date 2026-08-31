@@ -509,10 +509,18 @@ export const anchorService = {
     const parseResult = sep24TransactionResponseSchema.safeParse(json);
     if (!parseResult.success) {
       anchorCircuit.recordFailure(provider);
+      const issues = parseResult.error.issues;
+      const hasMissingTx = issues.some((i) => i.path.length === 0 || i.path[0] === "transaction");
+      const hasMissingStatus = issues.some((i) => i.path.join(".") === "transaction.status");
+      const detail = hasMissingStatus
+        ? "missing transaction status"
+        : hasMissingTx
+          ? "missing 'transaction'"
+          : "invalid fields";
       return {
         rawStatus: null,
         status: "pending_anchor",
-        message: "Anchor returned invalid or malformed transaction response schema",
+        message: `Anchor returned invalid or malformed response: ${detail}`,
         isError: true,
         errorCategory: "permanent",
       };
@@ -647,7 +655,7 @@ export function mapAnchorStatus(raw: string): string {
     case "no_market":
     case "too_small":
     case "too_large":
-      return "error";
+      return normalized;
 
     case "refunded":
       return "refunded";
@@ -664,7 +672,7 @@ export function mapAnchorStatus(raw: string): string {
     case "pending_stellar":
     case "pending_trust":
     case "pending_anchor":
-      return "pending_anchor";
+      return normalized;
 
     // ── Initial ──
     case "incomplete":

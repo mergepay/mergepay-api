@@ -87,12 +87,12 @@ describe("SEP-24 Status Mapping Consistency", () => {
     // Terminal success
     expect(mapAnchorStatus("completed")).toBe("completed");
 
-    // Terminal failure maps to error
+    // Terminal failure statuses map to themselves
     expect(mapAnchorStatus("error")).toBe("error");
-    expect(mapAnchorStatus("expired")).toBe("error");
-    expect(mapAnchorStatus("no_market")).toBe("error");
-    expect(mapAnchorStatus("too_small")).toBe("error");
-    expect(mapAnchorStatus("too_large")).toBe("error");
+    expect(mapAnchorStatus("expired")).toBe("expired");
+    expect(mapAnchorStatus("no_market")).toBe("no_market");
+    expect(mapAnchorStatus("too_small")).toBe("too_small");
+    expect(mapAnchorStatus("too_large")).toBe("too_large");
 
     // Refunded maps to refunded
     expect(mapAnchorStatus("refunded")).toBe("refunded");
@@ -100,13 +100,13 @@ describe("SEP-24 Status Mapping Consistency", () => {
     // User transfer start maps to pending_user_transfer_start
     expect(mapAnchorStatus("pending_user_transfer_start")).toBe("pending_user_transfer_start");
 
-    // Other intermediate states map to pending_anchor
-    expect(mapAnchorStatus("pending_user")).toBe("pending_anchor");
-    expect(mapAnchorStatus("pending_transaction_info_update")).toBe("pending_anchor");
-    expect(mapAnchorStatus("pending_receiver")).toBe("pending_anchor");
-    expect(mapAnchorStatus("pending_sender")).toBe("pending_anchor");
-    expect(mapAnchorStatus("pending_stellar")).toBe("pending_anchor");
-    expect(mapAnchorStatus("pending_trust")).toBe("pending_anchor");
+    // Other intermediate states map to themselves
+    expect(mapAnchorStatus("pending_user")).toBe("pending_user");
+    expect(mapAnchorStatus("pending_transaction_info_update")).toBe("pending_transaction_info_update");
+    expect(mapAnchorStatus("pending_receiver")).toBe("pending_receiver");
+    expect(mapAnchorStatus("pending_sender")).toBe("pending_sender");
+    expect(mapAnchorStatus("pending_stellar")).toBe("pending_stellar");
+    expect(mapAnchorStatus("pending_trust")).toBe("pending_trust");
     expect(mapAnchorStatus("pending_anchor")).toBe("pending_anchor");
 
     // Initial state maps to incomplete

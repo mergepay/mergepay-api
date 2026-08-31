@@ -6,7 +6,7 @@ import { Errors } from "../errors";
 import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
-import { audit } from "../services/audit";
+import { audit, auditTx } from "../services/audit";
 import {
   RefreshTokenError,
   issueRefreshToken,

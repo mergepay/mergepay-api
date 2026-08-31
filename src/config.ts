@@ -269,7 +269,7 @@ const schema = z.object({
   }
 );
 
-function safeErrorMessage(error: unknown): string {
+export function safeErrorMessage(error: unknown): string {
   if (error instanceof z.ZodError) {
     const issues = error.issues.map((issue) => {
       const path = issue.path.length > 0 ? issue.path.join(".") : "configuration";
@@ -284,6 +284,8 @@ function safeErrorMessage(error: unknown): string {
 }
 
 export type Env = z.infer<typeof schema>;
+
+export const envSchema = schema;
 
 let parsed: Env;
 try {

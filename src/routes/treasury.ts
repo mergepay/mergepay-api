@@ -488,6 +488,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           });
           await auditTx(tx, {
             userId: auth.id,
+            groupId: fresh.groupId,
             action: AuditAction.TREASURY_CONFIRM_FAILED,
             entityType: "treasury_transaction",
             entityId: id,
@@ -508,6 +509,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         });
         await auditTx(tx, {
           userId: auth.id,
+          groupId: fresh.groupId,
           action: AuditAction.TREASURY_CONFIRM,
           entityType: "treasury_transaction",
           entityId: id,

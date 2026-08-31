@@ -111,7 +111,18 @@ function parseXdr(xdr: string, malformedMessage: string): Transaction {
 }
 
 export const treasurySignaturesService = {
-  /** Store a new signature-collection proposal from a caller-supplied unsigned XDR. */
+  /**
+   * Store a new signature-collection proposal from a caller-supplied unsigned XDR.
+   *
+   * @param params - `{ groupId, creatorId, xdr }`. `xdr` is a base64 unsigned
+   *   Stellar transaction envelope, built externally, whose source account must be
+   *   the group's configured treasury account.
+   * @returns The created `TreasuryTxProposal` row and the `networkPassphrase` the
+   *   envelope was parsed against.
+   * @throws {AppError} `treasury_disabled` / `treasury_unfunded` if the group
+   *   treasury is off or unfunded; `bad_request` for a malformed, fee-bump, signed,
+   *   or source-mismatched XDR.
+   */
   async createProposal(params: CreateTxProposalParams) {
     const group = await prisma.group.findUnique({ where: { id: params.groupId } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
@@ -179,6 +190,18 @@ export const treasurySignaturesService = {
    * Verify every new signature on a submitted envelope, persist it, and
    * submit to Horizon once the summed admin signer weight meets the source
    * account's live threshold.
+   *
+   * @param args - `{ proposalId, groupId, userId, signedXdr }`. `signedXdr` is the
+   *   envelope carrying one or more new signatures over the proposal's stored
+   *   transaction.
+   * @returns `{ status, totalWeight, requiredWeight, stellarTxHash }` reflecting the
+   *   proposal's state after the call — `PENDING_SIGNATURES`, `READY` (registered
+   *   but not yet submitted), `SUBMITTED` (with a non-null `stellarTxHash`), or
+   *   `FAILED`.
+   * @throws {AppError} `not_found` / `conflict` for unknown or terminal proposals,
+   *   `bad_request` for an envelope containing a non-admin/unauthorized signer or a
+   *   signature that fails verification, and `upstream` when Stellar rejects the
+   *   merged transaction.
    */
   async submitSignature(
     args: SubmitSignatureParams

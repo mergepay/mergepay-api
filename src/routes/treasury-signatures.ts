@@ -26,6 +26,8 @@ import { rateLimited } from "../lib/rate-limit";
 import { requireAdmin, requireMembership } from "../services/access";
 import { treasurySignaturesService } from "../services/treasury-signatures";
 import { serializeTreasuryTxProposal } from "../serializers";
+import { audit } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 
 const createBodySchema = z.object({
   groupId: z.string().min(1),
@@ -93,16 +95,49 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
       if (!existing) throw Errors.notFound("Treasury proposal not found");
       await requireAdmin(existing.groupId, auth.id);
 
-      const result = await treasurySignaturesService.submitSignature({
-        proposalId: id,
-        groupId: existing.groupId,
-        userId: auth.id,
-        signedXdr: body.signedXdr,
-      });
+      let result;
+      try {
+        result = await treasurySignaturesService.submitSignature({
+          proposalId: id,
+          groupId: existing.groupId,
+          userId: auth.id,
+          signedXdr: body.signedXdr,
+        });
+      } catch (e: any) {
+        await audit({
+          userId: auth.id,
+          groupId: existing.groupId,
+          action: AuditAction.TREASURY_TX_PROPOSAL_FAILED,
+          entityType: "treasury_tx_proposal",
+          entityId: id,
+          outcome: "failure",
+          metadata: {
+            reason: e instanceof Error ? e.message : String(e),
+          },
+        });
+        throw e;
+      }
 
       const proposal = await prisma.treasuryTxProposal.findUnique({
         where: { id },
         include: { signatures: true },
+      });
+
+      await audit({
+        userId: auth.id,
+        groupId: existing.groupId,
+        action:
+          result.status === "SUBMITTED"
+            ? AuditAction.TREASURY_TX_PROPOSAL_SUBMITTED
+            : AuditAction.TREASURY_TX_PROPOSAL_SIGNATURE_ADDED,
+        entityType: "treasury_tx_proposal",
+        entityId: id,
+        metadata: {
+          status: result.status,
+          totalWeight: result.totalWeight,
+          requiredWeight: result.requiredWeight,
+          stellarTxHash: result.stellarTxHash,
+        },
       });
 
       return {

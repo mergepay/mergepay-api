@@ -92,12 +92,15 @@ describe("reconcileAnchors", () => {
     prisma.anchorSession.findUnique.mockResolvedValue(session);
     h.pollTransaction.mockResolvedValue(pollResult("completed"));
     prisma.anchorSession.update.mockResolvedValue({ ...session, status: "completed" });
+    prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
 
     await reconcileAnchors();
 
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+    // Status advancement is now a conditional updateMany guarded on the status
+    // the worker observed, so stale pollers can never regress a terminal state.
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "session_1" },
+        where: { id: "session_1", status: "pending_anchor" },
         data: expect.objectContaining({ status: "completed" }),
       })
     );
@@ -135,11 +138,12 @@ describe("reconcileAnchors", () => {
       .mockRejectedValueOnce(new Error("network blip"))
       .mockResolvedValueOnce(pollResult("completed"));
     prisma.anchorSession.update.mockResolvedValue({ ...sessionB, status: "completed" });
+    prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
 
     await expect(reconcileAnchors()).resolves.not.toThrow();
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "session_b" },
+        where: { id: "session_b", status: "pending_anchor" },
         data: expect.objectContaining({ status: "completed" }),
       })
     );

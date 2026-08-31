@@ -171,9 +171,11 @@ describe("reconcileAnchors", () => {
 
     await reconcileAnchors();
 
-    expect(h.prisma.anchorSession.update).toHaveBeenCalledWith(
+    // Status advancement uses a conditional updateMany guarded on the status
+    // this worker observed, so a stale writer can never land a regression.
+    expect(h.prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "as_1" },
+        where: { id: "as_1", status: "pending_anchor" },
         data: expect.objectContaining({
           status: "completed",
           lastPolledAt: expect.any(Date),

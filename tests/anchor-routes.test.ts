@@ -213,3 +213,46 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
     expect(prisma.anchorSession.update).not.toHaveBeenCalled();
   });
 });
+
+describe("GET /anchors/sessions/:id", () => {
+  it("returns 200 and the serialized session for the owner", async () => {
+    prisma.anchorSession.findUnique.mockResolvedValue(
+      fakeSession({ id: "session_1", userId: "user_1" })
+    );
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/anchors/sessions/session_1",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().session.id).toBe("session_1");
+  });
+
+  it("returns 404 if the session does not exist", async () => {
+    prisma.anchorSession.findUnique.mockResolvedValue(null);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/anchors/sessions/missing_session",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 404 if the session belongs to another user", async () => {
+    prisma.anchorSession.findUnique.mockResolvedValue(
+      fakeSession({ id: "session_1", userId: "someone_else" })
+    );
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/anchors/sessions/session_1",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+});

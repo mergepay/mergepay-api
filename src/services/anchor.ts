@@ -32,10 +32,14 @@
 
 import toml from "toml";
 import { z } from "zod";
+import pino from "pino";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { fetchWithTimeout } from "./timeout";
 import { anchorCircuit } from "./anchor-circuit";
+import { classifyJobFailure, safeFailureMessage } from "./job-retry";
+
+const log = pino({ name: "anchor-service" });
 
 export interface AnchorToml {
   homeDomain: string;
@@ -89,6 +93,14 @@ export interface PollResult {
   message: string;
   /** True if the poll encountered an error (timeout, network, malformed). */
   isError: boolean;
+  /** Classification of the failure if isError is true. */
+  errorCategory?: "transient" | "indeterminate" | "permanent";
+  /**
+   * Whether the raw status was recognized as a known SEP-24 value. Unknown
+   * statuses map to `pending_anchor` but carry `recognized === false` so the
+   * worker can log them explicitly.
+   */
+  recognized?: boolean;
   /** Anchor-provided transaction JSON for debugging (sanitized). */
   transaction?: Record<string, unknown>;
   /** SEP-24 amount_in / amount_out / amount_fee if available. */
@@ -115,22 +127,38 @@ const interactiveResponseSchema = z.object({
   id: z.string(),
 });
 
-const sep24TransactionResponseSchema = z.object({
-  transaction: z.object({
-    status: z.string(),
-    id: z.string().optional(),
-    kind: z.string().optional(),
-    amount_in: z.string().optional(),
-    amount_out: z.string().optional(),
-    amount_fee: z.string().optional(),
-    started_at: z.string().optional(),
-    completed_at: z.string().optional(),
-    stellar_transaction_hash: z.string().optional(),
-    external_transaction_id: z.string().optional(),
-    message: z.string().optional(),
-    refunds: z.any().optional(),
-  }),
-});
+const sep24TransactionResponseSchema = z
+  .object({
+    transaction: z
+      .object({
+        status: z.string().min(1),
+        id: z.string().optional(),
+        kind: z.string().optional(),
+        amount_in: z.union([z.string(), z.number()]).optional(),
+        amount_out: z.union([z.string(), z.number()]).optional(),
+        amount_fee: z.union([z.string(), z.number()]).optional(),
+        started_at: z.string().optional(),
+        completed_at: z.string().optional(),
+        stellar_transaction_hash: z.string().optional(),
+        external_transaction_id: z.string().optional(),
+        message: z.string().optional(),
+        refunds: z.any().optional(),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((data, ctx) => {
+    // A transaction without a usable status is malformed — never accept a
+    // blank/whitespace status that would silently round-trip to pending.
+    const raw = data.transaction.status.trim();
+    if (!raw) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["transaction", "status"],
+        message: "transaction status must be a non-empty string",
+      });
+    }
+  });
 
 // ─── Service implementation ─────────────────────────────────────────────────
 
@@ -325,6 +353,7 @@ export const anchorService = {
         status: "pending_anchor",
         message: "Anchor circuit is open",
         isError: true,
+        errorCategory: "transient",
       };
     }
 
@@ -339,21 +368,25 @@ export const anchorService = {
     } catch (err: unknown) {
       anchorCircuit.recordFailure(provider);
       const message = err instanceof Error ? err.message : String(err);
+      const errorCategory = classifyJobFailure(err);
       return {
         rawStatus: null,
         status: "pending_anchor",
         message: `Anchor poll failed: ${message}`,
         isError: true,
+        errorCategory,
       };
     }
 
     if (!response.ok) {
       anchorCircuit.recordFailure(provider);
+      const isTransient = response.status === 429 || response.status >= 500;
       return {
         rawStatus: null,
         status: "pending_anchor",
         message: `Anchor returned HTTP ${response.status}`,
         isError: true,
+        errorCategory: isTransient ? "transient" : "permanent",
       };
     }
 
@@ -367,29 +400,26 @@ export const anchorService = {
         status: "pending_anchor",
         message: "Anchor returned malformed (non-JSON) response",
         isError: true,
+        errorCategory: "permanent",
       };
     }
 
-    const tx = json.transaction as Record<string, unknown> | undefined;
-    if (!tx) {
+    const parseResult = sep24TransactionResponseSchema.safeParse(json);
+    if (!parseResult.success) {
+      anchorCircuit.recordFailure(provider);
       return {
         rawStatus: null,
         status: "pending_anchor",
-        message: "Anchor response missing 'transaction' field",
+        message: "Anchor returned invalid or malformed transaction response schema",
         isError: true,
+        errorCategory: "permanent",
       };
     }
 
-    const rawStatus =
-      typeof tx.status === "string" ? tx.status : (json.status as string | undefined) ?? null;
-    if (!rawStatus) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor response missing transaction status",
-        isError: true,
-      };
-    }
+    const tx = parseResult.data.transaction;
+    const rawStatus = tx.status;
+    const recognized = isKnownSep24Status(rawStatus);
+    const mappedStatus = mapAnchorStatus(rawStatus);
 
     // Sanitise — only carry forward benign fields for debugging
     const sanitizedTx: Record<string, unknown> = {
@@ -403,17 +433,32 @@ export const anchorService = {
       completed_at: tx.completed_at,
       stellar_transaction_hash: tx.stellar_transaction_hash,
       external_transaction_id: tx.external_transaction_id,
-      message: tx.message,
+      message: typeof tx.message === "string" ? safeFailureMessage(tx.message) : undefined,
       refunds: tx.refunds,
     };
 
-    const mappedStatus = mapAnchorStatus(rawStatus);
+    let displayMessage = `SEP-24 status: ${rawStatus} → ${mappedStatus}`;
+    if (mappedStatus === "error" && typeof tx.message === "string") {
+      displayMessage = safeFailureMessage(tx.message);
+    }
+
+    if (!recognized) {
+      log.warn(
+        {
+          rawStatus,
+          mappedStatus,
+          externalTransactionId: params.id,
+        },
+        `SEP-24 transaction reported an unknown status: ${rawStatus} — mapping to ${mappedStatus} and will keep polling`
+      );
+    }
 
     return {
       rawStatus,
       status: mappedStatus,
-      message: `SEP-24 status: ${rawStatus} → ${mappedStatus}`,
+      message: displayMessage,
       isError: false,
+      recognized,
       transaction: sanitizedTx,
       amountIn:
         typeof tx.amount_in === "string" || typeof tx.amount_in === "number"
@@ -439,53 +484,83 @@ export const anchorService = {
 // ─── Status mapping ─────────────────────────────────────────────────────────
 
 /**
+ * The exhaustive set of SEP-24 transaction statuses (lowercased) that we
+ * understand and map explicitly. Any status outside this set is treated as
+ * unknown and handled explicitly rather than silently swallowed.
+ *
+ * See: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md#transaction-history
+ */
+export const KNOWN_SEP24_STATUSES: ReadonlySet<string> = new Set([
+  // Initial
+  "incomplete",
+  // Intermediate
+  "pending_user_transfer_start",
+  "pending_stellar",
+  "pending_trust",
+  "pending_user",
+  "pending_anchor",
+  "pending_transaction_info_update",
+  "pending_receiver",
+  "pending_sender",
+  // Terminal
+  "completed",
+  "no_market",
+  "too_small",
+  "too_large",
+  "error",
+  "refunded",
+  "expired",
+]);
+
+/** Whether a raw status string is a recognized SEP-24 value (case-insensitive). */
+export function isKnownSep24Status(raw: string): boolean {
+  if (!raw) return false;
+  return KNOWN_SEP24_STATUSES.has(raw.trim().toLowerCase());
+}
+
+/**
  * Map a raw SEP-24 status string to Mergepay's internal status.
  *
- * Rule: If the upstream returns a status we do not recognise, we map it to
- * "pending_anchor" (a safe intermediate) instead of erroring out, because
- * a future anchor deployment might introduce new intermediate states.
+ * The mapping is exhaustive for every known SEP-24 value and funnels
+ * terminal failures into the repository's single `error` state. If the
+ * upstream returns a status we do not recognise, we map it to
+ * "pending_anchor" (a safe intermediate) instead of erroring out, because a
+ * future anchor deployment might introduce new intermediate states — but the
+ * unknown status is surfaced via `isKnownSep24Status` so callers can log it
+ * explicitly rather than mistaking a foreign terminal state for a pending one.
  *
- * Terminal states (completed, error, refunded, expired, no_market,
- * too_small, too_large) are idempotent — the worker must never overwrite
- * them once set.
+ * Terminal states (completed, error, refunded, expired, no_market, too_small,
+ * too_large) are idempotent — the worker must never overwrite them once set.
  */
 export function mapAnchorStatus(raw: string): string {
-  switch (raw) {
+  const normalized = raw ? raw.trim().toLowerCase() : "";
+  switch (normalized) {
     // ── Terminal (success) ──
     case "completed":
       return "completed";
 
     // ── Terminal (failure) ──
     case "error":
+    case "expired":
+    case "no_market":
+    case "too_small":
+    case "too_large":
       return "error";
+
     case "refunded":
       return "refunded";
-    case "expired":
-      return "expired";
-    case "no_market":
-      return "no_market";
-    case "too_small":
-      return "too_small";
-    case "too_large":
-      return "too_large";
 
     // ── Intermediate (requires user action) ──
     case "pending_user_transfer_start":
       return "pending_user_transfer_start";
-    case "pending_user":
-      return "pending_user";
-    case "pending_transaction_info_update":
-      return "pending_transaction_info_update";
-    case "pending_receiver":
-      return "pending_receiver";
-    case "pending_sender":
-      return "pending_sender";
 
-    // ── Intermediate (anchor / stellar) ──
+    // ── Intermediate (anchor / stellar / user actions) ──
+    case "pending_user":
+    case "pending_transaction_info_update":
+    case "pending_receiver":
+    case "pending_sender":
     case "pending_stellar":
-      return "pending_stellar";
     case "pending_trust":
-      return "pending_trust";
     case "pending_anchor":
       return "pending_anchor";
 
@@ -495,6 +570,10 @@ export function mapAnchorStatus(raw: string): string {
 
     // ── Unknown → safe default ──
     default:
+      log.warn(
+        { rawStatus: raw, mappedStatus: "pending_anchor" },
+        `Unknown SEP-24 status received: ${raw} — mapping to pending_anchor`
+      );
       return "pending_anchor";
   }
 }

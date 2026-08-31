@@ -117,7 +117,11 @@ See [.env.example](.env.example). Key ones:
 | Variable | Description |
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string |
-| `JWT_SECRET` | Secret for signing session JWTs (12h expiry) |
+| `JWT_SECRET` | Secret for signing session JWTs (default 15min expiry, configurable via `ACCESS_TOKEN_TTL_SECONDS`) |
+| `JWT_ISSUER` | JWT issuer claim (default: `mergepay-api`) |
+| `JWT_AUDIENCE` | JWT audience claim (default: `mergepay-app`) |
+| `ACCESS_TOKEN_TTL_SECONDS` | Access token lifetime in seconds (default: 900 / 15 minutes) |
+| `REFRESH_TOKEN_TTL_MS` | Refresh token lifetime in milliseconds (default: 30 days) |
 | `STELLAR_NETWORK` | `testnet` or `public` |
 | `HORIZON_URL` | Horizon server |
 | `SEP10_SIGNING_SECRET` | Server's SEP-10 signing key (`npm run gen:sep10key`) |
@@ -139,6 +143,35 @@ this helper.
 | `HORIZON_READ_RETRY_MAX_ATTEMPTS` | 3 | Total attempts (including the first) for a transiently failing read |
 | `HORIZON_READ_RETRY_INITIAL_DELAY_MS` | 250 | Backoff before the first retry |
 | `HORIZON_READ_RETRY_MAX_DELAY_MS` | 2000 | Cap on the exponential backoff |
+
+#### Upstream retry configuration
+
+General retry configuration for safe Horizon and anchor reads (see `src/services/retry.ts`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `UPSTREAM_RETRY_MAX_ATTEMPTS` | 3 | Total retry attempts for safe upstream calls |
+| `UPSTREAM_RETRY_INITIAL_DELAY_MS` | 200 | Initial delay before first retry |
+| `UPSTREAM_RETRY_MAX_DELAY_MS` | 2000 | Maximum delay cap for exponential backoff |
+| `UPSTREAM_RETRY_JITTER_RATIO` | 0.25 | Fraction of delay applied as random jitter |
+
+#### Idempotency configuration
+
+Idempotency for `POST /api/settlements/execute` prevents duplicate submissions:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `IDEMPOTENCY_TTL_MS` | 86400000 (24h) | How long a completed reservation replays its stored status |
+| `IDEMPOTENCY_IN_PROGRESS_TIMEOUT_MS` | 60000 (1m) | Timeout for in-progress reservations before they can be reclaimed |
+
+#### SEP-24 webhook configuration
+
+Configuration for SEP-24 anchor callbacks (`POST /api/webhooks/sep24`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SEP24_WEBHOOK_SECRETS` | "" | Per-anchor HMAC secrets as "anchorName:secret,anchorName:secret" |
+| `SEP24_WEBHOOK_TOLERANCE_MS` | 300000 (5m) | Maximum timestamp deviation allowed for anchor callbacks |
 
 ### Rate limiting
 

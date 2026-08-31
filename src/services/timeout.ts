@@ -112,6 +112,81 @@ export async function fetchWithTimeout(
   });
 }
 
+// ─── Bounded read retries ───────────────────────────────────────────────────
+
+/**
+ * Bounds for retrying a *read-only* external call that failed transiently.
+ * These knobs deliberately live by themselves so unsafe writes never inherit
+ * them: only operations passed to `retryRead` are retried.
+ */
+export interface ReadRetryPolicy {
+  /** Total attempts including the first. */
+  maxAttempts: number;
+  /** Delay before the first retry. */
+  initialDelayMs: number;
+  /** Cap on the exponential backoff delay. */
+  maxDelayMs: number;
+}
+
+/** Delay (ms) before a given retry attempt, capped and lightly jittered. */
+export function readRetryDelayMs(
+  attempt: number,
+  policy: ReadRetryPolicy,
+  random: () => number = Math.random
+): number {
+  if (!Number.isFinite(attempt) || attempt < 1) return 0;
+  const exponent = Math.max(0, attempt - 1);
+  const base = Math.min(policy.maxDelayMs, policy.initialDelayMs * 2 ** exponent);
+  // ±10% jitter keeps a fleet of processes retrying the same outage from
+  // hammering Horizon in lockstep without changing the bound materially.
+  const jitter = base * 0.1 * (random() * 2 - 1);
+  return Math.max(0, Math.round(base + jitter));
+}
+
+/**
+ * Retry a *read-only* external operation on transient failures.
+ *
+ * Only a network timeout, a transport failure (DNS, connection refused, socket
+ * reset) or an upstream/server error is retried — those are the failures a
+ * retry can plausibly outlive. Validation, authentication, and ordinary 4xx
+ * responses fail immediately on the first attempt.
+ *
+ * `submit` MUST NOT be an operation passed to this helper: a second submission
+ * could create an unintended duplicate. This helper exists for reads.
+ *
+ * After the retry budget is exhausted the last original error is re-thrown
+ * unchanged, so callers still see the same category (TimeoutError,
+ * TransportError, or UPSTREAM_ERROR AppError) they would have without retries.
+ */
+export async function retryRead<T>(
+  operation: string,
+  policy: ReadRetryPolicy,
+  fn: (attempt: number) => Promise<T>,
+  options: {
+    sleep?: (ms: number) => Promise<void>;
+    onRetry?: (info: { operation: string; attempt: number; maxAttempts: number }) => void;
+  } = {}
+): Promise<T> {
+  const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+    try {
+      return await fn(attempt);
+    } catch (error) {
+      lastError = error;
+      const category = classifyExternalError(error);
+      const retryable = category === "timeout" || category === "transport" || category === "upstream";
+      if (!retryable || attempt >= policy.maxAttempts) {
+        throw error;
+      }
+      options.onRetry?.({ operation, attempt, maxAttempts: policy.maxAttempts });
+      await sleep(readRetryDelayMs(attempt, policy));
+    }
+  }
+  throw lastError;
+}
+
 /**
  * Classify an error for retry/response logic.
  * Returns "timeout" for TimeoutError, "transport" for TransportError,

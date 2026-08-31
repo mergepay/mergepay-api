@@ -20,8 +20,8 @@
  *  - `ip` — strictly the client IP, for routes that have no authenticated user
  *    yet (SEP-10) or are authenticated by a shared secret (anchor webhook).
  *
- * A key never contains a Stellar public key, so a 429 can't be used to probe
- * whether a given wallet account is known to the API.
+ * Authenticated buckets use the SEP-10 public key so separate wallets cannot
+ * exhaust one another's sensitive-route budget.
  */
 import { config } from "../config";
 import { ipKey, userOrIpKey } from "../services/rate-limit-keys";
@@ -32,7 +32,9 @@ export type RateLimitPolicyName =
   | "authVerify"
   | "settlementCreate"
   | "settlementConfirm"
+  | "settlementExecute"
   | "treasurySubmit"
+  | "treasuryPropose"
   | "anchorInit"
   | "anchorPoll"
   | "anchorWebhook"
@@ -97,11 +99,28 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       prefix: "settlement.confirm",
       hook: "preHandler",
     },
+    // Its own bucket rather than sharing settlementConfirm's: execution is the
+    // endpoint clients retry after a network timeout, so its budget has to
+    // absorb legitimate retries without spending the confirm budget too.
+    settlementExecute: {
+      max: config.RATE_LIMIT_SETTLEMENT_EXECUTE_MAX,
+      timeWindow: config.RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "settlement.execute",
+      hook: "preHandler",
+    },
     treasurySubmit: {
       max: config.RATE_LIMIT_TREASURY_SUBMIT_MAX,
       timeWindow: config.RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "treasury.submit",
+      hook: "preHandler",
+    },
+    treasuryPropose: {
+      max: config.RATE_LIMIT_TREASURY_PROPOSE_MAX,
+      timeWindow: config.RATE_LIMIT_TREASURY_PROPOSE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "treasury.propose",
       hook: "preHandler",
     },
     anchorInit: {
@@ -127,14 +146,14 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
     },
     groupCreate: {
       max: config.RATE_LIMIT_GROUP,
-      timeWindow: config.RATE_LIMIT_WINDOW_MS,
+      timeWindow: config.RATE_LIMIT_GROUP_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "group.create",
       hook: "preHandler",
     },
     history: {
       max: config.RATE_LIMIT_HISTORY,
-      timeWindow: config.RATE_LIMIT_WINDOW_MS,
+      timeWindow: config.RATE_LIMIT_HISTORY_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "history.read",
       hook: "preHandler",

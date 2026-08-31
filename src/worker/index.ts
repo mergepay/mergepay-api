@@ -33,17 +33,29 @@
  */
 import { randomUUID } from "node:crypto";
 import pino from "pino";
-import { config } from "../config";
+import { config, env } from "../config";
 import { prisma } from "../db";
 import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { processPendingWebhookDeliveries } from "../services/webhook";
+import { expireStaleProposals } from "./cleanupProposals";
+import {
+  verifyTransactionMemo,
+  verifyPaymentOperation,
+  getTransactionPayments,
+} from "../services/horizonService";
 import {
   applySettlementTransition,
   type SettlementStatus,
 } from "../services/settlement-machine";
 import { pollForConfirmation } from "../services/horizon-confirm";
 import { settlementPaymentIntent } from "../services/settlement-xdr";
+import { checkSettlementPreflight } from "../services/settlement-preflight";
+import {
+  classifySettlementFailure,
+  type SettlementFailureCategory,
+} from "../services/settlement-failure";
 import {
   anchorService,
   AUDITABLE_ANCHOR_STATUSES,
@@ -61,13 +73,16 @@ import {
   type JobFailureCategory,
 } from "../services/job-retry";
 import { reconcileSettlements } from "../services/settlement-reconciliation";
+import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
 import { cleanupChallenges } from "./tasks/cleanup-challenges";
+import { acquireWorkerLease, releaseWorkerLease } from "../services/worker-lock";
 import {
   type CorrelationContext,
   jobContext,
   loggerWithContext,
 } from "../lib/correlation";
+import { jobLogger, type JobLogger } from "../lib/worker-logger";
 
 const log = pino({ name: "worker" });
 
@@ -218,22 +233,48 @@ async function scheduleRetry(params: {
   );
 }
 
-/** Stop retrying and leave the job visible to operators with a reason. */
+/**
+ * Stop retrying and leave the job visible to operators with a reason.
+ *
+ * Two classifications are recorded, and they answer different questions:
+ * `errorCategory` is the retry decision (transient / indeterminate /
+ * permanent), while `failureCategory` is *why* it failed, from the controlled
+ * set in src/services/settlement-failure.ts. The latter is what the status
+ * endpoint returns and what the request path records for the same failure, so
+ * the two paths cannot drift.
+ *
+ * Callers pass the original `error` where they have one; where the failure is
+ * the worker's own decision rather than a thrown error (no envelope to submit,
+ * an expired window), they pass an explicit `failureCategory` instead.
+ */
 async function failSettlement(params: {
   job: SettlementJob;
   attempt: number;
   category: JobFailureCategory;
   reason: string;
   ctx: CorrelationContext;
+  /** The thrown error, when the failure came from one. */
+  error?: unknown;
+  /** Explicit category for a failure the worker decided on its own. */
+  failureCategory?: SettlementFailureCategory;
 }): Promise<void> {
-  const { job, attempt, category, reason, ctx } = params;
+  const { job, attempt, category, reason, ctx, error, failureCategory } = params;
+
+  const resolvedFailureCategory =
+    failureCategory ??
+    (error !== undefined
+      ? classifySettlementFailure(error).category
+      : classifySettlementFailure(reason).category);
 
   await applySettlementTransition({
     settlementId: job.id,
     nextStatus: "failed",
     source: "worker",
+    // Folded into the same transition the status change goes through, so the
+    // failure and the state it explains are committed together.
     extraData: {
       failureReason: reason,
+      failureCategory: resolvedFailureCategory,
       errorCategory: category,
       retryCount: attempt,
       nextAttemptAt: null,
@@ -255,6 +296,7 @@ async function failSettlement(params: {
       attempt,
       outcome: "failed",
       category,
+      failureCategory: resolvedFailureCategory,
       reason,
     },
     "settlement failed"
@@ -360,6 +402,8 @@ async function confirmSubmission(params: {
       category: "permanent",
       reason: `Transaction ${hash} failed on Stellar`,
       ctx,
+      // The network accepted and applied it, and it failed there.
+      failureCategory: "ledger_rejected",
     });
     return;
   }
@@ -403,6 +447,8 @@ export async function processSettlementJob(
       category: "permanent",
       reason: "Settlement has no signed transaction to submit",
       ctx,
+      // Nothing was ever signed — the settlement is unusable as recorded.
+      failureCategory: "validation",
     });
     return;
   }
@@ -416,6 +462,37 @@ export async function processSettlementJob(
       category: "permanent",
       reason: "Signing window expired before the transaction was submitted",
       ctx,
+      failureCategory: "expired",
+    });
+    return;
+  }
+
+  // The same preflight the settlement route ran when it issued the envelope,
+  // re-run against the account as it stands now. Balances move between signing
+  // and submission — a payer can spend elsewhere in that window — and
+  // submitting a transaction the account can no longer fund only produces
+  // op_underfunded after burning an attempt.
+  //
+  // An unreachable Horizon is deliberately *not* a failure here: it says
+  // nothing about the balance, so the job proceeds and the submission path's
+  // own retry classification handles the outage.
+  const preflight = await checkSettlementPreflight({
+    sourcePublicKey: job.fromPublicKey,
+    assetCode: job.assetCode,
+    assetIssuer: job.assetIssuer,
+    amount: job.amount,
+  });
+  if (!preflight.ok && preflight.reason !== "upstream_unavailable") {
+    await failSettlement({
+      job,
+      attempt: job.retryCount,
+      category: "permanent",
+      reason: preflight.message,
+      ctx,
+      // Taken from the preflight's own outcome rather than re-derived from its
+      // message: an unfunded account is a funding problem, not a validation one.
+      failureCategory:
+        preflight.reason === "account_not_found" ? "validation" : "insufficient_funds",
     });
     return;
   }
@@ -498,7 +575,7 @@ if (applied?.successful) {
       }
 
       if (category === "permanent") {
-        await failSettlement({ job, attempt, category, reason, ctx });
+        await failSettlement({ job, attempt, category, reason, ctx, error });
         return;
       }
 
@@ -511,6 +588,9 @@ if (applied?.successful) {
           category: "permanent",
           reason: `${reason} (retries exhausted after ${attempt} attempts)`,
           ctx,
+          // Classified from the underlying error, not the "retries exhausted"
+          // wrapper — what finally stopped the job is still why it failed.
+          error,
         });
         return;
       }
@@ -848,7 +928,7 @@ export async function reconcileAnchors(): Promise<void> {
     // The anchor is unreachable entirely — skip the cycle rather than burning
     // every session's retry budget on the same outage.
     log.warn(
-      { jobType: "anchor", outcome: "skipped_cycle", reason: safeFailureMessage(error) },
+      { jobType: "anchor", jobId: "batch", outcome: "skipped_cycle", reason: safeFailureMessage(error) },
       "anchor TOML unavailable"
     );
     return;
@@ -913,7 +993,52 @@ export async function expireInvites(): Promise<void> {
   });
 }
 
+/**
+ * Send queued webhook deliveries. Sending lives here rather than in the request
+ * path so a slow or unreachable receiver cannot hold an API request open for
+ * the length of its own backoff.
+ */
+export async function deliverPendingWebhooks(): Promise<void> {
+  const job = jobLogger("webhook_delivery", "batch", log);
+  const { delivered, failed, attempted } = await processPendingWebhookDeliveries();
+
+  if (attempted > 0) {
+    job.log("completed", { attempted, delivered, failed });
+  }
+}
+
+/**
+ * Sweep treasury proposals that were never signed to threshold. The transition
+ * and its audit record are written together in src/worker/cleanupProposals.ts;
+ * this wrapper exists to log the outcome on the worker's own logger, the same
+ * way every other job in this cycle reports.
+ */
+export async function expireStaleTreasuryProposals(): Promise<void> {
+  const job = jobLogger("treasury_proposal_expiry", "batch", log);
+  const { expired, olderThan } = await expireStaleProposals();
+
+  // Only speak up when something actually changed. A quiet sweep is the normal
+  // case and logging it every cycle would bury the runs that mattered.
+  if (expired > 0) {
+    job.log("completed", {
+      expired,
+      olderThan: olderThan.toISOString(),
+    });
+  }
+}
+
 export async function runWorkerCycle(): Promise<void> {
+  const lease = await acquireWorkerLease(
+    "mergepay:worker-cycle",
+    config.WORKER_LEASE_TIMEOUT_MS,
+    WORKER_ID
+  );
+  if (!lease) {
+    log.debug({ jobType: "worker_cycle", outcome: "skipped_locked" }, "worker cycle already owned by another process");
+    return;
+  }
+
+  try {
   // Recover first: a restart should adopt the previous process's work before
   // looking for new jobs.
   await Promise.allSettled([recoverStaleSettlements(), recoverStaleAnchorSessions()]);
@@ -922,9 +1047,15 @@ export async function runWorkerCycle(): Promise<void> {
     processSubmittedSettlements(),
     reconcileAnchors(),
     reconcileSettlements(),
+    reconcileAllTreasuryBalances(),
     expireInvites(),
+    deliverPendingWebhooks(),
+    expireStaleTreasuryProposals(),
     cleanupChallenges(),
   ]);
+  } finally {
+    await releaseWorkerLease(lease);
+  }
 }
 
 export async function startWorker(): Promise<() => Promise<void>> {
@@ -932,50 +1063,109 @@ export async function startWorker(): Promise<() => Promise<void>> {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
+  // The cycle currently running, if any. Shutdown waits on this before it
+  // touches leases: a job that is mid-submission still owns its lease, and
+  // clearing it early is what would let a second worker resubmit the payment.
+  let inFlight: Promise<void> | undefined;
+
+  log.info({ workerId: WORKER_ID, intervalMs: config.WORKER_INTERVAL_MS }, "listening");
+
   const loop = async (): Promise<void> => {
     if (stopped) return;
+    const cycle = runWorkerCycle();
+    inFlight = cycle.then(
+      () => undefined,
+      () => undefined
+    );
     try {
-      await runWorkerCycle();
+      await cycle;
     } catch (error) {
-      log.error({ outcome: "error", reason: safeFailureMessage(error) }, "worker cycle failed");
+      log.error({ jobType: "worker_cycle", outcome: "error", reason: safeFailureMessage(error) }, "worker cycle failed");
+    } finally {
+      inFlight = undefined;
     }
     if (!stopped) timer = setTimeout(() => void loop(), config.WORKER_INTERVAL_MS);
   };
 
   void loop();
 
-  const shutdown = async (): Promise<void> => {
+  const shutdown = async (signal: NodeJS.Signals = "SIGINT"): Promise<void> => {
     if (stopped) return;
     stopped = true;
+    // Set before draining: in-flight jobs finish the transition they started,
+    // but no new job is claimed while we wind down.
     isShuttingDown = true;
     if (timer) clearTimeout(timer);
     stopReconciliation();
 
-    log.info({ outcome: "shutdown" }, "worker shutting down, releasing claims");
+    const timeoutMs = Math.max(config.SHUTDOWN_TIMEOUT_MS, config.WORKER_SHUTDOWN_DRAIN_MS);
+    const timeoutHandle = setTimeout(() => {
+      log.error({ jobType: "worker_cycle", signal, timeoutMs }, "shutdown timed out, forcing exit");
+      if (!config.isTest) {
+        process.exit(1);
+      }
+    }, timeoutMs);
 
-    // Release every lease this process holds so the next worker can pick the
-    // jobs up immediately instead of waiting for them to lapse.
-    await Promise.allSettled([
-      prisma.settlement.updateMany({
-        where: { claimedBy: WORKER_ID },
-        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
-      }),
-      prisma.anchorSession.updateMany({
-        where: { claimedBy: WORKER_ID },
-        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
-      }),
-    ]);
+    try {
+      log.info({ jobType: "worker_cycle", signal, timeoutMs, outcome: "shutdown" }, "shutting down");
 
-    log.info({ outcome: "shutdown_complete" }, "worker claims released");
+      // Wait for the running cycle, but not forever — a hung upstream must not
+      // hold the process open past the deployment's grace period.
+      let drained = true;
+      if (inFlight) {
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
+        const budget = new Promise<false>((resolve) => {
+          drainTimer = setTimeout(() => resolve(false), config.WORKER_SHUTDOWN_DRAIN_MS);
+        });
+        drained = await Promise.race([inFlight.then(() => true), budget]);
+        if (drainTimer) clearTimeout(drainTimer);
+      }
+
+      if (!drained) {
+        // A job is still running and still holds its lease. Releasing it now
+        // would invite a duplicate submission, so leave every lease in place and
+        // let it expire; the next worker recovers it through the normal path.
+        log.warn(
+          { jobType: "worker_cycle", outcome: "shutdown_drain_timeout" },
+          "in-flight job outran the drain budget, leaving leases to expire"
+        );
+        return;
+      }
+
+      // Nothing of ours is running now, so releasing is safe: the next worker
+      // picks these up immediately instead of waiting for them to lapse.
+      await Promise.allSettled([
+        prisma.settlement.updateMany({
+          where: { claimedBy: WORKER_ID },
+          data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+        }),
+        prisma.anchorSession.updateMany({
+          where: { claimedBy: WORKER_ID },
+          data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+        }),
+      ]);
+      await prisma.$disconnect();
+
+      log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "worker claims released");
+    } catch (error) {
+      log.error({ jobType: "worker_cycle", signal, reason: safeFailureMessage(error) }, "worker shutdown failed");
+      throw error;
+    } finally {
+      clearTimeout(timeoutHandle);
+      if (!config.isTest) {
+        process.exit(0);
+      }
+    }
+
   };
 
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
-  return shutdown;
+  return () => shutdown("SIGINT");
 }
 
-if (process.env.NODE_ENV !== "test") {
+if (env.NODE_ENV !== "test") {
   // Config validation already ran at module load; this catches a worker started
   // against an environment missing the external endpoints it depends on.
   if (!config.DATABASE_URL || !config.HORIZON_URL || !config.ANCHOR_HOME_DOMAIN) {

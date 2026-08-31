@@ -27,6 +27,9 @@ function sanitize(value: unknown): unknown {
 /** Whether the audited action succeeded, for operator-facing filtering. */
 export type AuditOutcome = "success" | "failure";
 
+/** Actor type for distinguishing authenticated users from automated system actions. */
+export type AuditActorType = "user" | "worker" | "system";
+
 export interface AuditParams {
   userId?: string | null;
   groupId?: string | null;
@@ -34,6 +37,7 @@ export interface AuditParams {
   entityType: string;
   entityId: string;
   outcome?: AuditOutcome;
+  actorType?: AuditActorType;
   /** Safe, structured detail only — never private keys, bearer tokens, or signed XDRs. */
   metadata?: Record<string, unknown>;
 }
@@ -49,6 +53,7 @@ export function auditData(params: AuditParams) {
     metadata: {
       ...(sanitize(params.metadata ?? {}) as Record<string, unknown>),
       ...(params.outcome ? { outcome: params.outcome } : {}),
+      ...(params.actorType ? { actorType: params.actorType } : {}),
     } as any,
   };
 }

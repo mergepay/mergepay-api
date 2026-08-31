@@ -14,6 +14,11 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         message: e.message,
         code: e.code,
       }));
+      const issues = err.errors.map((e) => ({
+        path: e.path,
+        message: e.message,
+        code: e.code,
+      }));
       const first = err.errors[0];
       const field = first?.path.join(".");
       const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
@@ -24,6 +29,7 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         message,
         requestId,
         details,
+        issues,
       });
     }
 

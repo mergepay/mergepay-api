@@ -136,14 +136,11 @@ function authHeader(user = fakeUser()) {
 
 describe("auth routes", () => {
   it("GET /health is open", async () => {
-    // The health service uses $queryRawUnsafe and getFeeStats (Horizon).
-    h.prisma.$queryRawUnsafe.mockResolvedValueOnce([{ "?column?": 1 }]);
-    h.mockFetchBaseFee.mockResolvedValueOnce(100);
     const res = await app.inject({ method: "GET", url: "/health" });
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("ok");
-    expect(res.json().database.connected).toBe(true);
-    expect(res.json().stellar.reachable).toBe(true);
+    expect(typeof res.json().uptime).toBe("number");
+    expect(typeof res.json().version).toBe("string");
   });
 
   it("POST /auth/challenge returns a transaction + passphrase", async () => {

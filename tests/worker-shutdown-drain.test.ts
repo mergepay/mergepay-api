@@ -13,7 +13,7 @@
  * path rather than a re-implementation of it.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
   settlement: {
@@ -35,6 +35,7 @@ vi.mock("../src/db", () => ({
     anchorSession: h.anchorSession,
     groupInvite: h.groupInvite,
     $executeRaw: vi.fn(async () => 1),
+    $disconnect: vi.fn(async () => {}),
   },
 }));
 
@@ -71,13 +72,20 @@ function ownLeaseReleases(spy: { mock: { calls: unknown[][] } }): unknown[] {
 }
 
 describe("worker shutdown drain", () => {
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
     h.gate.wait = async () => {};
     h.settlement.findMany.mockResolvedValue([]);
     h.anchorSession.findMany.mockResolvedValue([]);
     h.settlement.updateMany.mockResolvedValue({ count: 0 });
     h.anchorSession.updateMany.mockResolvedValue({ count: 0 });
+  });
+
+  afterEach(() => {
+    exitSpy.mockRestore();
   });
 
   it("waits for the in-flight cycle before releasing any lease", async () => {

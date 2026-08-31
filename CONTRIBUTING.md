@@ -36,6 +36,33 @@ Wave task:
    resolves (`Closes #NN`). PRs not tied to an issue will be asked to open one first.
 5. Reward points map to the issue's `complexity:*` label.
 
+## Quickstart
+
+For a local API setup against Stellar testnet, follow the step-by-step guide in
+[docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md). The project defaults to testnet and should
+not be pointed at mainnet — `STELLAR_NETWORK` and `HORIZON_URL` must match.
+
+```bash
+git clone https://github.com/mergepay/mergepay-api.git
+cd mergepay-api
+npm install
+cp .env.example .env
+npm run gen:sep10key
+npm run prisma:generate
+npm run prisma:migrate
+npm run db:seed
+npm run dev
+npm run worker
+```
+
+Then verify the local API is healthy:
+
+```bash
+curl -sS http://localhost:4000/health
+```
+
+Expected: a JSON response with `status` and both dependency checks reporting live values.
+
 ## PR checklist
 
 - [ ] Linked to an issue (`Closes #NN`)

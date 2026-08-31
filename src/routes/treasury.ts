@@ -1,7 +1,8 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
+import { StrKey, Transaction } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -9,6 +10,7 @@ import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import { validateAsset, validateAmount } from "../services/assets";
 import { rateLimited } from "../lib/rate-limit";
 import {
@@ -33,8 +35,8 @@ import {
   snapshotToSignerConfig,
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
+import { treasurySignerConfigSchema } from "../validations/treasury";
 
-const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
 const stellarAmountSchema = z.string().min(1);
 
 export default async function treasuryRoutes(app: FastifyInstance) {
@@ -46,7 +48,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z
       .object({
-        publicKey: stellarPublicKeySchema,
+        publicKey: stellarAccountIdSchema,
         requiredSigners: z.number().int().min(1).max(20).optional(),
       })
       .parse(req.body);
@@ -69,6 +71,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     // concurrent demotion/removal of `auth.id` can't bypass authorization.
     const group = await prisma.$transaction(async (tx) => {
       await requireAdmin(id, auth.id, tx);
+      // Read inside the transaction so the audit entry records the
+      // configuration this call actually replaced.
+      const existing = await tx.group.findUnique({ where: { id } });
       const updated = await tx.group.update({
         where: { id },
         data: {
@@ -79,9 +84,21 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
-        action: "treasury.enable",
+        groupId: id,
+        action: AuditAction.TREASURY_ENABLE,
         entityType: "group",
         entityId: id,
+        outcome: "success",
+        // The multisig configuration is the security-relevant part of this
+        // change: the signing threshold decides how many approvals it takes
+        // to move funds, so an audit needs to see what it was set to and what
+        // it replaced, not merely that the treasury was touched.
+        metadata: {
+          treasuryAccountPublicKey: body.publicKey,
+          previousRequiredSigners: existing?.treasuryRequiredSigners ?? null,
+          requiredSigners: body.requiredSigners ?? 1,
+          previouslyEnabled: existing?.treasuryEnabled ?? false,
+        },
       });
       return updated;
     });
@@ -117,21 +134,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireAdmin(id, auth.id);
     
-    const body = z
-      .object({
-        signers: z.array(
-          z.object({
-            publicKey: z.string(),
-            weight: z.number().int().min(0).max(255),
-          })
-        ),
-        thresholds: z.object({
-          low: z.number().int().min(0).max(255),
-          med: z.number().int().min(0).max(255),
-          high: z.number().int().min(0).max(255),
-        }),
-      })
-      .parse(req.body);
+    const body = treasurySignerConfigSchema.parse(req.body);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
@@ -149,7 +152,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     
     await audit({
       userId: auth.id,
-      action: "treasury.signer_validation",
+      action: AuditAction.TREASURY_SIGNER_VALIDATION,
       entityType: "group",
       entityId: id,
       metadata: {
@@ -168,6 +171,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/deposit", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -184,6 +188,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const group = await prisma.group.findUnique({ where: { id } });
+    await requireMembership(id, auth.id);
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
@@ -195,25 +200,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       key: idempotencyKey,
       resourceId: id,
       payload: body,
-      operation: async () => {
+      operation: async (tx) => {
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
-        const ttx = await prisma.treasuryTransaction.create({
-          data: {
-            shortCode: code,
-            groupId: id,
-            userId: auth.id,
-            direction: "deposit",
-            amount: body.amount,
-            assetCode: body.assetCode,
-            assetIssuer: body.assetIssuer ?? null,
-            destination: treasuryKey,
-            status: "pending",
-            memo: memoText(code),
-            expiresAt,
-          },
-          include: { user: true },
-        });
 
         const account = await stellar.loadAccount(auth.stellarPublicKey);
         if (!account.exists) {
@@ -228,6 +217,45 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           memoCode: code,
           validitySeconds,
         });
+
+        // Compute the transaction hash so the confirm endpoint can validate
+        // the submitted signed XDR is for this exact intent.
+        const intendedTxHash = new Transaction(xdr, config.networkPassphrase)
+          .hash()
+          .toString("hex");
+
+        const ttx = await tx.treasuryTransaction.create({
+          data: {
+            shortCode: code,
+            groupId: id,
+            userId: auth.id,
+            direction: "deposit",
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            destination: treasuryKey,
+            status: "pending",
+            memo: memoText(code),
+            expiresAt,
+            intendedTxHash,
+          },
+          include: { user: true },
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: id,
+          action: AuditAction.TREASURY_DEPOSIT_CREATE,
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          metadata: {
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            destination: treasuryKey,
+          },
+        });
+
 
         return {
           treasuryTransaction: serializeTreasuryTx(ttx),
@@ -244,6 +272,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/withdraw", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -263,6 +292,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     }
 
     const group = await prisma.group.findUnique({ where: { id } });
+    await requireMembership(id, auth.id);
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
@@ -276,25 +306,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       key: idempotencyKey,
       resourceId: id,
       payload: body,
-      operation: async () => {
+      operation: async (tx) => {
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
-        const ttx = await prisma.treasuryTransaction.create({
-          data: {
-            shortCode: code,
-            groupId: id,
-            userId: auth.id,
-            direction: "withdrawal",
-            amount: body.amount,
-            assetCode: body.assetCode,
-            assetIssuer: body.assetIssuer ?? null,
-            destination: body.destination,
-            status: requiresMulti ? "awaiting_signatures" : "pending",
-            memo: memoText(code),
-            expiresAt,
-          },
-          include: { user: true },
-        });
 
         const account = await stellar.loadAccount(treasuryKey);
         if (!account.exists) {
@@ -309,6 +323,45 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           memoCode: code,
           validitySeconds,
         });
+
+        // Compute the transaction hash so the confirm endpoint can validate
+        // the submitted signed XDR is for this exact intent.
+        const intendedTxHash = new Transaction(xdr, config.networkPassphrase)
+          .hash()
+          .toString("hex");
+
+        const ttx = await tx.treasuryTransaction.create({
+          data: {
+            shortCode: code,
+            groupId: id,
+            userId: auth.id,
+            direction: "withdrawal",
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            destination: body.destination,
+            status: requiresMulti ? "awaiting_signatures" : "pending",
+            memo: memoText(code),
+            expiresAt,
+            intendedTxHash,
+          },
+          include: { user: true },
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: id,
+          action: AuditAction.TREASURY_WITHDRAW_CREATE,
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          metadata: {
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            destination: body.destination,
+          },
+        });
+
 
         return {
           treasuryTransaction: serializeTreasuryTx(ttx),
@@ -334,18 +387,23 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const ttx = await prisma.treasuryTransaction.findUnique({ where: { id } });
     if (!ttx) throw Errors.notFound("Treasury transaction not found");
 
+    // Authorize from the transaction's persisted group before reading treasury
+    // configuration or accepting any signed envelope. Deposits are additionally
+    // owned by their creator; withdrawals require an administrator.
+    if (ttx.direction === "deposit") {
+      await requireMembership(ttx.groupId, auth.id);
+      if (ttx.userId !== auth.id) {
+        throw Errors.forbidden("Only the depositor can confirm this deposit");
+      }
+      await requireMembership(ttx.groupId, auth.id);
+    } else {
+      await requireAdmin(ttx.groupId, auth.id);
+    }
     const group = await prisma.group.findUnique({ where: { id: ttx.groupId } });
     if (!group?.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
-    if (ttx.direction === "deposit") {
-      if (ttx.userId !== auth.id) {
-        throw Errors.forbidden("Only the depositor can confirm this deposit");
-      }
-    } else {
-      await requireAdmin(ttx.groupId, auth.id);
-    }
     if (ttx.status === "confirmed") {
       return { treasuryTransaction: serializeTreasuryTx(ttx) };
     }
@@ -390,6 +448,25 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           return { treasuryTransaction: serializeTreasuryTx(fresh) };
         }
 
+        // Validate the submitted signed XDR is for the exact intended
+        // transaction. This prevents a signer from submitting a signature
+        // for a modified (attacker-changed) transaction.
+        if (fresh.intendedTxHash) {
+          try {
+            const submittedTx = new Transaction(body.signedXdr, config.networkPassphrase);
+            const submittedHash = submittedTx.hash().toString("hex");
+            if (submittedHash !== fresh.intendedTxHash) {
+              throw Errors.badRequest(
+                "xdr_mismatch",
+                "Submitted signed XDR does not match the intended transaction"
+              );
+            }
+          } catch (e) {
+            if (e instanceof AppError) throw e;
+            throw Errors.badRequest("xdr_malformed", "Could not parse signed XDR");
+          }
+        }
+
         let hash: string;
         try {
           const expected = {
@@ -411,7 +488,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           });
           await auditTx(tx, {
             userId: auth.id,
-            action: "treasury.confirm.failed",
+            action: AuditAction.TREASURY_CONFIRM_FAILED,
             entityType: "treasury_transaction",
             entityId: id,
             outcome: "failure",
@@ -431,7 +508,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         });
         await auditTx(tx, {
           userId: auth.id,
-          action: "treasury.confirm",
+          action: AuditAction.TREASURY_CONFIRM,
           entityType: "treasury_transaction",
           entityId: id,
           metadata: { hash, direction: fresh.direction },

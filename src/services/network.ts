@@ -1,6 +1,6 @@
 import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "../config";
-import { withTimeout } from "./timeout";
+import { logRetryAttempt, withRetry } from "./retry";
 
 export interface FeeStats {
   minAcceptedFee: number;
@@ -48,13 +48,28 @@ function normalize(raw: Record<string, unknown>): FeeStats {
   };
 }
 
+/**
+ * Fee statistics are a pure read, so a transient Horizon failure is retried
+ * rather than surfaced. The cache above means a single success covers every
+ * caller for FEE_CACHE_TTL, so the retry budget is spent at most once per
+ * window rather than once per request.
+ */
 async function fetchFeeStats(): Promise<FeeStats> {
-  const response = await withTimeout(
-    "Horizon.feeStats",
-    config.HORIZON_FEE_TIMEOUT_MS,
-    async (_signal) => {
-      // Horizon.Server.feeStats doesn't accept AbortSignal directly,
-      // but we wrap it so timeout still fires and rejects the promise.
+  const response = await withRetry(
+    {
+      operation: "Horizon.feeStats",
+      timeoutMs: config.HORIZON_FEE_TIMEOUT_MS,
+      onAttemptFailed: (entry) =>
+        logRetryAttempt(
+          {
+            warn: (obj, msg) => console.warn(`[network] ${msg}`, JSON.stringify(obj)),
+          },
+          entry
+        ),
+    },
+    async () => {
+      // Horizon.Server.feeStats doesn't accept AbortSignal directly, but the
+      // wrapper still fires and rejects the promise on timeout.
       return horizon().feeStats();
     }
   );

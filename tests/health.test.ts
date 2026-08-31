@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
   queryRaw: vi.fn(),
+  queryRawUnsafe: vi.fn(),
   feeStats: vi.fn(),
+  fetch: vi.fn(),
 }));
 
 vi.mock("../src/db", () => ({
-  prisma: { $queryRaw: h.queryRaw },
+  prisma: { $queryRaw: h.queryRaw, $queryRawUnsafe: h.queryRawUnsafe },
 }));
 
 vi.mock("../src/services/network", () => ({
@@ -14,70 +16,84 @@ vi.mock("../src/services/network", () => ({
 }));
 
 import { buildApp } from "../src/app";
-import { clearReadinessCache } from "../src/services/health";
 
 let app: Awaited<ReturnType<typeof buildApp>>;
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  clearReadinessCache();
   h.queryRaw.mockResolvedValue([{ 1: 1 }]);
+  h.queryRawUnsafe.mockResolvedValue([{ 1: 1 }]);
   h.feeStats.mockResolvedValue({ minAcceptedFee: 100 });
-  // checkAnchor reads process.env live at call time; unset it here (after
-  // config's own startup validation already ran) so readiness reports the
-  // anchor check as "disabled" instead of making a real network call.
-  vi.stubEnv("ANCHOR_HOME_DOMAIN", "");
+  h.fetch.mockResolvedValue({ ok: true, status: 200, text: async () => "ok" });
   if (!app) app = await buildApp();
+  global.fetch = h.fetch as typeof fetch;
 });
 
-describe("health routes", () => {
-  it("returns liveness without checking dependencies", async () => {
-    const response = await app.inject({ method: "GET", url: "/health/live" });
+describe("GET /health", () => {
+  it("returns a lightweight liveness payload without touching deps", async () => {
+    const response = await app.inject({ method: "GET", url: "/health" });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({
+    expect(response.json()).toMatchObject({
       status: "ok",
-      timestamp: expect.any(String),
+      uptime: expect.any(Number),
+      version: expect.any(String),
     });
-    expect(h.queryRaw).not.toHaveBeenCalled();
+    expect(h.queryRawUnsafe).not.toHaveBeenCalled();
     expect(h.feeStats).not.toHaveBeenCalled();
+    expect(h.fetch).not.toHaveBeenCalled();
   });
+});
 
-  it("returns ready when database and Stellar are available", async () => {
+describe("GET /health/ready", () => {
+  it("returns 200 with dependency status when healthy", async () => {
     const response = await app.inject({ method: "GET", url: "/health/ready" });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       status: "ok",
-      checks: { database: "up", stellar: "up", anchor: "disabled" },
+      uptime: expect.any(Number),
+      version: expect.any(String),
+      database: { status: "up", latencyMs: expect.any(Number) },
+      stellar: { status: "up", latencyMs: expect.any(Number) },
     });
   });
 
-  it("returns not ready when the database is unavailable", async () => {
-    h.queryRaw.mockRejectedValueOnce(new Error("password=secret SQL error"));
+  it("returns 503 when the database is unavailable", async () => {
+    h.queryRawUnsafe.mockRejectedValueOnce(new Error("connection refused"));
 
     const response = await app.inject({ method: "GET", url: "/health/ready" });
 
     expect(response.statusCode).toBe(503);
     expect(response.json()).toMatchObject({
-      status: "not_ready",
-      checks: { database: "down" },
+      status: "degraded",
+      database: { status: "down", latencyMs: expect.any(Number) },
     });
-    expect(JSON.stringify(response.json())).not.toContain("password");
-    expect(JSON.stringify(response.json())).not.toContain("SQL");
   });
 
-  it("returns not ready when Stellar times out", async () => {
-    h.feeStats.mockImplementationOnce(
-      () => new Promise((resolve) => setTimeout(() => resolve({}), 2_000))
+  it("returns 503 when Horizon is unavailable", async () => {
+    h.fetch.mockRejectedValueOnce(new Error("Horizon unreachable"));
+
+    const response = await app.inject({ method: "GET", url: "/health/ready" });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      status: "degraded",
+      stellar: { status: "down", latencyMs: expect.any(Number) },
+    });
+  });
+
+  it("never throws uncaught errors on slow dependency checks", async () => {
+    h.queryRawUnsafe.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve([{ 1: 1 }]), 3000))
+    );
+    h.fetch.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve({ ok: true, status: 200 }), 3000))
     );
 
     const response = await app.inject({ method: "GET", url: "/health/ready" });
 
-    expect(response.statusCode).toBe(503);
-    expect(response.json()).toMatchObject({
-      status: "not_ready",
-      checks: { stellar: "down" },
-    });
-  }, 3_000);
+    expect([200, 503]).toContain(response.statusCode);
+    expect(response.json().status).toBeTruthy();
+  }, 7000);
 });

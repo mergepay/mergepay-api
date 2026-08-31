@@ -1,72 +1,153 @@
+/**
+ * Money utilities for balance math and settlement computations.
+ *
+ * All math runs in BigInt stroops (10^7 per unit). This module delegates
+ * input validation to the shared `src/lib/money.ts` utility to ensure
+ * a single source of truth for amount/asset validation.
+ */
+
 import { z } from "zod";
-import { config } from "../config";
+import {
+  STROOPS_PER_UNIT,
+  MAX_STROOPS,
+  MAX_AMOUNT,
+  validateAmount as libValidateAmount,
+  validateAsset as libValidateAsset,
+  fromStroops as libFromStroops,
+  stroopsToStellarAmount as libStroopsToStellarAmount,
+  compareAmounts as libCompareAmounts,
+  addAmounts as libAddAmounts,
+  subtractAmounts as libSubtractAmounts,
+  refineValidatedAsset,
+  type ValidatedAmount,
+  type ValidationOutcome,
+} from "../lib/money";
 
-/** Stellar represents asset amounts as signed int64 stroops. */
-export const STROOPS_PER_XLM = 10_000_000n;
-export const MAX_STROOPS = 9_223_372_036_854_775_807n;
-export const MAX_AMOUNT = "922337203685.4775807";
-
-const CANONICAL_AMOUNT = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
-const CANONICAL_STROOPS = /^-?(?:0|[1-9]\d*)$/;
-/** Looser shape accepted by `normalizeAmount` — leading/trailing zeros allowed. */
-const RAW_AMOUNT = /^-?\d+(?:\.\d+)?$/;
+// Re-export constants for backward compatibility
+export { STROOPS_PER_UNIT as STROOPS_PER_XLM, MAX_STROOPS, MAX_AMOUNT };
 
 /** Absolute value of a bigint — used by balance math, which is signed. */
 export function bigIntAbs(value: bigint): bigint {
   return value < 0n ? -value : value;
 }
 
+/**
+ * Normalize a decimal amount string to canonical form (positive only).
+ * Delegates to shared validation utility.
+ */
 export function normalizeAmount(value: string): string {
-  if (typeof value !== "string" || !RAW_AMOUNT.test(value)) {
-    throw new Error("Amount must be a decimal string");
+  const result = libValidateAmount(value);
+  if (!result.ok) {
+    throw new Error(result.message);
   }
-
-  const negative = value.startsWith("-");
-  const unsigned = negative ? value.slice(1) : value;
-  const [wholeRaw, fractionRaw = ""] = unsigned.split(".");
-  if (fractionRaw.length > 7) {
-    throw new Error("Amount must have at most 7 decimal places");
-  }
-
-  const whole = wholeRaw.replace(/^0+(?=\d)/, "");
-  const fraction = fractionRaw.replace(/0+$/, "");
-  const canonical = `${negative ? "-" : ""}${whole}${fraction ? `.${fraction}` : ""}`;
-
-  const stroops = toStroops(canonical);
-  if (stroops <= 0n) {
-    throw new Error("Amount must be greater than zero");
-  }
-  if (stroops > MAX_STROOPS) {
-    throw new Error("Amount exceeds the supported Stellar range");
-  }
-
-  return canonical;
+  return result.value.decimal;
 }
 
 /**
  * Parse a canonical decimal amount exactly, without floating-point arithmetic.
  *
  * Signed values are accepted because net balances are signed (negative = owes).
- * Route input is validated with `normalizeAmount`/`amountSchema`, which stay
- * strictly positive.
+ * Zero is accepted for balance math. Route input is validated with
+ * `normalizeAmount`/`amountSchema`, which stay strictly positive.
  */
 export function toStroops(amount: string): bigint {
-  if (typeof amount !== "string" || !CANONICAL_AMOUNT.test(amount)) {
-    throw new Error("Amount must be a canonical decimal string");
+  // For signed amounts (used in balance math), we handle the sign ourselves
+  // then validate the magnitude using shared utility (but allow zero).
+  if (typeof amount !== "string") {
+    throw new Error("Amount must be a string");
   }
 
   const negative = amount.startsWith("-");
-  const [whole, fraction = ""] = (negative ? amount.slice(1) : amount).split(".");
-  if (fraction.length > 7) {
-    throw new Error("Amount must have at most 7 decimal places");
+  const unsigned = negative ? amount.slice(1) : amount;
+
+  // Validate the unsigned amount using shared utility but allow zero
+  const result = validateUnsignedAmountAllowZero(unsigned);
+  if (!result.ok) {
+    throw new Error(result.message);
   }
 
-  const paddedFraction = fraction.padEnd(7, "0");
-  const magnitude = BigInt(whole) * STROOPS_PER_XLM + BigInt(paddedFraction || "0");
-  if (magnitude > MAX_STROOPS) {
-    throw new Error("Amount exceeds the supported Stellar range");
+  return negative ? -result.value.stroops : result.value.stroops;
+}
+
+/**
+ * Internal validation for unsigned amounts that allows zero.
+ * Used by balance math where zero is a valid value.
+ */
+function validateUnsignedAmountAllowZero(value: string): ValidationOutcome<ValidatedAmount> {
+  // Reject whitespace padding
+  const trimmed = value.trim();
+  if (trimmed !== value) {
+    return {
+      ok: false,
+      reason: "whitespace_padding",
+      message: "Amount must not have leading or trailing whitespace",
+      code: "INVALID_AMOUNT",
+    };
   }
-  return negative ? -magnitude : magnitude;
+
+  // Reject empty
+  if (!trimmed) {
+    return {
+      ok: false,
+      reason: "malformed",
+      message: "Amount is required",
+      code: "INVALID_AMOUNT",
+    };
+  }
+
+  // Reject exponent notation, signs, non-digits
+  if (!/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    return {
+      ok: false,
+      reason: "malformed",
+      message: `"${value}" is not a valid decimal amount (no exponents, signs, or non-digits)`,
+      code: "INVALID_AMOUNT",
+    };
+  }
+
+  // Split into whole and fractional parts
+  const [wholeRaw, fracRaw = ""] = trimmed.split(".");
+
+  // Check precision (max 7 decimal places)
+  if (fracRaw.length > 7) {
+    return {
+      ok: false,
+      reason: "excess_precision",
+      message: `Amount "${value}" exceeds 7-decimal precision`,
+      code: "INVALID_AMOUNT",
+    };
+  }
+
+  // Convert to stroops using BigInt only
+  const whole = wholeRaw.replace(/^0+(?=\d)/, "") || "0";
+  const paddedFrac = (fracRaw + "0000000").slice(0, 7);
+  const stroops = BigInt(whole) * STROOPS_PER_UNIT + BigInt(paddedFrac);
+
+  // Allow zero for balance math
+  if (stroops < 0n) {
+    return {
+      ok: false,
+      reason: "zero_or_negative",
+      message: "Amount must not be negative",
+      code: "INVALID_AMOUNT",
+    };
+  }
+
+  // Must fit in Stellar's Int64 range
+  if (stroops > MAX_STROOPS) {
+    return {
+      ok: false,
+      reason: "out_of_range",
+      message: "Amount exceeds the maximum representable Stellar value",
+      code: "INVALID_AMOUNT",
+    };
+  }
+
+  // Build canonical decimal string (trim trailing zeros from fraction)
+  const canonicalFrac = paddedFrac.replace(/0+$/, "");
+  const canonical = canonicalFrac ? `${whole}.${canonicalFrac}` : whole;
+
+  return { ok: true, value: { decimal: canonical, stroops } };
 }
 
 /** Convert stroops to the canonical decimal representation used by the API. */
@@ -80,7 +161,8 @@ export function fromStroops(stroops: bigint | number | string): string {
     }
     value = BigInt(stroops);
   } else {
-    if (!CANONICAL_STROOPS.test(stroops)) {
+    // Parse integer string
+    if (!/^-?\d+$/.test(stroops)) {
       throw new Error("Stroop value must be a canonical integer string");
     }
     value = BigInt(stroops);
@@ -90,14 +172,7 @@ export function fromStroops(stroops: bigint | number | string): string {
     throw new Error("Stroop value is outside the supported Stellar range");
   }
 
-  const sign = value < 0n ? "-" : "";
-  const magnitude = bigIntAbs(value);
-  const whole = magnitude / STROOPS_PER_XLM;
-  const fraction = (magnitude % STROOPS_PER_XLM)
-    .toString()
-    .padStart(7, "0")
-    .replace(/0+$/, "");
-  return fraction.length > 0 ? `${sign}${whole}.${fraction}` : `${sign}${whole}`;
+  return libFromStroops(value);
 }
 
 /**
@@ -106,14 +181,7 @@ export function fromStroops(stroops: bigint | number | string): string {
  * canonical *API* representation; this is the canonical *ledger* one.
  */
 export function stroopsToStellarAmount(stroops: bigint): string {
-  if (bigIntAbs(stroops) > MAX_STROOPS) {
-    throw new Error("Stroop value is outside the supported Stellar range");
-  }
-  const sign = stroops < 0n ? "-" : "";
-  const magnitude = bigIntAbs(stroops);
-  const whole = magnitude / STROOPS_PER_XLM;
-  const fraction = (magnitude % STROOPS_PER_XLM).toString().padStart(7, "0");
-  return `${sign}${whole}.${fraction}`;
+  return libStroopsToStellarAmount(stroops);
 }
 
 /** Return true only for a valid, strictly positive Stellar amount. */
@@ -127,77 +195,59 @@ export function isPositive(amount: string): boolean {
 }
 
 export function addAmounts(left: string, right: string): string {
-  return fromStroops(toStroops(normalizeAmount(left)) + toStroops(normalizeAmount(right)));
+  return libAddAmounts(left, right);
 }
 
 export function subtractAmounts(left: string, right: string): string {
-  const result = toStroops(normalizeAmount(left)) - toStroops(normalizeAmount(right));
-  if (result < 0n) throw new Error("Amount cannot be negative");
-  return fromStroops(result);
+  return libSubtractAmounts(left, right);
 }
 
 export function compareAmounts(left: string, right: string): number {
-  const a = toStroops(normalizeAmount(left));
-  const b = toStroops(normalizeAmount(right));
-  return a < b ? -1 : a > b ? 1 : 0;
+  return libCompareAmounts(left, right);
 }
 
 export const amountSchema = z
   .string()
   .superRefine((value, ctx) => {
-    try {
-      normalizeAmount(value);
-    } catch (error) {
+    const result = libValidateAmount(value);
+    if (!result.ok) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: error instanceof Error ? error.message : "Invalid amount",
+        message: result.message,
       });
     }
   })
-  .transform(normalizeAmount);
+  .transform((value) => {
+    const result = libValidateAmount(value);
+    if (!result.ok) return z.NEVER;
+    return result.value.decimal;
+  });
 
 export const assetSchema = z
   .object({
-    assetCode: z.string(),
+    assetCode: z.string().min(1).max(12),
     assetIssuer: z.string().nullable().optional(),
   })
-  .superRefine((asset, ctx) => {
-    if (asset.assetCode === "XLM") {
-      if (asset.assetIssuer !== undefined && asset.assetIssuer !== null) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["assetIssuer"],
-          message: "XLM must not include an issuer",
-        });
-      }
-      return;
-    }
-
-    if (asset.assetCode !== config.STABLE_ASSET_CODE) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["assetCode"],
-        message: "Unsupported asset code",
-      });
-      return;
-    }
-
-    if (asset.assetIssuer !== config.STABLE_ASSET_ISSUER) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["assetIssuer"],
-        message: "Invalid issuer for the configured asset",
-      });
-    }
+  .superRefine((asset, ctx) => refineValidatedAsset(ctx, asset.assetCode, asset.assetIssuer))
+  .transform((asset) => {
+    // We can't easily get the ValidatedAsset here without re-validating,
+    // but the superRefine already validated it. Return the raw object for compatibility.
+    return {
+      assetCode: asset.assetCode,
+      assetIssuer: asset.assetIssuer ?? null,
+    };
   });
 
 export function validateAsset(assetCode: string, assetIssuer?: string | null): {
-  assetCode: "XLM" | string;
+  assetCode: string;
   assetIssuer: string | null;
 } {
-  const parsed = assetSchema.parse({ assetCode, assetIssuer });
+  const result = libValidateAsset(assetCode, assetIssuer);
+  if (!result.ok) {
+    throw new Error(result.message);
+  }
   return {
-    assetCode: parsed.assetCode,
-    assetIssuer: parsed.assetIssuer ?? null,
+    assetCode: result.value.code,
+    assetIssuer: result.value.issuer,
   };
 }

@@ -13,6 +13,7 @@ const h = vi.hoisted(() => {
   const prisma: any = {
     anchorSession,
     auditLog: { create: vi.fn() },
+    $executeRaw: vi.fn(async () => 1),
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
     $disconnect: vi.fn(),
   };

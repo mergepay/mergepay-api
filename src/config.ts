@@ -48,6 +48,12 @@ const schema = z.object({
   // gap, so a stolen access token stays useful for minutes rather than hours.
   // Expressed in seconds so it can be compared against the refresh TTL below.
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().max(86400).default(900),
+  // Minimum remaining lifetime (seconds) a JWT must have when presented.
+  // Tokens whose `exp` claim is closer than this margin to the current clock
+  // are rejected as near-expired — even though the SDK's own check would
+  // still accept them — so a token forged or replayed moments before expiry
+  // never grants a session.
+  TOKEN_EXPIRY_MARGIN_SECONDS: z.coerce.number().int().nonnegative().max(300).default(30),
   // Refresh-token lifetime. Bounds how long an idle session can be revived
   // without the wallet signing a new SEP-10 challenge.
   REFRESH_TOKEN_TTL_MS: z.coerce

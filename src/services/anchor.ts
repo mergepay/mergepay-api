@@ -37,7 +37,14 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { fetchWithTimeout } from "./timeout";
 import { anchorCircuit } from "./anchor-circuit";
-import { logRetryAttempt, upstreamCauseOf, withRetry } from "./retry";
+import { safeFailureMessage } from "./job-retry";
+import {
+  classifyUpstreamFailure,
+  isRetryableFailure,
+  logRetryAttempt,
+  upstreamCauseOf,
+  withRetry,
+} from "./retry";
 
 export interface AnchorToml {
   homeDomain: string;
@@ -471,6 +478,7 @@ export const anchorService = {
       // anchor's HTTP status is read back off the preserved cause to keep the
       // previous poll-result message intact.
       const cause = upstreamCauseOf(err);
+      const isTransient = isRetryableFailure(classifyUpstreamFailure(cause));
       const message =
         cause instanceof AnchorHttpError
           ? `Anchor returned HTTP ${cause.status}`
@@ -537,7 +545,7 @@ export const anchorService = {
     }
 
     if (!recognized) {
-      log.warn(
+      retryLog.warn(
         {
           rawStatus,
           mappedStatus,
@@ -664,7 +672,7 @@ export function mapAnchorStatus(raw: string): string {
 
     // ── Unknown → safe default ──
     default:
-      log.warn(
+      retryLog.warn(
         { rawStatus: raw, mappedStatus: "pending_anchor" },
         `Unknown SEP-24 status received: ${raw} — mapping to pending_anchor`
       );

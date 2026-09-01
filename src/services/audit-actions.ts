@@ -20,6 +20,7 @@ export const AuditAction = {
   GROUP_JOIN: "group.join",
   GROUP_LEAVE: "group.leave",
   GROUP_MEMBER_REMOVE: "group.member_remove",
+  GROUP_MEMBER_ROLE_CHANGE: "group.member_role_change",
 
   // ── Treasury ────────────────────────────────────────────────────────
   TREASURY_ENABLE: "treasury.enable",
@@ -44,6 +45,9 @@ export const AuditAction = {
 
   // ── Settlements ─────────────────────────────────────────────────────
   SETTLEMENT_CREATED: "settlement.created",
+  EXPENSE_CREATE: "expense.create",
+  EXPENSE_UPDATE: "expense.update",
+  EXPENSE_DELETE: "expense.delete",
   SETTLEMENT_CONFIRM_RETRY: "settlement.confirm.retry",
   SETTLEMENT_CONFIRM_SUBMITTED: "settlement.confirm.submitted",
   SETTLEMENT_CONFIRM_VALIDATION_FAILED: "settlement.confirm.validation_failed",

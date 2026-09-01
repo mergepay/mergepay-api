@@ -49,7 +49,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
-import { audit, auditTx } from "./audit";
+import { auditTx } from "./audit";
 import { AuditAction } from "./audit-actions";
 
 export interface CreateProposalParams {
@@ -426,10 +426,10 @@ export const treasuryProposalsService = {
           };
         }
 
-        // Audit each new signature (best-effort: the proposal update above
-        // succeeded, and if an audit write fails the signature is still stored).
+        // Signature persistence, proposal status, and audit records must
+        // commit together. A failed audit write must roll back the mutation.
         for (const pk of verified.slice(stored.length).map((s) => s.publicKey)) {
-          await audit({
+          await auditTx(tx, {
             groupId: proposal.groupId,
             action: AuditAction.TREASURY_PROPOSAL_SIGNED,
             entityType: "treasury_proposal",

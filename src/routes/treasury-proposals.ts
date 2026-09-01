@@ -24,7 +24,6 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar } from "../services/stellar";
-import { audit } from "../services/audit";
 import { isPositive } from "../services/money";
 import {
   serializeGroup,
@@ -91,20 +90,6 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         },
         threshold
       );
-
-    await audit({
-      userId: auth.id,
-      action: "treasury.proposal.created",
-      entityType: "treasury_proposal",
-      entityId: proposal.id,
-      metadata: {
-        groupId,
-        destination: body.destination,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        threshold,
-      },
-    });
 
     return {
       proposal: serializeTreasuryProposal(proposal),
@@ -173,20 +158,8 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         userId: auth.id,
       });
 
-      await audit({
-        userId: auth.id,
-        action:
-          result.status === "confirmed"
-            ? "treasury.proposal.submitted"
-            : "treasury.proposal.signed",
-        entityType: "treasury_proposal",
-        entityId: proposalId,
-        metadata: {
-          signatureCount: result.signatureCount,
-          threshold: result.threshold,
-          stellarTxHash: result.stellarTxHash,
-        },
-      });
+      // The service writes signature/submission audit records inside its
+      // transaction; do not add a second best-effort record after commit.
 
       const proposal = await prisma.treasuryProposal.findUnique({
         where: { id: proposalId },

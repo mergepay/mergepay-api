@@ -800,6 +800,31 @@ export default async function settlementRoutes(app: FastifyInstance) {
     };
   });
 
+  // -- list settlements for a group ------------------------------------------
+  //
+  // Returns settlements scoped to the caller's group membership, ordered by
+  // the same deterministic (createdAt, id) pair every other list endpoint
+  // uses. The cursor carries no membership authority — the groupId filter
+  // always scopa the query independently.
+  app.get("/groups/:id/settlements", async (req) => {
+    const auth = requireUser(req);
+    const { id: groupId } = idParamSchema.parse(req.params);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    await requireMembership(groupId, auth.id);
+
+    const position = requireCursor(cursor);
+
+    const settlements = await prisma.settlement.findMany({
+      where: { groupId, ...cursorFilter(position, order) },
+      include: settlementInclude,
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
+    });
+
+    const { items, meta } = buildPage(settlements, limit, order);
+    return { settlements: items.map(serializeSettlement), meta };
+  });
+
   // -- balances + suggestions -------------------------------------------------
   app.get("/groups/:id/balances", async (req) => {
     const auth = requireUser(req);

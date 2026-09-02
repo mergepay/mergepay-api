@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let currentSettlementState: Record<string, any> | null = null;
 let currentAnchorState: Record<string, any> | null = null;
@@ -213,9 +213,11 @@ describe("reconcileAnchors", () => {
 
     await reconcileAnchors();
 
-    expect(h.prisma.anchorSession.update).toHaveBeenCalledWith(
+    // Status advancement uses a conditional updateMany guarded on the status
+    // this worker observed, so a stale writer can never land a regression.
+    expect(h.prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "as_1" },
+        where: { id: "as_1", status: "pending_anchor" },
         data: expect.objectContaining({
           status: "completed",
           lastPolledAt: expect.any(Date),
@@ -754,6 +756,14 @@ describe("processSubmittedSettlements", () => {
 });
 
 describe("startWorker shutdown", () => {
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+  });
+  afterEach(() => {
+    exitSpy.mockRestore();
+  });
+
   it("releases its claims and stops the loop on shutdown", async () => {
     h.prisma.settlement.findMany.mockResolvedValue([]);
     h.prisma.anchorSession.findMany.mockResolvedValue([]);

@@ -83,8 +83,12 @@ describe("error response shape consistency", () => {
       const body = res.json();
       expect(body).not.toHaveProperty("stack");
       expect(body).not.toHaveProperty("statusCode");
+      // Canonical shape: the machine-readable code lives in `code`. `error`
+      // is a deprecated alias kept for older clients — both carry the same
+      // stable value, so every error response has exactly one shape.
       expect(typeof body.code).toBe("string");
       expect(body.code.length).toBeGreaterThan(0);
+      expect(body.error).toBe(body.code);
       expect(typeof body.message).toBe("string");
       expect(body.message.length).toBeGreaterThan(0);
       expect(typeof body.requestId).toBe("string");
@@ -106,9 +110,7 @@ describe("error response shape consistency", () => {
       expect(body.stack).toBeUndefined();
     }
   });
-});
-
-describe("malformed request validation", () => {
+});describe("malformed request validation", () => {
   it("VALIDATION_ERROR with details for empty body", async () => {
     const res = await app.inject({ method: "POST", url: "/auth/challenge", payload: {} });
     expect(res.statusCode).toBe(400);
@@ -119,13 +121,38 @@ describe("malformed request validation", () => {
 
   it("VALIDATION_ERROR with field-level details for invalid body types", async () => {
     const res = await app.inject({
-      method: "POST", url: "/groups", headers: authHeader(), payload: { name: "" },
+      method: "POST",
+      url: "/groups", headers: authHeader(), payload: { name: "" },
     });
     expect(res.statusCode).toBe(400);
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
     expect(Array.isArray(body.details)).toBe(true);
     expect(body.details[0].field).toBe("name");
+  });
+
+  it("Zod validation errors include standardized 'issues' array", async () => {
+    const res = await app.inject({ method: "POST", url: "/auth/challenge", payload: {} });
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.code).toBe("VALIDATION_ERROR");
+    expect(Array.isArray(body.issues)).toBe(true);
+    expect(body.issues.length).toBeGreaterThan(0);
+    // Each issue has path, message, and code — no stack traces or internal fields
+    for (const issue of body.issues) {
+      expect(Array.isArray(issue.path)).toBe(true);
+      expect(typeof issue.message).toBe("string");
+      expect(typeof issue.code).toBe("string");
+      expect(issue).not.toHaveProperty("stack");
+    }
+  });
+
+  it("Zod validation error response has no stack traces", async () => {
+    const res = await app.inject({ method: "POST", url: "/auth/challenge", payload: {} });
+    const body = res.json();
+    expect(body.stack).toBeUndefined();
+    expect(body.issues?.[0]?.stack).toBeUndefined();
+    expect(body.details?.[0]?.stack).toBeUndefined();
   });
 
 

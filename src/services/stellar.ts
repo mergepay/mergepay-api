@@ -8,6 +8,7 @@
  * from business-logic errors.
  */
 
+import pino from "pino";
 import {
   Account,
   Asset,
@@ -23,6 +24,7 @@ import {
 import pino from "pino";
 import { config } from "../config";
 import { Errors } from "../errors";
+import { ProviderError } from "../lib/provider-error";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
 import { withTimeout, TimeoutError, TransportError } from "./timeout";
 import { logRetryAttempt, withRetry } from "./retry";
@@ -72,8 +74,22 @@ export async function withHorizonFailover<T>(operation: (horizon: Horizon.Server
   throw lastError;
 }
 
-function logUpstreamError(e: unknown, codes: unknown): void {
-  console.error("[stellar] Upstream error:", e instanceof Error ? e.message : String(e), codes ? JSON.stringify(codes) : "");
+/**
+ * Operational logger for Horizon failures. Only safe fields are logged — the
+ * operation label, normalized failure category, and provider result codes.
+ * Raw error objects, response bodies, and signed envelopes never reach here.
+ */
+const log = pino({ name: "stellar" });
+
+function logHorizonFailure(
+  operation: string,
+  category: string,
+  resultCodes: string | null
+): void {
+  log.warn(
+    { provider: "horizon", operation, category, resultCodes },
+    "Horizon call failed"
+  );
 }
 
 /**
@@ -213,7 +229,15 @@ export const stellar = {
           thresholds: { low: 0, med: 0, high: 0 },
         };
       }
-      throw e;
+      const converted = toProviderError(e, {
+        provider: "horizon",
+        operation: "Horizon.loadAccount",
+        fallbackMessage: "Stellar account lookup failed",
+      });
+      if (converted instanceof ProviderError) {
+        logHorizonFailure(converted.operation, converted.category, converted.detail?.join(",") ?? null);
+      }
+      throw converted;
     }
   },
 
@@ -348,16 +372,19 @@ export const stellar = {
         }
       );
       return res.hash;
-    } catch (e: any) {
-      // Re-throw TimeoutError and TransportError as-is for retry classification
-      if (e instanceof TimeoutError || e instanceof TransportError) {
-        throw e;
+    } catch (e: unknown) {
+      // Normalize everything into a categorized ProviderError: timeouts stay
+      // indeterminate, transports transient, and Horizon result codes a
+      // permanent rejection — the worker's retry decision reads the category.
+      const converted = toProviderError(e, {
+        provider: "horizon",
+        operation: "Horizon.submitTransaction",
+        fallbackMessage: "Stellar rejected the transaction",
+      });
+      if (converted instanceof ProviderError) {
+        logHorizonFailure(converted.operation, converted.category, converted.detail?.join(",") ?? null);
       }
-      const codes =
-        e?.response?.data?.extras?.result_codes ??
-        e?.response?.data?.result_codes;
-      logUpstreamError(e, codes);
-      throw Errors.upstream("Stellar rejected the transaction");
+      throw converted;
     }
   },
 

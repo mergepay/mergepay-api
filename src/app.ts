@@ -236,6 +236,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: (request: FastifyRequest) => ({
       code: "RATE_LIMITED",
+      error: "RATE_LIMITED",
       message: "Too many requests. Please retry later.",
       requestId: request.id,
     }),
@@ -315,6 +316,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
       code: "NOT_FOUND",
+      error: "NOT_FOUND",
       message: "Route not found",
       requestId: correlationId,
     });

@@ -26,7 +26,6 @@ const schema = z.object({
   // database concurrency across Fastify workers on a single instance.
   DATABASE_CONNECTION_LIMIT: z.coerce.number().int().positive().default(5),
   PORT: z.coerce.number().int().positive().default(4000),
-  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   API_PUBLIC_URL: urlSchema,
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
@@ -128,6 +127,13 @@ const schema = z.object({
     .positive()
     .max(1024 * 1024)
     .default(64 * 1024),
+
+  // Graceful shutdown bounds. The API closes the HTTP server then disconnects
+  // Prisma; the worker waits for its in-flight job cycle. If either exceeds its
+  // bound, a stuck dependency cannot keep the process alive forever — the
+  // process force-exits with a non-zero status. See src/lib/shutdown.ts.
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  WORKER_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
 
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
@@ -286,7 +292,7 @@ const schema = z.object({
   }
 );
 
-function safeErrorMessage(error: unknown): string {
+export function safeErrorMessage(error: unknown): string {
   if (error instanceof z.ZodError) {
     const issues = error.issues.map((issue) => {
       const path = issue.path.length > 0 ? issue.path.join(".") : "configuration";
@@ -301,6 +307,8 @@ function safeErrorMessage(error: unknown): string {
 }
 
 export type Env = z.infer<typeof schema>;
+
+export const envSchema = schema;
 
 let parsed: Env;
 try {

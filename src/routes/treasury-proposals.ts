@@ -64,7 +64,6 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
     if (!isPositive(body.amount)) {
       throw Errors.badRequest("invalid_amount", "Amount must be positive");
     }
-    // Destination and asset issuer are validated by the shared Stellar schema before the request reaches service logic.
 
     const group = await prisma.group.findUnique({ where: { id: groupId } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {

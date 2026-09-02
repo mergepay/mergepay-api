@@ -59,10 +59,9 @@ import {
 import {
   anchorService,
   AUDITABLE_ANCHOR_STATUSES,
-  TERMINAL_ANCHOR_STATUSES,
   type PollResult,
 } from "../services/anchor";
-import { applyAnchorSessionTransition } from "../services/anchor-status";
+import { applyAnchorSessionTransition, isTerminalAnchorStatus } from "../services/anchor-status";
 import { recordStatusTransition } from "../services/status-history";
 import {
   ANCHOR_RETRY_POLICY,
@@ -787,8 +786,14 @@ async function reconcileSingleAnchor(
 
   // ── poll failed (timeout, network, malformed response) ───────────────────
   if (result.isError) {
+    const isTransient = result.errorCategory !== "permanent";
     const exhausted = attempt >= ANCHOR_RETRY_POLICY.maxAttempts;
     const reason = safeFailureMessage(result.message);
+    // A provider rejection can never succeed on retry; everything else stays
+    // transient until the retry budget runs out. The poll's normalized
+    // category drives the decision — no message-text guessing.
+    const errorCategory: JobFailureCategory =
+      exhausted || result.category === "rejected" ? "permanent" : "transient";
 
     await prisma.anchorSession.update({
       where: { id: job.id },
@@ -796,24 +801,45 @@ async function reconcileSingleAnchor(
         lastPolledAt: now,
         retryCount: attempt,
         failureReason: reason,
-        errorCategory: exhausted ? "permanent" : "transient",
+        errorCategory,
         nextAttemptAt: exhausted
           ? null
           : new Date(Date.now() + retryDelayMs(attempt, ANCHOR_RETRY_POLICY)),
       },
     });
 
+      jobLog.error(
+        {
+          jobType: "anchor",
+          jobId: job.id,
+          attempt,
+          outcome: "failed",
+          reason,
+        },
+        "anchor poll failed with terminal error"
+      );
+    }
+    return;
+  }
+
+  // ── unknown anchor status ────────────────────────────────────────────────
+  // A recognised-but-unknown raw status maps to pending_anchor and stays
+  // retryable. Emit an explicit, operationally useful entry so operators can
+  // spot a future anchor that introduced a status we cannot classify — but
+  // never treat it as a failure or overwrite a terminal state.
+  if (result.recognized === false) {
     jobLog.warn(
       {
         jobType: "anchor",
         jobId: job.id,
         attempt,
         outcome: exhausted ? "retries_exhausted" : "retry_scheduled",
+        category: result.category ?? "unknown",
+        errorCategory,
         reason,
       },
-      "anchor poll failed"
+      `anchor reported an unrecognized SEP-24 status '${result.rawStatus}' — kept pending and will keep polling`
     );
-    return;
   }
 
   // ── status unchanged ─────────────────────────────────────────────────────
@@ -833,27 +859,34 @@ async function reconcileSingleAnchor(
 
   // ── terminal-state protection ────────────────────────────────────────────
   // Anchor responses are untrusted and can arrive out of order; a local
-  // terminal state is never walked back.
-  if (TERMINAL_ANCHOR_STATUSES.has(job.status)) {
-    jobLog.warn(
-      {
-        jobType: "anchor",
-        jobId: job.id,
-        attempt,
-        outcome: "ignored",
-        localStatus: job.status,
-        remoteStatus: result.status,
-      },
-      "anchor reported a different status for a terminal session"
-    );
-    return;
+  // terminal state is never walked back. This is a fast-path using the
+  // snapshot; the authoritative guard is the conditional update in
+  // applyAnchorSessionTransition below, which re-reads the live status inside
+  // its transaction and no-ops if a concurrent write already advanced it.
+  if (isTerminalAnchorStatus(job.status)) {
+    // Only transition allowed out of a terminal state is from error to refunded
+    if (job.status !== "error" || result.status !== "refunded") {
+      jobLog.warn(
+        {
+          jobType: "anchor",
+          jobId: job.id,
+          attempt,
+          outcome: "ignored",
+          localStatus: job.status,
+          remoteStatus: result.status,
+        },
+        "anchor reported a different status for a terminal session"
+      );
+      return;
+    }
   }
 
   // ── advance ──────────────────────────────────────────────────────────────
-  await applyAnchorSessionTransition({
+  const updated = await applyAnchorSessionTransition({
     sessionId: job.id,
     nextStatus: result.status,
     source: "poll",
+    expectedCurrentStatus: job.status,
     extraData: {
       lastPolledAt: now,
       failureReason: result.status === "error" ? result.message ?? null : null,
@@ -862,6 +895,24 @@ async function reconcileSingleAnchor(
       retryCount: 0,
     } as never,
   });
+
+  if (!updated.changed) {
+    // A concurrent writer advanced (or terminalised) this session while we
+    // were polling. Do not clobber it — just record that the poll observed
+    // nothing actionable.
+    jobLog.info(
+      {
+        jobType: "anchor",
+        jobId: job.id,
+        attempt,
+        outcome: "superseded",
+        observedStatus: result.status,
+        localStatus: job.status,
+      },
+      "anchor session was advanced concurrently; discarded stale poll result"
+    );
+    return;
+  }
 
   await recordStatusTransition({
     entityType: "anchor_session",
@@ -923,6 +974,7 @@ export async function reconcileAnchors(): Promise<void> {
       },
       externalTransactionId: { not: null },
       AND: [
+        { OR: [{ errorCategory: null }, { errorCategory: { not: "permanent" } }] },
         { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
         { OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: now } }] },
       ],

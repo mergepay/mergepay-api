@@ -1,7 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { timingSafeEqual } from "node:crypto";
 import { prisma } from "../db";
+import { safeEqual } from "../lib/constant-time";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -14,6 +14,7 @@ import {
 import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
 import { ipKey } from "../services/rate-limit-keys";
+import { safeFailureMessage } from "../services/job-retry";
 import {
   paginationQuerySchema,
   buildPage,
@@ -195,6 +196,25 @@ export default async function anchorRoutes(app: FastifyInstance) {
     };
   });
 
+  // -- get session ------------------------------------------------------------
+  app.get(
+    "/anchors/sessions/:id",
+    { preHandler: [app.authenticate], ...pollLimit },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
+
+      const session = await prisma.anchorSession.findUnique({
+        where: { id },
+      });
+      if (!session || session.userId !== auth.id) {
+        throw Errors.notFound("Anchor session not found");
+      }
+
+      return { session: serializeAnchorSession(session) };
+    }
+  );
+
   // -- webhook (signed) -------------------------------------------------------
   // Rate limiting here is abuse protection for an unauthenticated-until-
   // checked endpoint; it never substitutes for the shared-secret check
@@ -213,16 +233,17 @@ export default async function anchorRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const secret = (req.headers["x-anchor-signature"] ??
         req.headers["x-webhook-secret"]) as string | undefined;
-      if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
+      if (!secret || !safeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
         return reply.code(200).send({ ok: true }); // don't reveal verification result
       }
       const body = z
         .object({
           transaction: z
-            .object({ id: z.string(), status: z.string() })
+            .object({ id: z.string(), status: z.string(), message: z.string().optional() })
             .optional(),
           id: z.string().optional(),
           status: z.string().optional(),
+          message: z.string().optional(),
         })
         .passthrough()
         .parse(req.body ?? {});
@@ -231,6 +252,9 @@ export default async function anchorRoutes(app: FastifyInstance) {
       const status = body.transaction?.status ?? body.status;
       if (externalId && status) {
         const mappedStatus = mapAnchorStatus(status);
+        const rawMessage = body.transaction?.message ?? body.message;
+        const sanitizedMessage = typeof rawMessage === "string" ? safeFailureMessage(rawMessage) : null;
+
         const sessions = await prisma.anchorSession.findMany({
           where: { externalTransactionId: externalId },
         });
@@ -244,6 +268,9 @@ export default async function anchorRoutes(app: FastifyInstance) {
             sessionId: session.id,
             nextStatus: mappedStatus,
             source: "webhook",
+            extraData: mappedStatus === "error" ? {
+              failureReason: sanitizedMessage,
+            } : undefined,
           });
         }
 
@@ -265,11 +292,4 @@ export default async function anchorRoutes(app: FastifyInstance) {
       return reply.code(200).send({ ok: true });
     }
   );
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
 }

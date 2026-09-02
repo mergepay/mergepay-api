@@ -8,12 +8,13 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
-import { auditTx } from "../services/audit";
+import { ADMIN_AUDIT_ACTIONS, auditTx } from "../services/audit";
 import {
   serializeGroup,
   serializeInvitation,
   serializeInvite,
   serializeMember,
+  serializeAuditLogEntry,
 } from "../serializers";
 import {
   groupPrimaryAsset,
@@ -37,6 +38,27 @@ export function clearGroupBalanceCache(): void {
 
 export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
+
+  // Privileged, paginated history for group administrators.
+  app.get("/groups/:id/audit-logs", async (req) => {
+    const auth = requireUser(req);
+    const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+    await requireAdmin(id, auth.id);
+    const query = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50), cursor: z.string().min(1).optional() }).parse(req.query ?? {});
+    const rows = await prisma.auditLog.findMany({
+      where: { groupId: id },
+      include: { user: true },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: query.limit + 1,
+      ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
+    });
+    const hasMore = rows.length > query.limit;
+    const events = hasMore ? rows.slice(0, query.limit) : rows;
+    return {
+      events: events.map(serializeAuditLogEntry),
+      nextCursor: hasMore ? events[events.length - 1].id : null,
+    };
+  });
 
   // -- create -----------------------------------------------------------------
   app.post("/groups", { config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } } }, async (req) => {
@@ -416,6 +438,32 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- remove member ---------------------------------------------------------
+  app.patch("/groups/:id/members/:memberId", async (req) => {
+    const auth = requireUser(req);
+    const { id, memberId } = z.object({ id: z.string(), memberId: z.string() }).parse(req.params);
+    const body = z.object({ role: z.enum(["admin", "member"]) }).parse(req.body);
+    const updated = await prisma.$transaction(async (tx) => {
+      await requireAdmin(id, auth.id, tx);
+      const member = await tx.groupMember.findUnique({ where: { groupId_userId: { groupId: id, userId: memberId } } });
+      if (!member) throw Errors.notFound("Member not found in this group");
+      const result = await tx.groupMember.update({
+        where: { groupId_userId: { groupId: id, userId: memberId } },
+        data: { role: body.role },
+        include: { user: true },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: id,
+        action: ADMIN_AUDIT_ACTIONS.MEMBER_ROLE_UPDATED,
+        entityType: "group_member",
+        entityId: memberId,
+        metadata: { previousRole: member.role, role: body.role },
+      });
+      return result;
+    });
+    return { member: serializeMember(updated) };
+  });
+
   app.delete("/groups/:id/members/:memberId", async (req) => {
     const auth = requireUser(req);
     const { id, memberId } = z
@@ -462,9 +510,9 @@ export default async function groupRoutes(app: FastifyInstance) {
       await auditTx(tx, {
         userId: auth.id,
         groupId: id,
-        action: "group.member_remove",
-        entityType: "group",
-        entityId: id,
+        action: ADMIN_AUDIT_ACTIONS.MEMBER_REMOVED,
+        entityType: "group_member",
+        entityId: memberId,
         outcome: "success",
         metadata: { removedUserId: memberId, removedRole: target.role },
       });

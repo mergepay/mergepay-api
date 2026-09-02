@@ -83,8 +83,12 @@ describe("error response shape consistency", () => {
       const body = res.json();
       expect(body).not.toHaveProperty("stack");
       expect(body).not.toHaveProperty("statusCode");
+      // Canonical shape: the machine-readable code lives in `code`. `error`
+      // is a deprecated alias kept for older clients — both carry the same
+      // stable value, so every error response has exactly one shape.
       expect(typeof body.code).toBe("string");
       expect(body.code.length).toBeGreaterThan(0);
+      expect(body.error).toBe(body.code);
       expect(typeof body.message).toBe("string");
       expect(body.message.length).toBeGreaterThan(0);
       expect(typeof body.requestId).toBe("string");

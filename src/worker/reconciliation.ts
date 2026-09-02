@@ -1,6 +1,7 @@
 import pino from "pino";
 import { env } from "../config";
 import { prisma } from "../db";
+import { config } from "../config";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import { type CorrelationContext, jobContext, loggerWithContext } from "../lib/correlation";
@@ -340,6 +341,10 @@ async function loadPendingRecords(
       stellarTxHash: { not: null },
     },
     orderBy: { updatedAt: "asc" },
+    // Bounded per cycle: a backlog is drained over successive cycles rather
+    // than loaded wholesale, so a large table cannot stall one cycle or mask
+    // an unbounded read behind an index.
+    take: config.WORKER_BATCH_SIZE,
   });
 
   return records as ReconciliationRecord[];

@@ -14,8 +14,18 @@ const schema = z.object({
   // Optional query timeout for Prisma client (ms). Default: 10 seconds.
   // Prevents hung queries from blocking Fastify request workers indefinitely.
   DATABASE_QUERY_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  // Postgres connection timeout (seconds) for the underlying driver. Bounds
+  // how long Prisma waits when establishing a new socket to the database. A
+  // slow/unreachable database fails fast instead of stalling a request worker.
+  DATABASE_CONNECT_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(10),
+  // How long (seconds) a connection may wait for a free slot in Prisma's pool
+  // before the request errors. Prevents a pool of exhausted connections from
+  // blocking indefinitely under load.
+  DATABASE_POOL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(10),
+  // Maximum number of connections Prisma opens in its pool. Bounds total
+  // database concurrency across Fastify workers on a single instance.
+  DATABASE_CONNECTION_LIMIT: z.coerce.number().int().positive().default(5),
   PORT: z.coerce.number().int().positive().default(4000),
-  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   API_PUBLIC_URL: urlSchema,
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
@@ -48,6 +58,12 @@ const schema = z.object({
   // gap, so a stolen access token stays useful for minutes rather than hours.
   // Expressed in seconds so it can be compared against the refresh TTL below.
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().max(86400).default(900),
+  // Minimum remaining lifetime (seconds) a JWT must have when presented.
+  // Tokens whose `exp` claim is closer than this margin to the current clock
+  // are rejected as near-expired — even though the SDK's own check would
+  // still accept them — so a token forged or replayed moments before expiry
+  // never grants a session.
+  TOKEN_EXPIRY_MARGIN_SECONDS: z.coerce.number().int().nonnegative().max(300).default(30),
   // Refresh-token lifetime. Bounds how long an idle session can be revived
   // without the wallet signing a new SEP-10 challenge.
   REFRESH_TOKEN_TTL_MS: z.coerce
@@ -111,6 +127,13 @@ const schema = z.object({
     .positive()
     .max(1024 * 1024)
     .default(64 * 1024),
+
+  // Graceful shutdown bounds. The API closes the HTTP server then disconnects
+  // Prisma; the worker waits for its in-flight job cycle. If either exceeds its
+  // bound, a stuck dependency cannot keep the process alive forever — the
+  // process force-exits with a non-zero status. See src/lib/shutdown.ts.
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  WORKER_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
 
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),

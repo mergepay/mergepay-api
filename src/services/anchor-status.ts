@@ -24,10 +24,20 @@ import { Errors } from "../errors";
 export type AnchorSessionStatus =
   | "incomplete"
   | "pending_user_transfer_start"
+  | "pending_user"
+  | "pending_transaction_info_update"
+  | "pending_receiver"
+  | "pending_sender"
+  | "pending_stellar"
+  | "pending_trust"
   | "pending_anchor"
   | "completed"
   | "error"
-  | "refunded";
+  | "refunded"
+  | "expired"
+  | "no_market"
+  | "too_small"
+  | "too_large";
 
 export type AnchorTransitionSource = "user" | "webhook" | "poll";
 
@@ -35,10 +45,20 @@ export type AnchorTransitionSource = "user" | "webhook" | "poll";
 export const ANCHOR_SESSION_STATUSES: readonly AnchorSessionStatus[] = [
   "incomplete",
   "pending_user_transfer_start",
+  "pending_user",
+  "pending_transaction_info_update",
+  "pending_receiver",
+  "pending_sender",
+  "pending_stellar",
+  "pending_trust",
   "pending_anchor",
   "completed",
   "error",
   "refunded",
+  "expired",
+  "no_market",
+  "too_small",
+  "too_large",
 ];
 
 /**
@@ -48,16 +68,58 @@ export const ANCHOR_SESSION_STATUSES: readonly AnchorSessionStatus[] = [
  * but never regresses back to a pending state.
  */
 const ALLOWED_TRANSITIONS: Record<AnchorSessionStatus, readonly AnchorSessionStatus[]> = {
-  incomplete: ["pending_user_transfer_start", "pending_anchor", "error"],
-  pending_user_transfer_start: ["pending_anchor", "error", "refunded", "completed"],
-  pending_anchor: ["completed", "error", "refunded"],
+  incomplete: [
+    "pending_user_transfer_start", "pending_user", "pending_transaction_info_update",
+    "pending_receiver", "pending_sender", "pending_stellar", "pending_trust", "pending_anchor",
+    "error", "expired", "no_market", "too_small", "too_large",
+  ],
+  pending_user_transfer_start: [
+    "pending_user", "pending_transaction_info_update", "pending_receiver", "pending_sender",
+    "pending_stellar", "pending_trust", "pending_anchor", "error", "refunded", "completed",
+    "expired", "no_market", "too_small", "too_large",
+  ],
+  pending_user: [
+    "pending_transaction_info_update", "pending_receiver", "pending_sender", "pending_stellar",
+    "pending_trust", "pending_anchor", "error", "refunded", "completed", "expired", "no_market",
+    "too_small", "too_large",
+  ],
+  pending_transaction_info_update: [
+    "pending_user", "pending_receiver", "pending_sender", "pending_stellar", "pending_trust",
+    "pending_anchor", "error", "refunded", "completed", "expired", "no_market", "too_small", "too_large",
+  ],
+  pending_receiver: [
+    "pending_user", "pending_transaction_info_update", "pending_sender", "pending_stellar", "pending_trust",
+    "pending_anchor", "error", "refunded", "completed", "expired", "no_market", "too_small", "too_large",
+  ],
+  pending_sender: [
+    "pending_user", "pending_transaction_info_update", "pending_receiver", "pending_stellar", "pending_trust",
+    "pending_anchor", "error", "refunded", "completed", "expired", "no_market", "too_small", "too_large",
+  ],
+  pending_stellar: [
+    "pending_user", "pending_transaction_info_update", "pending_receiver", "pending_sender", "pending_trust",
+    "pending_anchor", "error", "refunded", "completed", "expired", "no_market", "too_small", "too_large",
+  ],
+  pending_trust: [
+    "pending_user", "pending_transaction_info_update", "pending_receiver", "pending_sender", "pending_stellar",
+    "pending_anchor", "error", "refunded", "completed", "expired", "no_market", "too_small", "too_large",
+  ],
+  pending_anchor: [
+    "pending_user", "pending_transaction_info_update", "pending_receiver", "pending_sender", "pending_stellar",
+    "pending_trust", "error", "refunded", "completed", "expired", "no_market", "too_small", "too_large",
+  ],
   completed: [],
   error: ["refunded"],
   refunded: [],
+  expired: [],
+  no_market: [],
+  too_small: [],
+  too_large: [],
 };
 
 export function isTerminalAnchorStatus(status: string): boolean {
-  return status === "completed" || status === "refunded";
+  return [
+    "completed", "error", "refunded", "expired", "no_market", "too_small", "too_large",
+  ].includes(status);
 }
 
 export function canTransitionAnchorStatus(

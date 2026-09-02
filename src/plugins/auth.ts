@@ -5,6 +5,13 @@ import { z } from "zod";
 import { config } from "../config";
 import { Errors } from "../errors";
 
+/**
+ * Minimum remaining lifetime (seconds) a JWT must have when presented.
+ * Tokens whose `exp` claim is closer than this margin to the current clock
+ * are rejected as near-expired.
+ */
+const TOKEN_EXPIRY_MARGIN_SECONDS = config.TOKEN_EXPIRY_MARGIN_SECONDS ?? 30;
+
 export interface AuthUser {
   id: string;
   stellarPublicKey: string;
@@ -53,6 +60,16 @@ export function verifyToken(token: string): AuthUser {
     }) as jwt.JwtPayload;
   } catch {
     throw Errors.unauthorized();
+  }
+
+  // Reject tokens that are too close to expiry: even though the SDK's own
+  // check would still accept them within this margin, a token forged or
+  // replayed moments before expiry should never grant a session.
+  if (typeof decoded.exp === "number") {
+    const remainingSeconds = decoded.exp - Math.floor(Date.now() / 1000);
+    if (remainingSeconds < TOKEN_EXPIRY_MARGIN_SECONDS) {
+      throw Errors.unauthorized("Token is near expiry");
+    }
   }
 
   const { sub, pk } = decoded;

@@ -1,7 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { timingSafeEqual } from "node:crypto";
 import { prisma } from "../db";
+import { safeEqual } from "../lib/constant-time";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -213,7 +213,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const secret = (req.headers["x-anchor-signature"] ??
         req.headers["x-webhook-secret"]) as string | undefined;
-      if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
+      if (!secret || !safeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
         return reply.code(200).send({ ok: true }); // don't reveal verification result
       }
       const body = z
@@ -265,11 +265,4 @@ export default async function anchorRoutes(app: FastifyInstance) {
       return reply.code(200).send({ ok: true });
     }
   );
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
 }

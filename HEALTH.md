@@ -64,5 +64,5 @@ has valid configuration; readiness then verifies the live dependencies.
 The API and worker are separate processes. These endpoints report API process
 and API dependency health only; they do not assert that the background worker
 is running. Monitor the worker process independently using its process
-supervisor, logs, and job metrics. A healthy `/health/ready` response therefore
+supervisor, logs, and job metrics. A healthy `/health` response therefore
 does not mean settlement submission or reconciliation jobs are being consumed.

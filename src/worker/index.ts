@@ -197,6 +197,7 @@ async function scheduleRetry(params: {
 }): Promise<void> {
   const { job, attempt, category, reason, delayMs, ctx } = params;
   const nextAttemptAt = new Date(Date.now() + delayMs);
+  const leaseExpiresAt = new Date(nextAttemptAt.getTime() + config.WORKER_LEASE_TIMEOUT_MS);
 
   await prisma.settlement.update({
     where: { id: job.id },
@@ -205,7 +206,7 @@ async function scheduleRetry(params: {
       nextAttemptAt,
       errorCategory: category,
       failureReason: reason,
-      leaseExpiresAt: leaseDeadline(),
+      leaseExpiresAt,
     },
   });
 
@@ -788,6 +789,11 @@ async function reconcileSingleAnchor(
   if (result.isError) {
     const exhausted = attempt >= ANCHOR_RETRY_POLICY.maxAttempts;
     const reason = safeFailureMessage(result.message);
+    // A provider rejection can never succeed on retry; everything else stays
+    // transient until the retry budget runs out. The poll's normalized
+    // category drives the decision — no message-text guessing.
+    const errorCategory: JobFailureCategory =
+      exhausted || result.category === "rejected" ? "permanent" : "transient";
 
     await prisma.anchorSession.update({
       where: { id: job.id },
@@ -795,7 +801,7 @@ async function reconcileSingleAnchor(
         lastPolledAt: now,
         retryCount: attempt,
         failureReason: reason,
-        errorCategory: exhausted ? "permanent" : "transient",
+        errorCategory,
         nextAttemptAt: exhausted
           ? null
           : new Date(Date.now() + retryDelayMs(attempt, ANCHOR_RETRY_POLICY)),
@@ -808,6 +814,8 @@ async function reconcileSingleAnchor(
         jobId: job.id,
         attempt,
         outcome: exhausted ? "retries_exhausted" : "retry_scheduled",
+        category: result.category ?? "unknown",
+        errorCategory,
         reason,
       },
       "anchor poll failed"
@@ -907,7 +915,19 @@ export async function reconcileAnchors(): Promise<void> {
 
   const sessions = await prisma.anchorSession.findMany({
     where: {
-      status: { in: ["incomplete", "pending_user_transfer_start", "pending_anchor"] },
+      status: {
+        in: [
+          "incomplete",
+          "pending_user_transfer_start",
+          "pending_user",
+          "pending_transaction_info_update",
+          "pending_receiver",
+          "pending_sender",
+          "pending_stellar",
+          "pending_trust",
+          "pending_anchor",
+        ],
+      },
       externalTransactionId: { not: null },
       AND: [
         { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
@@ -1101,7 +1121,9 @@ export async function startWorker(): Promise<() => Promise<void>> {
     const timeoutMs = Math.max(config.SHUTDOWN_TIMEOUT_MS, config.WORKER_SHUTDOWN_DRAIN_MS);
     const timeoutHandle = setTimeout(() => {
       log.error({ jobType: "worker_cycle", signal, timeoutMs }, "shutdown timed out, forcing exit");
-      process.exit(1);
+      if (!config.isTest) {
+        process.exit(1);
+      }
     }, timeoutMs);
 
     try {
@@ -1150,7 +1172,9 @@ export async function startWorker(): Promise<() => Promise<void>> {
       throw error;
     } finally {
       clearTimeout(timeoutHandle);
-      process.exit(0);
+      if (!config.isTest) {
+        process.exit(0);
+      }
     }
 
   };

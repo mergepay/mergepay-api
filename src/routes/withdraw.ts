@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
+import { mpMemoSchema } from "../lib/stellar-validation";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -15,7 +16,7 @@ const SUPPORTED_ASSET_CODES = ["USDC", "XLM"] as const;
 const withdrawalBody = z.object({
   amount: z.string().min(1),
   assetCode: z.string().min(1),
-  memo: z.string().max(28).optional(),
+  memo: mpMemoSchema.optional(),
 });
 
 function units(value: string): bigint {

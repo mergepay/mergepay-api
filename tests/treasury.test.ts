@@ -366,3 +366,129 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
     expect(res.statusCode).toBe(403);
   });
 });
+
+describe("POST /groups/:id/treasury/deposit — audit events", () => {
+  it("writes an audit event when a deposit is created", async () => {
+    prisma.group.findUnique.mockResolvedValue(fakeGroup());
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: admin.id,
+      role: "admin",
+    });
+    const createdTx = {
+      id: "ttx_dep_1",
+      shortCode: "DP1",
+      groupId: "group_1",
+      userId: admin.id,
+      direction: "deposit",
+      amount: "10.0000000",
+      assetCode: "XLM",
+      assetIssuer: null,
+      destination: treasuryAccount.publicKey(),
+      status: "pending",
+      memo: memoText("DP1"),
+      expiresAt: new Date("2026-12-31T00:00:00.000Z"),
+      createdAt: new Date("2026-08-25T00:00:00.000Z"),
+      user: admin,
+    };
+    prisma.treasuryTransaction.create.mockResolvedValueOnce(createdTx);
+    prisma.auditLog.create.mockResolvedValueOnce({});
+    loadAccountMock.mockResolvedValueOnce({
+      exists: true,
+      sequence: "200",
+      balances: [],
+      signers: [{ key: admin.stellarPublicKey, weight: 1 }],
+      thresholds: { low: 1, med: 1, high: 1 },
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/deposit",
+      headers: authHeader(),
+      payload: {
+        amount: "10.0000000",
+        assetCode: "XLM",
+      },
+    });
+
+    if (res.statusCode !== 200) {
+      // eslint-disable-next-line no-console
+      console.error("DEPOSIT AUDIT TEST ERROR:", res.statusCode, res.json());
+    }
+    expect(res.statusCode).toBe(200);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "treasury.deposit.created",
+          entityType: "treasury_transaction",
+          entityId: "ttx_dep_1",
+        }),
+      })
+    );
+  });
+});
+
+describe("POST /groups/:id/treasury/withdraw — audit events", () => {
+  it("writes an audit event when a withdrawal is created", async () => {
+    prisma.group.findUnique.mockResolvedValue(fakeGroup());
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: admin.id,
+      role: "admin",
+    });
+    const createdTx = {
+      id: "ttx_wd_1",
+      shortCode: "WD2",
+      groupId: "group_1",
+      userId: admin.id,
+      direction: "withdrawal",
+      amount: "15.0000000",
+      assetCode: "XLM",
+      assetIssuer: null,
+      destination: withdrawDestination,
+      status: "awaiting_signatures",
+      memo: memoText("WD2"),
+      expiresAt: new Date("2026-12-31T00:00:00.000Z"),
+      createdAt: new Date("2026-08-25T00:00:00.000Z"),
+      user: admin,
+    };
+    prisma.treasuryTransaction.create.mockResolvedValueOnce(createdTx);
+    prisma.auditLog.create.mockResolvedValueOnce({});
+    loadAccountMock.mockResolvedValueOnce({
+      exists: true,
+      sequence: "200",
+      balances: [],
+      signers: [
+        { key: signerA.publicKey(), weight: 1 },
+        { key: signerB.publicKey(), weight: 1 },
+      ],
+      thresholds: { low: 1, med: 2, high: 2 },
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/withdraw",
+      headers: authHeader(),
+      payload: {
+        amount: "15.0000000",
+        assetCode: "XLM",
+        destination: withdrawDestination,
+      },
+    });
+
+    if (res.statusCode !== 200) {
+      // eslint-disable-next-line no-console
+      console.error("WITHDRAW AUDIT TEST ERROR:", res.statusCode, res.json());
+    }
+    expect(res.statusCode).toBe(200);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "treasury.withdrawal.created",
+          entityType: "treasury_transaction",
+          entityId: "ttx_wd_1",
+        }),
+      })
+    );
+  });
+});

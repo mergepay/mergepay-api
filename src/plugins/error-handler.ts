@@ -2,7 +2,7 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
-import { TimeoutError, TransportError } from "../services/timeout";
+import { toRequestLimitError } from "../lib/request-limits";
 
 export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
@@ -27,15 +27,25 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
       });
     }
 
-    // A service let a raw timeout/transport failure escape (it should have
-    // converted it via toProviderError). Still answer with a safe 502 rather
-    // than the generic 500.
-    if (err instanceof TimeoutError || err instanceof TransportError) {
-      return reply.code(502).send({
-        code: "UPSTREAM_ERROR",
-        error: "UPSTREAM_ERROR",
-        message: "An upstream provider is temporarily unavailable.",
+    // A request that failed Fastify's own JSON-schema validation (from a
+    // route's `schema` / OpenAPI body-schema annotation) is a validation
+    // error like any other, so it returns the same VALIDATION_ERROR contract
+    // the Zod-based handlers use. Failing that — falling into the generic 4xx
+    // branch below — would let two identical mistakes on two routes surface
+    // with two different codes.
+    if ((err as any).code === "FST_ERR_VALIDATION") {
+      const details = Array.isArray((err as any).validation)
+        ? (err as any).validation.map((v: any) => ({
+            field: (v?.instancePath ?? "").replace(/^\//, "") || undefined,
+            message: v?.message ?? "Validation failed",
+          }))
+        : undefined;
+      return reply.code(400).send({
+        code: "VALIDATION_ERROR",
+        error: "VALIDATION_ERROR",
+        message: "Validation failed",
         requestId,
+        details,
       });
     }
 
@@ -50,6 +60,20 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         body.details = err.details;
       }
       return reply.code(err.status).send(body);
+    }
+
+    // Size and shape limits rejected by Fastify or @fastify/multipart before a
+    // handler ever ran. Without this they fall through to the generic 4xx
+    // branch below, which echoes the framework's own wording and leaves clients
+    // no stable code to branch on. See src/lib/request-limits.ts.
+    const limitError = toRequestLimitError(err);
+    if (limitError) {
+      return reply.code(limitError.status).send({
+        code: limitError.code,
+        error: limitError.code,
+        message: limitError.message,
+        requestId,
+      });
     }
 
     if ((err as any).statusCode === 429) {

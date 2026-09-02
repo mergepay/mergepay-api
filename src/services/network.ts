@@ -1,6 +1,6 @@
 import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "../config";
-import { withTimeout, toProviderError } from "./timeout";
+import { logRetryAttempt, withRetry } from "./retry";
 
 export interface FeeStats {
   minAcceptedFee: number;
@@ -48,30 +48,37 @@ function normalize(raw: Record<string, unknown>): FeeStats {
   };
 }
 
+/**
+ * Fee statistics are a pure read, so a transient Horizon failure is retried
+ * rather than surfaced. The cache above means a single success covers every
+ * caller for FEE_CACHE_TTL, so the retry budget is spent at most once per
+ * window rather than once per request.
+ */
 async function fetchFeeStats(): Promise<FeeStats> {
-  try {
-    const response = await withTimeout(
-      "Horizon.feeStats",
-      config.HORIZON_FEE_TIMEOUT_MS,
-      async (_signal) => {
-        // Horizon.Server.feeStats doesn't accept AbortSignal directly,
-        // but we wrap it so timeout still fires and rejects the promise.
-        return horizon().feeStats();
-      }
-    );
-    const stats = normalize(response as unknown as Record<string, unknown>);
-    cached = {
-      stats,
-      expiresAt: Date.now() + config.FEE_CACHE_TTL * 1000,
-    };
-    return stats;
-  } catch (e: unknown) {
-    throw toProviderError(e, {
-      provider: "horizon",
+  const response = await withRetry(
+    {
       operation: "Horizon.feeStats",
-      fallbackMessage: "Stellar fee statistics unavailable",
-    });
-  }
+      timeoutMs: config.HORIZON_FEE_TIMEOUT_MS,
+      onAttemptFailed: (entry) =>
+        logRetryAttempt(
+          {
+            warn: (obj, msg) => console.warn(`[network] ${msg}`, JSON.stringify(obj)),
+          },
+          entry
+        ),
+    },
+    async () => {
+      // Horizon.Server.feeStats doesn't accept AbortSignal directly, but the
+      // wrapper still fires and rejects the promise on timeout.
+      return horizon().feeStats();
+    }
+  );
+  const stats = normalize(response as unknown as Record<string, unknown>);
+  cached = {
+    stats,
+    expiresAt: Date.now() + config.FEE_CACHE_TTL * 1000,
+  };
+  return stats;
 }
 
 /** Return Horizon fee statistics, refreshing the short-lived in-memory cache as needed. */

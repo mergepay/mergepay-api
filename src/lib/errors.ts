@@ -37,6 +37,14 @@ export const ErrorCode = {
   PAYER_SHARE: "PAYER_SHARE",
   SELF_SETTLE: "SELF_SETTLE",
   ACCOUNT_UNFUNDED: "ACCOUNT_UNFUNDED",
+  /**
+   * Settlement preflight outcomes (see src/services/settlement-preflight.ts).
+   * Kept distinct because the remedies differ: establish a trustline, acquire
+   * more of the asset, or top up XLM for the fee and account reserve.
+   */
+  MISSING_TRUSTLINE: "MISSING_TRUSTLINE",
+  INSUFFICIENT_BALANCE: "INSUFFICIENT_BALANCE",
+  INSUFFICIENT_FEE_BALANCE: "INSUFFICIENT_FEE_BALANCE",
   TREASURY_DISABLED: "TREASURY_DISABLED",
   TREASURY_UNFUNDED: "TREASURY_UNFUNDED",
   INVITE_EXPIRED: "INVITE_EXPIRED",
@@ -44,6 +52,16 @@ export const ErrorCode = {
   NO_FILE: "NO_FILE",
   BAD_FILE_TYPE: "BAD_FILE_TYPE",
   FILE_TOO_LARGE: "FILE_TOO_LARGE",
+  /**
+   * Request size and shape limits (see src/lib/request-limits.ts). Answered
+   * with 413 rather than 400: the request was well-formed, just too large.
+   * Distinct codes so a client can tell "shrink the file" from "send fewer
+   * files" from "shorten this field".
+   */
+  REQUEST_TOO_LARGE: "REQUEST_TOO_LARGE",
+  TOO_MANY_FILES: "TOO_MANY_FILES",
+  FIELD_TOO_LARGE: "FIELD_TOO_LARGE",
+  TOO_MANY_PARTS: "TOO_MANY_PARTS",
   XDR_MISMATCH: "XDR_MISMATCH",
   /** The envelope could not be parsed at all — not that it failed to match. */
   XDR_MALFORMED: "XDR_MALFORMED",

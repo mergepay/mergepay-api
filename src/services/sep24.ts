@@ -1,87 +1,68 @@
 /**
  * SEP-24 anchor callback verification and state application.
  *
- * Anchors report deposit and withdrawal progress asynchronously rather than
- * making Mergepay poll every open session. Those callbacks arrive from the
- * public internet carrying no Mergepay session, so the only thing separating a
- * real anchor from an attacker is the bearer token on the request.
+ * Anchors report deposit and withdrawal progress asynchronously: instead of
+ * Mergepay polling `GET /transaction` on every session, the anchor POSTs a
+ * status update whenever a transfer moves. Those callbacks arrive from the
+ * public internet with no session and no bearer token, so the only thing that
+ * distinguishes a real anchor from an attacker is an HMAC-SHA256 signature
+ * computed over the *exact bytes* the anchor sent.
  *
- * ## Why a JWT rather than a shared secret
+ * ## Why the raw body matters
  *
- * A shared secret sent verbatim in a header authenticates whoever holds it —
- * and anyone who ever observed one legitimate callback holds it. A JWT signed
- * by the anchor's SEP-10 key is verified against the key published in that
- * anchor's own stellar.toml, so possession of a past request proves nothing:
- * the token expires, and forging a new one requires the anchor's private key.
+ * The signature covers the serialized payload, not the parsed object. Once
+ * Fastify has parsed JSON, key order, whitespace, and numeric formatting are
+ * all lost, and re-serializing produces different bytes than the anchor
+ * signed — every signature would fail. The route therefore buffers the raw
+ * body (see `src/routes/webhooks.ts`) and hands it here untouched.
  *
- * The token is bound to this deployment on three axes:
+ * ## Verification rules
  *
- *   - **Signature** — against the anchor's `SIGNING_KEY` from its stellar.toml.
- *   - **Issuer** — the anchor's own home domain, so a token minted by a
- *     different anchor (or a different environment) is rejected even when it
- *     is otherwise well-formed.
- *   - **Expiry** — enforced by verification, which bounds replay of a captured
- *     token to its own lifetime.
+ *  - The signature header is parsed leniently (`sha256=<hex>` or bare hex) but
+ *    compared strictly, in constant time, against an HMAC of the raw body
+ *    keyed by the configured per-anchor secret.
+ *  - A missing, malformed, or non-matching signature is rejected *before* the
+ *    body is parsed or any database work happens. Nothing about which check
+ *    failed is returned to the caller.
+ *  - A timestamp header, when the anchor sends one, bounds replay: a signature
+ *    is only accepted inside `SEP24_WEBHOOK_TOLERANCE_MS` of now. Anchors that
+ *    do not send one are unaffected.
  *
  * ## State application
  *
- * Applying an update is delegated to `applyAnchorSessionTransition`, which
- * validates the change against the finite state map and writes its audit record
- * in the same database transaction as the status change. Anchors retry and give
- * no ordering guarantee, so duplicate and out-of-order deliveries have to be
- * no-ops rather than regressions — that guarantee lives there, not here.
+ * Applying the update is delegated to `applyAnchorSessionTransition`, which
+ * validates the transition against the finite state map and writes its audit
+ * record inside the same database transaction as the status change. That makes
+ * duplicate and out-of-order deliveries no-ops rather than regressions, which
+ * matters because anchors retry aggressively and give no ordering guarantee.
  */
-import jwt from "jsonwebtoken";
-import pino from "pino";
+import crypto from "node:crypto";
 import { z } from "zod";
 import { config } from "../config";
 import { prisma } from "../db";
-import { Errors } from "../errors";
-import { anchorService, mapAnchorStatus } from "./anchor";
-import { applyAnchorSessionTransition } from "./anchor-status";
 import { audit } from "./audit";
+import { mapAnchorStatus } from "./anchor";
+import { applyAnchorSessionTransition } from "./anchor-status";
 
-const log = pino({ name: "sep24" });
+/** Header carrying the anchor's HMAC-SHA256 signature over the raw body. */
+export const SEP24_SIGNATURE_HEADER = "x-sep24-signature";
 
 /**
- * Anchor statuses that mean the transfer will not complete but which
- * `AnchorSession.status` cannot itself hold. SEP-24 defines several distinct
- * terminal failures; Mergepay tracks one failure state.
- *
- * Collapsing them here matters: an unmapped status reaching the transition
- * layer is coerced to `pending_anchor`, which would leave a dead transfer
- * looking like one still in flight — the exact misreading a status callback
- * exists to prevent.
+ * Optional header carrying the signing timestamp (seconds or milliseconds
+ * since the epoch). Present, it bounds how long a captured request stays
+ * replayable; absent, signature verification alone is the gate.
  */
-const TERMINAL_FAILURE_STATUSES = new Set([
-  "error",
-  "expired",
-  "no_market",
-  "too_small",
-  "too_large",
-]);
+export const SEP24_TIMESTAMP_HEADER = "x-sep24-timestamp";
 
-/** Statuses this handler knows how to act on. Anything else is logged. */
-const RECOGNISED_STATUSES = new Set([
-  "incomplete",
-  "pending_user_transfer_start",
-  "pending_user_transfer_complete",
-  "pending_external",
-  "pending_anchor",
-  "pending_stellar",
-  "pending_trust",
-  "pending_user",
-  "completed",
-  "refunded",
-  ...TERMINAL_FAILURE_STATUSES,
-]);
+/** Signature encodings anchors are known to emit. */
+const SIGNATURE_PREFIX = "sha256=";
 
 /**
  * The SEP-24 transaction object, in both shapes anchors send it: wrapped in a
- * `transaction` envelope (the shape most anchors reuse from their
- * `GET /transaction` response) or flattened at the top level.
+ * `transaction` envelope (the SEP-24 `GET /transaction` response shape, which
+ * most anchors reuse for callbacks) or flattened at the top level.
  *
- * `passthrough` is deliberate — anchors add fields freely, and an unrecognized
+ * `passthrough` is deliberate — anchors add fields freely and an unrecognized
  * one must never reject an otherwise valid callback. Only what Mergepay reads
  * is validated.
  */
@@ -131,73 +112,170 @@ export const sep24CallbackSchema = z
 
 export type Sep24Callback = z.infer<typeof sep24CallbackSchema>;
 
+/** Why a callback was rejected. Never returned to the caller — logs only. */
+export type Sep24RejectionReason =
+  | "missing_signature"
+  | "malformed_signature"
+  | "invalid_signature"
+  | "stale_timestamp";
+
+export interface Sep24VerificationResult {
+  valid: boolean;
+  reason?: Sep24RejectionReason;
+}
+
+function constantTimeEqualHex(a: string, b: string): boolean {
+  // timingSafeEqual throws on length mismatch, which would itself leak length
+  // through an exception path, so the lengths are compared first and the
+  // comparison is skipped rather than attempted.
+  if (a.length !== b.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(a, "hex"), Buffer.from(b, "hex"));
+  } catch {
+    return false;
+  }
+}
+
+/** Normalize `sha256=<hex>` / bare hex to lowercase hex, or null if unusable. */
+function normalizeSignature(raw: unknown): string | null {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== "string") return null;
+
+  const trimmed = value.trim();
+  const hex = trimmed.toLowerCase().startsWith(SIGNATURE_PREFIX)
+    ? trimmed.slice(SIGNATURE_PREFIX.length)
+    : trimmed;
+
+  // A SHA-256 HMAC is always 64 hex characters. Anything else is malformed
+  // input, not a failed comparison, and is rejected without touching the key.
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) return null;
+  return hex.toLowerCase();
+}
+
+/** Parse a seconds- or milliseconds-precision epoch header. */
+function parseTimestamp(raw: unknown): number | null {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== "string" && typeof value !== "number") return null;
+
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+
+  // Values below ~1e12 are seconds; anchors differ, and guessing wrong by a
+  // factor of 1000 would make every callback look stale.
+  return numeric < 1e12 ? numeric * 1000 : numeric;
+}
+
+/** Compute the expected signature for a payload. Exported for tests. */
+export function signSep24Payload(rawBody: string | Buffer, secret: string): string {
+  return crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+}
+
+/**
+ * Verify an anchor callback's HMAC-SHA256 signature over the raw request body.
+ *
+ * The secret is resolved per anchor so a compromised anchor credential cannot
+ * be used to forge updates attributed to another.
+ */
+export function verifySep24Signature(params: {
+  rawBody: string | Buffer;
+  headers: Record<string, unknown>;
+  secret?: string;
+  now?: number;
+}): Sep24VerificationResult {
+  const { rawBody, headers, now = Date.now() } = params;
+  const secret = params.secret ?? resolveAnchorSecret();
+
+  const provided = normalizeSignature(headers[SEP24_SIGNATURE_HEADER]);
+  if (provided === null) {
+    const present = headers[SEP24_SIGNATURE_HEADER] !== undefined;
+    return { valid: false, reason: present ? "malformed_signature" : "missing_signature" };
+  }
+
+  // Replay bound. Checked before the HMAC so a captured-and-replayed request
+  // is rejected on age even though its signature is, by construction, valid.
+  const timestamp = parseTimestamp(headers[SEP24_TIMESTAMP_HEADER]);
+  if (timestamp !== null) {
+    if (Math.abs(now - timestamp) > config.SEP24_WEBHOOK_TOLERANCE_MS) {
+      return { valid: false, reason: "stale_timestamp" };
+    }
+  }
+
+  const expected = signSep24Payload(rawBody, secret);
+  if (!constantTimeEqualHex(provided, expected)) {
+    return { valid: false, reason: "invalid_signature" };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * The signing secret for an anchor.
+ *
+ * Secrets live in configuration, never in the database, so rotating one is a
+ * deploy rather than a migration. `SEP24_WEBHOOK_SECRETS` holds the per-anchor
+ * map (`name:secret,name:secret`); `ANCHOR_WEBHOOK_SECRET` remains the default
+ * for single-anchor deployments, which is every deployment today.
+ */
+export function resolveAnchorSecret(anchorName?: string): string {
+  if (anchorName) {
+    const perAnchor = anchorWebhookSecrets().get(anchorName);
+    if (perAnchor) return perAnchor;
+  }
+  return config.ANCHOR_WEBHOOK_SECRET;
+}
+
+let secretMapCache: Map<string, string> | null = null;
+
+function anchorWebhookSecrets(): Map<string, string> {
+  if (secretMapCache) return secretMapCache;
+
+  const map = new Map<string, string>();
+  for (const entry of config.SEP24_WEBHOOK_SECRETS.split(",")) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+
+    // Split on the first separator only: a secret may legitimately contain ':'.
+    const separator = trimmed.indexOf(":");
+    if (separator <= 0) continue;
+
+    const name = trimmed.slice(0, separator).trim();
+    const secret = trimmed.slice(separator + 1).trim();
+    if (name && secret) map.set(name, secret);
+  }
+
+  secretMapCache = map;
+  return map;
+}
+
+/** Drop the parsed secret map. Tests mutate config between cases. */
+export function resetAnchorSecretCache(): void {
+  secretMapCache = null;
+}
+
+/**
+ * Anchor statuses that mean the transfer will not complete, but which are not
+ * themselves values `AnchorSession.status` can hold. SEP-24 defines several
+ * distinct terminal failures (`no_market`, `too_small`, `too_large`,
+ * `expired`); Mergepay tracks one failure state.
+ *
+ * Collapsing them here rather than at the session layer matters: an unmapped
+ * status reaching `applyAnchorSessionTransition` is coerced to
+ * `pending_anchor`, which would leave a dead transfer looking like one still
+ * in flight — the exact misreading a status callback exists to prevent. The
+ * anchor's own wording is preserved separately in the audit metadata.
+ */
+const TERMINAL_FAILURE_STATUSES = new Set([
+  "error",
+  "expired",
+  "no_market",
+  "too_small",
+  "too_large",
+]);
+
 /** Normalize a raw anchor status onto the session status vocabulary. */
 export function toSessionStatus(rawStatus: string): string {
   const mapped = mapAnchorStatus(rawStatus);
   return TERMINAL_FAILURE_STATUSES.has(mapped) ? "error" : mapped;
-}
-
-/** Whether this handler recognises the status the anchor reported. */
-export function isRecognisedStatus(rawStatus: string): boolean {
-  return RECOGNISED_STATUSES.has(rawStatus);
-}
-
-/**
- * Verify the anchor's bearer token.
- *
- * Returns the token's subject on success. Every failure mode raises the same
- * 401 — telling a caller whether the signature, the issuer, or the expiry was
- * wrong hands an attacker a free oracle for probing the format.
- */
-export async function verifyAnchorToken(
-  authorization: string | undefined,
-  signingKey?: string
-): Promise<string> {
-  if (!authorization?.startsWith("Bearer ")) {
-    throw Errors.unauthorized("Anchor callback requires a bearer token");
-  }
-
-  const token = authorization.slice("Bearer ".length).trim();
-  if (!token) {
-    throw Errors.unauthorized("Anchor callback requires a bearer token");
-  }
-
-  const key = signingKey ?? (await anchorSigningKey());
-
-  try {
-    const payload = jwt.verify(token, key, {
-      algorithms: ["HS256"],
-      issuer: config.ANCHOR_HOME_DOMAIN,
-    });
-
-    const subject =
-      typeof payload === "object" && payload !== null
-        ? String((payload as jwt.JwtPayload).sub ?? "")
-        : "";
-
-    return subject;
-  } catch {
-    // The underlying reason is deliberately not surfaced or logged with the
-    // token attached — a rejected token is still a credential.
-    throw Errors.unauthorized("Invalid anchor callback token");
-  }
-}
-
-/**
- * The anchor's SEP-10 signing key, read from its stellar.toml.
- *
- * Fetched through `anchorService.getToml`, which caches, so a burst of
- * callbacks does not become a burst of upstream reads. A failure to resolve it
- * is an availability problem rather than an authorization decision, so it is
- * reported as such instead of silently rejecting a legitimate anchor.
- */
-async function anchorSigningKey(): Promise<string> {
-  try {
-    const toml = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
-    return toml.signingKey;
-  } catch {
-    throw Errors.upstream("Could not resolve the anchor's signing key");
-  }
 }
 
 export interface Sep24ApplyResult {
@@ -212,26 +290,15 @@ export interface Sep24ApplyResult {
 /**
  * Apply a verified callback to every anchor session tracking its transaction.
  *
- * A callback for a transaction Mergepay does not track is not an error —
- * anchors legitimately broadcast for sessions started elsewhere — but it is
- * audited so an operator can see it happened.
+ * Each session transitions through `applyAnchorSessionTransition`, so the
+ * finite state map decides whether the update applies and the audit record is
+ * written atomically with the status change. A callback for a transaction
+ * Mergepay does not track is not an error — anchors legitimately broadcast for
+ * sessions started elsewhere — but it is audited so operators can see it.
  */
 export async function applySep24Callback(
   callback: Sep24Callback
 ): Promise<Sep24ApplyResult> {
-  if (!isRecognisedStatus(callback.rawStatus)) {
-    // Logged rather than rejected: an anchor adding a status to the spec should
-    // not start failing callbacks, but an operator needs to know it happened.
-    log.warn(
-      {
-        event: "sep24.callback.unhandled_status",
-        rawStatus: callback.rawStatus,
-        externalTransactionId: callback.externalTransactionId,
-      },
-      "unhandled SEP-24 anchor status"
-    );
-  }
-
   const status = toSessionStatus(callback.rawStatus);
 
   const sessions = await prisma.anchorSession.findMany({
@@ -241,7 +308,7 @@ export async function applySep24Callback(
 
   if (sessions.length === 0) {
     await audit({
-      action: "sep24.callback.unmatched",
+      action: "sep24.webhook.unmatched",
       entityType: "anchor_session",
       entityId: callback.externalTransactionId,
       outcome: "failure",
@@ -261,8 +328,12 @@ export async function applySep24Callback(
     if (result.changed) updated += 1;
   }
 
+  // The per-session audit rows written inside the transition transaction record
+  // *what* changed. This one records that a signed callback was accepted at
+  // all, which is the record an operator needs when a status did not move
+  // because the transition was disallowed rather than because nothing arrived.
   await audit({
-    action: "sep24.callback.applied",
+    action: "sep24.webhook.applied",
     entityType: "anchor_session",
     entityId: callback.externalTransactionId,
     metadata: {
@@ -277,11 +348,8 @@ export async function applySep24Callback(
 }
 
 /**
- * Callback fields worth persisting alongside the transition.
- *
- * The Stellar transaction hash is recorded on completion so a settled deposit
- * can be traced to its on-chain payment. The anchor's JWT and the raw payload
- * are never persisted.
+ * Callback fields worth persisting alongside the transition. Only fields the
+ * schema already carries — never the anchor JWT, and never the raw payload.
  */
 function buildExtraData(callback: Sep24Callback) {
   const extra: Record<string, unknown> = {};

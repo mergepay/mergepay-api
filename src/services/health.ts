@@ -1,23 +1,15 @@
 import { prisma } from "../db";
 import { config } from "../config";
 import { getFeeStats } from "./network";
-import { anchorService } from "./anchor";
 
-const CHECK_TIMEOUT_MS = 1_500;
-const DEEP_CHECK_TIMEOUT_MS = 4_000;
+const CHECK_TIMEOUT_MS = 5_000;
+const DEEP_CHECK_TIMEOUT_MS = 5_000;
 const READINESS_CACHE_TTL_MS = 5_000;
 
-type DependencyStatus = "up" | "down" | "disabled";
-
-interface ReadinessChecks {
-  database: DependencyStatus;
-  stellar: DependencyStatus;
-  anchor: DependencyStatus;
-}
-
 export interface ReadinessResponse {
-  status: "ok" | "not_ready";
-  checks: ReadinessChecks;
+  status: "ok" | "degraded";
+  database: { connected: boolean };
+  stellar: { reachable: boolean; network: string };
   timestamp: string;
 }
 
@@ -63,54 +55,40 @@ function withTimeout<T>(operation: Promise<T>): Promise<T> {
   });
 }
 
-async function checkDatabase(): Promise<DependencyStatus> {
+export async function checkDatabase(): Promise<boolean> {
   try {
-    await withTimeout(prisma.$queryRaw`SELECT 1`);
-    return "up";
+    await withTimeout(prisma.$queryRawUnsafe("SELECT 1") as Promise<unknown>);
+    return true;
   } catch {
-    return "down";
+    return false;
   }
 }
 
-async function checkStellar(): Promise<DependencyStatus> {
+export async function checkStellar(): Promise<boolean> {
   try {
     // getFeeStats uses the shared Horizon client and its existing short cache.
     await withTimeout(getFeeStats());
-    return "up";
+    return true;
   } catch {
-    return "down";
-  }
-}
-
-async function checkAnchor(): Promise<DependencyStatus> {
-  // The default application configuration supports deployments without an
-  // anchor. Only explicitly configured anchors are required by readiness.
-  const homeDomain = process.env.ANCHOR_HOME_DOMAIN?.trim();
-  if (!homeDomain) return "disabled";
-
-  try {
-    await withTimeout(anchorService.getToml(homeDomain));
-    return "up";
-  } catch {
-    return "down";
+    return false;
   }
 }
 
 async function performReadinessCheck(): Promise<ReadinessResponse> {
-  const [database, stellar, anchor] = await Promise.all([
+  const [dbResult, stellarResult] = await Promise.allSettled([
     checkDatabase(),
     checkStellar(),
-    checkAnchor(),
   ]);
 
-  const checks = { database, stellar, anchor };
-  const ready = Object.values(checks).every(
-    (status) => status === "up" || status === "disabled"
-  );
+  const database = dbResult.status === "fulfilled" && dbResult.value;
+  const stellar = stellarResult.status === "fulfilled" && stellarResult.value;
+
+  const status: "ok" | "degraded" = database && stellar ? "ok" : "degraded";
 
   return {
-    status: ready ? "ok" : "not_ready",
-    checks,
+    status,
+    database: { connected: database },
+    stellar: { reachable: stellar, network: config.STELLAR_NETWORK },
     timestamp: new Date().toISOString(),
   };
 }

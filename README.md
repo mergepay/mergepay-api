@@ -281,6 +281,19 @@ Retry budgets are exponential with jitter and fully configurable via env vars
   (default 5000), `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` (default 120000),
   `WORKER_ANCHOR_RETRY_JITTER_RATIO` (default 0.25)
 
+### Graceful shutdown
+
+Both processes shut down gracefully on `SIGTERM`/`SIGINT` (see
+`src/lib/shutdown.ts`). The API stops accepting new connections, lets in-flight
+requests finish, then disconnects Prisma; the worker stops claiming new jobs,
+lets the active job cycle finish through its normal path, then releases its
+leases so the next worker picks the work up immediately. Cleanup is bounded:
+`SHUTDOWN_TIMEOUT_MS` for the API, `WORKER_SHUTDOWN_TIMEOUT_MS` for the worker.
+A dependency that hangs past the deadline forces the process to exit with a
+non-zero status instead of lingering. Repeated signals are ignored once
+shutdown has begun, so a deployment sending SIGTERM then SIGINT cannot run
+cleanup twice.
+
 ## How it works
 
 ### SEP-10 login
@@ -342,8 +355,13 @@ treasury account and, when `treasuryRequiredSigners > 1`, returned in
 ### Anchors (SEP-24)
 `POST /anchors/deposit|withdraw` creates a session and fetches a SEP-10 challenge
 **from the anchor**. The wallet signs it; `POST /anchors/sessions/:id/complete`
-exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signed
-`POST /anchors/webhook` updates session status; the worker also polls.
+exchanges it for an anchor JWT and the interactive deposit/withdraw URL. Status
+updates arrive either as callbacks authenticated by the configured shared
+secret (`POST /api/sep24/callback` and the legacy `POST /anchors/webhook`) or
+via the worker's polling; both paths run through the same idempotent,
+terminal-protected transition maps in `src/services/anchor-status.ts` and
+`src/services/withdrawal-status.ts`. See
+[docs/api-contract.md](docs/api-contract.md#sep-24-anchor-callback).
 
 ## Endpoints
 
@@ -359,6 +377,7 @@ exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signe
 | GET | `/groups/:id/balances` · `/groups/:id/ledger` | Balances & ledger |
 | POST/GET | `/groups/:id/treasury/*` · `/treasury-transactions/:id/confirm` | Treasury |
 | GET/POST | `/anchors` · `/anchors/deposit` · `/anchors/withdraw` · `/anchors/sessions/:id/complete` · `/anchors/sessions` · `/anchors/webhook` | Anchors |
+| POST | `/api/sep24/callback` | SEP-24 anchor status callback (shared-secret auth) |
 | GET | `/history` | Cross-group history |
 | POST/GET | `/uploads/receipt` · `/uploads/:file` | Receipts |
 | GET | `/health` · `/health/live` · `/health/ready` | Liveness & readiness probes (see [HEALTH.md](HEALTH.md)) |

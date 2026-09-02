@@ -34,8 +34,12 @@ import toml from "toml";
 import { z } from "zod";
 import pino from "pino";
 import { config } from "../config";
-import { Errors } from "../errors";
-import { fetchWithTimeout } from "./timeout";
+import { AppError } from "../errors";
+import {
+  ProviderError,
+  type ProviderFailureCategory,
+} from "../lib/provider-error";
+import { fetchWithTimeout, toProviderError } from "./timeout";
 import { anchorCircuit } from "./anchor-circuit";
 import { safeFailureMessage } from "./job-retry";
 import {
@@ -98,14 +102,12 @@ export interface PollResult {
   message: string;
   /** True if the poll encountered an error (timeout, network, malformed). */
   isError: boolean;
-  /** Classification of the failure if isError is true. */
-  errorCategory?: "transient" | "indeterminate" | "permanent";
   /**
-   * Whether the raw status was recognized as a known SEP-24 value. Unknown
-   * statuses map to `pending_anchor` but carry `recognized === false` so the
-   * worker can log them explicitly.
+   * Normalized provider failure category for a failed poll — lets the worker
+   * distinguish transient outages from permanent rejections without parsing
+   * message text. Undefined on success.
    */
-  recognized?: boolean;
+  category?: ProviderFailureCategory;
   /** Anchor-provided transaction JSON for debugging (sanitized). */
   transaction?: Record<string, unknown>;
   /** SEP-24 amount_in / amount_out / amount_fee if available. */
@@ -236,6 +238,51 @@ async function fetchReadWithRetry(
 
 // ─── Service implementation ─────────────────────────────────────────────────
 
+const PROVIDER = "anchor";
+
+/** Classify a non-OK anchor HTTP status into a provider failure category. */
+function httpFailureCategory(status: number): ProviderFailureCategory {
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "unavailable";
+  return "rejected";
+}
+
+/**
+ * fetchWithTimeout with its typed failures converted to ProviderError.
+ * The original error never escapes — timeout/transport details stay in the
+ * category, not in client-visible text.
+ */
+async function fetchAnchor(
+  operation: string,
+  url: string,
+  timeoutMs: number,
+  init?: RequestInit
+): Promise<Response> {
+  try {
+    return await fetchWithTimeout(url, operation, timeoutMs, init);
+  } catch (err) {
+    throw toProviderError(err, {
+      provider: PROVIDER,
+      operation,
+      fallbackMessage: `Anchor request failed (${operation})`,
+    });
+  }
+}
+
+/** Parse an anchor response body as JSON, mapping non-JSON to malformed. */
+async function readAnchorJson(operation: string, res: Response): Promise<unknown> {
+  try {
+    return await res.json();
+  } catch {
+    throw new ProviderError({
+      category: "malformed",
+      provider: PROVIDER,
+      operation,
+      message: "Anchor returned a malformed (non-JSON) response",
+    });
+  }
+}
+
 export const anchorService = {
   /**
    * Fetch & parse the anchor's stellar.toml (cached 5 min).
@@ -251,7 +298,12 @@ export const anchorService = {
 
     const provider = `toml:${homeDomain}`;
     if (anchorCircuit.isOpen(provider)) {
-      throw Errors.upstream(`Circuit open for anchor ${homeDomain}`);
+      throw new ProviderError({
+        category: "unavailable",
+        provider: PROVIDER,
+        operation: "Anchor.getToml",
+        message: `Circuit open for anchor ${homeDomain}`,
+      });
     }
 
     const url = `https://${homeDomain}/.well-known/stellar.toml`;
@@ -265,9 +317,15 @@ export const anchorService = {
     let parsed: any;
     try {
       parsed = toml.parse(await res.text());
-    } catch {
+    } catch (err) {
       anchorCircuit.recordFailure(provider);
-      throw Errors.upstream("Anchor returned invalid stellar.toml");
+      if (err instanceof AppError) throw err;
+      throw new ProviderError({
+        category: "malformed",
+        provider: PROVIDER,
+        operation: "Anchor.getToml",
+        message: "Anchor returned invalid stellar.toml",
+      });
     }
 
     const currencies = Array.isArray(parsed.CURRENCIES) ? parsed.CURRENCIES : [];
@@ -284,7 +342,12 @@ export const anchorService = {
       typeof parsed.SIGNING_KEY !== "string"
     ) {
       anchorCircuit.recordFailure(provider);
-      throw Errors.upstream("Anchor stellar.toml is missing required SEP-24 fields");
+      throw new ProviderError({
+        category: "malformed",
+        provider: PROVIDER,
+        operation: "Anchor.getToml",
+        message: "Anchor stellar.toml is missing required SEP-24 fields",
+      });
     }
     anchorCircuit.recordSuccess(provider);
 
@@ -313,6 +376,7 @@ export const anchorService = {
     webAuthEndpoint: string,
     account: string
   ): Promise<{ transaction: string; networkPassphrase: string }> {
+    const operation = "Anchor.getChallenge";
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
     const res = await fetchReadWithRetry(
       url,
@@ -335,18 +399,21 @@ export const anchorService = {
    * caller restarts from `getChallenge` instead.
    */
   async getToken(webAuthEndpoint: string, signedXdr: string): Promise<string> {
-    const res = await fetchWithTimeout(
-      webAuthEndpoint,
-      "Anchor.getToken",
-      config.ANCHOR_TOKEN_TIMEOUT_MS,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transaction: signedXdr }),
-      }
-    );
-    if (!res.ok) throw Errors.upstream("Anchor SEP-10 token exchange failed");
-    return parseJson(tokenResponseSchema, await res.json()).token;
+    const operation = "Anchor.getToken";
+    const res = await fetchAnchor(operation, webAuthEndpoint, config.ANCHOR_TOKEN_TIMEOUT_MS, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transaction: signedXdr }),
+    });
+    if (!res.ok) {
+      throw new ProviderError({
+        category: httpFailureCategory(res.status),
+        provider: PROVIDER,
+        operation,
+        message: "Anchor SEP-10 token exchange failed",
+      });
+    }
+    return parseJson(operation, tokenResponseSchema, await readAnchorJson(operation, res)).token;
   },
 
   /**
@@ -363,26 +430,29 @@ export const anchorService = {
     assetCode: string;
     account: string;
   }): Promise<{ url: string; id: string }> {
+    const operation = "Anchor.startInteractive";
     const path = params.kind === "deposit" ? "deposit" : "withdraw";
     const url = `${params.transferServer}/transactions/${path}/interactive`;
-    const res = await fetchWithTimeout(
-      url,
-      "Anchor.startInteractive",
-      config.ANCHOR_INTERACTIVE_TIMEOUT_MS,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${params.token}`,
-        },
-        body: JSON.stringify({
-          asset_code: params.assetCode,
-          account: params.account,
-        }),
-      }
-    );
-    if (!res.ok) throw Errors.upstream("Anchor interactive flow request failed");
-    return parseJson(interactiveResponseSchema, await res.json());
+    const res = await fetchAnchor(operation, url, config.ANCHOR_INTERACTIVE_TIMEOUT_MS, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.token}`,
+      },
+      body: JSON.stringify({
+        asset_code: params.assetCode,
+        account: params.account,
+      }),
+    });
+    if (!res.ok) {
+      throw new ProviderError({
+        category: httpFailureCategory(res.status),
+        provider: PROVIDER,
+        operation,
+        message: "Anchor interactive flow request failed",
+      });
+    }
+    return parseJson(operation, interactiveResponseSchema, await readAnchorJson(operation, res));
   },
 
   /**
@@ -424,7 +494,11 @@ export const anchorService = {
     }
 
     try {
-      const data = parseJson(sep24TransactionResponseSchema, await res.json());
+      const data = parseJson(
+        "Anchor.getTransactionStatus",
+        sep24TransactionResponseSchema,
+        await res.json()
+      );
       const rawStatus = data.transaction?.status;
       return rawStatus ? rawStatus.trim().toLowerCase() : null;
     } catch {
@@ -460,7 +534,7 @@ export const anchorService = {
         status: "pending_anchor",
         message: "Anchor circuit is open",
         isError: true,
-        errorCategory: "transient",
+        category: "unavailable",
       };
     }
 
@@ -488,7 +562,7 @@ export const anchorService = {
         status: "pending_anchor",
         message,
         isError: true,
-        errorCategory: isTransient ? "transient" : "permanent",
+        category: httpFailureCategory(response.status),
       };
     }
 
@@ -502,7 +576,7 @@ export const anchorService = {
         status: "pending_anchor",
         message: "Anchor returned malformed (non-JSON) response",
         isError: true,
-        errorCategory: "permanent",
+        category: "malformed",
       };
     }
 
@@ -522,14 +596,21 @@ export const anchorService = {
         status: "pending_anchor",
         message: `Anchor returned invalid or malformed response: ${detail}`,
         isError: true,
-        errorCategory: "permanent",
+        category: "malformed",
       };
     }
 
-    const tx = parseResult.data.transaction;
-    const rawStatus = tx.status;
-    const recognized = isKnownSep24Status(rawStatus);
-    const mappedStatus = mapAnchorStatus(rawStatus);
+    const rawStatus =
+      typeof tx.status === "string" ? tx.status : (json.status as string | undefined) ?? null;
+    if (!rawStatus) {
+      return {
+        rawStatus: null,
+        status: "pending_anchor",
+        message: "Anchor response missing transaction status",
+        isError: true,
+        category: "malformed",
+      };
+    }
 
     // Sanitise — only carry forward benign fields for debugging
     const sanitizedTx: Record<string, unknown> = {
@@ -695,10 +776,15 @@ export function isTerminalAnchorStatus(status: string): boolean {
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
-function parseJson<T>(schema: z.ZodSchema<T>, data: unknown): T {
+function parseJson<T>(operation: string, schema: z.ZodSchema<T>, data: unknown): T {
   const result = schema.safeParse(data);
   if (!result.success) {
-    throw Errors.upstream("Anchor returned an unexpected response format");
+    throw new ProviderError({
+      category: "malformed",
+      provider: PROVIDER,
+      operation,
+      message: "Anchor returned an unexpected response format",
+    });
   }
   return result.data;
 }

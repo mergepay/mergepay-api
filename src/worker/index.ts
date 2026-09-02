@@ -789,65 +789,24 @@ async function reconcileSingleAnchor(
     const isTransient = result.errorCategory !== "permanent";
     const exhausted = attempt >= ANCHOR_RETRY_POLICY.maxAttempts;
     const reason = safeFailureMessage(result.message);
+    // A provider rejection can never succeed on retry; everything else stays
+    // transient until the retry budget runs out. The poll's normalized
+    // category drives the decision — no message-text guessing.
+    const errorCategory: JobFailureCategory =
+      exhausted || result.category === "rejected" ? "permanent" : "transient";
 
-    if (isTransient) {
-      // Transient (or indeterminate/unknown network) failures are retryable:
-      // we must never falsely mark the transaction failed just because the
-      // anchor was momentarily unreachable. The status is left untouched and
-      // the row is scheduled for another attempt.
-      await prisma.anchorSession.update({
-        where: { id: job.id },
-        data: {
-          lastPolledAt: now,
-          retryCount: attempt,
-          failureReason: reason,
-          errorCategory: exhausted ? "permanent" : "transient",
-          nextAttemptAt: exhausted
-            ? null
-            : new Date(Date.now() + retryDelayMs(attempt, ANCHOR_RETRY_POLICY)),
-        },
-      });
-
-      jobLog.warn(
-        {
-          jobType: "anchor",
-          jobId: job.id,
-          attempt,
-          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
-          outcome: exhausted ? "retries_exhausted" : "retry_scheduled",
-          category: result.errorCategory,
-          reason,
-        },
-        exhausted
-          ? "anchor poll retries exhausted — handing session to operators without marking failed"
-          : "anchor poll failed with transient error — keeping transaction retryable"
-      );
-    } else {
-      // Terminal poll failure (e.g. 4xx auth, malformed response): the anchor
-      // will not accept this request again, so map to error and stop retrying.
-      // The transition is conditional on the status this worker observed, so a
-      // stale writer can never walk back a concurrently-advanced state.
-      await applyAnchorSessionTransition({
-        sessionId: job.id,
-        nextStatus: "error",
-        source: "poll",
-        expectedCurrentStatus: job.status,
-        extraData: {
-          lastPolledAt: now,
-          failureReason: reason,
-          errorCategory: "permanent",
-          nextAttemptAt: null,
-          retryCount: 0,
-        } as never,
-      });
-
-      await recordStatusTransition({
-        entityType: "anchor_session",
-        entityId: job.id,
-        newStatus: "error",
-        reason,
-        source: "worker",
-      }).catch(() => undefined);
+    await prisma.anchorSession.update({
+      where: { id: job.id },
+      data: {
+        lastPolledAt: now,
+        retryCount: attempt,
+        failureReason: reason,
+        errorCategory,
+        nextAttemptAt: exhausted
+          ? null
+          : new Date(Date.now() + retryDelayMs(attempt, ANCHOR_RETRY_POLICY)),
+      },
+    });
 
       jobLog.error(
         {
@@ -874,10 +833,10 @@ async function reconcileSingleAnchor(
         jobType: "anchor",
         jobId: job.id,
         attempt,
-        outcome: "unknown_status",
-        rawStatus: result.rawStatus,
-        localStatus: job.status,
-        action: "kept_pending",
+        outcome: exhausted ? "retries_exhausted" : "retry_scheduled",
+        category: result.category ?? "unknown",
+        errorCategory,
+        reason,
       },
       `anchor reported an unrecognized SEP-24 status '${result.rawStatus}' — kept pending and will keep polling`
     );

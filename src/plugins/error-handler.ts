@@ -4,6 +4,23 @@ import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
 import { toRequestLimitError } from "../lib/request-limits";
 
+/**
+ * The one error envelope every failure — validation, authorization, rate
+ * limiting, upstream, unexpected — is serialized into:
+ *
+ *   {
+ *     code: string,        // stable machine-readable code (e.g. "NOT_FOUND") — canonical
+ *     error: string,       // deprecated alias of `code`, kept for older clients
+ *     message: string,     // human-readable description
+ *     requestId: string,   // correlation id for tracing
+ *     details?: unknown,   // optional structured detail (e.g. Zod issues)
+ *   }
+ *
+ * The HTTP status is conveyed by the response status only — never duplicated
+ * in the body — and the body never contains stack traces, SQL, credentials,
+ * signed XDRs, or upstream response text. Those go to the server log, keyed
+ * by `requestId`.
+ */
 export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
     const requestId = req.id as string;
@@ -81,6 +98,18 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         code: "RATE_LIMITED",
         error: "RATE_LIMITED",
         message: "Too many requests, slow down.",
+        requestId,
+      });
+    }
+
+    // Fastify's payload-size guard (FST_ERR_CTP_BODY_TOO_LARGE) gets its own
+    // stable code instead of the generic BAD_REQUEST, so a client can tell a
+    // size rejection from a validation failure.
+    if ((err as any).statusCode === 413) {
+      return reply.code(413).send({
+        code: "PAYLOAD_TOO_LARGE",
+        error: "PAYLOAD_TOO_LARGE",
+        message: "Request body exceeds the allowed size limit",
         requestId,
       });
     }

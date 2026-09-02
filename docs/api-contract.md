@@ -52,7 +52,7 @@ leaks only the existence of an opaque identifier — never any content.
 
 ## Pagination
 
-Applies to `GET /groups`, `/groups/:id/expenses`, `/groups/:id/ledger`,
+Applies to `GET /groups`, `/groups/:id/expenses`, `/groups/:id/settlements`, `/groups/:id/ledger`,
 `/groups/:id/treasury/history`, `/anchors/sessions`, and `/history`. Defined in
 [../src/lib/pagination.ts](../src/lib/pagination.ts).
 

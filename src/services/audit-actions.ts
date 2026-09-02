@@ -35,6 +35,13 @@ export const AuditAction = {
   TREASURY_PROPOSAL_SUBMITTED: "treasury.proposal.submitted",
   TREASURY_PROPOSAL_FAILED: "treasury.proposal.failed",
 
+  // ── Treasury tx proposals (signature collector, caller-supplied XDR) ──
+  TREASURY_TX_PROPOSAL_CREATED: "treasury.tx_proposal.created",
+  TREASURY_TX_PROPOSAL_SIGNATURE_ADDED: "treasury.tx_proposal.signature_added",
+  TREASURY_TX_PROPOSAL_READY: "treasury.tx_proposal.ready",
+  TREASURY_TX_PROPOSAL_SUBMITTED: "treasury.tx_proposal.submitted",
+  TREASURY_TX_PROPOSAL_FAILED: "treasury.tx_proposal.failed",
+
   // ── Settlements ─────────────────────────────────────────────────────
   SETTLEMENT_CREATED: "settlement.created",
   SETTLEMENT_CONFIRM_RETRY: "settlement.confirm.retry",

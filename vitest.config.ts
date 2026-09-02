@@ -20,5 +20,12 @@ export default defineConfig({
       STABLE_ASSET_ISSUER: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
     },
     globals: true,
+    coverage: {
+      provider: "v8",
+      include: ["src/services/anchor.ts"],
+      thresholds: {
+        lines: 90,
+      },
+    },
   },
 });

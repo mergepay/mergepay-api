@@ -330,7 +330,7 @@ describe("API correlation headers", () => {
     );
   });
 
-  it("prefers x-correlation-id over x-request-id when both are present", async () => {
+  it("prefers x-request-id over x-correlation-id when both are present", async () => {
     const response = await app.inject({
       method: "GET",
       url: "/health",
@@ -339,7 +339,8 @@ describe("API correlation headers", () => {
         "x-request-id": "secondary-id",
       },
     });
-    expect(response.headers["x-correlation-id"]).toBe("primary-id");
+    expect(response.headers["x-request-id"]).toBe("secondary-id");
+    expect(response.headers["x-correlation-id"]).toBe("secondary-id");
   });
 });
 

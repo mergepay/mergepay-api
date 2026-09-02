@@ -22,6 +22,14 @@ const log = pino({ name: "treasury-service" });
  * after the decimal point (stroops precision). This function pads or trims
  * the fractional part to exactly 7 digits, avoiding unsafe floating-point
  * arithmetic.
+ *
+ * @param value - Raw balance string as returned by Horizon (e.g. `"12.3000000"`).
+ *   Must contain at most one decimal point. Integers are treated as having a
+ *   zero fractional part.
+ * @returns The balance normalized to exactly 7 fractional digits
+ *   (e.g. `"12.3000000"`), preserving integer and fractional digits without
+ *   rounding.
+ * @throws {Error} If `value` lacks a numeric integer part or is malformed.
  */
 export function normalizeBalance(value: string): string {
   const [integer, fraction = ""] = value.split(".");
@@ -39,9 +47,14 @@ export function normalizeBalance(value: string): string {
  *  5. On variance: update the cache and create an audit record.
  *  6. On match: keep the cache consistent (touch updatedAt).
  *
- * Returns `{ compared: number, variances: number }` for observability.
- *
  * Idempotent — safe to call repeatedly for the same treasury.
+ *
+ * @param treasuryId - The group id whose treasury balances should be reconciled.
+ *   The group must have `treasuryEnabled` and a `treasuryAccountPublicKey`,
+ *   otherwise reconciliation is skipped.
+ * @returns `{ compared, variances }` — the count of assets compared (0 or 2) and
+ *   the number of those that differed from the cache. Both are `0` when the
+ *   treasury is disabled or its account is not found on-chain.
  */
 export async function reconcileTreasuryBalance(
   treasuryId: string
@@ -211,6 +224,12 @@ async function compareAndUpdate(
  * Reconcile balances for all enabled treasuries.
  * Used by the periodic worker task.
  * Failures for one treasury do not prevent reconciliation of others.
+ *
+ * @returns Aggregated counts across every enabled treasury:
+ *   - `reconciled` — number of treasuries successfully processed.
+ *   - `variances` — total asset variances detected and corrected.
+ *   - `errors` — number of treasuries that threw during reconciliation
+ *     (logged individually; the run still completes for the rest).
  */
 export async function reconcileAllTreasuryBalances(): Promise<{
   reconciled: number;

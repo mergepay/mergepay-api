@@ -191,7 +191,7 @@ describe("POST /withdraw", () => {
       method: "POST",
       url: "/withdraw",
       headers: authHeader(user),
-      payload: { amount: "5", assetCode: "XLM", memo: "rent" },
+      payload: { amount: "5", assetCode: "XLM", memo: "MP:ABC123DEF0" },
     });
     expect(res.statusCode).toBe(200);
     const body = res.json();

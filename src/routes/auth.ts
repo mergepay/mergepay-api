@@ -1,7 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { Errors } from "../errors";
 import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
@@ -15,6 +15,7 @@ import {
   unauthorizedForRefresh,
 } from "../services/refresh-token";
 import { rateLimited } from "../lib/rate-limit";
+import { sep10VerifyRequestSchema } from "../validations/sep10";
 
 function shortName(pk: string): string {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
@@ -36,10 +37,7 @@ export default async function authRoutes(app: FastifyInstance) {
     "/auth/challenge",
     challengeLimit,
     async (req) => {
-      const body = z.object({ account: z.string() }).parse(req.body);
-      if (!StrKey.isValidEd25519PublicKey(body.account)) {
-        throw Errors.badRequest("invalid_account", "Not a valid Stellar public key");
-      }
+      const body = z.object({ account: stellarAccountIdSchema }).parse(req.body);
       return buildChallenge(body.account);
     }
   );
@@ -48,7 +46,7 @@ export default async function authRoutes(app: FastifyInstance) {
     "/auth/verify",
     verifyLimit,
     async (req) => {
-      const body = z.object({ transaction: z.string() }).parse(req.body);
+      const body = sep10VerifyRequestSchema.parse(req.body);
       const publicKey = await verifyChallenge(body.transaction);
 
       const user = await prisma.user.upsert({

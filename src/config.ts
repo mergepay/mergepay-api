@@ -11,10 +11,45 @@ const stellarPublicKeySchema = z.string().regex(/^G[A-Z0-9]{55}$/, "Invalid Stel
 const schema = z.object({
   // Required core configuration
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  // Optional query timeout for Prisma client (ms). Default: 10 seconds.
+  // Prevents hung queries from blocking Fastify request workers indefinitely.
+  DATABASE_QUERY_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  // Postgres connection timeout (seconds) for the underlying driver. Bounds
+  // how long Prisma waits when establishing a new socket to the database. A
+  // slow/unreachable database fails fast instead of stalling a request worker.
+  DATABASE_CONNECT_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(10),
+  // How long (seconds) a connection may wait for a free slot in Prisma's pool
+  // before the request errors. Prevents a pool of exhausted connections from
+  // blocking indefinitely under load.
+  DATABASE_POOL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(10),
+  // Maximum number of connections Prisma opens in its pool. Bounds total
+  // database concurrency across Fastify workers on a single instance.
+  DATABASE_CONNECTION_LIMIT: z.coerce.number().int().positive().default(5),
   PORT: z.coerce.number().int().positive().default(4000),
   API_PUBLIC_URL: urlSchema,
-  // "*" opens CORS to all origins; comma-separate for a whitelist e.g. "https://a.com,https://b.com"
-  WEB_URL: z.string().default("*"),
+  LOG_LEVEL: z
+    .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
+    .default("info"),
+  // CORS configuration. Comma-separated list of allowed origins.
+  // Empty (default) means no cross-origin requests allowed — set explicitly for production.
+  // Use "*" to allow all origins (development only).
+  // Example: "https://app.example.com,https://staging.example.com"
+  WEB_URL: z.string().default(""),
+  // Allow credentials (cookies, auth headers) in CORS requests.
+  // Defaults to false for security; enable only if your frontend requires it.
+  CORS_ALLOW_CREDENTIALS: z.coerce.boolean().default(false),
+  // Comma-separated list of allowed HTTP methods for CORS.
+  // Defaults to standard REST methods.
+  CORS_ALLOW_METHODS: z.string().default("GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS"),
+  // Comma-separated list of allowed headers for CORS.
+  // Defaults to common headers needed for API clients.
+  CORS_ALLOW_HEADERS: z.string().default("Content-Type,Authorization,X-Requested-With,Idempotency-Key"),
+  // Comma-separated list of headers exposed to the client.
+  // Defaults to headers useful for debugging and pagination.
+  CORS_EXPOSE_HEADERS: z.string().default("X-Request-ID,X-Correlation-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,Retry-After"),
+  // Max age (seconds) for CORS preflight cache.
+  // Defaults to 24 hours to reduce preflight requests.
+  CORS_MAX_AGE: z.coerce.number().int().positive().default(86400),
   JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
   // Bound a session to this deployment: a token minted for another environment
   // or audience is rejected even when the signing secret is shared.
@@ -23,6 +58,12 @@ const schema = z.object({
   // gap, so a stolen access token stays useful for minutes rather than hours.
   // Expressed in seconds so it can be compared against the refresh TTL below.
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().max(86400).default(900),
+  // Minimum remaining lifetime (seconds) a JWT must have when presented.
+  // Tokens whose `exp` claim is closer than this margin to the current clock
+  // are rejected as near-expired — even though the SDK's own check would
+  // still accept them — so a token forged or replayed moments before expiry
+  // never grants a session.
+  TOKEN_EXPIRY_MARGIN_SECONDS: z.coerce.number().int().nonnegative().max(300).default(30),
   // Refresh-token lifetime. Bounds how long an idle session can be revived
   // without the wallet signing a new SEP-10 challenge.
   REFRESH_TOKEN_TTL_MS: z.coerce
@@ -86,6 +127,13 @@ const schema = z.object({
     .positive()
     .max(1024 * 1024)
     .default(64 * 1024),
+
+  // Graceful shutdown bounds. The API closes the HTTP server then disconnects
+  // Prisma; the worker waits for its in-flight job cycle. If either exceeds its
+  // bound, a stuck dependency cannot keep the process alive forever — the
+  // process force-exits with a non-zero status. See src/lib/shutdown.ts.
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  WORKER_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
 
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
@@ -166,6 +214,10 @@ const schema = z.object({
   // against an upstream that is already struggling.
   UPSTREAM_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
   NODE_ENV: z.string().default("development"),
+  RECONCILIATION_INTERVAL: z.coerce.number().int().positive().default(30000),
+  CONFIRMATION_THRESHOLD: z.coerce.number().int().positive().default(1),
+  TX_TIMEOUT: z.coerce.number().int().positive().default(300000),
+  MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
 
   // Security-sensitive endpoint policies.
   RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
@@ -198,7 +250,9 @@ const schema = z.object({
   SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
   SEP24_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_GROUP: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_GROUP_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_HISTORY: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_HISTORY_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   // trusted proxies: only trust X-Forwarded-For if the direct peer is in this
   // comma-separated list; otherwise Fastify falls back to req.ip = socket remote.
   TRUSTED_PROXY_IPS: z.string().default(""),
@@ -252,7 +306,9 @@ function safeErrorMessage(error: unknown): string {
   return String(error);
 }
 
-let parsed: z.infer<typeof schema>;
+export type Env = z.infer<typeof schema>;
+
+let parsed: Env;
 try {
   parsed = schema.parse(process.env);
 } catch (error) {
@@ -261,6 +317,8 @@ try {
   console.error("Please check your environment variables and try again.\n");
   process.exit(1);
 }
+
+export const env = parsed;
 
 function hostOf(url: string): string {
   try {
@@ -276,17 +334,17 @@ const networkPassphrase =
   parsed.STELLAR_NETWORK === "public" ? Networks.PUBLIC : Networks.TESTNET;
 
 export const config = {
-  ...parsed,
-  HORIZON_ENDPOINTS: (parsed.HORIZON_URLS ?? parsed.HORIZON_URL)
+  ...env,
+  HORIZON_ENDPOINTS: (env.HORIZON_URLS ?? env.HORIZON_URL)
     .split(",")
     .map((url) => url.trim())
     .filter(Boolean),
-  API_URL: parsed.API_PUBLIC_URL,
-  SEP10_HOME_DOMAIN: parsed.SEP10_HOME_DOMAIN ?? apiHost,
-  WEB_AUTH_DOMAIN: parsed.WEB_AUTH_DOMAIN ?? apiHost,
-  isTest: process.env.NODE_ENV === "test" || process.env.VITEST === "true",
+  API_URL: env.API_PUBLIC_URL,
+  SEP10_HOME_DOMAIN: env.SEP10_HOME_DOMAIN ?? apiHost,
+  WEB_AUTH_DOMAIN: env.WEB_AUTH_DOMAIN ?? apiHost,
+  isTest: env.NODE_ENV === "test" || process.env.VITEST === "true",
   networkPassphrase,
-  jwtExpiresIn: `${parsed.ACCESS_TOKEN_TTL_SECONDS}s` as const,
+  jwtExpiresIn: `${env.ACCESS_TOKEN_TTL_SECONDS}s` as const,
 };
 
 export type Config = typeof config;

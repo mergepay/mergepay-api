@@ -789,6 +789,11 @@ async function reconcileSingleAnchor(
   if (result.isError) {
     const exhausted = attempt >= ANCHOR_RETRY_POLICY.maxAttempts;
     const reason = safeFailureMessage(result.message);
+    // A provider rejection can never succeed on retry; everything else stays
+    // transient until the retry budget runs out. The poll's normalized
+    // category drives the decision — no message-text guessing.
+    const errorCategory: JobFailureCategory =
+      exhausted || result.category === "rejected" ? "permanent" : "transient";
 
     await prisma.anchorSession.update({
       where: { id: job.id },
@@ -796,7 +801,7 @@ async function reconcileSingleAnchor(
         lastPolledAt: now,
         retryCount: attempt,
         failureReason: reason,
-        errorCategory: exhausted ? "permanent" : "transient",
+        errorCategory,
         nextAttemptAt: exhausted
           ? null
           : new Date(Date.now() + retryDelayMs(attempt, ANCHOR_RETRY_POLICY)),
@@ -809,6 +814,8 @@ async function reconcileSingleAnchor(
         jobId: job.id,
         attempt,
         outcome: exhausted ? "retries_exhausted" : "retry_scheduled",
+        category: result.category ?? "unknown",
+        errorCategory,
         reason,
       },
       "anchor poll failed"

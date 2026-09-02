@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
   queryRaw: vi.fn(),
@@ -8,11 +8,14 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("../src/db", () => ({
-  prisma: { $queryRaw: h.queryRaw, $queryRawUnsafe: h.queryRawUnsafe },
+  prisma: {
+    $queryRaw: h.queryRaw,
+    $queryRawUnsafe: h.queryRawUnsafe,
+  },
 }));
 
 vi.mock("../src/services/network", () => ({
-  getFeeStats: h.feeStats,
+  getFeeStats: (...args: unknown[]) => h.feeStats(...args),
 }));
 
 import { buildApp } from "../src/app";
@@ -112,4 +115,46 @@ describe("GET /health/deep", () => {
     expect([200, 503]).toContain(response.statusCode);
     expect(response.json().status).toBeTruthy();
   }, 7000);
+});
+
+describe("OpenAPI docs", () => {
+  it("exposes Swagger UI and JSON spec", async () => {
+    const uiResponse = await app.inject({ method: "GET", url: "/docs" });
+    expect(uiResponse.statusCode).toBe(200);
+    expect(uiResponse.headers["content-type"]).toContain("text/html");
+
+    const specResponse = await app.inject({ method: "GET", url: "/docs/json" });
+    expect(specResponse.statusCode).toBe(200);
+    expect(specResponse.headers["content-type"]).toContain("application/json");
+    expect(specResponse.json().openapi).toBe("3.0.0");
+    expect(specResponse.json().paths).toBeDefined();
+  });
+});
+
+describe("OpenAPI docs", () => {
+  it("exposes Swagger UI and JSON spec", async () => {
+    const uiResponse = await app.inject({ method: "GET", url: "/docs" });
+    expect(uiResponse.statusCode).toBe(200);
+    expect(uiResponse.headers["content-type"]).toContain("text/html");
+
+    const specResponse = await app.inject({ method: "GET", url: "/docs/json" });
+    expect(specResponse.statusCode).toBe(200);
+    expect(specResponse.headers["content-type"]).toContain("application/json");
+    expect(specResponse.json().openapi).toBe("3.0.0");
+    expect(specResponse.json().paths).toBeDefined();
+  });
+});
+
+describe("OpenAPI docs", () => {
+  it("exposes Swagger UI and JSON spec", async () => {
+    const uiResponse = await app.inject({ method: "GET", url: "/docs" });
+    expect(uiResponse.statusCode).toBe(200);
+    expect(uiResponse.headers["content-type"]).toContain("text/html");
+
+    const specResponse = await app.inject({ method: "GET", url: "/docs/json" });
+    expect(specResponse.statusCode).toBe(200);
+    expect(specResponse.headers["content-type"]).toContain("application/json");
+    expect(specResponse.json().openapi).toBe("3.0.0");
+    expect(specResponse.json().paths).toBeDefined();
+  });
 });

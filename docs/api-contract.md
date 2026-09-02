@@ -11,20 +11,26 @@ or query convention changes.
 
 ## Error envelope
 
-Every error — validation, authorization, rate limiting, upstream — uses one shape:
+Every error — validation, authorization, rate limiting, upstream — uses one shape.
+The HTTP status code carries the error class; the body never repeats it:
 
 ```json
 {
+  "code": "NOT_FOUND",
   "error": "NOT_FOUND",
   "message": "Settlement not found",
-  "statusCode": 404,
-  "details": { "…": "optional, structured" },
-  "requestId": "01J…"
+  "requestId": "01J…",
+  "details": { "…": "optional, structured" }
 }
 ```
 
-`error` is a stable machine-readable code from `ErrorCode` in
-[../src/lib/errors.ts](../src/lib/errors.ts). Codes worth calling out:
+`code` is the canonical stable machine-readable code from `ErrorCode` in
+[../src/lib/errors.ts](../src/lib/errors.ts). `error` is a deprecated alias of
+`code`, retained so existing clients keep working; new code should read `code`.
+`details` is present only when there is structured information to convey (e.g.
+the offending fields of a `VALIDATION_ERROR`). Error bodies never include stack
+traces, SQL, credentials, signed XDRs, or upstream response bodies — those go to
+the server log only, correlated by `requestId`. Codes worth calling out:
 
 | Code | Status | Meaning |
 | --- | --- | --- |
@@ -33,6 +39,7 @@ Every error — validation, authorization, rate limiting, upstream — uses one 
 | `INTENT_EXPIRED` | 400 | The unsigned transaction's signing window has closed — request a new one |
 | `XDR_MISMATCH` | 400 | The signed envelope does not match the intent it was built for |
 | `XDR_MALFORMED` | 400 | The envelope could not be parsed at all |
+| `PAYLOAD_TOO_LARGE` | 413 | The request body exceeded the route's size limit |
 | `INVALID_IDEMPOTENCY_KEY` | 400 | `Idempotency-Key` is outside 1–255 characters of `A–Z a–z 0–9 - _ . :` |
 | `MISSING_IDEMPOTENCY_KEY` | 400 | The route requires an `Idempotency-Key` header and none was sent |
 | `IDEMPOTENCY_CONFLICT` | 409 | The key was already used with a different payload |
@@ -385,10 +392,63 @@ submission, and anchor routes each get their own bucket. See the table in
 [../README.md](../README.md#rate-limiting) and the policy definitions in
 [../src/lib/rate-limit.ts](../src/lib/rate-limit.ts).
 
-A 429 uses the standard error envelope with `error: "RATE_LIMITED"` and, where
+A 429 uses the standard error envelope with `code: "RATE_LIMITED"` and, where
 available, `details.retryAfterSeconds`, alongside the usual `Retry-After` and
 `X-RateLimit-*` headers. It reveals nothing about the caller's identity or
 whether a wallet account is known to the API.
+
+---
+
+## SEP-24 anchor callback
+
+`POST /api/sep24/callback` receives asynchronous SEP-24 deposit and withdrawal
+status updates from the configured anchor (see `src/services/sep24.ts`). It is
+registered outside the authenticated route scopes — the anchor has no Mergepay
+session — so its own credential is what authenticates it.
+
+### Authentication
+
+| | |
+| --- | --- |
+| Header | `x-anchor-signature` (alias: `x-webhook-secret`) |
+| Value | The configured shared secret `ANCHOR_WEBHOOK_SECRET` |
+| Verification | Constant-time comparison, before the body is parsed or any database read |
+
+A missing or incorrect secret is a `401` with the standard error envelope. The
+rejection never discloses *why* it failed (missing vs. wrong secret), and the
+secret is never logged or persisted.
+
+### Payload
+
+Either the SEP-24 transaction envelope or the flattened shape, with unknown
+fields ignored:
+
+```json
+{ "transaction": { "id": "anchor_tx_1", "status": "completed", "asset_code": "USDC", "kind": "deposit" } }
+{ "id": "anchor_tx_1", "status": "completed" }
+```
+
+`id` and `status` are required (400 `VALIDATION_ERROR` otherwise).
+`asset_code`, `asset_issuer`, and `kind`, when present, scope the match to
+local records carrying the same values.
+
+### Behavior
+
+- The callback's transaction id is used to look up local records **only after**
+  the secret is verified, and is scoped to the configured anchor, asset, and
+  kind — never trusted on its own.
+- Matching `AnchorSession` rows are advanced through the finite transition map
+  in `src/services/anchor-status.ts`; `Withdrawal` rows keyed by the same
+  anchor transaction id (`anchorTxId`) are advanced through their own map in
+  `src/services/withdrawal-status.ts`. Both are idempotent and both protect
+  terminal states: a duplicate delivery is a no-op and a stale or contradictory
+  callback can never regress a completed/refunded record.
+- Every applied transition writes its audit record in the same database
+  transaction as the status change.
+- The response is `200` even when nothing matched or the transition was
+  disallowed (anchors retry non-2xx responses, so a correctly-processed no-op
+  must not amplify load). A callback for an unknown transaction is audited as
+  `sep24.callback.unmatched`.
 
 ---
 

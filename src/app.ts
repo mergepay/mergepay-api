@@ -19,6 +19,7 @@ import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
 import treasuryProposalRoutes from "./routes/treasury-proposals";
+import treasurySignatureRoutes from "./routes/treasury-signatures";
 import anchorRoutes from "./routes/anchors";
 import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
@@ -31,9 +32,12 @@ import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { rateLimitPolicies } from "./lib/rate-limit";
+import { stellarErrorSerializer } from "./lib/stellar-serializer";
+import { reqSerializer, resSerializer } from "./lib/serializers";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
+import { nanoid } from "nanoid";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -63,17 +67,28 @@ export async function buildApp(): Promise<FastifyInstance> {
   installMultipartGuard();
 
   const app = Fastify({
-    // Disable Fastify's unvalidated request-id header handling. The incoming
-    // values are validated by genReqId before becoming request.id.
-    requestIdHeader: false,
-    genReqId: (request) =>
-      getCorrelationId(
-        request.headers["x-correlation-id"] ?? request.headers["x-request-id"]
-      ),
+    requestIdHeader: "x-request-id",
+    genReqId: (request) => {
+      const incomingRequestId = request.headers["x-request-id"];
+      const incomingCorrelationId = request.headers["x-correlation-id"];
+      const preferred =
+        typeof incomingRequestId === "string" && incomingRequestId.trim()
+          ? incomingRequestId
+          : typeof incomingCorrelationId === "string" && incomingCorrelationId.trim()
+            ? incomingCorrelationId
+            : `req-${nanoid(16)}`;
+
+      return getCorrelationId(preferred);
+    },
     logger: config.isTest
       ? false
       : {
-          level: process.env.LOG_LEVEL ?? "info",
+          level: config.LOG_LEVEL,
+          serializers: {
+            err: stellarErrorSerializer as any,
+            req: reqSerializer as any,
+            res: resSerializer as any,
+          },
           redact: {
             paths: [
               "req.headers.authorization",
@@ -105,18 +120,23 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   app.addHook("onRequest", async (request, reply) => {
-    const correlationId = getCorrelationId(request.id);
-    reply.header("x-request-id", correlationId);
+    const requestId = request.id;
+    const correlationId = getCorrelationId(requestId);
+    reply.header("x-request-id", requestId);
     reply.header("x-correlation-id", correlationId);
-    request.log.info({ correlationId }, "request received");
+    request.log = request.log.child({ reqId: requestId, correlationId });
+    request.log.info({ requestId, correlationId }, "request received");
   });
 
   app.addHook("onResponse", async (request, reply) => {
-    const correlationId = getCorrelationId(request.id);
-    reply.header("x-request-id", correlationId);
+    const requestId = request.id;
+    const correlationId = getCorrelationId(requestId);
+    reply.header("x-request-id", requestId);
     reply.header("x-correlation-id", correlationId);
+    request.log = request.log.child({ reqId: requestId, correlationId });
     request.log.info(
       {
+        requestId,
         correlationId,
         statusCode: reply.statusCode,
         method: request.method,
@@ -137,13 +157,48 @@ export async function buildApp(): Promise<FastifyInstance> {
     );
   });
 
-  await app.register(helmet, { contentSecurityPolicy: false });
+  // Security headers via @fastify/helmet. CSP is left permissive for a JSON API:
+  // there is no rendered HTML, so we only lock down the vectors that matter for
+  // an API backend (frame embedding, MIME sniffing, referrer leakage) and let
+  // the SPA on Vercel own its own CSP for its own documents. `frameguard` denies
+  // embedding entirely — the API is never loaded in an <iframe>. `contentSecurityPolicy`
+  // is enabled with a baseline `default-src 'none'` so any accidental inline
+  // content is inert, without breaking JSON clients that only read headers/body.
+  const cspDirectives: Record<string, string[]> = {
+    defaultSrc: ["'none'"],
+    frameAncestors: ["'none'"],
+  };
+  await app.register(helmet, {
+    contentSecurityPolicy: {
+      directives: cspDirectives,
+    },
+    frameguard: { action: "deny" },
+    // Disabled on purpose: `require-corp` (helmet's default) would force the
+    // SPA's fetch() clients to negotiate CORP headers and break API calls.
+    crossOriginEmbedderPolicy: false,
+    // API responses are always JSON; never let a browser MIME-sniff them.
+    noSniff: true,
+    // Don't leak the full URL in the Referer header to third parties.
+    referrerPolicy: { policy: "no-referrer" },
+    // Block the page from being used as a cross-origin opener.
+    crossOriginOpenerPolicy: { policy: "same-origin" },
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    // Harden the connection by opting into HTTPS upgrades where supported.
+    hsts: {
+      maxAge: 60 * 60 * 24 * 365,
+      includeSubDomains: true,
+      preload: true,
+    },
+  });
   const allowAll = config.WEB_URL === "*";
   const allowed = config.WEB_URL
     .split(",")
     .map((o) => o.trim().replace(/\/+$/, ""))
     .filter(Boolean);
   const allowVercelPreviews = allowed.some((o) => o.endsWith(".vercel.app"));
+  const allowMethods = config.CORS_ALLOW_METHODS.split(",").map((m) => m.trim().toUpperCase());
+  const allowHeaders = config.CORS_ALLOW_HEADERS.split(",").map((h) => h.trim());
+  const exposeHeaders = config.CORS_EXPOSE_HEADERS.split(",").map((h) => h.trim());
   await app.register(cors, {
     origin: allowAll
       ? true
@@ -156,7 +211,11 @@ export async function buildApp(): Promise<FastifyInstance> {
           }
           return cb(null, false);
         },
-    credentials: false,
+    credentials: config.CORS_ALLOW_CREDENTIALS,
+    methods: allowMethods,
+    allowedHeaders: allowHeaders,
+    exposedHeaders: exposeHeaders,
+    maxAge: config.CORS_MAX_AGE,
   });
   // Global default limit. Sensitive routes (SEP-10 auth, settlement and
   // treasury submission, anchor initiation and polling) override this with
@@ -177,6 +236,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: (request: FastifyRequest) => ({
       code: "RATE_LIMITED",
+      error: "RATE_LIMITED",
       message: "Too many requests. Please retry later.",
       requestId: request.id,
     }),
@@ -216,6 +276,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     "/groups/:id/treasury/deposit",
     "/groups/:id/treasury/withdraw",
     "/treasury-transactions/:id/confirm",
+    "/api/treasury/proposals",
+    "/api/treasury/proposals/:id/signatures",
     "/anchors/deposit",
     "/anchors/withdraw",
     "/anchors/sessions/:id/complete",
@@ -254,6 +316,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     reply.header("x-correlation-id", correlationId);
     reply.code(404).send({
       code: "NOT_FOUND",
+      error: "NOT_FOUND",
       message: "Route not found",
       requestId: correlationId,
     });
@@ -267,13 +330,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
   app.get("/health/live", liveness);
 
-  const { getReadiness, getDeepHealth } = await import("./services/health.js");
-  app.get("/health/ready", async (request, reply) => {
-    const readiness = await getReadiness();
-    const statusCode = readiness.status === "ok" ? 200 : 503;
-    return reply.code(statusCode).send(readiness);
-  });
-
+  const { getDeepHealth } = await import("./services/health.js");
   app.get("/health/deep", async (request, reply) => {
     const deepHealth = await getDeepHealth();
     const statusCode = deepHealth.status === "ok" ? 200 : 503;
@@ -286,6 +343,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
   await app.register(treasuryProposalRoutes);
+  await app.register(treasurySignatureRoutes);
   await app.register(anchorRoutes);
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);

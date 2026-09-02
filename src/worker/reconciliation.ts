@@ -1,5 +1,7 @@
 import pino from "pino";
+import { env } from "../config";
 import { prisma } from "../db";
+import { config } from "../config";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import { type CorrelationContext, jobContext, loggerWithContext } from "../lib/correlation";
@@ -69,19 +71,16 @@ export function reconciliationConfig(
   return {
     intervalMs:
       options.intervalMs ??
-      positiveInteger(process.env.RECONCILIATION_INTERVAL, DEFAULT_INTERVAL_MS),
+      positiveInteger(String(env.RECONCILIATION_INTERVAL), DEFAULT_INTERVAL_MS),
     confirmationThreshold:
       options.confirmationThreshold ??
-      positiveInteger(
-        process.env.CONFIRMATION_THRESHOLD,
-        DEFAULT_CONFIRMATION_THRESHOLD
-      ),
+      positiveInteger(String(env.CONFIRMATION_THRESHOLD), DEFAULT_CONFIRMATION_THRESHOLD),
     timeoutMs:
       options.timeoutMs ??
-      positiveInteger(process.env.TX_TIMEOUT, DEFAULT_TIMEOUT_MS),
+      positiveInteger(String(env.TX_TIMEOUT), DEFAULT_TIMEOUT_MS),
     maxRetries:
       options.maxRetries ??
-      nonNegativeInteger(process.env.MAX_RETRIES, DEFAULT_MAX_RETRIES),
+      nonNegativeInteger(String(env.MAX_RETRIES), DEFAULT_MAX_RETRIES),
   };
 }
 
@@ -342,6 +341,10 @@ async function loadPendingRecords(
       stellarTxHash: { not: null },
     },
     orderBy: { updatedAt: "asc" },
+    // Bounded per cycle: a backlog is drained over successive cycles rather
+    // than loaded wholesale, so a large table cannot stall one cycle or mask
+    // an unbounded read behind an index.
+    take: config.WORKER_BATCH_SIZE,
   });
 
   return records as ReconciliationRecord[];

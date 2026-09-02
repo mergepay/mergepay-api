@@ -2,6 +2,7 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { StrKey, Transaction } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -34,8 +35,8 @@ import {
   snapshotToSignerConfig,
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
+import { treasurySignerConfigSchema } from "../validations/treasury";
 
-const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
 const stellarAmountSchema = z.string().min(1);
 
 export default async function treasuryRoutes(app: FastifyInstance) {
@@ -47,7 +48,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z
       .object({
-        publicKey: stellarPublicKeySchema,
+        publicKey: stellarAccountIdSchema,
         requiredSigners: z.number().int().min(1).max(20).optional(),
       })
       .parse(req.body);
@@ -133,21 +134,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireAdmin(id, auth.id);
     
-    const body = z
-      .object({
-        signers: z.array(
-          z.object({
-            publicKey: z.string(),
-            weight: z.number().int().min(0).max(255),
-          })
-        ),
-        thresholds: z.object({
-          low: z.number().int().min(0).max(255),
-          med: z.number().int().min(0).max(255),
-          high: z.number().int().min(0).max(255),
-        }),
-      })
-      .parse(req.body);
+    const body = treasurySignerConfigSchema.parse(req.body);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
@@ -216,6 +203,20 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       operation: async (tx) => {
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
+
+        await audit({
+          userId: auth.id,
+          action: "treasury.deposit.created",
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          outcome: "success",
+          metadata: {
+            groupId: id,
+            amount: body.amount,
+            assetCode: body.assetCode,
+            destination: treasuryKey,
+          },
+        });
 
         const account = await stellar.loadAccount(auth.stellarPublicKey);
         if (!account.exists) {
@@ -322,6 +323,21 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       operation: async (tx) => {
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
+
+        await audit({
+          userId: auth.id,
+          action: "treasury.withdrawal.created",
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          outcome: "success",
+          metadata: {
+            groupId: id,
+            amount: body.amount,
+            assetCode: body.assetCode,
+            destination: body.destination,
+            status: ttx.status,
+          },
+        });
 
         const account = await stellar.loadAccount(treasuryKey);
         if (!account.exists) {
@@ -501,6 +517,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           });
           await auditTx(tx, {
             userId: auth.id,
+            groupId: fresh.groupId,
             action: AuditAction.TREASURY_CONFIRM_FAILED,
             entityType: "treasury_transaction",
             entityId: id,
@@ -521,6 +538,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         });
         await auditTx(tx, {
           userId: auth.id,
+          groupId: fresh.groupId,
           action: AuditAction.TREASURY_CONFIRM,
           entityType: "treasury_transaction",
           entityId: id,

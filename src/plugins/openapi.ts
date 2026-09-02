@@ -1,47 +1,10 @@
 import { FastifyInstance } from "fastify";
 import fastifySwagger from "@fastify/swagger";
 import fastifySwaggerUi from "@fastify/swagger-ui";
+import fp from "fastify-plugin";
 import { config } from "../config";
 
-function routeTag(url: string | undefined): string {
-  const segments = (url ?? "/").split("/").filter(Boolean);
-  return segments[0] ?? "general";
-}
-
-export default async function openAPIPlugin(app: FastifyInstance) {
-  app.addHook("onRoute", (routeOptions) => {
-    const schema = routeOptions.schema ?? {};
-    const response = { ...schema.response };
-    const sameStatus = (status: number) => ({
-      ...(response[status as keyof typeof response] ?? {}),
-      description: response[status as keyof typeof response]?.description ?? "Response",
-    });
-
-    routeOptions.schema = {
-      ...schema,
-      description:
-        schema.description ??
-        `Endpoint for ${routeOptions.method?.join(", ")?.toUpperCase() ?? "route"} ${routeOptions.url ?? "/"}`,
-      tags: Array.from(new Set([...(schema.tags ?? []), routeTag(routeOptions.url)])),
-      response: {
-        "200": sameStatus(200),
-        "400": {
-          $ref: "Error",
-          ...((response[400] as Record<string, unknown> | undefined) ?? {}),
-        },
-        "401": {
-          $ref: "Error",
-          ...((response[401] as Record<string, unknown> | undefined) ?? {}),
-        },
-        "500": {
-          $ref: "Error",
-          ...((response[500] as Record<string, unknown> | undefined) ?? {}),
-        },
-        ...response,
-      },
-    };
-  });
-
+export default fp(async function openAPIPlugin(app: FastifyInstance) {
   await app.register(fastifySwagger, {
     openapi: {
       openapi: "3.0.0",
@@ -72,15 +35,18 @@ export default async function openAPIPlugin(app: FastifyInstance) {
         schemas: {
           Error: {
             type: "object",
-            required: ["error"],
+            required: ["code", "message", "requestId"],
             properties: {
+              code: { type: "string", description: "Canonical machine-readable code" },
               error: {
-                type: "object",
-                required: ["code", "message"],
-                properties: {
-                  code: { type: "string" },
-                  message: { type: "string" },
-                },
+                type: "string",
+                description: "Deprecated alias of `code`, kept for older clients",
+              },
+              message: { type: "string" },
+              requestId: { type: "string" },
+              details: {
+                type: ["array", "object"],
+                description: "Optional structured validation details",
               },
             },
           },
@@ -155,4 +121,4 @@ export default async function openAPIPlugin(app: FastifyInstance) {
       deepLinking: false,
     },
   });
-}
+});

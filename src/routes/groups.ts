@@ -9,12 +9,12 @@ import { requireMembership, requireAdmin } from "../services/access";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
 import { ADMIN_AUDIT_ACTIONS, auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import {
   serializeGroup,
   serializeInvitation,
   serializeInvite,
   serializeMember,
-  serializeAuditLogEntry,
 } from "../serializers";
 import {
   groupPrimaryAsset,
@@ -38,27 +38,6 @@ export function clearGroupBalanceCache(): void {
 
 export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
-
-  // Privileged, paginated history for group administrators.
-  app.get("/groups/:id/audit-logs", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
-    await requireAdmin(id, auth.id);
-    const query = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50), cursor: z.string().min(1).optional() }).parse(req.query ?? {});
-    const rows = await prisma.auditLog.findMany({
-      where: { groupId: id },
-      include: { user: true },
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: query.limit + 1,
-      ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
-    });
-    const hasMore = rows.length > query.limit;
-    const events = hasMore ? rows.slice(0, query.limit) : rows;
-    return {
-      events: events.map(serializeAuditLogEntry),
-      nextCursor: hasMore ? events[events.length - 1].id : null,
-    };
-  });
 
   // -- create -----------------------------------------------------------------
   app.post("/groups", { config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } } }, async (req) => {
@@ -510,9 +489,9 @@ export default async function groupRoutes(app: FastifyInstance) {
       await auditTx(tx, {
         userId: auth.id,
         groupId: id,
-        action: ADMIN_AUDIT_ACTIONS.MEMBER_REMOVED,
-        entityType: "group_member",
-        entityId: memberId,
+        action: AuditAction.GROUP_MEMBER_REMOVE,
+        entityType: "group",
+        entityId: id,
         outcome: "success",
         metadata: { removedUserId: memberId, removedRole: target.role },
       });

@@ -180,7 +180,6 @@ model Settlement {
   @@index([status, updatedAt]) // For worker reconciliation queries
   @@index([status, nextAttemptAt]) // For picking up eligible worker jobs
   @@index([leaseExpiresAt]) // For recovering leases from crashed workers
-  @@index([status, leaseExpiresAt]) // For the worker's stale-lease recovery sweep
   @@index([expiresAt])
   @@index([expenseShareId])
   @@unique([expenseShareId, idempotencyKey], name: "settlement_expense_share_idempotency")
@@ -232,7 +231,6 @@ model Invite {
   createdBy User  @relation(fields: [createdByUserId], references: [id])
 
   @@index([groupId])
-  @@index([expiresAt]) // For the worker's expired-invite sweep
   @@map("invites")
 }
 
@@ -285,7 +283,6 @@ model AnchorSession {
   @@index([status])
   @@index([anchorToken, externalTransactionId]) // For worker polling queries
   @@index([status, lastPolledAt]) // For worker polling with time-based filtering
-  @@index([leaseExpiresAt]) // For recovering leases from crashed workers
   @@map("anchor_sessions")
 }
 
@@ -353,7 +350,6 @@ model TreasuryProposal {
   @@index([groupId])
   @@index([status])
   @@index([creatorId])
-  @@index([status, createdAt]) // For the worker's stale-proposal sweep (oldest first)
   @@map("treasury_proposals")
 }
 

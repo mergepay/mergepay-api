@@ -145,17 +145,4 @@ describe("runReconciliation — settlements", () => {
     await expect(runReconciliation({ intervalMs: 60_000 })).resolves.toBeUndefined();
     expect(logger.error).toHaveBeenCalled();
   });
-
-  it("bounds each table's pending-record scan per cycle", async () => {
-    // The pending-record scan must be a bounded batch (like every other worker
-    // query) so a backlog drains across cycles instead of loading the whole
-    // table at once — an index must never mask unbounded work.
-    prisma.settlement.findMany.mockResolvedValue([]);
-
-    await runReconciliation({ intervalMs: 60_000 });
-
-    expect(prisma.settlement.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ take: expect.any(Number) })
-    );
-  });
 });

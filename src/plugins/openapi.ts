@@ -35,18 +35,15 @@ export default fp(async function openAPIPlugin(app: FastifyInstance) {
         schemas: {
           Error: {
             type: "object",
-            required: ["code", "message", "requestId"],
+            required: ["error"],
             properties: {
-              code: { type: "string", description: "Canonical machine-readable code" },
               error: {
-                type: "string",
-                description: "Deprecated alias of `code`, kept for older clients",
-              },
-              message: { type: "string" },
-              requestId: { type: "string" },
-              details: {
-                type: ["array", "object"],
-                description: "Optional structured validation details",
+                type: "object",
+                required: ["code", "message"],
+                properties: {
+                  code: { type: "string" },
+                  message: { type: "string" },
+                },
               },
             },
           },

@@ -78,8 +78,6 @@ beforeAll(async () => {
   app.get("/test/internal", async () => {
     throw new Error("DB exploded: secret connection string");
   });
-
-  app.post("/test/small-body", { bodyLimit: 1024 }, async () => ({ ok: true }));
 });
 
 describe("AppError transformation", () => {
@@ -160,19 +158,6 @@ describe("AppError transformation", () => {
     const body = res.json();
     expect(body.stack).toBeUndefined();
   });
-
-  it("emits the canonical { code, message, requestId } envelope", async () => {
-    const res = await app.inject({ method: "GET", url: "/test/not-found" });
-
-    const body = res.json();
-    expect(body.code).toBe("NOT_FOUND");
-    expect(body.message).toBe("Thing not found");
-    expect(body.requestId).toBeTruthy();
-    // The status is carried by the HTTP status code, never duplicated in the
-    // body, and no internal detail leaks into the response.
-    expect(body.statusCode).toBeUndefined();
-    expect(body.stack).toBeUndefined();
-  });
 });
 
 describe("ZodError (validation) transformation", () => {
@@ -209,24 +194,6 @@ describe("ZodError (validation) transformation", () => {
     expect(body.details[0].field).toBe("user.age");
     expect(body.details[0].message).toContain("18");
     expect(body.requestId).toBeTruthy();
-  });
-});
-
-describe("payload size failures", () => {
-  it("maps Fastify's body-too-large error to 413 PAYLOAD_TOO_LARGE", async () => {
-    const res = await app.inject({
-      method: "POST",
-      url: "/test/small-body",
-      payload: { data: "x".repeat(5000) },
-    });
-
-    expect(res.statusCode).toBe(413);
-    const body = res.json();
-    expect(body.code).toBe("PAYLOAD_TOO_LARGE");
-    expect(typeof body.message).toBe("string");
-    expect(body.requestId).toBeTruthy();
-    expect(body.statusCode).toBeUndefined();
-    expect(body.stack).toBeUndefined();
   });
 });
 

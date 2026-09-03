@@ -21,12 +21,11 @@ import {
   Transaction,
   TransactionBuilder,
 } from "@stellar/stellar-sdk";
-import pino from "pino";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { ProviderError } from "../lib/provider-error";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
-import { withTimeout, TimeoutError, TransportError } from "./timeout";
+import { withTimeout, toProviderError } from "./timeout";
 import { logRetryAttempt, withRetry } from "./retry";
 import {
   INTENT_VALIDITY_SECONDS,
@@ -79,8 +78,6 @@ export async function withHorizonFailover<T>(operation: (horizon: Horizon.Server
  * operation label, normalized failure category, and provider result codes.
  * Raw error objects, response bodies, and signed envelopes never reach here.
  */
-const log = pino({ name: "stellar" });
-
 function logHorizonFailure(
   operation: string,
   category: string,
@@ -403,12 +400,19 @@ export const stellar = {
     try {
       const res = await withHorizonFailover((horizon) => horizon.submitTransaction(tx));
       return res.hash;
-    } catch (e: any) {
-      const codes =
-        e?.response?.data?.extras?.result_codes ??
-        e?.response?.data?.result_codes;
-      const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
-      throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+    } catch (e: unknown) {
+      // Normalize into a categorized ProviderError exactly like the worker's
+      // submission path: Horizon result codes become a permanent rejection
+      // carrying only the safe code identifiers.
+      const converted = toProviderError(e, {
+        provider: "horizon",
+        operation: "Horizon.submitTransaction",
+        fallbackMessage: "Stellar rejected the transaction",
+      });
+      if (converted instanceof ProviderError) {
+        logHorizonFailure(converted.operation, converted.category, converted.detail?.join(",") ?? null);
+      }
+      throw converted;
     }
   },
 

@@ -57,12 +57,17 @@ export default async function expenseRoutes(app: FastifyInstance) {
     const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
-    const payerMembership = await prisma.groupMember.findUnique({
-      where: { groupId_userId: { groupId, userId: payerUserId } },
-      select: { userId: true },
-    });
-    if (!payerMembership) {
-      throw Errors.badRequest("invalid_payer", "Payer must be an active group member");
+    // When the payer is the caller, the membership check above already proved
+    // they are an active member — only a *different* payer needs a second
+    // lookup.
+    if (payerUserId !== auth.id) {
+      const payerMembership = await prisma.groupMember.findUnique({
+        where: { groupId_userId: { groupId, userId: payerUserId } },
+        select: { userId: true },
+      });
+      if (!payerMembership) {
+        throw Errors.badRequest("invalid_payer", "Payer must be an active group member");
+      }
     }
 
     let computed;

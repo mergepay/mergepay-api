@@ -786,14 +786,52 @@ async function reconcileSingleAnchor(
 
   // ── poll failed (timeout, network, malformed response) ───────────────────
   if (result.isError) {
-    const isTransient = result.errorCategory !== "permanent";
     const exhausted = attempt >= ANCHOR_RETRY_POLICY.maxAttempts;
     const reason = safeFailureMessage(result.message);
-    // A provider rejection can never succeed on retry; everything else stays
-    // transient until the retry budget runs out. The poll's normalized
-    // category drives the decision — no message-text guessing.
+    // A provider rejection or a malformed response can never succeed on retry;
+    // everything else stays transient until the retry budget runs out. The
+    // poll's normalized category drives the decision — no message-text
+    // guessing.
     const errorCategory: JobFailureCategory =
-      exhausted || result.category === "rejected" ? "permanent" : "transient";
+      exhausted || result.errorCategory === "permanent" ? "permanent" : "transient";
+
+    // Permanent failures stop the session: the anchor told us something that
+    // no retry can change (rejected a request, returned garbage), so move the
+    // session to error rather than burning the retry budget on it.
+    if (result.errorCategory === "permanent") {
+      await applyAnchorSessionTransition({
+        sessionId: job.id,
+        nextStatus: "error",
+        source: "poll",
+        expectedCurrentStatus: job.status,
+        extraData: {
+          lastPolledAt: now,
+          failureReason: reason,
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        } as never,
+      });
+      await recordStatusTransition({
+        entityType: "anchor_session",
+        entityId: job.id,
+        newStatus: "error",
+        reason,
+        source: "worker",
+      }).catch(() => undefined);
+      jobLog.error(
+        {
+          jobType: "anchor",
+          jobId: job.id,
+          attempt,
+          outcome: "failed",
+          category: "permanent",
+          reason,
+        },
+        "anchor poll failed with a permanent error"
+      );
+      return;
+    }
 
     await prisma.anchorSession.update({
       where: { id: job.id },
@@ -808,6 +846,7 @@ async function reconcileSingleAnchor(
       },
     });
 
+    if (exhausted) {
       jobLog.error(
         {
           jobType: "anchor",
@@ -833,10 +872,9 @@ async function reconcileSingleAnchor(
         jobType: "anchor",
         jobId: job.id,
         attempt,
-        outcome: exhausted ? "retries_exhausted" : "retry_scheduled",
+        outcome: "retry_scheduled",
         category: result.category ?? "unknown",
-        errorCategory,
-        reason,
+        status: result.status,
       },
       `anchor reported an unrecognized SEP-24 status '${result.rawStatus}' — kept pending and will keep polling`
     );

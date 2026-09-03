@@ -46,6 +46,7 @@ import {
   classifyUpstreamFailure,
   isRetryableFailure,
   logRetryAttempt,
+  type UpstreamFailureKind,
   upstreamCauseOf,
   withRetry,
 } from "./retry";
@@ -108,6 +109,12 @@ export interface PollResult {
    * message text. Undefined on success.
    */
   category?: ProviderFailureCategory;
+  /**
+   * Whether a failed poll can ever succeed on retry. "permanent" covers
+   * provider rejections and malformed responses; "transient" covers timeouts,
+   * transport failures, and server/rate-limit outages. Undefined on success.
+   */
+  errorCategory?: "permanent" | "transient";
   /** Anchor-provided transaction JSON for debugging (sanitized). */
   transaction?: Record<string, unknown>;
   /** SEP-24 amount_in / amount_out / amount_fee if available. */
@@ -116,6 +123,11 @@ export interface PollResult {
   amountFee?: string;
   /** SEP-24 stellar_transaction_hash if available. */
   stellarTransactionHash?: string;
+  /**
+   * False when the anchor returned a status string outside the known SEP-24
+   * set (mapped to a safe pending state). Undefined on failed polls.
+   */
+  recognized?: boolean;
 }
 
 // ─── Zod schemas for anchor responses ───────────────────────────────────────
@@ -245,6 +257,23 @@ function httpFailureCategory(status: number): ProviderFailureCategory {
   if (status === 429) return "rate_limited";
   if (status >= 500) return "unavailable";
   return "rejected";
+}
+
+/** Map a retry classification onto the provider category the worker persists. */
+const PROVIDER_CATEGORY_BY_KIND: Record<UpstreamFailureKind, ProviderFailureCategory> = {
+  timeout: "timeout",
+  transport: "transport",
+  server_error: "unavailable",
+  rate_limited: "rate_limited",
+  client_error: "rejected",
+  unknown: "unavailable",
+};
+
+/** Whether a provider category is a permanent rejection vs a transient outage. */
+function errorCategoryOf(
+  category: ProviderFailureCategory
+): "permanent" | "transient" {
+  return category === "rejected" || category === "malformed" ? "permanent" : "transient";
 }
 
 /**
@@ -378,12 +407,29 @@ export const anchorService = {
   ): Promise<{ transaction: string; networkPassphrase: string }> {
     const operation = "Anchor.getChallenge";
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
-    const res = await fetchReadWithRetry(
-      url,
-      "Anchor.getChallenge",
-      config.ANCHOR_CHALLENGE_TIMEOUT_MS
-    );
-    const data = parseJson(challengeResponseSchema, await res.json());
+    let res: Response;
+    try {
+      // A single attempt, not the bounded retry wrapper: the challenge is
+      // issued fresh per request and an abandoned one expires unused, so the
+      // timeout/transport error is converted straight into a typed
+      // ProviderError (never leaking the endpoint URL).
+      res = await fetchWithTimeout(url, operation, config.ANCHOR_CHALLENGE_TIMEOUT_MS);
+    } catch (err) {
+      throw toProviderError(err, {
+        provider: PROVIDER,
+        operation,
+        fallbackMessage: "Anchor SEP-10 challenge request failed",
+      });
+    }
+    if (!res.ok) {
+      throw new ProviderError({
+        category: httpFailureCategory(res.status),
+        provider: PROVIDER,
+        operation,
+        message: "Anchor SEP-10 challenge request failed",
+      });
+    }
+    const data = parseJson(operation, challengeResponseSchema, await readAnchorJson(operation, res));
     return {
       transaction: data.transaction,
       networkPassphrase: data.network_passphrase ?? config.networkPassphrase,
@@ -535,6 +581,7 @@ export const anchorService = {
         message: "Anchor circuit is open",
         isError: true,
         category: "unavailable",
+        errorCategory: "transient",
       };
     }
 
@@ -551,18 +598,20 @@ export const anchorService = {
       // The retry wrapper maps every failure to a stable upstream error, so the
       // anchor's HTTP status is read back off the preserved cause to keep the
       // previous poll-result message intact.
-      const cause = upstreamCauseOf(err);
-      const isTransient = isRetryableFailure(classifyUpstreamFailure(cause));
+      const cause = upstreamCauseOf(err) ?? err;
+      const kind = classifyUpstreamFailure(cause);
       const message =
         cause instanceof AnchorHttpError
           ? `Anchor returned HTTP ${cause.status}`
           : `Anchor poll failed: ${err instanceof Error ? err.message : String(err)}`;
+      const category = PROVIDER_CATEGORY_BY_KIND[kind];
       return {
         rawStatus: null,
         status: "pending_anchor",
         message,
         isError: true,
-        category: httpFailureCategory(response.status),
+        category,
+        errorCategory: errorCategoryOf(category),
       };
     }
 
@@ -577,6 +626,7 @@ export const anchorService = {
         message: "Anchor returned malformed (non-JSON) response",
         isError: true,
         category: "malformed",
+        errorCategory: "permanent",
       };
     }
 
@@ -597,9 +647,11 @@ export const anchorService = {
         message: `Anchor returned invalid or malformed response: ${detail}`,
         isError: true,
         category: "malformed",
+        errorCategory: "permanent",
       };
     }
 
+    const tx = parseResult.data.transaction;
     const rawStatus =
       typeof tx.status === "string" ? tx.status : (json.status as string | undefined) ?? null;
     if (!rawStatus) {
@@ -609,8 +661,14 @@ export const anchorService = {
         message: "Anchor response missing transaction status",
         isError: true,
         category: "malformed",
+        errorCategory: "permanent",
       };
     }
+
+    // Distinguish a genuinely new anchor status (kept pending, logged loudly)
+    // from the statuses we know how to interpret.
+    const recognized = isKnownSep24Status(rawStatus);
+    const mappedStatus = mapAnchorStatus(rawStatus);
 
     // Sanitise — only carry forward benign fields for debugging
     const sanitizedTx: Record<string, unknown> = {

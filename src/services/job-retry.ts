@@ -20,6 +20,7 @@
  */
 
 import { config } from "../config";
+import { ProviderError } from "../lib/provider-error";
 
 export type JobFailureCategory = "transient" | "indeterminate" | "permanent";
 

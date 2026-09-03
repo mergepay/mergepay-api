@@ -370,7 +370,7 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
 describe("POST /groups/:id/treasury/deposit — audit events", () => {
   it("writes an audit event when a deposit is created", async () => {
     prisma.group.findUnique.mockResolvedValue(fakeGroup());
-    prisma.groupMember.findUnique.mockResolvedValueOnce({
+    prisma.groupMember.findUnique.mockResolvedValue({
       groupId: "group_1",
       userId: admin.id,
       role: "admin",
@@ -431,7 +431,7 @@ describe("POST /groups/:id/treasury/deposit — audit events", () => {
 describe("POST /groups/:id/treasury/withdraw — audit events", () => {
   it("writes an audit event when a withdrawal is created", async () => {
     prisma.group.findUnique.mockResolvedValue(fakeGroup());
-    prisma.groupMember.findUnique.mockResolvedValueOnce({
+    prisma.groupMember.findUnique.mockResolvedValue({
       groupId: "group_1",
       userId: admin.id,
       role: "admin",

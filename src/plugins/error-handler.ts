@@ -3,24 +3,8 @@ import fp from "fastify-plugin";
 import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
 import { toRequestLimitError } from "../lib/request-limits";
+import { TimeoutError, TransportError, toProviderError } from "../services/timeout";
 
-/**
- * The one error envelope every failure — validation, authorization, rate
- * limiting, upstream, unexpected — is serialized into:
- *
- *   {
- *     code: string,        // stable machine-readable code (e.g. "NOT_FOUND") — canonical
- *     error: string,       // deprecated alias of `code`, kept for older clients
- *     message: string,     // human-readable description
- *     requestId: string,   // correlation id for tracing
- *     details?: unknown,   // optional structured detail (e.g. Zod issues)
- *   }
- *
- * The HTTP status is conveyed by the response status only — never duplicated
- * in the body — and the body never contains stack traces, SQL, credentials,
- * signed XDRs, or upstream response text. Those go to the server log, keyed
- * by `requestId`.
- */
 export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
     const requestId = req.id as string;
@@ -85,6 +69,24 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
       return reply.code(err.status).send(body);
     }
 
+    // A timeout or transport failure that escaped a handler still means the
+    // upstream is unavailable, not that this process has a bug — answer 502
+    // with the safe envelope rather than the generic 500, and never echo the
+    // upstream's own error text.
+    if (err instanceof TimeoutError || err instanceof TransportError) {
+      const converted = toProviderError(err, {
+        provider: "upstream",
+        operation: "route",
+        fallbackMessage: "The upstream service is unavailable",
+      });
+      return reply.code(converted.status).send({
+        code: converted.code,
+        error: converted.code,
+        message: converted.message,
+        requestId,
+      });
+    }
+
     // Size and shape limits rejected by Fastify or @fastify/multipart before a
     // handler ever ran. Without this they fall through to the generic 4xx
     // branch below, which echoes the framework's own wording and leaves clients
@@ -104,18 +106,6 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         code: "RATE_LIMITED",
         error: "RATE_LIMITED",
         message: "Too many requests, slow down.",
-        requestId,
-      });
-    }
-
-    // Fastify's payload-size guard (FST_ERR_CTP_BODY_TOO_LARGE) gets its own
-    // stable code instead of the generic BAD_REQUEST, so a client can tell a
-    // size rejection from a validation failure.
-    if ((err as any).statusCode === 413) {
-      return reply.code(413).send({
-        code: "PAYLOAD_TOO_LARGE",
-        error: "PAYLOAD_TOO_LARGE",
-        message: "Request body exceeds the allowed size limit",
         requestId,
       });
     }

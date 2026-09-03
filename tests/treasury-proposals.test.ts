@@ -559,11 +559,13 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       destination: Keypair.random().publicKey(),
       amount: "5",
     });
+    const proposalHash = txHash(proposalXdr);
     const pendingProposal = {
       id: "prop_1",
       groupId: "group_1",
       creatorId: "u_creator",
       xdr: proposalXdr,
+      txHash: proposalHash,
       threshold: 1,
       signatures: [],
       status: "pending",
@@ -610,11 +612,13 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
     expect(prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
+          groupId: "group_1",
           action: "treasury.proposal.failed",
           entityType: "treasury_proposal",
           entityId: "prop_1",
           metadata: expect.objectContaining({
-            groupId: "group_1",
+            reason: "txFailed",
+            outcome: "failure",
           }),
         }),
       })

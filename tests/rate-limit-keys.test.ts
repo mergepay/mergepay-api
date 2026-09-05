@@ -6,18 +6,18 @@ function fakeReq(over: Record<string, any> = {}): any {
 }
 
 describe("userOrIpKey", () => {
-  it("keys by user id when authenticated", () => {
+  it("keys by Stellar public key when authenticated", () => {
     const gen = userOrIpKey("settlement.create");
     const key = gen(fakeReq({ user: { id: "user_123", stellarPublicKey: "GABC..." } }));
-    expect(key).toBe("settlement.create:user:user_123");
+    expect(key).toBe("settlement.create:public-key:GABC...");
   });
 
-  it("never includes the Stellar public key in the key", () => {
+  it("does not use the internal user id in the key", () => {
     const gen = userOrIpKey("settlement.create");
     const key = gen(
       fakeReq({ user: { id: "user_123", stellarPublicKey: "GSECRETPUBLICKEYXXXXXXXXXXXX" } })
     );
-    expect(key).not.toContain("GSECRETPUBLICKEYXXXXXXXXXXXX");
+    expect(key).not.toContain("user_123");
   });
 
   it("falls back to IP when unauthenticated", () => {

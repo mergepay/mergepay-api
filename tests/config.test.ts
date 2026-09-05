@@ -1,223 +1,214 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { z } from "zod";
-import { Networks } from "@stellar/stellar-sdk";
+import { describe, it, expect } from "vitest";
+import { envSchema, safeErrorMessage } from "../src/config";
 
-// Import the schema directly to test validation without triggering module-level exit
-const urlSchema = z.string().url("Invalid URL format");
-const stellarPublicKeySchema = z.string().regex(/^G[A-Z0-9]{55}$/, "Invalid Stellar public key format");
-
-const schema = z.object({
-  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
-  PORT: z.coerce.number().int().positive().default(4000),
-  API_PUBLIC_URL: urlSchema,
-  WEB_URL: z.string().default("*"),
-  JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
-  STELLAR_NETWORK: z.enum(["testnet", "public"], {
-    errorMap: () => ({ message: "STELLAR_NETWORK must be either 'testnet' or 'public'" }),
-  }),
-  HORIZON_URL: urlSchema,
-  FEE_CACHE_TTL: z.coerce.number().positive().default(30),
-  MAX_FEE_STROOPS: z.coerce.number().int().positive().default(1000),
-  DEFAULT_FEE_STROOPS: z.coerce.number().int().positive().default(100),
-  SEP10_SIGNING_SECRET: z.string().optional(),
-  SEP10_HOME_DOMAIN: z.string().optional(),
-  WEB_AUTH_DOMAIN: z.string().optional(),
-  ANCHOR_HOME_DOMAIN: z.string().min(1, "ANCHOR_HOME_DOMAIN is required"),
-  ANCHOR_NAME: z.string().min(1, "ANCHOR_NAME is required"),
-  ANCHOR_WEBHOOK_SECRET: z.string().min(1, "ANCHOR_WEBHOOK_SECRET is required"),
-  STABLE_ASSET_CODE: z.string().min(1, "STABLE_ASSET_CODE is required"),
-  STABLE_ASSET_ISSUER: stellarPublicKeySchema,
-  UPLOADS_DIR: z.string().default("./uploads"),
-  WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
-  NODE_ENV: z.string().default("development"),
-  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
-  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
-  SETTLEMENT_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(20),
-  SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
-  AUTH_BODY_LIMIT_BYTES: z.coerce.number().int().positive().max(10 * 1024 * 1024).default(256 * 1024),
-  MULTIPART_FILE_SIZE_BYTES: z.coerce.number().int().positive().max(50 * 1024 * 1024).default(5 * 1024 * 1024),
-}).refine(
-  (data) => {
-    const isTestnet = data.STELLAR_NETWORK === "testnet";
-    const horizonUrl = data.HORIZON_URL.toLowerCase();
-    
-    if (isTestnet && !horizonUrl.includes("testnet")) {
-      return false;
-    }
-    if (!isTestnet && horizonUrl.includes("testnet")) {
-      return false;
-    }
-    return true;
-  },
-  {
-    message: "HORIZON_URL must match STELLAR_NETWORK (testnet URLs for testnet, public URLs for public)",
-    path: ["HORIZON_URL"],
-  }
-);
-
-const validConfig = {
+// A minimal valid env object, mirroring what dotenv would hand the schema:
+// all values are strings, every mandatory variable is present, and everything
+// else falls back to the schema's defaults.
+const validEnv: Record<string, string> = {
   DATABASE_URL: "postgresql://user:pass@localhost:5432/mergepay",
-  PORT: 4000,
   API_PUBLIC_URL: "http://localhost:4000",
-  WEB_URL: "*",
   JWT_SECRET: "secure-secret-key-16-chars",
-  STELLAR_NETWORK: "testnet" as const,
+  STELLAR_NETWORK: "testnet",
   HORIZON_URL: "https://horizon-testnet.stellar.org",
-  FEE_CACHE_TTL: 30,
-  MAX_FEE_STROOPS: 1000,
-  DEFAULT_FEE_STROOPS: 100,
   ANCHOR_HOME_DOMAIN: "testanchor.stellar.org",
   ANCHOR_NAME: "Stellar Test Anchor",
   ANCHOR_WEBHOOK_SECRET: "webhook-secret",
   STABLE_ASSET_CODE: "USDC",
   STABLE_ASSET_ISSUER: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
-  UPLOADS_DIR: "./uploads",
-  WORKER_INTERVAL_MS: 30000,
-  NODE_ENV: "development",
-  RATE_LIMIT_WINDOW_MS: 60000,
-  AUTH_RATE_LIMIT_MAX: 10,
-  SETTLEMENT_RATE_LIMIT_MAX: 20,
-  SEP24_RATE_LIMIT_MAX: 10,
-  AUTH_BODY_LIMIT_BYTES: 256 * 1024,
-  MULTIPART_FILE_SIZE_BYTES: 5 * 1024 * 1024,
 };
 
-describe("Configuration validation", () => {
+const requiredKeys: string[] = [
+  "DATABASE_URL",
+  "API_PUBLIC_URL",
+  "JWT_SECRET",
+  "STELLAR_NETWORK",
+  "HORIZON_URL",
+  "ANCHOR_HOME_DOMAIN",
+  "ANCHOR_NAME",
+  "ANCHOR_WEBHOOK_SECRET",
+  "STABLE_ASSET_CODE",
+  "STABLE_ASSET_ISSUER",
+];
+
+function without(env: Record<string, string>, key: string): Record<string, string> {
+  const copy = { ...env };
+  delete copy[key];
+  return copy;
+}
+
+describe("env schema — valid configurations", () => {
   it("accepts a valid testnet configuration", () => {
-    const result = schema.parse(validConfig);
+    const result = envSchema.parse(validEnv);
     expect(result.STELLAR_NETWORK).toBe("testnet");
     expect(result.HORIZON_URL).toBe("https://horizon-testnet.stellar.org");
   });
 
   it("accepts a valid public network configuration", () => {
-    const config = {
-      ...validConfig,
-      STELLAR_NETWORK: "public" as const,
+    const result = envSchema.parse({
+      ...validEnv,
+      STELLAR_NETWORK: "public",
       HORIZON_URL: "https://horizon.stellar.org",
-    };
-    const result = schema.parse(config);
+    });
     expect(result.STELLAR_NETWORK).toBe("public");
     expect(result.HORIZON_URL).toBe("https://horizon.stellar.org");
   });
 
-  it("rejects missing DATABASE_URL", () => {
-    const config = { ...validConfig, DATABASE_URL: "" };
-    expect(() => schema.parse(config)).toThrow("DATABASE_URL is required");
+  it("coerces numeric strings to numbers", () => {
+    const result = envSchema.parse({ ...validEnv, PORT: "4000", FEE_CACHE_TTL: "30" });
+    expect(result.PORT).toBe(4000);
+    expect(result.FEE_CACHE_TTL).toBe(30);
   });
 
-  it("rejects invalid API_PUBLIC_URL format", () => {
-    const config = { ...validConfig, API_PUBLIC_URL: "not-a-url" };
-    expect(() => schema.parse(config)).toThrow("Invalid URL format");
+  it("coerces boolean strings", () => {
+    const result = envSchema.parse({ ...validEnv, CORS_ALLOW_CREDENTIALS: "true" });
+    expect(result.CORS_ALLOW_CREDENTIALS).toBe(true);
   });
 
-  it("rejects JWT_SECRET shorter than 16 characters", () => {
-    const config = { ...validConfig, JWT_SECRET: "short" };
-    expect(() => schema.parse(config)).toThrow("JWT_SECRET must be at least 16 characters");
+  it("applies defaults for omitted optional fields", () => {
+    const result = envSchema.parse(validEnv);
+    expect(result.PORT).toBe(4000);
+    expect(result.LOG_LEVEL).toBe("info");
+    expect(result.CORS_ALLOW_CREDENTIALS).toBe(false);
+    expect(result.ACCESS_TOKEN_TTL_SECONDS).toBe(900);
   });
 
-  it("rejects unsupported STELLAR_NETWORK value", () => {
-    const config = { ...validConfig, STELLAR_NETWORK: "mainnet" as any };
-    expect(() => schema.parse(config)).toThrow("STELLAR_NETWORK must be either 'testnet' or 'public'");
-  });
-
-  it("rejects invalid HORIZON_URL format", () => {
-    const config = { ...validConfig, HORIZON_URL: "not-a-url" };
-    expect(() => schema.parse(config)).toThrow("Invalid URL format");
-  });
-
-  it("rejects HORIZON_URL that doesn't match testnet network", () => {
-    const config = {
-      ...validConfig,
-      STELLAR_NETWORK: "testnet" as const,
-      HORIZON_URL: "https://horizon.stellar.org",
-    };
-    expect(() => schema.parse(config)).toThrow("HORIZON_URL must match STELLAR_NETWORK");
-  });
-
-  it("rejects HORIZON_URL that doesn't match public network", () => {
-    const config = {
-      ...validConfig,
-      STELLAR_NETWORK: "public" as const,
-      HORIZON_URL: "https://horizon-testnet.stellar.org",
-    };
-    expect(() => schema.parse(config)).toThrow("HORIZON_URL must match STELLAR_NETWORK");
-  });
-
-  it("rejects missing ANCHOR_HOME_DOMAIN", () => {
-    const config = { ...validConfig, ANCHOR_HOME_DOMAIN: "" };
-    expect(() => schema.parse(config)).toThrow("ANCHOR_HOME_DOMAIN is required");
-  });
-
-  it("rejects missing ANCHOR_NAME", () => {
-    const config = { ...validConfig, ANCHOR_NAME: "" };
-    expect(() => schema.parse(config)).toThrow("ANCHOR_NAME is required");
-  });
-
-  it("rejects missing ANCHOR_WEBHOOK_SECRET", () => {
-    const config = { ...validConfig, ANCHOR_WEBHOOK_SECRET: "" };
-    expect(() => schema.parse(config)).toThrow("ANCHOR_WEBHOOK_SECRET is required");
-  });
-
-  it("rejects missing STABLE_ASSET_CODE", () => {
-    const config = { ...validConfig, STABLE_ASSET_CODE: "" };
-    expect(() => schema.parse(config)).toThrow("STABLE_ASSET_CODE is required");
-  });
-
-  it("rejects invalid Stellar public key format", () => {
-    const config = { ...validConfig, STABLE_ASSET_ISSUER: "not-a-valid-key" };
-    expect(() => schema.parse(config)).toThrow("Invalid Stellar public key format");
-  });
-
-  it("rejects Stellar secret key (starts with S)", () => {
-    const config = { ...validConfig, STABLE_ASSET_ISSUER: "SABCD1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890" };
-    expect(() => schema.parse(config)).toThrow("Invalid Stellar public key format");
-  });
-
-  it("accepts valid Stellar public key", () => {
-    const result = schema.parse(validConfig);
-    expect(result.STABLE_ASSET_ISSUER).toBe("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN");
-  });
-
-  it("accepts optional SEP10_SIGNING_SECRET when provided", () => {
-    const config = { ...validConfig, SEP10_SIGNING_SECRET: "secret-key" };
-    const result = schema.parse(config);
+  it("accepts optional SEP-10 and Horizon fields when provided", () => {
+    const result = envSchema.parse({
+      ...validEnv,
+      SEP10_SIGNING_SECRET: "secret-key",
+      SEP10_HOME_DOMAIN: "auth.example.com",
+      WEB_AUTH_DOMAIN: "auth.example.com",
+      HORIZON_URLS: "https://horizon-testnet.stellar.org,https://horizon2-testnet.stellar.org",
+    });
     expect(result.SEP10_SIGNING_SECRET).toBe("secret-key");
+    expect(result.SEP10_HOME_DOMAIN).toBe("auth.example.com");
+    expect(result.WEB_AUTH_DOMAIN).toBe("auth.example.com");
+    expect(result.HORIZON_URLS).toContain(",");
+  });
+});
+
+describe("env schema — missing mandatory variables", () => {
+  it.each(requiredKeys)("throws when %s is missing", (key) => {
+    expect(() => envSchema.parse(without(validEnv, key))).toThrow();
   });
 
-  it("accepts configuration without SEP10_SIGNING_SECRET", () => {
-    const configWithoutSecret: any = { ...validConfig };
-    delete configWithoutSecret.SEP10_SIGNING_SECRET;
-    const result = schema.parse(configWithoutSecret);
-    expect(result.SEP10_SIGNING_SECRET).toBeUndefined();
+  it.each(requiredKeys)("throws when %s is empty", (key) => {
+    expect(() => envSchema.parse({ ...validEnv, [key]: "" })).toThrow();
   });
 
-  it("rejects PORT that is not a positive integer", () => {
-    const config = { ...validConfig, PORT: -1 };
-    expect(() => schema.parse(config)).toThrow();
+  it("reports the missing variable name in the error", () => {
+    const result = envSchema.safeParse(without(validEnv, "DATABASE_URL"));
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(safeErrorMessage(result.error)).toContain("DATABASE_URL");
+    }
+  });
+});
+
+describe("env schema — invalid formats", () => {
+  it("rejects a non-URL API_PUBLIC_URL", () => {
+    expect(() => envSchema.parse({ ...validEnv, API_PUBLIC_URL: "not-a-url" })).toThrow(
+      "Invalid URL format"
+    );
   });
 
-  it("rejects PORT that is not an integer", () => {
-    const config = { ...validConfig, PORT: 4000.5 };
-    expect(() => schema.parse(config)).toThrow();
+  it("rejects a non-URL HORIZON_URL", () => {
+    expect(() => envSchema.parse({ ...validEnv, HORIZON_URL: "not-a-url" })).toThrow(
+      "Invalid URL format"
+    );
   });
 
-  it("rejects negative WORKER_INTERVAL_MS", () => {
-    const config = { ...validConfig, WORKER_INTERVAL_MS: -1000 };
-    expect(() => schema.parse(config)).toThrow();
+  it("rejects a JWT_SECRET shorter than 16 characters", () => {
+    expect(() => envSchema.parse({ ...validEnv, JWT_SECRET: "short" })).toThrow(
+      "JWT_SECRET must be at least 16 characters"
+    );
   });
 
-  it("rejects rate limit max values exceeding 100000", () => {
-    const config = { ...validConfig, AUTH_RATE_LIMIT_MAX: 100001 };
-    expect(() => schema.parse(config)).toThrow();
+  it("rejects an unsupported STELLAR_NETWORK value", () => {
+    expect(() => envSchema.parse({ ...validEnv, STELLAR_NETWORK: "mainnet" })).toThrow(
+      "STELLAR_NETWORK must be either 'testnet' or 'public'"
+    );
   });
 
-  it("provides clear error messages for multiple validation failures", () => {
-    const config = {
-      ...validConfig,
-      DATABASE_URL: "",
-      API_PUBLIC_URL: "invalid-url",
+  it("rejects a malformed STABLE_ASSET_ISSUER", () => {
+    expect(() => envSchema.parse({ ...validEnv, STABLE_ASSET_ISSUER: "not-a-valid-key" })).toThrow(
+      "Invalid Stellar public key format"
+    );
+  });
+
+  it("rejects a secret key as STABLE_ASSET_ISSUER", () => {
+    expect(() =>
+      envSchema.parse({
+        ...validEnv,
+        STABLE_ASSET_ISSUER: "SABCD1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+      })
+    ).toThrow("Invalid Stellar public key format");
+  });
+
+  it("rejects a public HORIZON_URL when STELLAR_NETWORK is testnet", () => {
+    expect(() => envSchema.parse({ ...validEnv, HORIZON_URL: "https://horizon.stellar.org" })).toThrow(
+      "HORIZON_URL must match STELLAR_NETWORK"
+    );
+  });
+
+  it("rejects a testnet HORIZON_URL when STELLAR_NETWORK is public", () => {
+    expect(() =>
+      envSchema.parse({
+        ...validEnv,
+        STELLAR_NETWORK: "public",
+        HORIZON_URL: "https://horizon-testnet.stellar.org",
+      })
+    ).toThrow("HORIZON_URL must match STELLAR_NETWORK");
+  });
+});
+
+describe("env schema — numeric constraints", () => {
+  it("rejects a non-positive PORT", () => {
+    expect(() => envSchema.parse({ ...validEnv, PORT: "0" })).toThrow();
+  });
+
+  it("rejects a non-integer PORT", () => {
+    expect(() => envSchema.parse({ ...validEnv, PORT: "4000.5" })).toThrow();
+  });
+
+  it("rejects a negative WORKER_INTERVAL_MS", () => {
+    expect(() => envSchema.parse({ ...validEnv, WORKER_INTERVAL_MS: "-1000" })).toThrow();
+  });
+
+  it("rejects WEBHOOK_MAX_ATTEMPTS above the max of 10", () => {
+    expect(() => envSchema.parse({ ...validEnv, WEBHOOK_MAX_ATTEMPTS: "11" })).toThrow();
+  });
+
+  it("rejects WORKER_BATCH_SIZE above the max of 500", () => {
+    expect(() => envSchema.parse({ ...validEnv, WORKER_BATCH_SIZE: "501" })).toThrow();
+  });
+
+  it("rejects ACCESS_TOKEN_TTL_SECONDS above 86400", () => {
+    expect(() => envSchema.parse({ ...validEnv, ACCESS_TOKEN_TTL_SECONDS: "86401" })).toThrow();
+  });
+});
+
+describe("env schema — error reporting", () => {
+  it("reports every failed field with its path", () => {
+    const result = envSchema.safeParse({
+      ...without(validEnv, "DATABASE_URL"),
+      API_PUBLIC_URL: "not-a-url",
       JWT_SECRET: "short",
-    };
-    expect(() => schema.parse(config)).toThrow();
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const message = safeErrorMessage(result.error);
+      expect(message).toContain("DATABASE_URL");
+      expect(message).toContain("API_PUBLIC_URL");
+      expect(message).toContain("JWT_SECRET");
+    }
+  });
+
+  it("formats a single failure as path: message", () => {
+    const result = envSchema.safeParse(without(validEnv, "STABLE_ASSET_CODE"));
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(safeErrorMessage(result.error)).toContain("STABLE_ASSET_CODE");
+    }
   });
 });

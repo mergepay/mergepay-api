@@ -185,6 +185,7 @@ describe("pagination primitives", () => {
 describe("list endpoints share one pagination contract", () => {
   const listRoutes: { name: string; url: string; key: string }[] = [
     { name: "group expenses", url: `/groups/${GROUP_ID}/expenses`, key: "expenses" },
+    { name: "group settlements", url: `/groups/${GROUP_ID}/settlements`, key: "settlements" },
     { name: "group ledger", url: `/groups/${GROUP_ID}/ledger`, key: "entries" },
     {
       name: "treasury history",
@@ -478,5 +479,99 @@ describe("group ledger pagination", () => {
     // Row ids are not leaked as a bare `id` field on ledger entries.
     expect(body.entries[0].id).toBeUndefined();
     expect(body.meta.hasMore).toBe(false);
+  });
+});
+
+describe("group settlements pagination", () => {
+  function tiedSettlements(ids: string[], at = "2026-02-02T00:00:00Z") {
+    return ids.map((id) => ({
+      id,
+      groupId: GROUP_ID,
+      fromUserId: USER_ID,
+      toUserId: "user_2",
+      createdAt: new Date(at),
+      amount: "5",
+      assetCode: "XLM",
+      assetIssuer: null,
+      status: "pending",
+      from: fakeUser(),
+      to: fakeUser("user_2"),
+      statusHistory: [],
+    }));
+  }
+
+  it("returns the first page and a cursor pointing at its last row", async () => {
+    const rows = tiedSettlements(["3", "2", "1"], "2026-02-03T00:00:00Z");
+    prisma.settlement.findMany.mockResolvedValueOnce(rows as any);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/groups/${GROUP_ID}/settlements?limit=2`,
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.settlements.map((s: any) => s.id)).toEqual(["3", "2"]);
+    expect(body.meta.hasMore).toBe(true);
+    expect(body.meta.nextCursor).toBe(encodeCursor(rows[1].createdAt, "2"));
+  });
+
+  it("resumes strictly after the cursor, breaking ties on id", async () => {
+    const at = new Date("2026-02-02T00:00:00Z");
+    const cursor = encodeCursor(at, "2");
+
+    await app.inject({
+      method: "GET",
+      url: `/groups/${GROUP_ID}/settlements?limit=2&cursor=${cursor}`,
+      headers: authHeader(),
+    });
+
+    const args = prisma.settlement.findMany.mock.calls[0][0] as any;
+    expect(args.where.OR).toEqual([
+      { createdAt: { lt: at } },
+      { createdAt: at, id: { lt: "2" } },
+    ]);
+    expect(args.orderBy).toEqual([{ createdAt: "desc" }, { id: "desc" }]);
+  });
+
+  it("keeps the query bounded rather than loading the result set", async () => {
+    await app.inject({
+      method: "GET",
+      url: `/groups/${GROUP_ID}/settlements?limit=25`,
+      headers: authHeader(),
+    });
+
+    const args = prisma.settlement.findMany.mock.calls[0][0] as any;
+    expect(args.take).toBe(26);
+    expect(args.skip).toBeUndefined();
+  });
+
+  it("rejects a non-member even when they present a valid-looking cursor", async () => {
+    prisma.groupMember.findUnique.mockResolvedValueOnce(null as any);
+    prisma.group.findUnique.mockResolvedValueOnce({ id: GROUP_ID } as any);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/groups/${GROUP_ID}/settlements`,
+      headers: authHeader("outsider"),
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.settlement.findMany).not.toHaveBeenCalled();
+  });
+
+  it("scopes the query to the group, not the cursor", async () => {
+    const at = new Date("2026-02-02T00:00:00Z");
+    const foreignCursor = encodeCursor(at, "row_from_another_group");
+
+    await app.inject({
+      method: "GET",
+      url: `/groups/${GROUP_ID}/settlements?cursor=${foreignCursor}`,
+      headers: authHeader(),
+    });
+
+    const args = prisma.settlement.findMany.mock.calls[0][0] as any;
+    expect(args.where.groupId).toBe(GROUP_ID);
   });
 });

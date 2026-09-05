@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
+import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
@@ -32,77 +33,7 @@ const expenseInclude = {
 export default async function expenseRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-  app.post(
-    "/groups/:id/expenses",
-    {
-      schema: {
-        tags: ["expenses"],
-        summary: "Create an expense",
-        description: "Create a group expense with a payer, split configuration, and asset metadata, and calculate the resulting share allocations.",
-        params: {
-          type: "object",
-          required: ["id"],
-          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
-          additionalProperties: false,
-        },
-        body: {
-          type: "object",
-          required: ["title", "amount", "assetCode", "splitType", "shares"],
-          properties: {
-            title: { type: "string", minLength: 1, maxLength: 80 },
-            description: { type: ["string", "null"], maxLength: 500 },
-            amount: { type: "string" },
-            assetCode: { type: "string", minLength: 1 },
-            assetIssuer: { type: ["string", "null"] },
-            splitType: { type: "string", enum: ["equal", "exact", "percent", "shares"] },
-            payerUserId: { type: ["string", "null"] },
-            memo: { type: ["string", "null"], maxLength: 24 },
-            receiptUrl: { type: ["string", "null"] },
-            shares: {
-              type: "array",
-              items: {
-                type: "object",
-                required: ["userId"],
-                properties: {
-                  userId: { type: "string" },
-                  shareAmount: { type: ["string", "number", "null"] },
-                  percent: { type: ["number", "null"] },
-                },
-              },
-            },
-          },
-          additionalProperties: false,
-        },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              expense: {
-                type: "object",
-                properties: {
-                  id: { type: "string" },
-                  groupId: { type: "string" },
-                  payerUserId: { type: "string" },
-                  title: { type: "string" },
-                  description: { type: ["string", "null"] },
-                  amount: { type: "string" },
-                  assetCode: { type: "string" },
-                  assetIssuer: { type: ["string", "null"] },
-                  splitType: { type: "string" },
-                  memo: { type: ["string", "null"] },
-                  receiptUrl: { type: ["string", "null"] },
-                  createdAt: { type: "string", format: "date-time" },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-    async (req) => {
-      const auth = requireUser(req);
-      const { id: groupId } = idParamSchema.parse(req.params);
-      await requireMembership(groupId, auth.id);
+
 
       const body = createExpenseSchema.parse(req.body);
       validateAmount(body.amount);
@@ -175,9 +106,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
         return created;
       });
 
-      return { expense: serializeExpense(expense) };
-    }
-  );
+
 
   app.get(
     "/groups/:id/expenses",

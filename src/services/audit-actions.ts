@@ -20,6 +20,7 @@ export const AuditAction = {
   GROUP_JOIN: "group.join",
   GROUP_LEAVE: "group.leave",
   GROUP_MEMBER_REMOVE: "group.member_remove",
+  GROUP_MEMBER_ROLE_CHANGE: "group.member_role_change",
 
   // ── Treasury ────────────────────────────────────────────────────────
   TREASURY_ENABLE: "treasury.enable",
@@ -35,8 +36,18 @@ export const AuditAction = {
   TREASURY_PROPOSAL_SUBMITTED: "treasury.proposal.submitted",
   TREASURY_PROPOSAL_FAILED: "treasury.proposal.failed",
 
+  // ── Treasury tx proposals (signature collector, caller-supplied XDR) ──
+  TREASURY_TX_PROPOSAL_CREATED: "treasury.tx_proposal.created",
+  TREASURY_TX_PROPOSAL_SIGNATURE_ADDED: "treasury.tx_proposal.signature_added",
+  TREASURY_TX_PROPOSAL_READY: "treasury.tx_proposal.ready",
+  TREASURY_TX_PROPOSAL_SUBMITTED: "treasury.tx_proposal.submitted",
+  TREASURY_TX_PROPOSAL_FAILED: "treasury.tx_proposal.failed",
+
   // ── Settlements ─────────────────────────────────────────────────────
   SETTLEMENT_CREATED: "settlement.created",
+  EXPENSE_CREATE: "expense.create",
+  EXPENSE_UPDATE: "expense.update",
+  EXPENSE_DELETE: "expense.delete",
   SETTLEMENT_CONFIRM_RETRY: "settlement.confirm.retry",
   SETTLEMENT_CONFIRM_SUBMITTED: "settlement.confirm.submitted",
   SETTLEMENT_CONFIRM_VALIDATION_FAILED: "settlement.confirm.validation_failed",

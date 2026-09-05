@@ -283,7 +283,7 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
       },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INVALID_ASSET_ISSUER");
+    expect(res.json().error).toBe("VALIDATION_ERROR");
   });
 
   it("returns 400 when treasury is not enabled", async () => {
@@ -548,6 +548,81 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
     expect(body.threshold).toBe(1);
     expect(body.stellarTxHash).toBe("hash_xyz");
     expect(body.status).toBe("confirmed");
+  });
+
+  it("writes an audit event when Stellar submission fails", async () => {
+    const user = fakeUser({ id: "u_signatory" });
+    const treasury = Keypair.random();
+
+    const proposalXdr = makeUnsignedXdr({
+      source: treasury,
+      destination: Keypair.random().publicKey(),
+      amount: "5",
+    });
+    const proposalHash = txHash(proposalXdr);
+    const pendingProposal = {
+      id: "prop_1",
+      groupId: "group_1",
+      creatorId: "u_creator",
+      xdr: proposalXdr,
+      txHash: proposalHash,
+      threshold: 1,
+      signatures: [],
+      status: "pending",
+      stellarTxHash: null,
+      failureReason: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "member",
+    });
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { user: { stellarPublicKey: treasury.publicKey() } },
+    ]);
+    prisma.treasuryProposal.findUnique
+      .mockResolvedValueOnce(pendingProposal)
+      .mockResolvedValueOnce(pendingProposal);
+
+    const signed = new Transaction(proposalXdr, NET);
+    signed.sign(treasury);
+
+    prisma.treasuryProposal.update.mockResolvedValue({
+      ...pendingProposal,
+      status: "failed",
+      failureReason: "Stellar rejected the multisig transaction",
+    });
+    prisma.auditLog.create.mockResolvedValue({});
+
+    const { stellar } = await import("../src/services/stellar");
+    vi.mocked(stellar.submitSigned).mockRejectedValueOnce(
+      new Error("txFailed")
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals/prop_1/sign",
+      headers: authHeader(user),
+      payload: { signedXdr: signed.toXDR() },
+    });
+    expect(res.statusCode).toBe(502);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          groupId: "group_1",
+          action: "treasury.proposal.failed",
+          entityType: "treasury_proposal",
+          entityId: "prop_1",
+          metadata: expect.objectContaining({
+            reason: "txFailed",
+            outcome: "failure",
+          }),
+        }),
+      })
+    );
   });
 
   it("rejects duplicate approval from the same signer idempotently", async () => {

@@ -20,6 +20,7 @@
  */
 
 import { config } from "../config";
+import { ProviderError } from "../lib/provider-error";
 
 export type JobFailureCategory = "transient" | "indeterminate" | "permanent";
 
@@ -138,11 +139,26 @@ const TRANSIENT_MARKERS = [
   "stale",
 ];
 
+/** How a normalized provider failure category maps to a job retry decision. */
+const PROVIDER_CATEGORY_JOB: Record<ProviderError["category"], JobFailureCategory> = {
+  timeout: "indeterminate",
+  transport: "transient",
+  rate_limited: "transient",
+  unavailable: "transient",
+  malformed: "transient",
+  rejected: "permanent",
+};
+
 /**
- * Classify a job failure. Error *types* and status codes are consulted before
- * message text, so classification does not hinge on provider wording.
+ * Classify a job failure. Typed provider errors are consulted first (their
+ * category is authoritative), then error *types* and status codes, and only
+ * then message text — classification never hinges on provider wording alone.
  */
 export function classifyJobFailure(error: unknown): JobFailureCategory {
+  if (error instanceof ProviderError) {
+    return PROVIDER_CATEGORY_JOB[error.category];
+  }
+
   const name = error instanceof Error ? error.name : "";
   if (name === "TimeoutError") return "indeterminate";
   if (name === "TransportError") return "transient";

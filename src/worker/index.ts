@@ -33,7 +33,7 @@
  */
 import { randomUUID } from "node:crypto";
 import pino from "pino";
-import { config } from "../config";
+import { config, env } from "../config";
 import { prisma } from "../db";
 import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
@@ -59,10 +59,9 @@ import {
 import {
   anchorService,
   AUDITABLE_ANCHOR_STATUSES,
-  TERMINAL_ANCHOR_STATUSES,
   type PollResult,
 } from "../services/anchor";
-import { applyAnchorSessionTransition } from "../services/anchor-status";
+import { applyAnchorSessionTransition, isTerminalAnchorStatus } from "../services/anchor-status";
 import { recordStatusTransition } from "../services/status-history";
 import {
   ANCHOR_RETRY_POLICY,
@@ -82,6 +81,7 @@ import {
   jobContext,
   loggerWithContext,
 } from "../lib/correlation";
+import { jobLogger, type JobLogger } from "../lib/worker-logger";
 
 const log = pino({ name: "worker" });
 
@@ -196,6 +196,7 @@ async function scheduleRetry(params: {
 }): Promise<void> {
   const { job, attempt, category, reason, delayMs, ctx } = params;
   const nextAttemptAt = new Date(Date.now() + delayMs);
+  const leaseExpiresAt = new Date(nextAttemptAt.getTime() + config.WORKER_LEASE_TIMEOUT_MS);
 
   await prisma.settlement.update({
     where: { id: job.id },
@@ -204,7 +205,7 @@ async function scheduleRetry(params: {
       nextAttemptAt,
       errorCategory: category,
       failureReason: reason,
-      leaseExpiresAt: leaseDeadline(),
+      leaseExpiresAt,
     },
   });
 
@@ -787,6 +788,50 @@ async function reconcileSingleAnchor(
   if (result.isError) {
     const exhausted = attempt >= ANCHOR_RETRY_POLICY.maxAttempts;
     const reason = safeFailureMessage(result.message);
+    // A provider rejection or a malformed response can never succeed on retry;
+    // everything else stays transient until the retry budget runs out. The
+    // poll's normalized category drives the decision — no message-text
+    // guessing.
+    const errorCategory: JobFailureCategory =
+      exhausted || result.errorCategory === "permanent" ? "permanent" : "transient";
+
+    // Permanent failures stop the session: the anchor told us something that
+    // no retry can change (rejected a request, returned garbage), so move the
+    // session to error rather than burning the retry budget on it.
+    if (result.errorCategory === "permanent") {
+      await applyAnchorSessionTransition({
+        sessionId: job.id,
+        nextStatus: "error",
+        source: "poll",
+        expectedCurrentStatus: job.status,
+        extraData: {
+          lastPolledAt: now,
+          failureReason: reason,
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        } as never,
+      });
+      await recordStatusTransition({
+        entityType: "anchor_session",
+        entityId: job.id,
+        newStatus: "error",
+        reason,
+        source: "worker",
+      }).catch(() => undefined);
+      jobLog.error(
+        {
+          jobType: "anchor",
+          jobId: job.id,
+          attempt,
+          outcome: "failed",
+          category: "permanent",
+          reason,
+        },
+        "anchor poll failed with a permanent error"
+      );
+      return;
+    }
 
     await prisma.anchorSession.update({
       where: { id: job.id },
@@ -794,24 +839,45 @@ async function reconcileSingleAnchor(
         lastPolledAt: now,
         retryCount: attempt,
         failureReason: reason,
-        errorCategory: exhausted ? "permanent" : "transient",
+        errorCategory,
         nextAttemptAt: exhausted
           ? null
           : new Date(Date.now() + retryDelayMs(attempt, ANCHOR_RETRY_POLICY)),
       },
     });
 
+    if (exhausted) {
+      jobLog.error(
+        {
+          jobType: "anchor",
+          jobId: job.id,
+          attempt,
+          outcome: "failed",
+          reason,
+        },
+        "anchor poll failed with terminal error"
+      );
+    }
+    return;
+  }
+
+  // ── unknown anchor status ────────────────────────────────────────────────
+  // A recognised-but-unknown raw status maps to pending_anchor and stays
+  // retryable. Emit an explicit, operationally useful entry so operators can
+  // spot a future anchor that introduced a status we cannot classify — but
+  // never treat it as a failure or overwrite a terminal state.
+  if (result.recognized === false) {
     jobLog.warn(
       {
         jobType: "anchor",
         jobId: job.id,
         attempt,
-        outcome: exhausted ? "retries_exhausted" : "retry_scheduled",
-        reason,
+        outcome: "retry_scheduled",
+        category: result.category ?? "unknown",
+        status: result.status,
       },
-      "anchor poll failed"
+      `anchor reported an unrecognized SEP-24 status '${result.rawStatus}' — kept pending and will keep polling`
     );
-    return;
   }
 
   // ── status unchanged ─────────────────────────────────────────────────────
@@ -831,27 +897,34 @@ async function reconcileSingleAnchor(
 
   // ── terminal-state protection ────────────────────────────────────────────
   // Anchor responses are untrusted and can arrive out of order; a local
-  // terminal state is never walked back.
-  if (TERMINAL_ANCHOR_STATUSES.has(job.status)) {
-    jobLog.warn(
-      {
-        jobType: "anchor",
-        jobId: job.id,
-        attempt,
-        outcome: "ignored",
-        localStatus: job.status,
-        remoteStatus: result.status,
-      },
-      "anchor reported a different status for a terminal session"
-    );
-    return;
+  // terminal state is never walked back. This is a fast-path using the
+  // snapshot; the authoritative guard is the conditional update in
+  // applyAnchorSessionTransition below, which re-reads the live status inside
+  // its transaction and no-ops if a concurrent write already advanced it.
+  if (isTerminalAnchorStatus(job.status)) {
+    // Only transition allowed out of a terminal state is from error to refunded
+    if (job.status !== "error" || result.status !== "refunded") {
+      jobLog.warn(
+        {
+          jobType: "anchor",
+          jobId: job.id,
+          attempt,
+          outcome: "ignored",
+          localStatus: job.status,
+          remoteStatus: result.status,
+        },
+        "anchor reported a different status for a terminal session"
+      );
+      return;
+    }
   }
 
   // ── advance ──────────────────────────────────────────────────────────────
-  await applyAnchorSessionTransition({
+  const updated = await applyAnchorSessionTransition({
     sessionId: job.id,
     nextStatus: result.status,
     source: "poll",
+    expectedCurrentStatus: job.status,
     extraData: {
       lastPolledAt: now,
       failureReason: result.status === "error" ? result.message ?? null : null,
@@ -860,6 +933,24 @@ async function reconcileSingleAnchor(
       retryCount: 0,
     } as never,
   });
+
+  if (!updated.changed) {
+    // A concurrent writer advanced (or terminalised) this session while we
+    // were polling. Do not clobber it — just record that the poll observed
+    // nothing actionable.
+    jobLog.info(
+      {
+        jobType: "anchor",
+        jobId: job.id,
+        attempt,
+        outcome: "superseded",
+        observedStatus: result.status,
+        localStatus: job.status,
+      },
+      "anchor session was advanced concurrently; discarded stale poll result"
+    );
+    return;
+  }
 
   await recordStatusTransition({
     entityType: "anchor_session",
@@ -906,9 +997,22 @@ export async function reconcileAnchors(): Promise<void> {
 
   const sessions = await prisma.anchorSession.findMany({
     where: {
-      status: { in: ["incomplete", "pending_user_transfer_start", "pending_anchor"] },
+      status: {
+        in: [
+          "incomplete",
+          "pending_user_transfer_start",
+          "pending_user",
+          "pending_transaction_info_update",
+          "pending_receiver",
+          "pending_sender",
+          "pending_stellar",
+          "pending_trust",
+          "pending_anchor",
+        ],
+      },
       externalTransactionId: { not: null },
       AND: [
+        { OR: [{ errorCategory: null }, { errorCategory: { not: "permanent" } }] },
         { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
         { OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: now } }] },
       ],
@@ -927,7 +1031,7 @@ export async function reconcileAnchors(): Promise<void> {
     // The anchor is unreachable entirely — skip the cycle rather than burning
     // every session's retry budget on the same outage.
     log.warn(
-      { jobType: "anchor", outcome: "skipped_cycle", reason: safeFailureMessage(error) },
+      { jobType: "anchor", jobId: "batch", outcome: "skipped_cycle", reason: safeFailureMessage(error) },
       "anchor TOML unavailable"
     );
     return;
@@ -998,13 +1102,11 @@ export async function expireInvites(): Promise<void> {
  * the length of its own backoff.
  */
 export async function deliverPendingWebhooks(): Promise<void> {
+  const job = jobLogger("webhook_delivery", "batch", log);
   const { delivered, failed, attempted } = await processPendingWebhookDeliveries();
 
   if (attempted > 0) {
-    log.info(
-      { job: "webhook_delivery", outcome: "ok", attempted, delivered, failed },
-      "processed webhook deliveries"
-    );
+    job.log("completed", { attempted, delivered, failed });
   }
 }
 
@@ -1015,20 +1117,16 @@ export async function deliverPendingWebhooks(): Promise<void> {
  * way every other job in this cycle reports.
  */
 export async function expireStaleTreasuryProposals(): Promise<void> {
+  const job = jobLogger("treasury_proposal_expiry", "batch", log);
   const { expired, olderThan } = await expireStaleProposals();
 
   // Only speak up when something actually changed. A quiet sweep is the normal
   // case and logging it every cycle would bury the runs that mattered.
   if (expired > 0) {
-    log.info(
-      {
-        job: "treasury_proposal_expiry",
-        outcome: "ok",
-        expired,
-        olderThan: olderThan.toISOString(),
-      },
-      "expired stale treasury proposals"
-    );
+    job.log("completed", {
+      expired,
+      olderThan: olderThan.toISOString(),
+    });
   }
 }
 
@@ -1039,7 +1137,7 @@ export async function runWorkerCycle(): Promise<void> {
     WORKER_ID
   );
   if (!lease) {
-    log.debug({ outcome: "skipped_locked" }, "worker cycle already owned by another process");
+    log.debug({ jobType: "worker_cycle", outcome: "skipped_locked" }, "worker cycle already owned by another process");
     return;
   }
 
@@ -1073,6 +1171,8 @@ export async function startWorker(): Promise<() => Promise<void>> {
   // clearing it early is what would let a second worker resubmit the payment.
   let inFlight: Promise<void> | undefined;
 
+  log.info({ workerId: WORKER_ID, intervalMs: config.WORKER_INTERVAL_MS }, "listening");
+
   const loop = async (): Promise<void> => {
     if (stopped) return;
     const cycle = runWorkerCycle();
@@ -1083,7 +1183,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
     try {
       await cycle;
     } catch (error) {
-      log.error({ outcome: "error", reason: safeFailureMessage(error) }, "worker cycle failed");
+      log.error({ jobType: "worker_cycle", outcome: "error", reason: safeFailureMessage(error) }, "worker cycle failed");
     } finally {
       inFlight = undefined;
     }
@@ -1092,7 +1192,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
 
   void loop();
 
-  const shutdown = async (): Promise<void> => {
+  const shutdown = async (signal: NodeJS.Signals = "SIGINT"): Promise<void> => {
     if (stopped) return;
     stopped = true;
     // Set before draining: in-flight jobs finish the transition they started,
@@ -1101,54 +1201,74 @@ export async function startWorker(): Promise<() => Promise<void>> {
     if (timer) clearTimeout(timer);
     stopReconciliation();
 
-    log.info({ outcome: "shutdown" }, "worker shutting down, draining in-flight jobs");
+    const timeoutMs = Math.max(config.SHUTDOWN_TIMEOUT_MS, config.WORKER_SHUTDOWN_DRAIN_MS);
+    const timeoutHandle = setTimeout(() => {
+      log.error({ jobType: "worker_cycle", signal, timeoutMs }, "shutdown timed out, forcing exit");
+      if (!config.isTest) {
+        process.exit(1);
+      }
+    }, timeoutMs);
 
-    // Wait for the running cycle, but not forever — a hung upstream must not
-    // hold the process open past the deployment's grace period.
-    let drained = true;
-    if (inFlight) {
-      let drainTimer: ReturnType<typeof setTimeout> | undefined;
-      const budget = new Promise<false>((resolve) => {
-        drainTimer = setTimeout(() => resolve(false), config.WORKER_SHUTDOWN_DRAIN_MS);
-      });
-      drained = await Promise.race([inFlight.then(() => true), budget]);
-      if (drainTimer) clearTimeout(drainTimer);
+    try {
+      log.info({ jobType: "worker_cycle", signal, timeoutMs, outcome: "shutdown" }, "shutting down");
+
+      // Wait for the running cycle, but not forever — a hung upstream must not
+      // hold the process open past the deployment's grace period.
+      let drained = true;
+      if (inFlight) {
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
+        const budget = new Promise<false>((resolve) => {
+          drainTimer = setTimeout(() => resolve(false), config.WORKER_SHUTDOWN_DRAIN_MS);
+        });
+        drained = await Promise.race([inFlight.then(() => true), budget]);
+        if (drainTimer) clearTimeout(drainTimer);
+      }
+
+      if (!drained) {
+        // A job is still running and still holds its lease. Releasing it now
+        // would invite a duplicate submission, so leave every lease in place and
+        // let it expire; the next worker recovers it through the normal path.
+        log.warn(
+          { jobType: "worker_cycle", outcome: "shutdown_drain_timeout" },
+          "in-flight job outran the drain budget, leaving leases to expire"
+        );
+        return;
+      }
+
+      // Nothing of ours is running now, so releasing is safe: the next worker
+      // picks these up immediately instead of waiting for them to lapse.
+      await Promise.allSettled([
+        prisma.settlement.updateMany({
+          where: { claimedBy: WORKER_ID },
+          data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+        }),
+        prisma.anchorSession.updateMany({
+          where: { claimedBy: WORKER_ID },
+          data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+        }),
+      ]);
+      await prisma.$disconnect();
+
+      log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "worker claims released");
+    } catch (error) {
+      log.error({ jobType: "worker_cycle", signal, reason: safeFailureMessage(error) }, "worker shutdown failed");
+      throw error;
+    } finally {
+      clearTimeout(timeoutHandle);
+      if (!config.isTest) {
+        process.exit(0);
+      }
     }
 
-    if (!drained) {
-      // A job is still running and still holds its lease. Releasing it now
-      // would invite a duplicate submission, so leave every lease in place and
-      // let it expire; the next worker recovers it through the normal path.
-      log.warn(
-        { outcome: "shutdown_drain_timeout" },
-        "in-flight job outran the drain budget, leaving leases to expire"
-      );
-      return;
-    }
-
-    // Nothing of ours is running now, so releasing is safe: the next worker
-    // picks these up immediately instead of waiting for them to lapse.
-    await Promise.allSettled([
-      prisma.settlement.updateMany({
-        where: { claimedBy: WORKER_ID },
-        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
-      }),
-      prisma.anchorSession.updateMany({
-        where: { claimedBy: WORKER_ID },
-        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
-      }),
-    ]);
-
-    log.info({ outcome: "shutdown_complete" }, "worker claims released");
   };
 
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
-  return shutdown;
+  return () => shutdown("SIGINT");
 }
 
-if (process.env.NODE_ENV !== "test") {
+if (env.NODE_ENV !== "test") {
   // Config validation already ran at module load; this catches a worker started
   // against an environment missing the external endpoints it depends on.
   if (!config.DATABASE_URL || !config.HORIZON_URL || !config.ANCHOR_HOME_DOMAIN) {

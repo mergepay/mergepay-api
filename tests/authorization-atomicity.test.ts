@@ -151,6 +151,32 @@ describe("POST /groups/:id/archive authorization", () => {
   });
 });
 
+describe("POST /groups/:id/expenses authorization", () => {
+  it("rejects a non-member payer before creating the expense", async () => {
+    membershipDb({ "group_1:user_1": { role: "member" } });
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: "user_1", user: { stellarPublicKey: fakeUser().stellarPublicKey } },
+    ]);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/expenses",
+      headers: authHeader(),
+      payload: {
+        title: "Hotel",
+        amount: "120.00",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [{ userId: "user_1" }],
+        payerUserId: "ghost_user",
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(prisma.expense.create).not.toHaveBeenCalled();
+  });
+});
+
 describe("DELETE /expenses/:id authorization", () => {
   const expense = {
     id: "exp_1",

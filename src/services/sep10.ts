@@ -106,6 +106,23 @@ interface ChallengeOperation {
 }
 
 /**
+ * Extract the home domain name from a challenge envelope's first manageData
+ * operation. Returns null when the operation is missing or not a manageData
+ * type.
+ */
+function extractHomeDomain(tx: Transaction): string | null {
+  const operations = tx.operations as ChallengeOperation[];
+  const authOp = operations[0];
+  if (!authOp || authOp.type !== "manageData" || typeof authOp.name !== "string") {
+    return null;
+  }
+  // The name is `<homeDomain> auth` — strip the trailing ` auth` suffix.
+  const suffix = " auth";
+  if (!authOp.name.endsWith(suffix)) return null;
+  return authOp.name.slice(0, -suffix.length);
+}
+
+/**
  * Re-check the envelope against the shape this server issues.
  *
  * Deliberately redundant with `readChallengeTx`: an authentication bypass here
@@ -119,6 +136,13 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): vo
   // guarantees that, and it is part of the SEP-10 definition.
   if (String(tx.sequence) !== "0") invalidChallenge();
   if (!isValidAccount(clientAccountId)) invalidChallenge();
+
+  // Explicit home domain assertion: the first manageData operation must carry
+  // `<homeDomain> auth` where `homeDomain` matches the server configuration.
+  // This is a defense-in-depth check — the SDK also validates the home
+  // domain, but catching it here produces a clear, auditable rejection.
+  const homeDomain = extractHomeDomain(tx);
+  if (homeDomain !== config.SEP10_HOME_DOMAIN) invalidChallenge();
 
   // Time bounds arrive as decimal strings from the SDK; readTimeBounds
   // normalizes them and returns null for an envelope with none.

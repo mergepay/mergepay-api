@@ -1,13 +1,15 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
-import { auditTx } from "../services/audit";
+import { ADMIN_AUDIT_ACTIONS, auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import {
   serializeGroup,
   serializeInvitation,
@@ -26,8 +28,6 @@ import {
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
-
-const stellarPublicKeySchema = z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key format");
 
 const GROUP_BALANCE_CACHE_TTL_MS = 30_000;
 const groupBalanceCache = new Map<string, { expiresAt: number; balances: { asset: "XLM" | "USDC"; balance: string }[] }>();
@@ -428,7 +428,7 @@ export default async function groupRoutes(app: FastifyInstance) {
     ) {
       const body = z
         .object({
-          publicKey: stellarPublicKeySchema,
+          publicKey: stellarAccountIdSchema,
         })
         .parse(req.body);
 
@@ -664,27 +664,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- remove member ---------------------------------------------------------
-  app.delete(
-    "/groups/:id/members/:memberId",
-    {
-      schema: {
-        tags: ["groups"],
-        summary: "Remove a member from a group",
-        description: "Remove a member from the group after verifying the caller is an admin and the group will still have at least one admin.",
-        params: {
-          type: "object",
-          required: ["id", "memberId"],
-          properties: { id: { type: "string", minLength: 1 }, memberId: { type: "string", minLength: 1 } },
-          additionalProperties: false,
-        },
-        response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } },
-      },
-    },
-    async (req) => {
-      const auth = requireUser(req);
-      const { id, memberId } = z
-        .object({ id: z.string(), memberId: z.string() })
-        .parse(req.params);
+
     await requireAdmin(id, auth.id);
 
     if (memberId === auth.id) {
@@ -726,7 +706,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       await auditTx(tx, {
         userId: auth.id,
         groupId: id,
-        action: "group.member_remove",
+        action: AuditAction.GROUP_MEMBER_REMOVE,
         entityType: "group",
         entityId: id,
         outcome: "success",

@@ -70,30 +70,7 @@ export async function withHorizonFailover<T>(operation: (horizon: Horizon.Server
       console.warn(`[stellar] Horizon endpoint failed; rotating to endpoint ${next + 1}`);
     }
   }
-  throw lastError;
-}
-
-/**
- * Operational logger for Horizon failures. Only safe fields are logged — the
- * operation label, normalized failure category, and provider result codes.
- * Raw error objects, response bodies, and signed envelopes never reach here.
- */
-function logHorizonFailure(
-  operation: string,
-  category: string,
-  resultCodes: string | null
-): void {
-  log.warn(
-    { provider: "horizon", operation, category, resultCodes },
-    "Horizon call failed"
-  );
-}
-
-/**
- * Structured sink for retry telemetry. This module has no request context to
- * borrow a Fastify logger from — it is called from routes and from the worker
- * alike — so attempt metadata goes to the same console channel as the upstream
- * errors above. It carries the operation and attempt number and nothing from
+  throw  the operation and attempt number and nothing from
  * the upstream's response body.
  */
 const retryLog = {

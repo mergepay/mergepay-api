@@ -40,14 +40,54 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- create -----------------------------------------------------------------
-  app.post("/groups", { config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } } }, async (req) => {
-    const auth = requireUser(req);
-    const body = z
-      .object({
-        name: z.string().min(1).max(60),
-        description: z.string().max(280).optional(),
-      })
-      .parse(req.body);
+  app.post(
+    "/groups",
+    {
+      config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } },
+      schema: {
+        tags: ["groups"],
+        summary: "Create a group",
+        description: "Create a new group and add the authenticated user as its first admin.",
+        body: {
+          type: "object",
+          required: ["name"],
+          properties: {
+            name: { type: "string", minLength: 1, maxLength: 60 },
+            description: { type: ["string", "null"], maxLength: 280 },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              group: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  createdByUserId: { type: "string" },
+                  treasuryEnabled: { type: "boolean" },
+                  treasuryAccountPublicKey: { type: ["string", "null"] },
+                  treasuryRequiredSigners: { type: ["integer", "null"] },
+                  archived: { type: "boolean" },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const body = z
+        .object({
+          name: z.string().min(1).max(60),
+          description: z.string().max(280).optional(),
+        })
+        .parse(req.body);
 
     const group = await prisma.$transaction(async (tx) => {
       const created = await tx.group.create({
@@ -76,10 +116,46 @@ export default async function groupRoutes(app: FastifyInstance) {
   // list would scale that work with a user's group count. Membership rows are
   // ordered by `joinedAt`, which is this resource's creation timestamp, so the
   // shared cursor helpers are given that field as `createdAt`.
-  app.get("/groups", async (req) => {
-    const auth = requireUser(req);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    const position = requireCursor(cursor);
+  app.get(
+    "/groups",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "List groups for the current user",
+        description: "Return the paginated list of groups the authenticated user belongs to, including each group's summary metadata and net position.",
+        querystring: {
+          type: "object",
+          properties: {
+            cursor: { type: "string" },
+            limit: { type: "integer", minimum: 1, maximum: 50 },
+            order: { type: "string", enum: ["asc", "desc"] },
+          },
+          additionalProperties: true,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              groups: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              meta: {
+                type: "object",
+                properties: {
+                  nextCursor: { type: ["string", "null"] },
+                  hasMore: { type: "boolean" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+      const position = requireCursor(cursor);
 
     const cursorScope = position
       ? {
@@ -125,10 +201,43 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- on-chain balance -------------------------------------------------------
-  app.get("/groups/:id/balance", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
-    await requireMembership(id, auth.id);
+  app.get(
+    "/groups/:id/balance",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Get treasury balances for a group",
+        description: "Fetch the current on-chain balances for a group's treasury account, filtered to supported assets.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              balances: {
+                type: "array",
+                items: {
+                  type: "object",
+                  required: ["asset", "balance"],
+                  properties: {
+                    asset: { type: "string", enum: ["XLM", "USDC"] },
+                    balance: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
+      await requireMembership(id, auth.id);
 
     const cached = groupBalanceCache.get(id);
     if (cached && cached.expiresAt > Date.now()) {
@@ -168,11 +277,67 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- detail -----------------------------------------------------------------
-  app.get("/groups/:id", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
-    const ctx = await requireMembership(id, auth.id);
+  app.get(
+    "/groups/:id",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Get a group and its members",
+        description: "Retrieve a group's details, membership list, and the current user's role within it.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1 } },
+          additionalProperties: false,
+        },
+        querystring: {
+          type: "object",
+          properties: {
+            cursor: { type: "string" },
+            limit: { type: "integer", minimum: 1, maximum: 50 },
+          },
+          additionalProperties: true,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              group: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  createdByUserId: { type: "string" },
+                  treasuryEnabled: { type: "boolean" },
+                  treasuryAccountPublicKey: { type: ["string", "null"] },
+                  treasuryRequiredSigners: { type: ["integer", "null"] },
+                  archived: { type: "boolean" },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+              members: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              yourRole: { type: "string", enum: ["admin", "member"] },
+              meta: {
+                type: "object",
+                properties: {
+                  nextCursor: { type: ["string", "null"] },
+                  hasMore: { type: "boolean" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+      const ctx = await requireMembership(id, auth.id);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group) throw Errors.notFound("Group not found");
@@ -221,9 +386,39 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- invite (by public key or invite code) ---------------------------------
-  app.post("/groups/:id/invite", async (req, reply) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+  app.post(
+    "/groups/:id/invite",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Invite a member by public key or invite code",
+        description: "Create a pending group invitation, either for a Stellar public key or for a legacy code-based invite.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1 } },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              invitation: { type: "object", additionalProperties: true },
+              invite: { type: "object", additionalProperties: true },
+            },
+          },
+          201: {
+            type: "object",
+            properties: {
+              invitation: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    async (req, reply) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
 
     // Direct invitation by Stellar public key
     if (
@@ -335,9 +530,45 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- join -------------------------------------------------------------------
-  app.post("/groups/join", async (req) => {
-    const auth = requireUser(req);
-    const body = z.object({ code: z.string().min(1) }).parse(req.body);
+  app.post(
+    "/groups/join",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Join a group with an invite code",
+        description: "Join a group using a valid invite code, checking expiration and usage limits before adding the member.",
+        body: {
+          type: "object",
+          required: ["code"],
+          properties: { code: { type: "string", minLength: 1 } },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              group: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  createdByUserId: { type: "string" },
+                  treasuryEnabled: { type: "boolean" },
+                  treasuryAccountPublicKey: { type: ["string", "null"] },
+                  treasuryRequiredSigners: { type: ["integer", "null"] },
+                  archived: { type: "boolean" },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const body = z.object({ code: z.string().min(1) }).parse(req.body);
 
     const invite = await prisma.invite.findUnique({
       where: { code: body.code.toUpperCase() },
@@ -380,9 +611,25 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- leave ------------------------------------------------------------------
-  app.post("/groups/:id/leave", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+  app.post(
+    "/groups/:id/leave",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Leave a group",
+        description: "Leave the group after the last-admin safety checks ensure the group remains administrable.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1 } },
+          additionalProperties: false,
+        },
+        response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
 
     // The membership check, the last-admin guard, and the removal all run
     // inside one transaction so a concurrent leave/removal by another admin
@@ -417,62 +664,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- remove member ---------------------------------------------------------
-  app.patch("/groups/:id/members/:memberId", async (req) => {
-    const auth = requireUser(req);
-    const { id, memberId } = z.object({ id: z.string(), memberId: z.string() }).parse(req.params);
-    const body = z.object({ role: z.enum(["admin", "member"]) }).parse(req.body);
-    const updated = await prisma.$transaction(async (tx) => {
-      await requireAdmin(id, auth.id, tx);
-      const member = await tx.groupMember.findUnique({ where: { groupId_userId: { groupId: id, userId: memberId } } });
-      if (!member) throw Errors.notFound("Member not found in this group");
-      const result = await tx.groupMember.update({
-        where: { groupId_userId: { groupId: id, userId: memberId } },
-        data: { role: body.role },
-        include: { user: true },
-      });
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId: id,
-        action: ADMIN_AUDIT_ACTIONS.MEMBER_ROLE_UPDATED,
-        entityType: "group_member",
-        entityId: memberId,
-        metadata: { previousRole: member.role, role: body.role },
-      });
-      return result;
-    });
-    return { member: serializeMember(updated) };
-  });
-
-  app.delete("/groups/:id/members/:memberId", async (req) => {
-    const auth = requireUser(req);
-    const { id, memberId } = z
-      .object({ id: z.string(), memberId: z.string() })
-      .parse(req.params);
-    await requireAdmin(id, auth.id);
-
-    if (memberId === auth.id) {
-      throw Errors.badRequest(
-        "SELF_REMOVE",
-        "Cannot remove yourself from the group; use the leave endpoint instead"
-      );
-    }
-
-    // The lookup, the last-admin guard, the delete, and the audit record run
-    // in one transaction. Previously they did not: two concurrent removals
-    // could each see two admins and both proceed, leaving the group with
-    // none, and the audit write happened after the commit where a failure
-    // would lose the record of a removal that had already happened.
-    await prisma.$transaction(async (tx) => {
-      const target = await tx.groupMember.findUnique({
-        where: { groupId_userId: { groupId: id, userId: memberId } },
-      });
-      if (!target) {
-        throw Errors.notFound("Member not found in this group");
-      }
-
-      if (target.role === "admin") {
-        const adminCount = await tx.groupMember.count({
-          where: { groupId: id, role: "admin" },
+role: "admin" },
         });
         if (adminCount <= 1) {
           throw Errors.conflict(
@@ -510,15 +702,54 @@ export default async function groupRoutes(app: FastifyInstance) {
    * lost while the change commits). `auditTx` deliberately does not swallow
    * errors, so a failed audit write rolls the role change back with it.
    */
-  app.post("/groups/:id/members/role", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z
-      .object({
-        userId: z.string().min(1).max(64),
-        role: z.enum(["admin", "member"]),
-      })
-      .parse(req.body);
+  app.post(
+    "/groups/:id/members/role",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Update a member role",
+        description: "Promote or demote a group member while enforcing the last-admin protection rules.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1 } },
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          required: ["userId", "role"],
+          properties: {
+            userId: { type: "string", minLength: 1, maxLength: 64 },
+            role: { type: "string", enum: ["admin", "member"] },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              member: {
+                type: "object",
+                required: ["userId", "role"],
+                properties: {
+                  userId: { type: "string" },
+                  role: { type: "string", enum: ["admin", "member"] },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const body = z
+        .object({
+          userId: z.string().min(1).max(64),
+          role: z.enum(["admin", "member"]),
+        })
+        .parse(req.body);
 
     const updated = await prisma.$transaction(async (tx) => {
       // Authorization is re-checked inside the transaction so a concurrent
@@ -578,9 +809,45 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- archive ----------------------------------------------------------------
-  app.post("/groups/:id/archive", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+  app.post(
+    "/groups/:id/archive",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Archive a group",
+        description: "Archive a group so it is no longer active while preserving its data and membership history.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1 } },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              group: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  createdByUserId: { type: "string" },
+                  treasuryEnabled: { type: "boolean" },
+                  treasuryAccountPublicKey: { type: ["string", "null"] },
+                  treasuryRequiredSigners: { type: ["integer", "null"] },
+                  archived: { type: "boolean" },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
 
     const group = await prisma.$transaction(async (tx) => {
       await requireAdmin(id, auth.id, tx);

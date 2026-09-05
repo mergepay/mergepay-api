@@ -5,6 +5,35 @@ import { AppError } from "../lib/errors";
 import { toRequestLimitError } from "../lib/request-limits";
 import { TimeoutError, TransportError, toProviderError } from "../services/timeout";
 
+function isHorizonError(error: unknown): error is Error & {
+  response?: { status?: number };
+  status?: number;
+  statusCode?: number;
+  operation?: string;
+  code?: string;
+} {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as Record<string, unknown>;
+  const responseStatus = typeof candidate.response === "object" && candidate.response
+    ? (candidate.response as { status?: number }).status
+    : undefined;
+  const status = typeof candidate.status === "number" ? candidate.status : undefined;
+  const code = typeof candidate.code === "string" ? candidate.code : undefined;
+  const operation = typeof candidate.operation === "string" ? candidate.operation : undefined;
+  const name = typeof candidate.name === "string" ? candidate.name : undefined;
+
+  return (
+    typeof responseStatus === "number" ||
+    typeof status === "number" ||
+    typeof code === "string" ||
+    typeof operation === "string" ||
+    name === "TimeoutError" ||
+    name === "TransportError" ||
+    name === "BadRequestError" ||
+    name === "NotFoundError"
+  );
+}
+
 export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
     const requestId = req.id as string;
@@ -97,6 +126,50 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         code: limitError.code,
         error: limitError.code,
         message: limitError.message,
+        requestId,
+      });
+    }
+
+    const upstreamStatus =
+      (err as Record<string, unknown>).response && typeof (err as any).response === "object"
+        ? (err as any).response.status
+        : (err as any).statusCode ?? (err as any).status;
+
+    if (isHorizonError(err) && typeof upstreamStatus === "number") {
+      const operation = (err as any).operation ?? "Horizon request";
+      req.log.warn(
+        {
+          requestId,
+          operation,
+          statusCode: upstreamStatus,
+          errorCode: (err as any).code ?? "UPSTREAM_ERROR",
+          err,
+        },
+        "Horizon upstream failure"
+      );
+
+      if (upstreamStatus === 429) {
+        return reply.code(429).send({
+          code: "RATE_LIMITED",
+          error: "RATE_LIMITED",
+          message: "Horizon is rate limiting requests. Please retry shortly.",
+          requestId,
+        });
+      }
+
+      if (upstreamStatus >= 500 || upstreamStatus === 408) {
+        return reply.code(502).send({
+          code: "UPSTREAM_ERROR",
+          error: "UPSTREAM_ERROR",
+          message: `${operation} is temporarily unavailable. Please retry shortly.`,
+          requestId,
+        });
+      }
+
+      return reply.code(502).send({
+        code: "UPSTREAM_ERROR",
+        error: "UPSTREAM_ERROR",
+        message: `${operation} failed while contacting the Stellar network.`,
         requestId,
       });
     }

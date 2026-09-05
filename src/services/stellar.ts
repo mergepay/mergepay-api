@@ -73,20 +73,7 @@ export async function withHorizonFailover<T>(operation: (horizon: Horizon.Server
   throw lastError;
 }
 
-/**
- * Operational logger for Horizon failures. Only safe fields are logged — the
- * operation label, normalized failure category, and provider result codes.
- * Raw error objects, response bodies, and signed envelopes never reach here.
- */
-function logHorizonFailure(
-  operation: string,
-  category: string,
-  resultCodes: string | null
-): void {
-  log.warn(
-    { provider: "horizon", operation, category, resultCodes },
-    "Horizon call failed"
-  );
+
 }
 
 /**

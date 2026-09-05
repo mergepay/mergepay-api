@@ -1,229 +1,8 @@
-import { FastifyInstance } from "fastify";
-import { z } from "zod";
-import { prisma } from "../db";
-import { stellarAccountIdSchema } from "../lib/stellar-validation";
-import { config } from "../config";
-import { Errors } from "../errors";
-import { requireUser } from "../plugins/auth";
-import { requireMembership, requireAdmin } from "../services/access";
-import { stellar } from "../services/stellar";
-import { inviteCode } from "../services/codes";
-import { ADMIN_AUDIT_ACTIONS, auditTx } from "../services/audit";
-import { AuditAction } from "../services/audit-actions";
-import {
-  serializeGroup,
-  serializeInvitation,
-  serializeInvite,
-  serializeMember,
-} from "../serializers";
-import {
-  groupPrimaryAsset,
-  loadGroupBalances,
-} from "../services/group-balances";
-import {
-  buildPage,
-  encodeCursor,
-  decodeCursor,
-  paginationQuerySchema,
-  requireCursor,
-  takeForPage,
-} from "../lib/pagination";
 
-const GROUP_BALANCE_CACHE_TTL_MS = 30_000;
-const groupBalanceCache = new Map<string, { expiresAt: number; balances: { asset: "XLM" | "USDC"; balance: string }[] }>();
-
-export function clearGroupBalanceCache(): void {
-  groupBalanceCache.clear();
-}
-
-export default async function groupRoutes(app: FastifyInstance) {
-  app.addHook("preHandler", app.authenticate);
-
-  // -- create -----------------------------------------------------------------
-  app.post("/groups", { config: { rateLimit: { max: config.RATE_LIMIT_GROUP, timeWindow: "1 minute" } } }, async (req) => {
-    const auth = requireUser(req);
-    const body = z
-      .object({
-        name: z.string().min(1).max(60),
-        description: z.string().max(280).optional(),
-      })
-      .parse(req.body);
-
-    const group = await prisma.$transaction(async (tx) => {
-      const created = await tx.group.create({
-        data: {
-          name: body.name,
-          description: body.description,
-          createdByUserId: auth.id,
-          members: { create: { userId: auth.id, role: "admin" } },
-        },
-      });
-      await auditTx(tx, {
-        userId: auth.id,
-        action: "group.create",
-        entityType: "group",
-        entityId: created.id,
-        metadata: { name: body.name },
-      });
-      return created;
-    });
-    return { group: serializeGroup(group) };
-  });
-
-  // -- list (with summaries) -------------------------------------------------
-  //
-  // Paginated because each row costs a balance computation, so an unbounded
-  // list would scale that work with a user's group count. Membership rows are
-  // ordered by `joinedAt`, which is this resource's creation timestamp, so the
-  // shared cursor helpers are given that field as `createdAt`.
-  app.get("/groups", async (req) => {
-    const auth = requireUser(req);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    const position = requireCursor(cursor);
-
-    const cursorScope = position
-      ? {
-          OR: [
-            { joinedAt: { [order === "desc" ? "lt" : "gt"]: position.createdAt } },
-            {
-              joinedAt: position.createdAt,
-              id: { [order === "desc" ? "lt" : "gt"]: position.id },
-            },
-          ],
-        }
-      : {};
-
-    const memberships = await prisma.groupMember.findMany({
-      where: { userId: auth.id, ...cursorScope },
-      include: { group: { include: { _count: { select: { members: true } } } } },
-      orderBy: [{ joinedAt: order }, { id: order }],
-      take: takeForPage(limit),
-    });
-
-    const { items, meta } = buildPage(
-      memberships.map((m) => ({ ...m, createdAt: m.joinedAt })),
-      limit,
-      order
-    );
-
-    const groups = await Promise.all(
-      items.map(async (m) => {
-        const balances = await loadGroupBalances(m.groupId);
-        const asset = await groupPrimaryAsset(m.groupId);
-        const yourNet =
-          balances.find((b) => b.userId === auth.id)?.net ?? "0";
-        return {
-          ...serializeGroup(m.group),
-          memberCount: (m.group as any)._count.members,
-          yourNet,
-          netAssetCode: asset.assetCode,
-        };
-      })
-    );
-
-    return { groups, meta };
-  });
-
-  // -- on-chain balance -------------------------------------------------------
-  app.get("/groups/:id/balance", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
-    await requireMembership(id, auth.id);
-
-    const cached = groupBalanceCache.get(id);
-    if (cached && cached.expiresAt > Date.now()) {
-      return { balances: cached.balances };
-    }
-    if (cached) groupBalanceCache.delete(id);
-
-    const group = await prisma.group.findUnique({
-      where: { id },
-      select: { treasuryAccountPublicKey: true },
-    });
-    if (!group?.treasuryAccountPublicKey) {
-      const balances: { asset: "XLM" | "USDC"; balance: string }[] = [];
-      groupBalanceCache.set(id, { expiresAt: Date.now() + GROUP_BALANCE_CACHE_TTL_MS, balances });
-      return { balances };
-    }
-
-    const account = await stellar.loadAccount(group.treasuryAccountPublicKey);
-    if (!account.exists) {
-      const balances: { asset: "XLM" | "USDC"; balance: string }[] = [];
-      groupBalanceCache.set(id, { expiresAt: Date.now() + GROUP_BALANCE_CACHE_TTL_MS, balances });
-      return { balances };
-    }
-
-    const balances = account.balances
-      .filter((balance) =>
-        balance.assetCode === "XLM" ||
-        (balance.assetCode === "USDC" && balance.assetIssuer === config.STABLE_ASSET_ISSUER)
-      )
-      .map((balance) => ({ asset: balance.assetCode as "XLM" | "USDC", balance: balance.balance }));
-
-    groupBalanceCache.set(id, {
-      expiresAt: Date.now() + GROUP_BALANCE_CACHE_TTL_MS,
-      balances,
-    });
-    return { balances };
-  });
-
-  // -- detail -----------------------------------------------------------------
-  app.get("/groups/:id", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
-    const ctx = await requireMembership(id, auth.id);
-
-    const group = await prisma.group.findUnique({ where: { id } });
-    if (!group) throw Errors.notFound("Group not found");
-
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
-
-    const members = await prisma.groupMember.findMany({
-      where: {
-        groupId: id,
-        ...(decodedCursor && {
-          OR: [
-            { joinedAt: { gt: decodedCursor.createdAt } },
-            {
-              joinedAt: decodedCursor.createdAt,
-              id: { gt: decodedCursor.id },
-            },
-          ],
+  : }
         }),
       },
-      include: { user: true },
-      orderBy: [{ joinedAt: "asc" }, { id: "asc" }],
-      take: limit + 1,
-    });
-
-    const hasMore = members.length > limit;
-    const results = hasMore ? members.slice(0, limit) : members;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].joinedAt,
-          results[results.length - 1].id
-        )
-      : null;
-
-    return {
-      group: serializeGroup(group),
-      members: results.map(serializeMember),
-      yourRole: ctx.role,
-      meta: { nextCursor, hasMore },
-    };
-  });
-
-  // -- invite (by public key or invite code) ---------------------------------
-  app.post("/groups/:id/invite", async (req, reply) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+      id } = z.object({ id: z.string() }).parse(req.params);
 
     // Direct invitation by Stellar public key
     if (
@@ -335,9 +114,45 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- join -------------------------------------------------------------------
-  app.post("/groups/join", async (req) => {
-    const auth = requireUser(req);
-    const body = z.object({ code: z.string().min(1) }).parse(req.body);
+  app.post(
+    "/groups/join",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Join a group with an invite code",
+        description: "Join a group using a valid invite code, checking expiration and usage limits before adding the member.",
+        body: {
+          type: "object",
+          required: ["code"],
+          properties: { code: { type: "string", minLength: 1 } },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              group: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  createdByUserId: { type: "string" },
+                  treasuryEnabled: { type: "boolean" },
+                  treasuryAccountPublicKey: { type: ["string", "null"] },
+                  treasuryRequiredSigners: { type: ["integer", "null"] },
+                  archived: { type: "boolean" },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const body = z.object({ code: z.string().min(1) }).parse(req.body);
 
     const invite = await prisma.invite.findUnique({
       where: { code: body.code.toUpperCase() },
@@ -350,39 +165,8 @@ export default async function groupRoutes(app: FastifyInstance) {
       throw Errors.badRequest("invite_used_up", "This invite has reached its use limit");
     }
 
-    const existing = await prisma.groupMember.findUnique({
-      where: { groupId_userId: { groupId: invite.groupId, userId: auth.id } },
-    });
-
-    if (!existing) {
-      await prisma.$transaction(async (tx) => {
-        await tx.groupMember.create({
-          data: { groupId: invite.groupId, userId: auth.id, role: "member" },
-        });
-        await tx.invite.update({
-          where: { id: invite.id },
-          data: { uses: { increment: 1 } },
-        });
-        await auditTx(tx, {
-          userId: auth.id,
-          action: "group.join",
-          entityType: "group",
-          entityId: invite.groupId,
-          metadata: { inviteId: invite.id },
-        });
-      });
-    }
-
-    const group = await prisma.group.findUnique({
-      where: { id: invite.groupId },
-    });
-    return { group: serializeGroup(group) };
-  });
-
-  // -- leave ------------------------------------------------------------------
-  app.post("/groups/:id/leave", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const = requireUser(req);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
 
     // The membership check, the last-admin guard, and the removal all run
     // inside one transaction so a concurrent leave/removal by another admin
@@ -417,8 +201,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   });
 
   // -- remove member ---------------------------------------------------------
-  app.patch("/groups/:id/members/:memberId", async (req) => {
-    const auth = requireUser(req);
+= requireUser(req);
     const { id, memberId } = z.object({ id: z.string(), memberId: z.string() }).parse(req.params);
     const body = z.object({ role: z.enum(["admin", "member"]) }).parse(req.body);
     const updated = await prisma.$transaction(async (tx) => {
@@ -430,172 +213,4 @@ export default async function groupRoutes(app: FastifyInstance) {
         data: { role: body.role },
         include: { user: true },
       });
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId: id,
-        action: ADMIN_AUDIT_ACTIONS.MEMBER_ROLE_UPDATED,
-        entityType: "group_member",
-        entityId: memberId,
-        metadata: { previousRole: member.role, role: body.role },
-      });
-      return result;
-    });
-    return { member: serializeMember(updated) };
-  });
-
-  app.delete("/groups/:id/members/:memberId", async (req) => {
-    const auth = requireUser(req);
-    const { id, memberId } = z
-      .object({ id: z.string(), memberId: z.string() })
-      .parse(req.params);
-    await requireAdmin(id, auth.id);
-
-    if (memberId === auth.id) {
-      throw Errors.badRequest(
-        "SELF_REMOVE",
-        "Cannot remove yourself from the group; use the leave endpoint instead"
-      );
-    }
-
-    // The lookup, the last-admin guard, the delete, and the audit record run
-    // in one transaction. Previously they did not: two concurrent removals
-    // could each see two admins and both proceed, leaving the group with
-    // none, and the audit write happened after the commit where a failure
-    // would lose the record of a removal that had already happened.
-    await prisma.$transaction(async (tx) => {
-      const target = await tx.groupMember.findUnique({
-        where: { groupId_userId: { groupId: id, userId: memberId } },
-      });
-      if (!target) {
-        throw Errors.notFound("Member not found in this group");
-      }
-
-      if (target.role === "admin") {
-        const adminCount = await tx.groupMember.count({
-          where: { groupId: id, role: "admin" },
-        });
-        if (adminCount <= 1) {
-          throw Errors.conflict(
-            "last_admin",
-            "Cannot remove the last admin from the group"
-          );
-        }
-      }
-
-      await tx.groupMember.delete({
-        where: { groupId_userId: { groupId: id, userId: memberId } },
-      });
-
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId: id,
-        action: AuditAction.GROUP_MEMBER_REMOVE,
-        entityType: "group",
-        entityId: id,
-        outcome: "success",
-        metadata: { removedUserId: memberId, removedRole: target.role },
-      });
-    });
-
-    return { ok: true };
-  });
-
-  /**
-   * Change a member's role.
-   *
-   * The membership read, the last-admin guard, the update, and the audit
-   * record all run in one transaction. That matters in both directions: a
-   * concurrent demotion cannot slip past the guard and leave a group with no
-   * admin, and the audit entry cannot survive a rolled-back change (or be
-   * lost while the change commits). `auditTx` deliberately does not swallow
-   * errors, so a failed audit write rolls the role change back with it.
-   */
-  app.post("/groups/:id/members/role", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z
-      .object({
-        userId: z.string().min(1).max(64),
-        role: z.enum(["admin", "member"]),
-      })
-      .parse(req.body);
-
-    const updated = await prisma.$transaction(async (tx) => {
-      // Authorization is re-checked inside the transaction so a concurrent
-      // demotion of the caller cannot let an ex-admin land one last write.
-      await requireAdmin(id, auth.id, tx);
-
-      const target = await tx.groupMember.findUnique({
-        where: { groupId_userId: { groupId: id, userId: body.userId } },
-      });
-      if (!target) {
-        throw Errors.notFound("Member not found in this group");
-      }
-
-      if (target.role === body.role) {
-        // Nothing changed, so there is nothing to audit. Returning the current
-        // membership keeps the endpoint idempotent for a retried request.
-        return target;
-      }
-
-      // Demoting the last admin would leave the group unadministrable, with
-      // no one able to promote anyone back.
-      if (target.role === "admin" && body.role !== "admin") {
-        const adminCount = await tx.groupMember.count({
-          where: { groupId: id, role: "admin" },
-        });
-        if (adminCount <= 1) {
-          throw Errors.conflict(
-            "last_admin",
-            "Cannot demote the last admin of the group"
-          );
-        }
-      }
-
-      const result = await tx.groupMember.update({
-        where: { groupId_userId: { groupId: id, userId: body.userId } },
-        data: { role: body.role },
-      });
-
-      await auditTx(tx, {
-        userId: auth.id,
-        groupId: id,
-        action: "group.member_role_change",
-        entityType: "group_member",
-        entityId: body.userId,
-        outcome: "success",
-        metadata: {
-          targetUserId: body.userId,
-          previousRole: target.role,
-          newRole: body.role,
-        },
-      });
-
-      return result;
-    });
-
-    return { member: { userId: updated.userId, role: updated.role } };
-  });
-
-  // -- archive ----------------------------------------------------------------
-  app.post("/groups/:id/archive", async (req) => {
-    const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
-
-    const group = await prisma.$transaction(async (tx) => {
-      await requireAdmin(id, auth.id, tx);
-      const updated = await tx.group.update({
-        where: { id },
-        data: { archived: true },
-      });
-      await auditTx(tx, {
-        userId: auth.id,
-        action: "group.archive",
-        entityType: "group",
-        entityId: id,
-      });
-      return updated;
-    });
-    return { group: serializeGroup(group) };
-  });
-}
+      await 

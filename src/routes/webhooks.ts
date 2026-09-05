@@ -270,6 +270,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
       groupId,
     }).catch(() => undefined);
 
+
     return { queued: true };
   });
 

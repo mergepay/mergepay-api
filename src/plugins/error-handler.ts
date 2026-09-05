@@ -3,6 +3,7 @@ import fp from "fastify-plugin";
 import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
 import { toRequestLimitError } from "../lib/request-limits";
+import { TimeoutError, TransportError, toProviderError } from "../services/timeout";
 
 function isHorizonError(error: unknown): error is Error & {
   response?: { status?: number };
@@ -43,6 +44,11 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         message: e.message,
         code: e.code,
       }));
+      const issues = err.errors.map((e) => ({
+        path: e.path,
+        message: e.message,
+        code: e.code,
+      }));
       const first = err.errors[0];
       const field = first?.path.join(".");
       const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
@@ -51,6 +57,29 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         code: "VALIDATION_ERROR",
         error: "VALIDATION_ERROR",
         message,
+        requestId,
+        details,
+        issues,
+      });
+    }
+
+    // A request that failed Fastify's own JSON-schema validation (from a
+    // route's `schema` / OpenAPI body-schema annotation) is a validation
+    // error like any other, so it returns the same VALIDATION_ERROR contract
+    // the Zod-based handlers use. Failing that — falling into the generic 4xx
+    // branch below — would let two identical mistakes on two routes surface
+    // with two different codes.
+    if ((err as any).code === "FST_ERR_VALIDATION") {
+      const details = Array.isArray((err as any).validation)
+        ? (err as any).validation.map((v: any) => ({
+            field: (v?.instancePath ?? "").replace(/^\//, "") || undefined,
+            message: v?.message ?? "Validation failed",
+          }))
+        : undefined;
+      return reply.code(400).send({
+        code: "VALIDATION_ERROR",
+        error: "VALIDATION_ERROR",
+        message: "Validation failed",
         requestId,
         details,
       });
@@ -67,6 +96,24 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         body.details = err.details;
       }
       return reply.code(err.status).send(body);
+    }
+
+    // A timeout or transport failure that escaped a handler still means the
+    // upstream is unavailable, not that this process has a bug — answer 502
+    // with the safe envelope rather than the generic 500, and never echo the
+    // upstream's own error text.
+    if (err instanceof TimeoutError || err instanceof TransportError) {
+      const converted = toProviderError(err, {
+        provider: "upstream",
+        operation: "route",
+        fallbackMessage: "The upstream service is unavailable",
+      });
+      return reply.code(converted.status).send({
+        code: converted.code,
+        error: converted.code,
+        message: converted.message,
+        requestId,
+      });
     }
 
     // Size and shape limits rejected by Fastify or @fastify/multipart before a

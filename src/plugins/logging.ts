@@ -35,13 +35,16 @@ function redactSecrets(obj: any): any {
 
 export default async function loggingPlugin(app: FastifyInstance) {
   app.addHook("onRequest", async (req: FastifyRequest) => {
-    req.id = nanoid(16);
+    if (!req.id) {
+      req.id = `req-${nanoid(16)}`;
+    }
     req.startTime = Date.now();
+    req.log = req.log.child({ reqId: req.id });
   });
 
   app.addHook("onResponse", async (req: FastifyRequest, reply: FastifyReply) => {
     const duration = Date.now() - (req.startTime ?? Date.now());
-    app.log.info({
+    req.log.info({
       requestId: req.id,
       method: req.method,
       path: req.url,

@@ -2,6 +2,7 @@ import { FastifyInstance } from "fastify";
 import fp from "fastify-plugin";
 import fastifySwagger from "@fastify/swagger";
 import fastifySwaggerUi from "@fastify/swagger-ui";
+import fp from "fastify-plugin";
 import { config } from "../config";
 
 export default fp(async function openAPIPlugin(app: FastifyInstance) {
@@ -118,4 +119,3 @@ export default fp(async function openAPIPlugin(app: FastifyInstance) {
       deepLinking: false,
     },
   });
-}, { name: "openapi-plugin" });

@@ -16,15 +16,14 @@
 
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { mpMemoSchema, stellarAccountIdSchema } from "../lib/stellar-validation";
 import { rateLimited } from "../lib/rate-limit";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { stellar } from "../services/stellar";
-import { audit } from "../services/audit";
 import { isPositive } from "../services/money";
 import {
   serializeGroup,
@@ -41,11 +40,11 @@ import {
 } from "../lib/pagination";
 
 const createBodySchema = z.object({
-  destination: z.string().min(1),
+  destination: stellarAccountIdSchema,
   amount: z.string().min(1),
   assetCode: z.string().min(1),
-  assetIssuer: z.string().nullable().optional(),
-  memo: z.string().min(1).max(28).optional(),
+  assetIssuer: stellarAccountIdSchema.nullable().optional(),
+  memo: mpMemoSchema.optional(),
 });
 
 const signBodySchema = z.object({
@@ -64,18 +63,6 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
 
     if (!isPositive(body.amount)) {
       throw Errors.badRequest("invalid_amount", "Amount must be positive");
-    }
-    if (!StrKey.isValidEd25519PublicKey(body.destination)) {
-      throw Errors.badRequest(
-        "invalid_destination",
-        "Destination must be a valid Stellar public key"
-      );
-    }
-    if (body.assetIssuer && !StrKey.isValidEd25519PublicKey(body.assetIssuer)) {
-      throw Errors.badRequest(
-        "invalid_asset_issuer",
-        "assetIssuer must be a valid Stellar public key when supplied"
-      );
     }
 
     const group = await prisma.group.findUnique({ where: { id: groupId } });
@@ -102,20 +89,6 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         },
         threshold
       );
-
-    await audit({
-      userId: auth.id,
-      action: "treasury.proposal.created",
-      entityType: "treasury_proposal",
-      entityId: proposal.id,
-      metadata: {
-        groupId,
-        destination: body.destination,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        threshold,
-      },
-    });
 
     return {
       proposal: serializeTreasuryProposal(proposal),
@@ -184,20 +157,8 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         userId: auth.id,
       });
 
-      await audit({
-        userId: auth.id,
-        action:
-          result.status === "confirmed"
-            ? "treasury.proposal.submitted"
-            : "treasury.proposal.signed",
-        entityType: "treasury_proposal",
-        entityId: proposalId,
-        metadata: {
-          signatureCount: result.signatureCount,
-          threshold: result.threshold,
-          stellarTxHash: result.stellarTxHash,
-        },
-      });
+      // The service writes signature/submission audit records inside its
+      // transaction; do not add a second best-effort record after commit.
 
       const proposal = await prisma.treasuryProposal.findUnique({
         where: { id: proposalId },

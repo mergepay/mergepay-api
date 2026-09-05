@@ -167,7 +167,7 @@ describe("auth routes", () => {
     });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.code).toBe("INVALID_ACCOUNT");
+    expect(body.code).toBe("VALIDATION_ERROR");
     expect(body.requestId).toBeTruthy();
   });
 

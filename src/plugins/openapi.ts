@@ -23,6 +23,32 @@ export default fp(async function openAPIPlugin(app: FastifyInstance) {
           description: "API server",
         },
       ],
+      tags: [
+        {
+          name: "Auth",
+          description:
+            "SEP-10 Stellar authentication challenge, token verification, session lifecycle, and user profile management",
+        },
+        {
+          name: "SEP-24",
+          description:
+            "SEP-24 interactive deposit, withdrawal, anchor sessions, and callback endpoints",
+        },
+        {
+          name: "Expenses",
+          description: "Group expense creation, splits, receipt uploads, and management",
+        },
+        {
+          name: "Settlements",
+          description:
+            "Settlement intent generation, signatures, and Stellar transaction execution",
+        },
+        {
+          name: "Treasury",
+          description:
+            "Multi-signature treasury management, deposit/withdraw proposals, and signatures",
+        },
+      ],
       components: {
         securitySchemes: {
           bearerAuth: {

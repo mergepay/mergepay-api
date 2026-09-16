@@ -26,6 +26,7 @@ import {
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 import { sep24InteractiveRequestSchema } from "../validations/sep24";
+import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {
   // Every anchor route that reaches an anchor gets an explicit budget so a
@@ -46,7 +47,16 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // -- list anchors (public-ish, but behind auth for consistency) -------------
   app.get(
     "/anchors",
-    { preHandler: [app.authenticate], ...pollLimit },
+    {
+      preHandler: [app.authenticate],
+      ...pollLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "List supported SEP-24 anchors",
+        description: "Returns list of configured SEP-24 anchors and their supported assets.",
+        response: openApiEnvelope("anchors"),
+      },
+    },
     async () => {
     try {
       const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
@@ -122,17 +132,74 @@ export default async function anchorRoutes(app: FastifyInstance) {
     };
   }
 
-  app.post("/anchors/deposit", { preHandler: [app.authenticate], ...initLimit }, (req) =>
-    start("deposit", req)
+  app.post(
+    "/anchors/deposit",
+    {
+      preHandler: [app.authenticate],
+      ...initLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Initiate SEP-24 interactive deposit",
+        description:
+          "Initiates a SEP-24 interactive deposit session and returns an anchor auth challenge.",
+        body: openApiBody(sep24InteractiveRequestSchema),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              session: { type: "object", additionalProperties: true },
+              challenge: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    (req) => start("deposit", req)
   );
-  app.post("/anchors/withdraw", { preHandler: [app.authenticate], ...initLimit }, (req) =>
-    start("withdrawal", req)
+
+  app.post(
+    "/anchors/withdraw",
+    {
+      preHandler: [app.authenticate],
+      ...initLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Initiate SEP-24 interactive withdrawal",
+        description:
+          "Initiates a SEP-24 interactive withdrawal session and returns an anchor auth challenge.",
+        body: openApiBody(sep24InteractiveRequestSchema),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              session: { type: "object", additionalProperties: true },
+              challenge: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    (req) => start("withdrawal", req)
   );
 
   // -- complete (exchange signed challenge for interactive url) ---------------
   app.post(
     "/anchors/sessions/:id/complete",
-    { preHandler: [app.authenticate], ...initLimit },
+    {
+      preHandler: [app.authenticate],
+      ...initLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Complete SEP-24 interactive session",
+        description:
+          "Exchanges signed SEP-10 challenge for an anchor JWT and returns the SEP-24 interactive URL.",
+        params: openApiIdParams(),
+        body: openApiBody(z.object({ signedXdr: z.string().min(1) })),
+        response: openApiEnvelope("session"),
+      },
+    },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string() }).parse(req.params);
@@ -174,32 +241,64 @@ export default async function anchorRoutes(app: FastifyInstance) {
   );
 
   // -- sessions ---------------------------------------------------------------
-  app.get("/anchors/sessions", { preHandler: [app.authenticate] }, async (req) => {
-    const auth = requireUser(req);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    const position = requireCursor(cursor);
-
-    const sessions = await prisma.anchorSession.findMany({
-      where: {
-        userId: auth.id,
-        ...cursorFilter(position, order),
+  app.get(
+    "/anchors/sessions",
+    {
+      preHandler: [app.authenticate],
+      schema: {
+        tags: ["SEP-24"],
+        summary: "List user anchor sessions",
+        description:
+          "Returns a paginated list of SEP-24 interactive sessions for the authenticated user.",
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              sessions: { type: "array", items: { type: "object" } },
+              meta: { type: "object", additionalProperties: true },
+            },
+          },
+        },
       },
-      orderBy: cursorOrderBy(order),
-      take: takeForPage(limit),
-    });
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+      const position = requireCursor(cursor);
 
-    const { items, meta } = buildPage(sessions, limit, order);
+      const sessions = await prisma.anchorSession.findMany({
+        where: {
+          userId: auth.id,
+          ...cursorFilter(position, order),
+        },
+        orderBy: cursorOrderBy(order),
+        take: takeForPage(limit),
+      });
 
-    return {
-      sessions: items.map(serializeAnchorSession),
-      meta,
-    };
-  });
+      const { items, meta } = buildPage(sessions, limit, order);
+
+      return {
+        sessions: items.map(serializeAnchorSession),
+        meta,
+      };
+    }
+  );
 
   // -- get session ------------------------------------------------------------
   app.get(
     "/anchors/sessions/:id",
-    { preHandler: [app.authenticate], ...pollLimit },
+    {
+      preHandler: [app.authenticate],
+      ...pollLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Get anchor session status",
+        description: "Returns details and status for a specific SEP-24 anchor session.",
+        params: openApiIdParams(),
+        response: openApiEnvelope("session"),
+      },
+    },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string() }).parse(req.params);
@@ -227,6 +326,20 @@ export default async function anchorRoutes(app: FastifyInstance) {
           max: config.SEP24_RATE_LIMIT_MAX,
           timeWindow: config.RATE_LIMIT_WINDOW_MS,
           keyGenerator: ipKey("anchor.webhook"),
+        },
+      },
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Anchor status webhook",
+        description: "Receives signed webhook status notifications from SEP-24 anchors.",
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              ok: { type: "boolean" },
+            },
+          },
         },
       },
     },

@@ -61,4 +61,25 @@ describe("OpenAPI / Swagger spec", () => {
     expect(post?.responses?.[200]).toBeTruthy();
     expect(post?.summary).toMatch(/Create an expense/i);
   });
+
+  it("documents group settlement and balance operations", async () => {
+    const app = await buildApp();
+    const res = await app.inject({ method: "GET", url: "/docs/json" });
+    const paths = res.json().paths ?? {};
+
+    const listSettlements = paths["/groups/{id}/settlements"]?.get;
+    expect(listSettlements).toBeTruthy();
+    expect(listSettlements?.summary).toMatch(/List settlements for a group/i);
+    expect(listSettlements?.responses?.[200]).toBeTruthy();
+
+    const previewSettlement = paths["/groups/{id}/settlement/preview"]?.get;
+    expect(previewSettlement).toBeTruthy();
+    expect(previewSettlement?.summary).toMatch(/Preview group settlement suggestions/i);
+    expect(previewSettlement?.responses?.[200]).toBeTruthy();
+
+    const groupBalances = paths["/groups/{id}/balances"]?.get;
+    expect(groupBalances).toBeTruthy();
+    expect(groupBalances?.summary).toMatch(/Get group member balances/i);
+    expect(groupBalances?.responses?.[200]).toBeTruthy();
+  });
 });

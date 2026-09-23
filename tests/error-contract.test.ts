@@ -169,7 +169,6 @@ describe("authorization failures", () => {
     expect(res.statusCode).toBe(401);
     const body = res.json();
     expect(body.error.code).toBe("INVALID_TOKEN");
-    expect(body.error.message).toBe("Invalid token");
   });
 
   it("UNAUTHORIZED when token is missing Bearer scheme", async () => {

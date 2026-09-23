@@ -142,6 +142,7 @@ export default async function groupRoutes(app: FastifyInstance) {
               },
               meta: {
                 type: "object",
+                additionalProperties: true,
                 properties: {
                   nextCursor: { type: ["string", "null"] },
                   hasMore: { type: "boolean" },
@@ -665,14 +666,39 @@ export default async function groupRoutes(app: FastifyInstance) {
 
   // -- remove member ---------------------------------------------------------
 
-    await requireAdmin(id, auth.id);
+  app.delete(
+    "/groups/:id/members/:memberId",
+    {
+      schema: {
+        tags: ["groups"],
+        summary: "Remove a member",
+        description: "Remove a member from the group (admin-only), enforcing the last-admin protection rules.",
+        params: {
+          type: "object",
+          required: ["id", "memberId"],
+          properties: {
+            id: { type: "string", minLength: 1 },
+            memberId: { type: "string", minLength: 1 },
+          },
+          additionalProperties: false,
+        },
+        response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id, memberId } = z
+        .object({ id: z.string().min(1), memberId: z.string().min(1) })
+        .parse(req.params);
 
-    if (memberId === auth.id) {
-      throw Errors.badRequest(
-        "SELF_REMOVE",
-        "Cannot remove yourself from the group; use the leave endpoint instead"
-      );
-    }
+      await requireAdmin(id, auth.id);
+
+      if (memberId === auth.id) {
+        throw Errors.badRequest(
+          "SELF_REMOVE",
+          "Cannot remove yourself from the group; use the leave endpoint instead"
+        );
+      }
 
     // The lookup, the last-admin guard, the delete, and the audit record run
     // in one transaction. Previously they did not: two concurrent removals

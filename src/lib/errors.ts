@@ -78,6 +78,20 @@ export const ErrorCode = {
   INVALID_CURSOR: "INVALID_CURSOR",
   // 401
   UNAUTHORIZED: "UNAUTHORIZED",
+  /**
+   * 401 — a structurally valid session token whose `exp` has passed (or that
+   * sits inside the expiry margin). Deliberately distinct from UNAUTHORIZED
+   * and INVALID_TOKEN so a client knows the credential was once good and the
+   * remedy is to re-authenticate (SEP-10) or exchange a refresh token.
+   */
+  TOKEN_EXPIRED: "TOKEN_EXPIRED",
+  /**
+   * 401 — the presented token could not be verified at all: malformed JWT,
+   * bad signature, wrong issuer/audience/algorithm, or missing required
+   * claims. Distinct from TOKEN_EXPIRED so a client does not mistake an
+   * unusable credential for a merely old one.
+   */
+  INVALID_TOKEN: "INVALID_TOKEN",
   // 403
   FORBIDDEN: "FORBIDDEN",
   // 404
@@ -145,6 +159,23 @@ export class AppError extends Error {
 export const Errors = {
   unauthorized: (msg = "Authentication required") =>
     new AppError(401, ErrorCode.UNAUTHORIZED, msg),
+
+  /**
+   * The session token's expiry has passed. Carries a `details.hint` naming
+   * the re-authentication path — SEP-10 challenge/verify, or the refresh
+   * endpoint for clients holding a refresh token — so a wallet integration
+   * can react to the code without hard-coding the API's auth flow.
+   */
+  tokenExpired: (msg = "Token expired") =>
+    new AppError(401, ErrorCode.TOKEN_EXPIRED, msg, {
+      hint: "Re-authenticate via SEP-10 (POST /auth/challenge, then POST /auth/verify), or exchange a refresh token via POST /auth/refresh.",
+    }),
+
+  /** The bearer token failed verification — malformed, wrong signature, or
+   * missing claims. There is nothing to refresh; the caller must present a
+   * token this API actually minted. */
+  invalidToken: (msg = "Invalid token") =>
+    new AppError(401, ErrorCode.INVALID_TOKEN, msg),
 
   forbidden: (msg = "You do not have access to this resource") =>
     new AppError(403, ErrorCode.FORBIDDEN, msg),

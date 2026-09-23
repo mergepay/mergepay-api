@@ -25,7 +25,10 @@ describe("JWT issuance / verification", () => {
       "wrong-secret",
       { algorithm: "HS256", issuer: config.JWT_ISSUER, audience: config.JWT_AUDIENCE }
     );
-    expect(() => verifyToken(forged)).toThrow();
+    // #16: an unverifiable credential is INVALID_TOKEN, not a generic 401.
+    expect(() => verifyToken(forged)).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
   });
 
   it("rejects a token with the wrong issuer", () => {
@@ -57,7 +60,11 @@ describe("JWT issuance / verification", () => {
         expiresIn: -10,
       }
     );
-    expect(() => verifyToken(token)).toThrow();
+    // #16: an expired token is TOKEN_EXPIRED, so the client knows to
+    // re-authenticate rather than to re-create its credential.
+    expect(() => verifyToken(token)).toThrow(
+      expect.objectContaining({ code: "TOKEN_EXPIRED" })
+    );
   });
 
   it("rejects a token signed with a different algorithm", () => {

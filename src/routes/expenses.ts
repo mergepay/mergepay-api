@@ -1,21 +1,12 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
-import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
 import { shortCode } from "../services/codes";
 import { serializeExpense } from "../serializers";
-import {
-  buildPage,
-  cursorFilter,
-  cursorOrderBy,
-  paginationQuerySchema,
-  requireCursor,
-  takeForPage,
-} from "../lib/pagination";
 import { auditTx } from "../services/audit";
 import { validateAsset, validateAmount } from "../services/assets";
 import { assertParticipantsCanHoldAsset } from "../services/horizon";
@@ -33,13 +24,77 @@ const expenseInclude = {
 export default async function expenseRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-
-
+  // -- create ----------------------------------------------------------------
+  app.post(
+    "/groups/:id/expenses",
+    {
+      schema: {
+        tags: ["expenses"],
+        summary: "Create an expense",
+        description: "Create an expense in a group, computing shares for the requested split and validating every participant can hold the asset on-chain.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 80 },
+            description: { type: ["string", "null"], maxLength: 500 },
+            amount: { type: "string" },
+            assetCode: { type: "string" },
+            assetIssuer: { type: ["string", "null"] },
+            splitType: { type: "string", enum: ["equal", "shares", "exact"] },
+            payerUserId: { type: "string" },
+            shares: { type: "array", items: { type: "object", additionalProperties: true } },
+            memo: { type: ["string", "null"], maxLength: 24 },
+            receiptUrl: { type: ["string", "null"] },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              expense: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  groupId: { type: "string" },
+                  payerUserId: { type: "string" },
+                  title: { type: "string" },
+                  description: { type: ["string", "null"] },
+                  amount: { type: "string" },
+                  assetCode: { type: "string" },
+                  assetIssuer: { type: ["string", "null"] },
+                  splitType: { type: "string" },
+                  memo: { type: ["string", "null"] },
+                  receiptUrl: { type: ["string", "null"] },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id: groupId } = idParamSchema.parse(req.params);
       const body = createExpenseSchema.parse(req.body);
       validateAmount(body.amount);
       const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
       const payerUserId = body.payerUserId ?? auth.id;
+
+      // The caller must be a member before any share math or Horizon
+      // lookups, so an unauthorized request never does expensive work. A
+      // non-member *payer* is a participant-validation failure (400) rather
+      // than an access error (403): the caller is authorized, the payload
+      // names someone who is not in the group.
+      await requireMembership(groupId, auth.id);
 
       let computed;
       try {
@@ -48,7 +103,11 @@ export default async function expenseRoutes(app: FastifyInstance) {
         throw Errors.badRequest("invalid_split", e?.message ?? "Invalid split");
       }
 
-      const participantIds = [...new Set(computed.map((share) => share.userId))];
+      // The payer is a participant even when their (auto-settled) share is
+      // not listed, so a payer from outside the group is rejected here too.
+      const participantIds = [
+        ...new Set([payerUserId, ...computed.map((share) => share.userId)]),
+      ];
       const members = await prisma.groupMember.findMany({
         where: { groupId, userId: { in: participantIds } },
         select: { userId: true, user: { select: { stellarPublicKey: true } } },
@@ -106,7 +165,46 @@ export default async function expenseRoutes(app: FastifyInstance) {
         return created;
       });
 
+      return { expense: serializeExpense(expense) };
+    }
+  );
 
+  // -- list for a group ------------------------------------------------------
+  app.get(
+    "/groups/:id/expenses",
+    {
+      schema: {
+        tags: ["expenses"],
+        summary: "List a group's expenses",
+        description: "Return the paginated list of a group's expenses with their participant shares, newest first.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", minLength: 1, maxLength: 64 } },
+          additionalProperties: false,
+        },
+        querystring: {
+          type: "object",
+          properties: {
+            cursor: { type: "string" },
+            limit: { type: "integer", minimum: 1, maximum: 100 },
+            order: { type: "string", enum: ["asc", "desc"] },
+          },
+          additionalProperties: true,
+        },
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              expenses: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: true,
+                  properties: {
+                    id: { type: "string" },
+                    groupId: { type: "string" },
                     payerUserId: { type: "string" },
                     title: { type: "string" },
                     description: { type: ["string", "null"] },
@@ -118,14 +216,6 @@ export default async function expenseRoutes(app: FastifyInstance) {
                     receiptUrl: { type: ["string", "null"] },
                     createdAt: { type: "string", format: "date-time" },
                   },
-                },
-              },
-              meta: {
-                type: "object",
-                properties: {
-                  nextCursor: { type: ["string", "null"] },
-                  hasMore: { type: "boolean" },
-                  total: { type: ["integer", "null"] },
                 },
               },
             },

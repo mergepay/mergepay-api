@@ -78,6 +78,20 @@ export const ErrorCode = {
   INVALID_CURSOR: "INVALID_CURSOR",
   // 401
   UNAUTHORIZED: "UNAUTHORIZED",
+  /**
+   * 401 — the session JWT was correctly signed but its `exp` claim has passed
+   * (or the token is inside the configured expiry margin). The remedy is a
+   * fresh session: re-authenticate via SEP-10, or POST /auth/refresh with a
+   * valid refresh token. See src/plugins/auth.ts.
+   */
+  TOKEN_EXPIRED: "TOKEN_EXPIRED",
+  /**
+   * 401 — the credential was rejected outright: malformed JWT, bad signature,
+   * wrong algorithm/issuer/audience, or a claims shape that cannot identify an
+   * account. Refreshing is pointless; the client must re-authenticate via
+   * SEP-10. See src/plugins/auth.ts.
+   */
+  INVALID_TOKEN: "INVALID_TOKEN",
   // 403
   FORBIDDEN: "FORBIDDEN",
   // 404
@@ -145,6 +159,24 @@ export class AppError extends Error {
 export const Errors = {
   unauthorized: (msg = "Authentication required") =>
     new AppError(401, ErrorCode.UNAUTHORIZED, msg),
+
+  /**
+   * The session JWT's lifetime has elapsed (or it sits inside the configured
+   * expiry margin). The client can recover without user interaction by
+   * re-authenticating via SEP-10 — or, when a refresh token is still valid,
+   * by POSTing it to /auth/refresh.
+   */
+  tokenExpired: (msg = "Token expired", details?: unknown) =>
+    new AppError(401, ErrorCode.TOKEN_EXPIRED, msg, details),
+
+  /**
+   * The credential itself was rejected: malformed JWT, wrong signature,
+   * disallowed algorithm, wrong issuer/audience, or a claims shape that does
+   * not identify an account. A refresh token cannot rescue a token like this;
+   * the client must re-authenticate via SEP-10.
+   */
+  invalidToken: (msg = "Invalid token", details?: unknown) =>
+    new AppError(401, ErrorCode.INVALID_TOKEN, msg, details),
 
   forbidden: (msg = "You do not have access to this resource") =>
     new AppError(403, ErrorCode.FORBIDDEN, msg),

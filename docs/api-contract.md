@@ -38,6 +38,8 @@ Every error — validation, authorization, rate limiting, upstream — uses one 
 | `IDEMPOTENCY_CONFLICT` | 409 | The key was already used with a different payload |
 | `IDEMPOTENCY_IN_PROGRESS` | 409 | The first request with this key is still running; retry shortly |
 | `UNAUTHORIZED` | 401 | Missing or invalid session |
+| `TOKEN_EXPIRED` | 401 | The session JWT's `exp` claim has passed — re-authenticate via SEP-10 or `POST /auth/refresh`; `details` carries a re-auth hint |
+| `INVALID_TOKEN` | 401 | The bearer token was rejected (malformed, wrong signature, wrong algorithm/issuer/audience) — re-authenticate via SEP-10; refresh cannot redeem it |
 | `FORBIDDEN` | 403 | Authenticated, but not permitted on this resource |
 | `NOT_FOUND` | 404 | The resource does not exist |
 | `RATE_LIMITED` | 429 | Per-route budget exhausted; `details.retryAfterSeconds` when available |

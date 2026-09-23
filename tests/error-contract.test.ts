@@ -161,10 +161,12 @@ describe("authorization failures", () => {
     expect(res.json().code).toBe("UNAUTHORIZED");
   });
 
-  it("UNAUTHORIZED for malformed Bearer token", async () => {
+  it("INVALID_TOKEN for malformed Bearer token", async () => {
+    // Issue #16: a present-but-unverifiable credential is distinguished from
+    // a missing one — malformed tokens are INVALID_TOKEN, not UNAUTHORIZED.
     const res = await app.inject({ method: "GET", url: "/me", headers: { authorization: "Bearer bad-token" } });
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
+    expect(res.json().code).toBe("INVALID_TOKEN");
   });
 
   it("UNAUTHORIZED when token is missing Bearer scheme", async () => {

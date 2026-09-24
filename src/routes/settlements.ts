@@ -816,7 +816,30 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // the same deterministic (createdAt, id) pair every other list endpoint
   // uses. The cursor carries no membership authority — the groupId filter
   // always scopa the query independently.
-  app.get("/groups/:id/settlements", async (req) => {
+  app.get(
+    "/groups/:id/settlements",
+    {
+      schema: {
+        tags: ["Settlements"],
+        summary: "List settlements for a group",
+        description: "Returns paginated settlements scoped to the caller's group membership, ordered deterministically by creation timestamp and ID.",
+        params: openApiIdParams(),
+        response: {
+          200: {
+            type: "object",
+            required: ["settlements", "meta"],
+            properties: {
+              settlements: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              meta: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
     const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
@@ -836,7 +859,31 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- balances + suggestions -------------------------------------------------
-  app.get("/groups/:id/settlement/preview", async (req) => {
+  app.get(
+    "/groups/:id/settlement/preview",
+    {
+      schema: {
+        tags: ["Settlements"],
+        summary: "Preview group settlement suggestions",
+        description: "Computes net member balances and generates optimized debt simplification transfers to settle all group obligations.",
+        params: openApiIdParams(),
+        response: {
+          200: {
+            type: "object",
+            required: ["assetCode", "operations"],
+            properties: {
+              assetCode: { type: "string" },
+              assetIssuer: { type: "string", nullable: true },
+              operations: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
@@ -856,7 +903,33 @@ export default async function settlementRoutes(app: FastifyInstance) {
     };
   });
 
-  app.get("/groups/:id/balances", async (req) => {
+  app.get(
+    "/groups/:id/balances",
+    {
+      schema: {
+        tags: ["Settlements"],
+        summary: "Get group member balances and settlement suggestions",
+        description: "Returns net member balances and suggested payment transfers for settling group balances.",
+        params: openApiIdParams(),
+        response: {
+          200: {
+            type: "object",
+            required: ["balances", "suggestions"],
+            properties: {
+              balances: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              suggestions: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);

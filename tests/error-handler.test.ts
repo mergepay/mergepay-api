@@ -61,6 +61,16 @@ beforeAll(async () => {
     throw Errors.upstream("Anchor service unavailable");
   });
 
+  app.get("/test/horizon-rate-limit", async () => {
+    const err = new Error("Horizon rate limited");
+    Object.assign(err, {
+      response: { status: 429 },
+      operation: "Horizon.loadAccount",
+      name: "BadRequestError",
+    });
+    throw err;
+  });
+
   app.get("/test/with-details", async () => {
     throw new AppError(400, "VALIDATION_ERROR", "Bad input", [
       { field: "amount", message: "Required" },
@@ -139,6 +149,16 @@ describe("AppError transformation", () => {
     expect(body.message).toBe("Anchor service unavailable");
     expect(body.requestId).toBeTruthy();
     expect(body.details).toBeUndefined();
+  });
+
+  it("maps Horizon rate-limit exceptions to the stable upstream response", async () => {
+    const res = await app.inject({ method: "GET", url: "/test/horizon-rate-limit" });
+
+    expect(res.statusCode).toBe(429);
+    const body = res.json();
+    expect(body.code).toBe("RATE_LIMITED");
+    expect(body.message).toBe("Horizon is rate limiting requests. Please retry shortly.");
+    expect(body.requestId).toBeTruthy();
   });
 
   it("includes details when AppError has a details payload", async () => {

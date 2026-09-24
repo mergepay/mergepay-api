@@ -15,6 +15,7 @@
 import type { FastifyInstance } from "fastify";
 import { config } from "../config";
 import { ipKey } from "../services/rate-limit-keys";
+import { openApiBody } from "../lib/openapi";
 import {
   applySep24Callback,
   sep24CallbackSchema,
@@ -34,6 +35,25 @@ export default async function sep24Routes(app: FastifyInstance) {
           max: config.SEP24_RATE_LIMIT_MAX,
           timeWindow: config.SEP24_RATE_LIMIT_WINDOW_MS,
           keyGenerator: ipKey("sep24.callback"),
+        },
+      },
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Process SEP-24 anchor callback",
+        description:
+          "Accepts and processes SEP-24 transaction status callbacks signed with the anchor SEP-10 JWT token.",
+        body: openApiBody(sep24CallbackSchema),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              received: { type: "boolean" },
+              status: { type: "string" },
+              matched: { type: "integer" },
+              updated: { type: "integer" },
+            },
+          },
         },
       },
     },

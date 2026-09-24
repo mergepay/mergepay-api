@@ -36,6 +36,7 @@ import {
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
 import { treasurySignerConfigSchema } from "../validations/treasury";
+import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 const stellarAmountSchema = z.string().min(1);
 
@@ -43,7 +44,25 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- enable -----------------------------------------------------------------
-  app.post("/groups/:id/treasury/enable", async (req) => {
+  app.post(
+    "/groups/:id/treasury/enable",
+    {
+      schema: {
+        tags: ["Treasury"],
+        summary: "Enable group treasury",
+        description:
+          "Enables multi-signature treasury for a group with a designated Stellar public key.",
+        params: openApiIdParams(),
+        body: openApiBody(
+          z.object({
+            publicKey: stellarAccountIdSchema,
+            requiredSigners: z.number().int().min(1).max(20).optional(),
+          })
+        ),
+        response: openApiEnvelope("group"),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z
@@ -106,7 +125,17 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- info -------------------------------------------------------------------
-  app.get("/groups/:id/treasury", async (req) => {
+  app.get(
+    "/groups/:id/treasury",
+    {
+      schema: {
+        tags: ["Treasury"],
+        summary: "Get group treasury status",
+        description: "Returns treasury account public key, balances, signers, and thresholds.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(id, auth.id);
@@ -129,7 +158,19 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- validate signer config -------------------------------------------------
-  app.post("/groups/:id/treasury/validate-signers", async (req) => {
+  app.post(
+    "/groups/:id/treasury/validate-signers",
+    {
+      schema: {
+        tags: ["Treasury"],
+        summary: "Validate treasury signer configuration",
+        description:
+          "Validates proposed signer set and threshold changes against the Stellar network state.",
+        params: openApiIdParams(),
+        body: openApiBody(treasurySignerConfigSchema),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireAdmin(id, auth.id);
@@ -168,7 +209,18 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- deposit ----------------------------------------------------------------
-  app.post("/groups/:id/treasury/deposit", rateLimited("settlementCreate"), async (req) => {
+  app.post(
+    "/groups/:id/treasury/deposit",
+    {
+      ...rateLimited("settlementCreate"),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Initiate treasury deposit",
+        description: "Creates an unsigned deposit intent transaction for a group treasury.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(id, auth.id);
@@ -283,7 +335,18 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- withdraw ---------------------------------------------------------------
-  app.post("/groups/:id/treasury/withdraw", rateLimited("settlementCreate"), async (req) => {
+  app.post(
+    "/groups/:id/treasury/withdraw",
+    {
+      ...rateLimited("settlementCreate"),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Propose treasury withdrawal",
+        description: "Creates a withdrawal proposal requiring multi-signature approval.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(id, auth.id);
@@ -407,7 +470,18 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   // Submitting a signed treasury envelope validates it and pushes it to
   // Horizon, so it gets its own budget rather than sharing one with the
   // treasury read routes — or with settlement submission.
-  app.post("/treasury-transactions/:id/confirm", rateLimited("treasurySubmit"), async (req) => {
+  app.post(
+    "/treasury-transactions/:id/confirm",
+    {
+      ...rateLimited("treasurySubmit"),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Confirm treasury transaction",
+        description: "Submits signatures and confirms execution of a treasury transaction.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
@@ -550,7 +624,17 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- history ----------------------------------------------------------------
-  app.get("/groups/:id/treasury/history", async (req) => {
+  app.get(
+    "/groups/:id/treasury/history",
+    {
+      schema: {
+        tags: ["Treasury"],
+        summary: "Get treasury transaction history",
+        description: "Returns paginated transaction history for a group treasury.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
     const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});

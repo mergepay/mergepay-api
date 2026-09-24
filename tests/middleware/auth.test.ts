@@ -180,6 +180,22 @@ describe("verifyToken — classification", () => {
     );
   });
 
+  it("classifies a token missing the expiry claim as INVALID_TOKEN", () => {
+    const token = jwt.sign(
+      { sub: USER_ID, pk: PUBLIC_KEY },
+      config.JWT_SECRET,
+      {
+        algorithm: "HS256",
+        issuer: config.JWT_ISSUER,
+        audience: config.JWT_AUDIENCE,
+      }
+    );
+
+    expect(() => verifyToken(token)).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
+  });
+
   it("never echoes the jsonwebtoken error text", () => {
     const token = signWith({ expiresIn: -10 });
     try {

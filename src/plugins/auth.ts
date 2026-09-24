@@ -76,16 +76,18 @@ export function verifyToken(token: string): AuthUser {
     throw Errors.invalidToken();
   }
 
+  if (typeof decoded.exp !== "number" || !Number.isFinite(decoded.exp)) {
+    throw Errors.invalidToken("Token is missing required expiry claim");
+  }
+
   // Reject tokens that are too close to expiry: even though the SDK's own
   // check would still accept them within this margin, a token forged or
   // replayed moments before expiry should never grant a session. This is
   // still an expiry outcome for the client — the remedy is to re-authenticate
   // — so it reports TOKEN_EXPIRED rather than INVALID_TOKEN.
-  if (typeof decoded.exp === "number") {
-    const remainingSeconds = decoded.exp - Math.floor(Date.now() / 1000);
-    if (remainingSeconds < TOKEN_EXPIRY_MARGIN_SECONDS) {
-      throw Errors.tokenExpired("Token is near expiry");
-    }
+  const remainingSeconds = decoded.exp - Math.floor(Date.now() / 1000);
+  if (remainingSeconds < TOKEN_EXPIRY_MARGIN_SECONDS) {
+    throw Errors.tokenExpired("Token is near expiry");
   }
 
   const { sub, pk } = decoded;

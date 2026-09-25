@@ -64,6 +64,22 @@ export function classifyHorizonError(error: unknown): HorizonErrorCategory {
     if (status >= 400) return "permanent";
   }
 
+  // Raw HTTP status on the error itself, in either shape it arrives:
+  // the Horizon SDK rejects with e.response.status, and fetch-shaped
+  // errors carry e.status. Checked before the response body so a 4xx
+  // that happens to carry a result-codes body is still honoured as
+  // "the upstream refused this request" — retrying a 400 identically
+  // only multiplies load and delays the caller's error (issue #531).
+  if (error && typeof error === "object") {
+    const e = error as { response?: { status?: number }; status?: number };
+    const httpStatus = e.response?.status ?? e.status;
+    if (typeof httpStatus === "number") {
+      if (httpStatus === 429) return "transient";
+      if (httpStatus >= 500) return "transient";
+      if (httpStatus >= 400) return "permanent";
+    }
+  }
+
   // Horizon SDK error shapes — the response body may carry result_codes.
   const response = extractResponse(error);
   if (response) {

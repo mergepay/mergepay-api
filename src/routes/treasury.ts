@@ -193,6 +193,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     
     await audit({
       userId: auth.id,
+      groupId: id,
       action: AuditAction.TREASURY_SIGNER_VALIDATION,
       entityType: "group",
       entityId: id,
@@ -294,20 +295,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           include: { user: true },
         });
 
-        await audit({
-          userId: auth.id,
-          action: "treasury.deposit.created",
-          entityType: "treasury_transaction",
-          entityId: ttx.id,
-          outcome: "success",
-          metadata: {
-            groupId: id,
-            amount: body.amount,
-            assetCode: body.assetCode,
-            destination: treasuryKey,
-          },
-        });
-
+        // The audit row is written through the same transaction as the state
+        // change (issue #367): a best-effort write here would survive a
+        // rollback and orphan an entry for a deposit that never happened.
         await auditTx(tx, {
           userId: auth.id,
           groupId: id,
@@ -425,21 +415,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           include: { user: true },
         });
 
-        await audit({
-          userId: auth.id,
-          action: "treasury.withdrawal.created",
-          entityType: "treasury_transaction",
-          entityId: ttx.id,
-          outcome: "success",
-          metadata: {
-            groupId: id,
-            amount: body.amount,
-            assetCode: body.assetCode,
-            destination: body.destination,
-            status: ttx.status,
-          },
-        });
-
+        // The audit row is written through the same transaction as the state
+        // change (issue #367): a best-effort write here would survive a
+        // rollback and orphan an entry for a withdrawal that never happened.
         await auditTx(tx, {
           userId: auth.id,
           groupId: id,

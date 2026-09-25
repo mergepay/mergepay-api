@@ -11,6 +11,7 @@ import {
   requireCursor,
   takeForPage,
 } from "../src/lib/pagination";
+import { paginationQuerySchema as standardizedPaginationQuerySchema } from "../src/schemas/pagination";
 import { signToken } from "../src/plugins/auth";
 
 const h = vi.hoisted(() => {
@@ -44,6 +45,30 @@ const prisma = h.prisma;
 
 const GROUP_ID = "group_1";
 const USER_ID = "user_1";
+
+describe("standardized pagination query schema", () => {
+  it("coerces query strings and applies page defaults", () => {
+    expect(standardizedPaginationQuerySchema.parse({})).toEqual({
+      limit: 20,
+      page: 1,
+    });
+    expect(
+      standardizedPaginationQuerySchema.parse({ limit: "25", page: "3" })
+    ).toEqual({ limit: 25, page: 3 });
+    expect(
+      standardizedPaginationQuerySchema.parse({ limit: "100", page: "1" })
+    ).toEqual({ limit: 100, page: 1 });
+  });
+
+  it("rejects invalid limits and page boundaries", () => {
+    for (const limit of ["0", "101", "1.5", "many"]) {
+      expect(() => standardizedPaginationQuerySchema.parse({ limit })).toThrow();
+    }
+    for (const page of ["0", "-1", "1.5", "many"]) {
+      expect(() => standardizedPaginationQuerySchema.parse({ page })).toThrow();
+    }
+  });
+});
 
 function authHeader(userId = USER_ID) {
   const token = signToken({

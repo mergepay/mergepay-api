@@ -23,7 +23,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
-import { stellar } from "../services/stellar";
+import { getTreasuryAccount } from "../services/treasury-stellar";
 import { isPositive } from "../services/money";
 import {
   serializeGroup,
@@ -187,17 +187,13 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
       );
     }
 
-    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
+    const view = await getTreasuryAccount(group.treasuryAccountPublicKey);
     return {
       group: serializeGroup(group),
-      publicKey: group.treasuryAccountPublicKey,
-      balances: snapshot.balances.map((b) => ({
-        assetCode: b.assetCode,
-        assetIssuer: b.assetIssuer,
-        balance: b.balance,
-      })),
-      signers: snapshot.signers,
-      thresholds: snapshot.thresholds,
+      publicKey: view.publicKey,
+      balances: view.balances,
+      signers: view.signers,
+      thresholds: view.thresholds,
       requiredSigners: group.treasuryRequiredSigners ?? 1,
       networkPassphrase: config.networkPassphrase,
     };

@@ -862,7 +862,7 @@ describe("reconcilePendingSettlements", () => {
       expect.objectContaining({
         where: expect.objectContaining({
           id: "pc_a",
-          status: { in: ["pending_confirmation"] },
+          status: { in: ["pending_confirmation", "needs_review"] },
         }),
         data: expect.objectContaining({ leaseExpiresAt: expect.any(Date) }),
       })
@@ -928,7 +928,7 @@ describe("reconcilePendingSettlements", () => {
     await reconcilePendingSettlements();
 
     const batchLog = h.logger.info.mock.calls.find(
-      ([, msg]: unknown[]) => msg === "reconciled pending_confirmation settlements against Horizon"
+      ([, msg]: unknown[]) => msg === "reconciled pending_confirmation and needs_review settlements against Horizon"
     );
     expect(batchLog).toBeDefined();
     const [fields] = batchLog as [Record<string, unknown>, string];
@@ -942,6 +942,110 @@ describe("reconcilePendingSettlements", () => {
     });
   });
 
+  it("picks up needs_review settlements whose submission response was lost", async () => {
+    // Issue #541: a settlement submitted to Horizon whose confirmation went
+    // unanswered lands in needs_review with a recorded hash. The reconciliation
+    // job must treat it as the same open question as pending_confirmation and
+    // resolve it from the ledger.
+    const row = pendingRow({
+      id: "nr_1",
+      status: "needs_review",
+      stellarTxHash: "nrhash0001",
+      failureReason: "Awaiting on-chain confirmation for nrhash0001",
+    });
+    currentSettlementState = { ...row };
+    h.prisma.settlement.findMany.mockResolvedValue([row]);
+    h.reconcileSingleSettlement.mockResolvedValue("confirmed");
+
+    await reconcilePendingSettlements();
+
+    // The candidate query includes needs_review alongside pending_confirmation.
+    expect(h.prisma.settlement.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { in: ["pending_confirmation", "needs_review"] },
+          stellarTxHash: { not: null },
+        }),
+      })
+    );
+    // The row is claimed under the same lease regime and reconciled by hash.
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: "nr_1",
+          status: { in: ["pending_confirmation", "needs_review"] },
+        }),
+      })
+    );
+    expect(h.reconcileSingleSettlement).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "nr_1", stellarTxHash: "nrhash0001" }),
+      RECONCILIATION_MAX_RETRIES,
+      expect.objectContaining({ jobId: "nr_1" })
+    );
+  });
+
+  it("echoes a confirmed outcome for a needs_review row and releases the lease", async () => {
+    // The worker's contract: whatever reconcileSingleSettlement resolves for a
+    // needs_review row (the Horizon lookup and the needs_review → confirmed/
+    // failed transitions inside it are the reconciliation service's job, and
+    // the state machine already allows both hops) is echoed into the batch
+    // summary, and the lease is dropped so later cycles can revisit the row.
+    const row = pendingRow({
+      id: "nr_2",
+      status: "needs_review",
+      stellarTxHash: "nrhash0002",
+    });
+    currentSettlementState = { ...row };
+    h.prisma.settlement.findMany.mockResolvedValue([row]);
+    h.reconcileSingleSettlement.mockResolvedValue("confirmed");
+
+    await reconcilePendingSettlements();
+
+    expect(h.reconcileSingleSettlement).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "nr_2", stellarTxHash: "nrhash0002" }),
+      RECONCILIATION_MAX_RETRIES,
+      expect.anything()
+    );
+    const batchLog = h.logger.info.mock.calls.find(
+      ([, msg]: unknown[]) =>
+        msg === "reconciled pending_confirmation and needs_review settlements against Horizon"
+    );
+    expect((batchLog as unknown as [Record<string, unknown>, string])[0]).toMatchObject({
+      confirmed: 1,
+      failed: 0,
+      stillPending: 0,
+    });
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "nr_2", claimedBy: expect.any(String) },
+        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+      })
+    );
+  });
+
+  it("echoes a failed outcome for a needs_review row whose transaction failed on-chain", async () => {
+    const row = pendingRow({
+      id: "nr_3",
+      status: "needs_review",
+      stellarTxHash: "nrhash0003",
+    });
+    currentSettlementState = { ...row };
+    h.prisma.settlement.findMany.mockResolvedValue([row]);
+    h.reconcileSingleSettlement.mockResolvedValue("failed");
+
+    await reconcilePendingSettlements();
+
+    const batchLog = h.logger.info.mock.calls.find(
+      ([, msg]: unknown[]) =>
+        msg === "reconciled pending_confirmation and needs_review settlements against Horizon"
+    );
+    expect((batchLog as unknown as [Record<string, unknown>, string])[0]).toMatchObject({
+      confirmed: 0,
+      failed: 1,
+      stillPending: 0,
+    });
+  });
+
   it("reconciles nothing when there are no pending_confirmation rows", async () => {
     h.prisma.settlement.findMany.mockResolvedValue([]);
 
@@ -952,7 +1056,7 @@ describe("reconcilePendingSettlements", () => {
     expect(h.prisma.settlement.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
-          status: { in: ["pending_confirmation"] },
+          status: { in: ["pending_confirmation", "needs_review"] },
           stellarTxHash: { not: null },
           AND: [{ OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: expect.any(Date) } }] }],
         },

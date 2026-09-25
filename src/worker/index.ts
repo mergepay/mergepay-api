@@ -704,10 +704,12 @@ export async function recoverStaleSettlements(): Promise<number> {
   const now = new Date();
   const { count } = await prisma.settlement.updateMany({
     where: {
-      // pending_confirmation is included: its reconciliation runs under the
-      // same lease regime, so a crash mid-check must free the row the same way
-      // a crash mid-submission does.
-      status: { in: [...SUBMITTABLE_STATUSES, "pending_confirmation"] },
+      // pending_confirmation and needs_review are included: their
+      // reconciliation runs under the same lease regime, so a crash mid-check
+      // must free the row the same way a crash mid-submission does.
+      status: {
+        in: [...SUBMITTABLE_STATUSES, "pending_confirmation", "needs_review"],
+      },
       leaseExpiresAt: { lt: now },
     },
     data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
@@ -723,17 +725,18 @@ export async function recoverStaleSettlements(): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// pending_confirmation reconciliation
+// pending_confirmation + needs_review reconciliation
 // ---------------------------------------------------------------------------
 
 /** The settlement statuses the reconciliation job owes a Horizon check. */
-const RECONCILABLE_STATUSES = ["pending_confirmation"] as const;
+const RECONCILABLE_STATUSES = ["pending_confirmation", "needs_review"] as const;
 
 /**
- * Take exclusive ownership of a pending-confirmation reconciliation.
+ * Take exclusive ownership of a pending-confirmation or needs-review
+ * reconciliation.
  *
  * Same conditional-update lease as settlement submission: the row must still
- * be in `pending_confirmation`, still be on the attempt this worker read, and
+ * be in a reconcilable status, still be on the attempt this worker read, and
  * must not carry a live lease. Two workers racing on one row produce exactly
  * one update with `count === 1`.
  */
@@ -764,9 +767,20 @@ async function claimPendingConfirmation(job: {
 }
 
 /**
- * One cycle of pending_confirmation reconciliation: pick up every settled-in
- * question row, claim it, ask Horizon which of the three outcomes it reached,
- * and let the state machine persist it.
+ * One cycle of pending-confirmation/needs-review reconciliation: pick up
+ * every settlement whose on-chain outcome is unresolved — a submitted
+ * transaction not yet confirmed (`pending_confirmation`) or one whose
+ * confirmation response was lost (`needs_review`) — claim it, ask Horizon
+ * which of the three outcomes it reached, and let the state machine persist
+ * it.
+ *
+ * Issue #541: `needs_review` rows were never revisited before this job
+ * covered them. A settlement that reached `needs_review` — submitted, hash
+ * recorded, but Horizon went quiet before pollForConfirmation could report
+ * an outcome — was terminal in practice: the API could not confirm it and
+ * nothing ever asked Horizon again, leaving an actually-settled expense
+ * stuck as unsettled. Both statuses are the same question ("did this hash
+ * land?") with an answer only Horizon holds, so both are reconciled here.
  *
  * A Horizon lookup that comes back empty is deliberately *not* a resolution:
  * the transaction was submitted but is not on the ledger yet, so the row keeps
@@ -855,7 +869,7 @@ export async function reconcilePendingSettlements(): Promise<void> {
       failed: outcomes.failed,
       stillPending: outcomes.pending,
     },
-    "reconciled pending_confirmation settlements against Horizon"
+    "reconciled pending_confirmation and needs_review settlements against Horizon"
   );
 }
 

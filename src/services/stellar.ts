@@ -52,6 +52,24 @@ function isRetryableHorizonError(error: any): boolean {
   const status = error?.response?.status;
   return status === undefined || status === 408 || status === 429 || status >= 500;
 }
+/**
+ * Run a Horizon operation against the currently preferred endpoint, rotating
+ * to the next configured endpoint when the failure looks transient.
+ *
+ * A failed endpoint is quarantined for 30s so a single outage does not cost
+ * every call in flight one round trip, and each endpoint is tried at most once
+ * per call. Non-retryable failures (4xx validation, rejected transaction) are
+ * re-thrown immediately — rotating endpoints cannot fix a bad request.
+ *
+ * @param operation - Receives the selected `Horizon.Server` and performs the
+ *   call. Invoked once per attempt, at most `HORIZON_ENDPOINTS.length` times.
+ * @returns Whatever `operation` resolves to from the first attempt that
+ *   succeeds.
+ * @throws The last error encountered once every endpoint has been tried, or
+ *   immediately for a non-retryable (non-408/429/5xx) Horizon error. Callers
+ *   see the raw SDK error — the wrapping into `ProviderError`/`AppError`
+ *   happens in the helpers below, not here.
+ */
 export async function withHorizonFailover<T>(operation: (horizon: Horizon.Server) => Promise<T>): Promise<T> {
   const tried = new Set<number>();
   let lastError: unknown;
@@ -115,6 +133,11 @@ function isNotFound(error: unknown): boolean {
   return candidate?.response?.status === 404 || candidate?.name === "NotFoundError";
 }
 
+/**
+ * The asset a payment moves, in the app's own shape. `issuer` omitted (or
+ * `null`) means native XLM; otherwise it is the issuing account's public key.
+ * Validated by `validateAssetSpec` before any SDK object is built.
+ */
 export interface AssetSpec {
   code: string;
   issuer?: string | null;
@@ -149,6 +172,12 @@ export function memoText(code: string): string {
   return text.length > 28 ? text.slice(0, 28) : text;
 }
 
+/**
+ * A point-in-time view of a Stellar account as Horizon reports it, in the
+ * app's own field names. Every field is always present: an unfunded account
+ * is returned with `exists: false`, `sequence: "0"`, and empty collections
+ * rather than being reported as an error.
+ */
 export interface AccountSnapshot {
   exists: boolean;
   sequence: string;
@@ -167,6 +196,10 @@ export type PaymentIntent = Pick<
   "sourcePublicKey" | "destination" | "asset" | "amount" | "memoCode"
 >;
 
+/**
+ * Who may authorize a treasury payment and how many of them must sign.
+ * Enforced by {@link verifyMultisig} before any envelope reaches Horizon.
+ */
 export interface MultisigRequirement {
   /** Public keys of the accounts authorized to sign for this treasury. */
   signers: string[];
@@ -183,8 +216,12 @@ export const stellar = {
    * @returns An `AccountSnapshot` describing the account's sequence, balances,
    *   signers and thresholds. When the account is unfunded, `exists` is `false`
    *   and the remaining fields are zero/empty defaults.
-   * @throws Re-throws any non-404 Horizon error (network/timeout) after retry
-   *   exhaustion. A 404 is a legitimate "not funded" answer, not a failure.
+   * @throws {AppError} for any non-404 Horizon failure once the read's bounded
+   *   retries are spent, normalized to a `ProviderError` carrying a category of
+   *   `timeout`, `transport`, `rate_limited`, or `unavailable`. Only the
+   *   operation label and safe identifiers survive — Horizon's response body
+   *   never reaches the caller. A 404 is a legitimate "not funded" answer, not
+   *   a failure.
    */
   async loadAccount(publicKey: string): Promise<AccountSnapshot> {
     try {
@@ -423,8 +460,10 @@ export const stellar = {
    * @returns `{ successful: boolean }` when the transaction is found, or `null`
    *   if it has not yet reached Horizon (a 404 is treated as "not visible yet",
    *   not an error).
-   * @throws Re-throws any non-404 Horizon error (network/timeout) after retry
-   *   exhaustion.
+   * @throws {AppError} `upstream` once the read's bounded retries are spent on
+   *   a non-404 Horizon failure (timeout, transport, rate limit, 5xx). Callers
+   *   distinguish "not visible yet" (`null`) from "Horizon could not answer"
+   *   (throw) — the latter says nothing about whether the transaction applied.
    */
   async getTransaction(
     hash: string
@@ -678,6 +717,14 @@ const MAX_FEE_STROOPS_PER_OP = Number(BASE_FEE) * 2;
  * expiry (submittable forever), one valid longer than the intent it was built
  * for, and one that has already lapsed. An intent-less call still rejects the
  * first and the third.
+ *
+ * @param tx - The parsed envelope whose `timeBounds` are checked.
+ * @param expiresAt - The intent's recorded expiry. `null`/undefined means the
+ *   intent recorded no expiry, so the envelope must not impose one either.
+ * @param resource - Name used in the expiration error, e.g. `"settlement"`.
+ * @returns `void` — resolves when the envelope's window is acceptable.
+ * @throws {AppError} `bad_request` when the envelope has no expiry, outlives
+ *   the intent, or has already lapsed.
  */
 export function assertTimeBoundsValid(
   tx: Transaction,
@@ -831,10 +878,16 @@ function normalizeAmount(a: string): string {
   return `${w}.${(f + "0000000").slice(0, 7)}`;
 }
 
+/** Result of {@link validateSignedXdr}: the parsed envelope plus its hex hash. */
+export interface SignedXdrValidation {
+  tx: Transaction;
+  hash: string;
+}
+
 /**
  * Parse and validate a signed XDR against the expected payment intent
  * without submitting it to Horizon. Returns the parsed transaction and its
- * hash on success. Throws AppError (400 XDR_MISMATCH) on any mismatch.
+ * hash on success. Throws AppError (bad_request) on any mismatch.
  *
  * Callers use this in API routes to reject invalid signed XDRs *before*
  * persisting them, so Horizon is never called for a transaction that fails
@@ -845,11 +898,6 @@ function normalizeAmount(a: string): string {
  * @returns `{ tx, hash }`: the parsed `Transaction` and its hex hash.
  * @throws {AppError} `bad_request` for malformed, expired, or intent-mismatched XDR.
  */
-export interface SignedXdrValidation {
-  tx: Transaction;
-  hash: string;
-}
-
 export function validateSignedXdr(
   signedXdr: string,
   expected: PaymentExpectation

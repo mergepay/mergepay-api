@@ -62,20 +62,21 @@ function withTimeout<T>(operation: Promise<T>): Promise<T> {
  * @returns `true` when `SELECT 1` answers within the readiness deadline.
  */
 export async function checkDatabase(): Promise<boolean> {
+  let timer: NodeJS.Timeout | null = null;
   try {
     const queryPromise =
-      typeof client.$queryRawUnsafe === "function"
-        ? client.$queryRawUnsafe("SELECT 1")
-        : typeof client.$queryRaw === "function"
-          ? client.$queryRaw`SELECT 1`
+      typeof prisma.$queryRawUnsafe === "function"
+        ? prisma.$queryRawUnsafe("SELECT 1")
+        : typeof prisma.$queryRaw === "function"
+          ? prisma.$queryRaw`SELECT 1`
           : Promise.reject(new Error("No queryRaw method on prisma client"));
 
     await Promise.race([
       Promise.resolve(queryPromise),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error(`Database health check timed out after ${timeoutMs}ms`)),
-          timeoutMs
+          () => reject(new Error(`Database health check timed out after ${CHECK_TIMEOUT_MS}ms`)),
+          CHECK_TIMEOUT_MS
         );
       }),
     ]);
@@ -86,6 +87,8 @@ export async function checkDatabase(): Promise<boolean> {
     if (timer) clearTimeout(timer);
   }
 }
+
+export const checkDatabaseConnection = checkDatabase;
 
 /**
  * Probe Horizon through the shared fee-stats client (and its short cache) so

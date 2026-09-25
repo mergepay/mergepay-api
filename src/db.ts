@@ -81,10 +81,17 @@ export async function checkDatabaseConnection(
   client: PrismaClient = prisma,
   timeoutMs: number = env.DATABASE_QUERY_TIMEOUT_MS || 5000
 ): Promise<boolean> {
-  let timer: NodeJS.Timeout | undefined;
+  let timer: NodeJS.Timeout | null = null;
   try {
+    const queryPromise =
+      typeof (client as any).$queryRawUnsafe === "function"
+        ? (client as any).$queryRawUnsafe("SELECT 1")
+        : typeof client.$queryRaw === "function"
+          ? client.$queryRaw`SELECT 1`
+          : Promise.reject(new Error("No queryRaw method on prisma client"));
+
     await Promise.race([
-      client.$queryRaw`SELECT 1`,
+      Promise.resolve(queryPromise),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new Error(`Database health check timed out after ${timeoutMs}ms`)),

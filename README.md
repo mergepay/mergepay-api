@@ -11,7 +11,8 @@ integration, treasury multisig, anchor (SEP-24) flows, and background jobs.
 [Web repo](https://github.com/mergepay/mergepay-web) ·
 [API repo](https://github.com/mergepay/mergepay-api)
 
-![CI](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml/badge.svg)](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict%20mode-3178C6?logo=typescript&logoColor=white)](https://github.com/mergepay/mergepay-api/blob/main/tsconfig.json)
 ![License](https://img.shields.io/github/license/mergepay/mergepay-api)
 ![Stellar](https://img.shields.io/badge/stellar-testnet-blueviolet)
 
@@ -109,6 +110,8 @@ npm run db:seed
 npm run dev                   # API on :4000
 npm run worker                # background reconciliation worker (separate shell)
 ```
+
+New to the codebase? The typing standards enforced across `src/` are documented in [TypeScript strict mode](#typescript-strict-mode).
 
 ## Environment variables
 
@@ -399,6 +402,19 @@ Covers `GET /groups`, `/groups/:id/expenses`, `/groups/:id/ledger`,
 `/groups/:id/treasury/history`, `/anchors/sessions`, and `/history` (which
 paginates its expense and settlement streams independently, via `cursor` and
 `settlementCursor`).
+
+## TypeScript strict mode
+
+The whole of `src/` compiles under TypeScript's [`strict`](https://www.typescriptlang.org/tsconfig/#strict) flag — see [tsconfig.json](tsconfig.json) for the exact configuration. `strict` turns on every strict type-checking family at once (`strictNullChecks`, `noImplicitAny`, `strictFunctionTypes`, `strictBindCallApply`, `strictPropertyInitialization`, `noImplicitThis`, `alwaysStrict`, and `useUnknownInCatchVariables`), so `null`/`undefined` flows, implicit `any`s, and unbound `this` are compile errors rather than production incidents.
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `strict` | `true` | All strict checks on across `src/` — no per-file opt-outs |
+| `forceConsistentCasingInFileNames` | `true` | Casing differences cannot break Linux CI builds |
+| `noUnusedLocals` | `false` | Deliberate: readability over lint-by-compiler (ESLint's `no-unused-vars` covers it) |
+| `noUncheckedIndexedAccess` | `false` | Deliberate: index accesses are guarded where they matter |
+
+CI enforces it: [`npm run build`](CONTRIBUTING.md#pr-checklist) must pass with zero TS errors before a PR merges. When contributing, keep new code strict-clean — narrow unknowns explicitly, annotate catch variables, and never suppress with `any` casts where a real type exists (see [CONTRIBUTING.md](CONTRIBUTING.md#coding-standards)).
 
 ## Testing
 

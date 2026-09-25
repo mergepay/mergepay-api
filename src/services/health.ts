@@ -55,14 +55,42 @@ function withTimeout<T>(operation: Promise<T>): Promise<T> {
   });
 }
 
-export async function checkDatabase(): Promise<boolean> {
+/**
+ * Lightweight database ping helper that executes a simple query (SELECT 1) with a timeout
+ * to verify active PostgreSQL connectivity. Returns `true` on success, or
+ * `false` on any failure or timeout instead of throwing uncaught exceptions.
+ */
+export async function checkDatabaseConnection(
+  client: any = prisma,
+  timeoutMs: number = CHECK_TIMEOUT_MS
+): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
   try {
-    await withTimeout(prisma.$queryRawUnsafe("SELECT 1") as Promise<unknown>);
+    const queryPromise =
+      typeof client.$queryRawUnsafe === "function"
+        ? client.$queryRawUnsafe("SELECT 1")
+        : typeof client.$queryRaw === "function"
+          ? client.$queryRaw`SELECT 1`
+          : Promise.reject(new Error("No queryRaw method on prisma client"));
+
+    await Promise.race([
+      Promise.resolve(queryPromise),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Database health check timed out after ${timeoutMs}ms`)),
+          timeoutMs
+        );
+      }),
+    ]);
     return true;
   } catch {
     return false;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
+
+export const checkDatabase = checkDatabaseConnection;
 
 export async function checkStellar(): Promise<boolean> {
   try {

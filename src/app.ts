@@ -1,4 +1,4 @@
-import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
+import Fastify, { FastifyInstance, FastifyRequest, FastifyServerOptions } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -61,7 +61,20 @@ function globalRateLimitKey(request: FastifyRequest): string {
   return `global:ip:${request.ip}`;
 }
 
-export async function buildApp(): Promise<FastifyInstance> {
+/**
+ * Build-time overrides.
+ *
+ * `logger` exists so tests can inject a Pino instance that writes into an
+ * in-memory stream: under test the default logger is disabled (see the
+ * `config.isTest` branch below), so without an injection point there is
+ * nothing for the error-handling tests to assert against. Production callers
+ * pass no options and keep the configured logger.
+ */
+export interface BuildAppOptions {
+  logger?: FastifyServerOptions["logger"];
+}
+
+export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
   validateAssetConfig();
 
   // Contains a @fastify/busboy defect that turns a truncated multipart body
@@ -82,9 +95,11 @@ export async function buildApp(): Promise<FastifyInstance> {
 
       return getCorrelationId(preferred);
     },
-    logger: config.isTest
-      ? false
-      : {
+    logger:
+      options.logger ??
+      (config.isTest
+        ? false
+        : {
           level: config.LOG_LEVEL,
           serializers: {
             err: stellarErrorSerializer as any,
@@ -117,7 +132,7 @@ export async function buildApp(): Promise<FastifyInstance> {
             config.NODE_ENV === "development"
               ? { target: "pino-pretty", options: { colorize: true } }
               : undefined,
-        },
+        }),
     bodyLimit: config.JSON_BODY_LIMIT_BYTES,
   });
 
@@ -153,18 +168,18 @@ export async function buildApp(): Promise<FastifyInstance> {
     const errorCode = (error as any).code ?? "INTERNAL_ERROR";
     const correlationId = getCorrelationId(request.id);
 
-    const level = statusCode >= 500 ? "error" : "warn";
     const logData: Record<string, unknown> = {
       correlationId,
       statusCode,
       errorCode,
     };
-    if (level === "error") {
+    if (statusCode >= 500) {
       // Include the error object (and its stack) for unexpected server faults.
-      logData.err = error;
+      request.log.error({ ...logData, err: error }, "request failed");
+    } else {
+      // Client errors are expected rejections: warn level, no stack.
+      request.log.warn(logData, "request failed");
     }
-    // @ts-ignore - pino child methods accessed dynamically
-    request.log[level](logData, "request failed");
   });
 
   // Security headers via @fastify/helmet. CSP is left permissive for a JSON API:

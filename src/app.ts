@@ -166,7 +166,9 @@ export async function buildApp(): Promise<FastifyInstance> {
     keyGenerator: globalRateLimitKey,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: (request: FastifyRequest) => ({
+      statusCode: 429,
       code: "RATE_LIMITED",
+      error: "RATE_LIMITED",
       message: "Too many requests. Please retry later.",
       requestId: request.id,
     }),

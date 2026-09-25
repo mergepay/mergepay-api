@@ -13,9 +13,10 @@ import {
   encodeCursor,
   type CursorPosition,
 } from "../lib/pagination";
+import { assetCodeSchema } from "../schemas/asset";
 
 const historyQuerySchema = paginationQuerySchema.extend({
-  assetCode: z.string().optional(),
+  assetCode: assetCodeSchema.optional(),
   status: z.string().optional(),
   fromDate: z.string().datetime().optional(),
   toDate: z.string().datetime().optional(),

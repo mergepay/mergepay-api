@@ -67,9 +67,14 @@ const sharedFields = {
   anchorName: z.string().max(64).optional(),
 };
 
-function validateNativeIssuer<T extends { assetCode: string; assetIssuer?: string | null }>(
-  schema: z.ZodType<T>
-) {
+function validateNativeIssuer<
+  T extends {
+    assetCode: string;
+    assetIssuer?: string | null;
+    memo?: string;
+    memoType?: "text" | "id" | "hash";
+  }
+>(schema: z.ZodType<T>) {
   return schema.refine(
     (value) => !(value.assetCode === "XLM" && value.assetIssuer),
     {

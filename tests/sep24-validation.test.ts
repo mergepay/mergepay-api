@@ -148,6 +148,14 @@ describe("sep24InteractiveRequestSchema", () => {
     expect(result.success).toBe(false);
   });
 
+  it("rejects unknown request fields", () => {
+    const result = sep24InteractiveRequestSchema.safeParse({
+      assetCode: "XLM",
+      unexpected: true,
+    });
+    expect(result.success).toBe(false);
+  });
+
   it("rejects an amount with excess precision", () => {
     const result = sep24InteractiveRequestSchema.safeParse({
       assetCode: "XLM",
@@ -174,6 +182,15 @@ describe("sep24WithdrawRequestSchema", () => {
       account: goodKey,
     });
     expect(ok.success).toBe(true);
+  });
+
+  it("rejects unknown withdrawal fields", () => {
+    const result = sep24WithdrawRequestSchema.safeParse({
+      assetCode: "USDC",
+      amount: "5",
+      unexpected: true,
+    });
+    expect(result.success).toBe(false);
   });
 });
 

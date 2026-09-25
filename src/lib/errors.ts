@@ -75,6 +75,14 @@ export const ErrorCode = {
    * promptly. See src/lib/time-bounds.ts.
    */
   INTENT_EXPIRED: "INTENT_EXPIRED",
+  /**
+   * 401 — the signed SEP-10 challenge arrived after its validity window
+   * closed. Deliberately distinct from UNAUTHORIZED (signature or domain
+   * failure — the envelope itself is wrong) and TOKEN_EXPIRED (a session
+   * credential, not a challenge): the remedy is to request a fresh challenge
+   * and sign it promptly. See src/services/sep10.ts.
+   */
+  CHALLENGE_EXPIRED: "CHALLENGE_EXPIRED",
   INVALID_CURSOR: "INVALID_CURSOR",
   // 401
   UNAUTHORIZED: "UNAUTHORIZED",
@@ -176,6 +184,18 @@ export const Errors = {
    * token this API actually minted. */
   invalidToken: (msg = "Invalid token") =>
     new AppError(401, ErrorCode.INVALID_TOKEN, msg),
+
+  /**
+   * The SEP-10 challenge the wallet signed has passed its validity window.
+   * Deliberately distinct from the generic UNAUTHORIZED rejection of
+   * signature and domain failures (see src/services/sep10.ts): the envelope
+   * was otherwise well-formed and correctly signed, so the only remedy is to
+   * request a fresh challenge and sign it promptly. Carries
+   * `details.challengeValiditySeconds` so clients can size their own
+   * sign-prompt timeout without hard-coding one.
+   */
+  challengeExpired: (msg: string, details?: unknown) =>
+    new AppError(401, ErrorCode.CHALLENGE_EXPIRED, msg, details),
 
   forbidden: (msg = "You do not have access to this resource") =>
     new AppError(403, ErrorCode.FORBIDDEN, msg),

@@ -1,22 +1,25 @@
-import { z } from "zod";
-
-const memoType = z.enum(["text", "id", "hash"]);
-
-/** Shared SEP-24 parameter contract for deposit and withdrawal starts. */
-export const sep24InteractiveSchema = z
-  .object({
-    assetCode: z.string().trim().min(1).max(12),
-    anchorName: z.string().trim().min(1).max(120).optional(),
-    account: z.string().regex(/^G[A-Z2-7]{55}$/).optional(),
-    memo: z.string().trim().min(1).max(64).optional(),
-    memoType: memoType.optional(),
-    walletName: z.string().trim().min(1).max(120).optional(),
-  })
-  .superRefine((value, ctx) => {
-    if (value.memo && !value.memoType) {
-      ctx.addIssue({ code: "custom", path: ["memoType"], message: "memoType is required when memo is supplied" });
-    }
-    if (value.memoType && !value.memo) {
-      ctx.addIssue({ code: "custom", path: ["memo"], message: "memo is required when memoType is supplied" });
-    }
-  });
+/**
+ * SEP-24 request schemas — issue #366.
+ *
+ * The canonical Zod schemas for SEP-24 deposit/withdrawal initialization and
+ * status requests live in `src/validations/sep24.ts`, which the anchor routes
+ * (src/routes/anchors.ts) apply inside their handlers so malformed payloads
+ * are rejected with a 400 VALIDATION_ERROR before any anchor I/O happens.
+ *
+ * This module re-exports them under the location the issue names so callers
+ * have a single import point and there is exactly one source of truth — the
+ * earlier divergent schema that lived here (regex-only account checks, no
+ * amount/memo rules) was never wired into a route and has been removed rather
+ * than left as a weaker duplicate.
+ */
+export {
+  sep24AccountSchema,
+  sep24AmountSchema,
+  sep24AssetCodeSchema,
+  sep24InteractiveRequestSchema,
+  sep24MemoSchema,
+  sep24MemoTypeSchema,
+  sep24WithdrawRequestSchema,
+  type Sep24InteractiveRequest,
+  type Sep24WithdrawRequest,
+} from "../validations/sep24";

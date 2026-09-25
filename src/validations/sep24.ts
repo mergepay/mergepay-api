@@ -9,7 +9,9 @@
  *   - asset code: alphanumeric, 1-12 chars (upper-cased on parse);
  *   - amount: a positive, precision-safe Stellar decimal when supplied;
  *   - account / `to`: a checksum-validated ed25519 Stellar public key;
- *   - memo: a short, alphanumeric anchor memo (no arbitrary bytes).
+ *   - memo: a short, alphanumeric anchor memo (no arbitrary bytes);
+ *   - memo / memoType: supplied together — an anchor cannot apply a memo it
+ *     cannot classify (`memoType` is one of `text`, `id`, `hash`).
  *
  * Supported-asset and network checks intentionally stay in the handler via
  * `validateAsset` (src/services/assets.ts) so they keep their existing error
@@ -42,6 +44,33 @@ export const sep24MemoSchema = z
   .regex(/^[A-Za-z0-9]+$/, "memo may only contain letters and digits")
   .optional();
 
+/** SEP-24 memo type: the Stellar transaction-memo kind accompanying `memo`. */
+export const sep24MemoTypeSchema = z.enum(["text", "id", "hash"]);
+
+/**
+ * `memo` and `memoType` travel together (issue #366): an anchor cannot apply
+ * a memo it cannot classify, so one without the other is rejected at the door.
+ */
+function refineMemoPairing(
+  value: { memo?: string; memoType?: "text" | "id" | "hash" },
+  ctx: z.RefinementCtx
+): void {
+  if (value.memo && !value.memoType) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["memoType"],
+      message: "memoType is required when memo is supplied",
+    });
+  }
+  if (value.memoType && !value.memo) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["memo"],
+      message: "memo is required when memoType is supplied",
+    });
+  }
+}
+
 /**
  * Fields shared by SEP-24 deposit and withdrawal initiation.
  *
@@ -59,6 +88,9 @@ export const sep24InteractiveRequestSchema = z
     account: sep24AccountSchema.optional(),
     to: sep24AccountSchema.optional(),
     memo: sep24MemoSchema,
+    memoType: sep24MemoTypeSchema.optional(),
+    // SEP-24 interactive starts may identify the requesting wallet.
+    walletName: z.string().trim().min(1).max(120).optional(),
     anchorName: z.string().max(64).optional(),
   })
   .refine(
@@ -70,7 +102,8 @@ export const sep24InteractiveRequestSchema = z
       message: "XLM is a native asset and does not take an issuer",
       path: ["assetIssuer"],
     }
-  );
+  )
+  .superRefine(refineMemoPairing);
 
 export type Sep24InteractiveRequest = z.infer<typeof sep24InteractiveRequestSchema>;
 
@@ -86,6 +119,8 @@ export const sep24WithdrawRequestSchema = z
     account: sep24AccountSchema.optional(),
     to: sep24AccountSchema.optional(),
     memo: sep24MemoSchema,
+    memoType: sep24MemoTypeSchema.optional(),
+    walletName: z.string().trim().min(1).max(120).optional(),
     anchorName: z.string().max(64).optional(),
   })
   .refine(
@@ -94,6 +129,7 @@ export const sep24WithdrawRequestSchema = z
       message: "XLM is a native asset and does not take an issuer",
       path: ["assetIssuer"],
     }
-  );
+  )
+  .superRefine(refineMemoPairing);
 
 export type Sep24WithdrawRequest = z.infer<typeof sep24WithdrawRequestSchema>;

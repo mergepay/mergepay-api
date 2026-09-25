@@ -202,7 +202,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
       const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
 
       const session = await prisma.anchorSession.findUnique({
@@ -301,7 +301,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
 
       const session = await prisma.anchorSession.findUnique({
         where: { id },

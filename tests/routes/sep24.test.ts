@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import jwt from "jsonwebtoken";
-import { sep24InteractiveSchema } from "../../src/schemas/sep24";
+import { Keypair } from "@stellar/stellar-sdk";
+import { sep24InteractiveRequestSchema } from "../../src/schemas/sep24";
 
 const h = vi.hoisted(() => {
   const prisma: any = {
@@ -347,23 +348,26 @@ describe("POST /api/sep24/callback — state updates", () => {
 });
 
 describe("SEP-24 interactive parameters", () => {
-  it("accepts a valid asset and memo pair", () => {
-    const result = sep24InteractiveSchema.safeParse({
+  it("accepts a valid asset, account, and memo pair", () => {
+    const result = sep24InteractiveRequestSchema.safeParse({
       assetCode: "USDC",
-      account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      memo: "invoice-42",
+      account: Keypair.random().publicKey(),
+      memo: "invoice42",
       memoType: "text",
     });
     expect(result.success).toBe(true);
   });
 
   it("rejects a memo without a memo type", () => {
-    const result = sep24InteractiveSchema.safeParse({ assetCode: "XLM", memo: "42" });
+    const result = sep24InteractiveRequestSchema.safeParse({
+      assetCode: "XLM",
+      memo: "42",
+    });
     expect(result.success).toBe(false);
   });
 
   it("rejects an invalid account and unsupported memo type", () => {
-    const result = sep24InteractiveSchema.safeParse({
+    const result = sep24InteractiveRequestSchema.safeParse({
       assetCode: "XLM",
       account: "not-a-stellar-account",
       memo: "42",

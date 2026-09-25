@@ -2,7 +2,9 @@ import { defineConfig } from "vitest/config";
 import * as dotenv from "dotenv";
 import * as path from "path";
 
-// Load test environment variables
+// Load test environment variables. A real .env.test (CI or local secrets)
+// wins over the defaults below; otherwise the built-in defaults keep
+// src/config.ts validation from exiting before any test runs.
 const envPath = path.resolve(process.cwd(), ".env.test");
 dotenv.config({ path: envPath });
 
@@ -15,10 +17,13 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/integration/**/*.test.ts"],
+    exclude: ["**/node_modules/**"],
     env: {
       NODE_ENV: "test",
       VITEST: "true",
-      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/mergepay_test",
+      DATABASE_URL:
+        process.env.DATABASE_URL ||
+        "postgresql://postgres:postgres@localhost:5432/mergepay_test",
       API_PUBLIC_URL: "http://localhost:4000",
       JWT_SECRET: "test-secret-key-at-least-16-chars",
       STELLAR_NETWORK: "public",

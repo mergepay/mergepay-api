@@ -56,15 +56,12 @@ function withTimeout<T>(operation: Promise<T>): Promise<T> {
 }
 
 /**
- * Lightweight database ping helper that executes a simple query (SELECT 1) with a timeout
- * to verify active PostgreSQL connectivity. Returns `true` on success, or
- * `false` on any failure or timeout instead of throwing uncaught exceptions.
+ * Cheap liveness probe for the database. Never throws — an unreachable
+ * database is reported as `false`, not as an error to the caller.
+ *
+ * @returns `true` when `SELECT 1` answers within the readiness deadline.
  */
-export async function checkDatabaseConnection(
-  client: any = prisma,
-  timeoutMs: number = CHECK_TIMEOUT_MS
-): Promise<boolean> {
-  let timer: NodeJS.Timeout | undefined;
+export async function checkDatabase(): Promise<boolean> {
   try {
     const queryPromise =
       typeof client.$queryRawUnsafe === "function"
@@ -90,8 +87,15 @@ export async function checkDatabaseConnection(
   }
 }
 
-export const checkDatabase = checkDatabaseConnection;
-
+/**
+ * Probe Horizon through the shared fee-stats client (and its short cache) so
+ * a readiness check costs no extra Horizon traffic in the common case. Every
+ * failure mode — timeout, connection refusal, `upstream` error — is reported
+ * as `false` rather than thrown — the health route reports dependency state
+ * instead of failing on it.
+ *
+ * @returns `true` when Horizon answered within the readiness deadline.
+ */
 export async function checkStellar(): Promise<boolean> {
   try {
     // getFeeStats uses the shared Horizon client and its existing short cache.

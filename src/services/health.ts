@@ -55,6 +55,12 @@ function withTimeout<T>(operation: Promise<T>): Promise<T> {
   });
 }
 
+/**
+ * Cheap liveness probe for the database. Never throws — an unreachable
+ * database is reported as `false`, not as an error to the caller.
+ *
+ * @returns `true` when `SELECT 1` answers within the readiness deadline.
+ */
 export async function checkDatabase(): Promise<boolean> {
   try {
     await withTimeout(prisma.$queryRawUnsafe("SELECT 1") as Promise<unknown>);
@@ -64,6 +70,15 @@ export async function checkDatabase(): Promise<boolean> {
   }
 }
 
+/**
+ * Probe Horizon through the shared fee-stats client (and its short cache) so
+ * a readiness check costs no extra Horizon traffic in the common case. Every
+ * failure mode — timeout, connection refusal, `upstream` error — is reported
+ * as `false` rather than thrown — the health route reports dependency state
+ * instead of failing on it.
+ *
+ * @returns `true` when Horizon answered within the readiness deadline.
+ */
 export async function checkStellar(): Promise<boolean> {
   try {
     // getFeeStats uses the shared Horizon client and its existing short cache.

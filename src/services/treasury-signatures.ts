@@ -71,6 +71,7 @@ export const STATUS = {
 export interface CreateTxProposalParams {
   groupId: string;
   creatorId: string;
+  creatorPublicKey: string;
   /** Unsigned base64 XDR, built externally, sourced from the treasury account. */
   xdr: string;
 }
@@ -172,6 +173,7 @@ export const treasurySignaturesService = {
       await auditTx(db, {
         userId: params.creatorId,
         groupId: params.groupId,
+        actorPublicKey: params.creatorPublicKey,
         action: AuditAction.TREASURY_TX_PROPOSAL_CREATED,
         entityType: "treasury_tx_proposal",
         entityId: created.id,
@@ -252,6 +254,8 @@ export const treasurySignaturesService = {
             weight: onChainWeight.get(a.user.stellarPublicKey) ?? 0,
           }))
           .filter((a) => a.weight > 0);
+        const actorPublicKey =
+          authorizedAdmins.find((admin) => admin.userId === args.userId)?.publicKey ?? null;
 
         const submitted = parseXdr(args.signedXdr, "Could not parse signed XDR");
         const submittedHash = submitted.hash().toString("hex");
@@ -355,6 +359,7 @@ export const treasurySignaturesService = {
           await auditTx(db, {
             userId: sig.userId,
             groupId: proposal.groupId,
+            actorPublicKey: sig.publicKey,
             action: AuditAction.TREASURY_TX_PROPOSAL_SIGNATURE_ADDED,
             entityType: "treasury_tx_proposal",
             entityId: proposal.id,
@@ -386,7 +391,9 @@ export const treasurySignaturesService = {
           data: { status: STATUS.ready, requiredWeight },
         });
         await auditTx(db, {
+          userId: args.userId,
           groupId: proposal.groupId,
+          actorPublicKey,
           action: AuditAction.TREASURY_TX_PROPOSAL_READY,
           entityType: "treasury_tx_proposal",
           entityId: proposal.id,
@@ -413,7 +420,9 @@ export const treasurySignaturesService = {
             data: { status: STATUS.submitted, stellarTxHash: hash },
           });
           await auditTx(db, {
+            userId: args.userId,
             groupId: proposal.groupId,
+            actorPublicKey,
             action: AuditAction.TREASURY_TX_PROPOSAL_SUBMITTED,
             entityType: "treasury_tx_proposal",
             entityId: proposal.id,
@@ -432,7 +441,9 @@ export const treasurySignaturesService = {
             data: { status: STATUS.failed, failureReason: reason },
           });
           await auditTx(db, {
+            userId: args.userId,
             groupId: proposal.groupId,
+            actorPublicKey,
             action: AuditAction.TREASURY_TX_PROPOSAL_FAILED,
             entityType: "treasury_tx_proposal",
             entityId: proposal.id,

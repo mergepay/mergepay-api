@@ -23,46 +23,27 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 import { auditTx } from "./audit";
 import { Errors } from "../errors";
+import {
+  SEP24_TRANSACTION_STATUSES,
+  isTerminalSep24Status,
+  type Sep24TransactionStatus,
+} from "./sep24-types";
 
-export type AnchorSessionStatus =
-  | "incomplete"
-  | "pending_user_transfer_start"
-  | "pending_user"
-  | "pending_transaction_info_update"
-  | "pending_receiver"
-  | "pending_sender"
-  | "pending_stellar"
-  | "pending_trust"
-  | "pending_anchor"
-  | "completed"
-  | "error"
-  | "refunded"
-  | "expired"
-  | "no_market"
-  | "too_small"
-  | "too_large";
+/**
+ * Local anchor-session status vocabulary.
+ *
+ * This is exactly the set of raw SEP-24 transaction statuses — kept as an
+ * alias of {@link Sep24TransactionStatus} rather than a second copy, so the
+ * session state machine and the raw status mapper can never disagree about
+ * which statuses exist.
+ */
+export type AnchorSessionStatus = Sep24TransactionStatus;
 
 export type AnchorTransitionSource = "user" | "webhook" | "poll";
 
 /** The full set of statuses Mergepay tracks for an anchor session. */
-export const ANCHOR_SESSION_STATUSES: readonly AnchorSessionStatus[] = [
-  "incomplete",
-  "pending_user_transfer_start",
-  "pending_user",
-  "pending_transaction_info_update",
-  "pending_receiver",
-  "pending_sender",
-  "pending_stellar",
-  "pending_trust",
-  "pending_anchor",
-  "completed",
-  "error",
-  "refunded",
-  "expired",
-  "no_market",
-  "too_small",
-  "too_large",
-];
+export const ANCHOR_SESSION_STATUSES: readonly AnchorSessionStatus[] =
+  SEP24_TRANSACTION_STATUSES;
 
 /**
  * Documented finite transition map. `completed` and `refunded` are terminal:
@@ -132,9 +113,7 @@ const ALLOWED_TRANSITIONS: Record<AnchorSessionStatus, readonly AnchorSessionSta
  * kept consistent with the SEP-24 terminal set in src/services/anchor.ts.
  */
 export function isTerminalAnchorStatus(status: string): boolean {
-  return [
-    "completed", "error", "refunded", "expired", "no_market", "too_small", "too_large",
-  ].includes(status);
+  return isTerminalSep24Status(status);
 }
 
 export function canTransitionAnchorStatus(

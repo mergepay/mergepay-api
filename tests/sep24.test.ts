@@ -224,6 +224,26 @@ describe("POST /anchors/withdraw — request validation", () => {
     expect(anchorService.getToml).not.toHaveBeenCalled();
     expect(prisma.anchorSession.create).not.toHaveBeenCalled();
   });
+
+  it("rejects a withdrawal without an amount before any anchor call", async () => {
+    const res = await post("/anchors/withdraw", { assetCode: "XLM", to: userKey });
+
+    expectValidation400(res);
+    expect(anchorService.getToml).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown withdrawal fields before any anchor call", async () => {
+    const res = await post("/anchors/withdraw", {
+      assetCode: "XLM",
+      amount: "5",
+      unexpected: true,
+    });
+
+    expectValidation400(res);
+    expect(anchorService.getToml).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.create).not.toHaveBeenCalled();
+  });
 });
 
 describe("SEP-24 session status — query validation", () => {

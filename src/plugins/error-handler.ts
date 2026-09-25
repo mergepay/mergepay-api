@@ -77,6 +77,26 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
       );
     }
 
+    // A body Fastify could not parse at all (malformed JSON) or an empty body
+    // sent where JSON was required. Surfaced here so it carries the same
+    // envelope as every other error instead of falling into the generic 4xx
+    // branch, which echoes the parser's own message — text that can quote the
+    // malformed input back to the client. Fixed 400 text, no parse details.
+    //
+    // Malformed JSON arrives as the SyntaxError thrown by JSON.parse with
+    // statusCode 400 set by Fastify's content-type parser — a shape nothing
+    // else in this pipeline produces, and one stable across parser message
+    // formats (which change between V8 releases and are deliberately not
+    // matched here).
+    if (
+      (err as any).code === "FST_ERR_CTP_EMPTY_JSON_BODY" ||
+      (err instanceof SyntaxError && (err as any).statusCode === 400)
+    ) {
+      return reply.code(400).send(
+        formatErrorResponse("VALIDATION_ERROR", "Request body must be valid JSON.", requestId)
+      );
+    }
+
     if (err instanceof AppError) {
       return reply.code(err.status).send(
         formatErrorResponse(err.code, err.message, requestId, err.details)

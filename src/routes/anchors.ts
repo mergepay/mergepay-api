@@ -25,7 +25,10 @@ import {
 } from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
-import { sep24InteractiveRequestSchema } from "../validations/sep24";
+import {
+  sep24DepositRequestSchema,
+  sep24WithdrawRequestSchema,
+} from "../validations/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {
@@ -93,9 +96,15 @@ export default async function anchorRoutes(app: FastifyInstance) {
   );
 
   // -- start deposit / withdraw -----------------------------------------------
-  async function start(kind: "deposit" | "withdrawal", req: any) {
+  async function start(
+    kind: "deposit" | "withdrawal",
+    req: any,
+    requestSchema = kind === "deposit"
+      ? sep24DepositRequestSchema
+      : sep24WithdrawRequestSchema
+  ) {
     const auth = requireUser(req);
-    const body = sep24InteractiveRequestSchema.parse(req.body);
+    const body = requestSchema.parse(req.body);
 
     // Validate that the requested asset is supported.
     validateAsset(body.assetCode);
@@ -142,7 +151,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         summary: "Initiate SEP-24 interactive deposit",
         description:
           "Initiates a SEP-24 interactive deposit session and returns an anchor auth challenge.",
-        body: openApiBody(sep24InteractiveRequestSchema),
+        body: openApiBody(sep24DepositRequestSchema),
         response: {
           200: {
             type: "object",
@@ -168,7 +177,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         summary: "Initiate SEP-24 interactive withdrawal",
         description:
           "Initiates a SEP-24 interactive withdrawal session and returns an anchor auth challenge.",
-        body: openApiBody(sep24InteractiveRequestSchema),
+        body: openApiBody(sep24WithdrawRequestSchema),
         response: {
           200: {
             type: "object",

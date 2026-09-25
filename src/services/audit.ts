@@ -73,6 +73,8 @@ export interface AuditParams {
   entityId: string;
   outcome?: AuditOutcome;
   actorType?: AuditActorType;
+  /** Public Stellar key of the actor; private key material is never accepted. */
+  actorPublicKey?: string | null;
   /** Safe, structured detail only — never private keys, bearer tokens, or signed XDRs. */
   metadata?: Record<string, unknown>;
 }
@@ -89,6 +91,7 @@ export function auditData(params: AuditParams) {
       ...(sanitize(params.metadata ?? {}) as Record<string, unknown>),
       ...(params.outcome ? { outcome: params.outcome } : {}),
       ...(params.actorType ? { actorType: params.actorType } : {}),
+      ...(params.actorPublicKey ? { actorPublicKey: params.actorPublicKey } : {}),
     } as any,
   };
 }

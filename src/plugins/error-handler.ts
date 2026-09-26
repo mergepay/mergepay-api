@@ -5,6 +5,7 @@ import { AppError } from "../lib/errors";
 import { formatErrorResponse } from "../utils/error-response";
 import { toRequestLimitError } from "../lib/request-limits";
 import { toPrismaError } from "../lib/prisma-error";
+import { ProviderError } from "../lib/provider-error";
 import { TimeoutError, TransportError, toProviderError } from "../services/timeout";
 
 function isHorizonError(error: unknown): error is Error & {
@@ -99,6 +100,9 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     }
 
     if (err instanceof AppError) {
+      if (err instanceof ProviderError && err.retryAfterSeconds !== undefined) {
+        reply.header("Retry-After", String(err.retryAfterSeconds));
+      }
       return reply.code(err.status).send(
         formatErrorResponse(err.code, err.message, requestId, err.details)
       );
@@ -182,8 +186,16 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
       );
 
       if (upstreamStatus === 429) {
-        return reply.code(429).send(
-          formatErrorResponse("RATE_LIMITED", "Horizon is rate limiting requests. Please retry shortly.", requestId)
+        const converted = toProviderError(err, {
+          provider: "horizon",
+          operation,
+          fallbackMessage: "Horizon is rate limiting requests. Please retry shortly.",
+        });
+        if (converted instanceof ProviderError && converted.retryAfterSeconds !== undefined) {
+          reply.header("Retry-After", String(converted.retryAfterSeconds));
+        }
+        return reply.code(converted.status).send(
+          formatErrorResponse(converted.code, converted.message, requestId, converted.details)
         );
       }
 

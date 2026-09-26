@@ -128,7 +128,11 @@ describe("loadAccount — transient failures are retried", () => {
   it("gives up after the configured attempts on a persistent 429", async () => {
     h.loadAccount.mockRejectedValue(horizonError(429));
 
-    await expect(stellar.loadAccount("GABC")).rejects.toMatchObject({ code: "UPSTREAM_ERROR" });
+    await expect(stellar.loadAccount("GABC")).rejects.toMatchObject({
+      code: "SERVICE_UNAVAILABLE",
+      status: 503,
+      category: "rate_limited",
+    });
     expect(h.loadAccount).toHaveBeenCalledTimes(3);
   });
 
@@ -144,7 +148,11 @@ describe("loadAccount — transient failures are retried", () => {
     setConfig({ HORIZON_RETRY_ON_RATE_LIMIT: false });
     h.loadAccount.mockRejectedValue(horizonError(429));
 
-    await expect(stellar.loadAccount("GABC")).rejects.toMatchObject({ code: "UPSTREAM_ERROR" });
+    await expect(stellar.loadAccount("GABC")).rejects.toMatchObject({
+      code: "SERVICE_UNAVAILABLE",
+      status: 503,
+      category: "rate_limited",
+    });
     expect(h.loadAccount).toHaveBeenCalledTimes(1);
   });
 });

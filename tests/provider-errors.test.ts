@@ -87,9 +87,33 @@ describe("toProviderError", () => {
   });
 
   it("maps upstream 429 to rate_limited", () => {
-    const err = toProviderError({ response: { status: 429, data: {} } }, ctx) as ProviderError;
+    const err = toProviderError({
+      response: { status: 429, headers: { "Retry-After": "7" }, data: {} },
+    }, ctx) as ProviderError;
     expect(err.category).toBe("rate_limited");
     expect(err.retryable).toBe(true);
+    expect(err.status).toBe(503);
+    expect(err.code).toBe("SERVICE_UNAVAILABLE");
+    expect(err.retryAfterSeconds).toBe(7);
+    expect(err.details).toMatchObject({ hint: expect.any(String), retryAfterSeconds: 7 });
+  });
+
+  it("parses Retry-After HTTP dates on timeout-wrapped SDK errors", () => {
+    const retryAt = new Date(Date.now() + 5_000);
+    const err = toProviderError(
+      new TransportError("Horizon.loadAccount", {
+        response: {
+          status: 429,
+          headers: { get: () => retryAt.toUTCString() },
+          data: {},
+        },
+      }),
+      ctx,
+    ) as ProviderError;
+
+    expect(err.category).toBe("rate_limited");
+    expect(err.retryAfterSeconds).toBeGreaterThanOrEqual(0);
+    expect(err.retryAfterSeconds).toBeLessThanOrEqual(5);
   });
 
   it("maps upstream 5xx to unavailable", () => {

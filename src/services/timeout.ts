@@ -9,6 +9,7 @@
 import { AppError, Errors } from "../errors";
 import {
   ProviderError,
+  retryAfterSeconds,
   type ProviderFailureCategory,
 } from "../lib/provider-error";
 
@@ -297,12 +298,17 @@ export function toProviderError(
   if (error instanceof TimeoutError) {
     return new ProviderError({ ...ctx, message: ctx.fallbackMessage, category: "timeout" });
   }
-  if (error instanceof TransportError) {
+  if (error instanceof TransportError && statusOf(error.cause) === null) {
     return new ProviderError({ ...ctx, message: ctx.fallbackMessage, category: "transport" });
   }
 
-  const codes = resultCodesOf(error);
-  const status = statusOf(error);
+  // withTimeout wraps unknown SDK failures as TransportError. Preserve the
+  // underlying HTTP response so rate limits and their headers are not lost.
+  const upstreamError = error instanceof TransportError && statusOf(error.cause) !== null
+    ? error.cause
+    : error;
+  const codes = resultCodesOf(upstreamError);
+  const status = statusOf(upstreamError);
   const category: ProviderFailureCategory = codes
     ? "rejected"
     : status === 429
@@ -319,5 +325,8 @@ export function toProviderError(
     message: ctx.fallbackMessage,
     category,
     detail: codes ?? undefined,
+    retryAfterSeconds: category === "rate_limited" && ctx.provider === "horizon"
+      ? retryAfterSeconds(upstreamError)
+      : undefined,
   });
 }

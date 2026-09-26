@@ -379,3 +379,92 @@ export function errorSerializer(error: unknown): SerializedError {
 
   return { ...errorHeadline(error), ...applicationErrorFields(error) };
 }
+
+// ─── Stellar transaction hash serializer ────────────────────────────────────
+
+/**
+ * Number of hexadecimal characters in a Stellar transaction hash.
+ *
+ * A Stellar transaction hash is the SHA-256 digest of the transaction
+ * envelope, so it is always exactly 32 bytes rendered as 64 hex characters
+ * (e.g. Horizon's `hash` field and `Transaction.hash()` both produce this
+ * shape).
+ */
+export const STELLAR_TX_HASH_HEX_LENGTH = 64;
+
+/** Exact shape of a well-formed Stellar transaction hash. */
+const STELLAR_TX_HASH_PATTERN = /^[0-9a-fA-F]{64}$/;
+
+/** Leading characters kept when shortening a valid hash for logs. */
+const TX_HASH_HEAD = 8;
+
+/** Trailing characters kept when shortening a valid hash for logs. */
+const TX_HASH_TAIL = 8;
+
+/** Emitted for `null` / `undefined` hash fields. */
+export const MISSING_TX_HASH = "[missing-tx-hash]";
+
+/** Emitted for non-string or structurally-invalid hash fields. */
+export const INVALID_TX_HASH = "[invalid-tx-hash]";
+
+/**
+ * Type guard: is `value` a well-formed Stellar transaction hash?
+ *
+ * Surrounding whitespace is tolerated (anchors and clients sometimes pad
+ * values) and the hash is matched case-insensitively — Stellar emits
+ * lowercase, but uppercase hex is accepted and normalized downstream.
+ */
+export function isStellarTxHash(value: unknown): value is string {
+  return typeof value === "string" && STELLAR_TX_HASH_PATTERN.test(value.trim());
+}
+
+/**
+ * Shorten a validated transaction hash for human-readable log output:
+ * `abc12345…6789def0`. Short inputs are returned untouched so the helper
+ * cannot mangle a value it was never meant to transform.
+ */
+export function truncateStellarTxHash(hash: string): string {
+  const normalized = hash.trim();
+  if (normalized.length <= TX_HASH_HEAD + TX_HASH_TAIL) return normalized;
+  return `${normalized.slice(0, TX_HASH_HEAD)}…${normalized.slice(-TX_HASH_TAIL)}`;
+}
+
+/**
+ * Pino-compatible serializer for Stellar transaction hashes.
+ *
+ * Raw transaction objects and full 64-character hashes clutter structured log
+ * output. This serializer validates the value, normalizes it to lowercase, and
+ * shortens it to an `xxxxxxxx…xxxxxxxx` form. Malformed values never throw and
+ * are replaced with a sentinel so the field is still visible without echoing
+ * untrusted input into the logs.
+ *
+ * Non-string values (including `null`) are collapsed to a sentinel rather than
+ * stringified — a serialized object or `"undefined"` would be both noisy and
+ * misleading about which hash a log line refers to.
+ */
+export function txHashSerializer(value: unknown): string {
+  if (value === null || value === undefined) return MISSING_TX_HASH;
+  if (typeof value !== "string") return INVALID_TX_HASH;
+  if (!isStellarTxHash(value)) return INVALID_TX_HASH;
+  return truncateStellarTxHash(value.trim().toLowerCase());
+}
+
+/**
+ * Pino `serializers` entries for the field names Stellar hashes travel under
+ * across the API server and workers.
+ *
+ * Spread this into a Pino `serializers` map (or a Fastify `logger.serializers`
+ * config) so every Stellar hash field is normalized and shortened
+ * automatically. Pino only invokes a serializer for the exact key it is
+ * registered under, so each known alias is listed explicitly.
+ */
+export const stellarTxHashSerializers: Record<
+  string,
+  (value: unknown) => string
+> = {
+  txHash: txHashSerializer,
+  stellarTxHash: txHashSerializer,
+  intendedTxHash: txHashSerializer,
+  transactionHash: txHashSerializer,
+  stellarTransactionHash: txHashSerializer,
+};

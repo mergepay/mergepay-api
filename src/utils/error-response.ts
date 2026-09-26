@@ -7,13 +7,20 @@ export interface ErrorPayload {
   issues?: unknown;
 }
 
+export interface FormattedErrorResponse {
+  error: ErrorPayload;
+  code: string;
+  message: string;
+  requestId?: string;
+}
+
 export function formatErrorResponse(
   code: string,
   message: string,
   requestId?: string,
   details?: unknown,
   issues?: unknown
-) {
+): FormattedErrorResponse {
   const payload: ErrorPayload = {
     code,
     message,

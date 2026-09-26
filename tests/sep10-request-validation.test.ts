@@ -7,7 +7,8 @@
  * and no audit row is written. Valid requests must still succeed.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { Keypair, Transaction } from "@stellar/stellar-sdk";
+import jwt from "jsonwebtoken";
+import { Account, Keypair, MuxedAccount, Transaction } from "@stellar/stellar-sdk";
 
 const h = vi.hoisted(() => {
   const consumed = new Set<string>();
@@ -60,7 +61,7 @@ vi.mock("../src/services/sep10", async (importActual) => {
   return {
     ...actual,
     buildChallenge: vi.fn(actual.buildChallenge),
-    verifyChallenge: vi.fn(actual.verifyChallenge),
+    authenticateChallenge: vi.fn(actual.authenticateChallenge),
   };
 });
 
@@ -76,7 +77,7 @@ vi.mock("../src/services/refresh-token", async (importActual) => {
 });
 
 import { buildApp } from "../src/app";
-import { buildChallenge, verifyChallenge } from "../src/services/sep10";
+import { authenticateChallenge, buildChallenge } from "../src/services/sep10";
 import { config } from "../src/config";
 
 const realSep10 = await vi.importActual<typeof import("../src/services/sep10")>(
@@ -160,6 +161,25 @@ describe("POST /auth/challenge validation", () => {
     expect(buildChallenge).not.toHaveBeenCalled();
   });
 
+  it("rejects a muxed (M...) account (not supported)", async () => {
+    const base = Keypair.random().publicKey();
+    const muxed = new MuxedAccount(new Account(base, "0"), "7").accountId();
+    const res = await inject({ method: "POST", url: "/auth/challenge", payload: { account: muxed } });
+
+    expectValidationError(res, "account");
+    expect(buildChallenge).not.toHaveBeenCalled();
+  });
+
+  it("rejects a SEP-10 memo (not supported)", async () => {
+    const res = await inject({
+      method: "POST",
+      url: "/auth/challenge",
+      payload: { account: Keypair.random().publicKey(), memo: "12345" },
+    });
+    expectValidationError(res);
+    expect(buildChallenge).not.toHaveBeenCalled();
+  });
+
   it("rejects an array body", async () => {
     const res = await inject({
       method: "POST",
@@ -218,6 +238,32 @@ describe("POST /auth/verify validation", () => {
     expect(res.json().token).toBeTruthy();
   });
 
+  it("issues a session token whose jti is the redeemed challenge's hash", async () => {
+    const client = Keypair.random();
+    h.prisma.user.upsert.mockResolvedValueOnce({
+      id: "user_jti",
+      stellarPublicKey: client.publicKey(),
+      displayName: "Tester",
+      avatarUrl: null,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    const signed = signedChallenge(client);
+    const challengeHash = new Transaction(signed, config.networkPassphrase).hash().toString("hex");
+
+    const res = await inject({ method: "POST", url: "/auth/verify", payload: { transaction: signed } });
+
+    expect(res.statusCode).toBe(200);
+    const claims = jwt.decode(res.json().token) as jwt.JwtPayload;
+    expect(claims).toMatchObject({
+      sub: "user_jti",
+      pk: client.publicKey(),
+      iss: config.JWT_ISSUER,
+      aud: config.JWT_AUDIENCE,
+      jti: challengeHash,
+    });
+    expect(claims.exp! - claims.iat!).toBe(config.ACCESS_TOKEN_TTL_SECONDS);
+  });
+
   it("accepts the optional SEP-10 domain fields", async () => {
     const client = Keypair.random();
     h.prisma.user.upsert.mockResolvedValueOnce({
@@ -252,7 +298,7 @@ describe("POST /auth/verify validation", () => {
   ])("rejects %s with 400 before verification", async (_label, payload, field) => {
     const res = await inject({ method: "POST", url: "/auth/verify", payload });
     expectValidationError(res, field);
-    expect(verifyChallenge).not.toHaveBeenCalled();
+    expect(authenticateChallenge).not.toHaveBeenCalled();
     expect(h.prisma.user.upsert).not.toHaveBeenCalled();
     expect(h.prisma.auditLog.create).not.toHaveBeenCalled();
   });
@@ -266,7 +312,7 @@ describe("POST /auth/verify validation", () => {
       payload: { transaction, account: client.publicKey() },
     });
     expectValidationError(res);
-    expect(verifyChallenge).not.toHaveBeenCalled();
+    expect(authenticateChallenge).not.toHaveBeenCalled();
     // The challenge was not burned by the rejected request, so a corrected
     // retry with the same signed envelope still succeeds.
     expect(h.consumed.size).toBe(0);
@@ -279,12 +325,12 @@ describe("POST /auth/verify validation", () => {
       payload: { transaction: "AAAA" },
     });
     expectValidationError(res);
-    expect(verifyChallenge).not.toHaveBeenCalled();
+    expect(authenticateChallenge).not.toHaveBeenCalled();
   });
 
   it("rejects a request with no body", async () => {
     const res = await inject({ method: "POST", url: "/auth/verify" });
     expectValidationError(res);
-    expect(verifyChallenge).not.toHaveBeenCalled();
+    expect(authenticateChallenge).not.toHaveBeenCalled();
   });
 });

@@ -106,26 +106,49 @@ describe("error response shape consistency", () => {
       expect(body.stack).toBeUndefined();
     }
   });
-});
-
-describe("malformed request validation", () => {
+});describe("malformed request validation", () => {
   it("VALIDATION_ERROR with details for empty body", async () => {
     const res = await app.inject({ method: "POST", url: "/auth/challenge", payload: {} });
     expect(res.statusCode).toBe(400);
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.details)).toBe(true);
+    expect(Array.isArray(body.error.details)).toBe(true);
   });
 
   it("VALIDATION_ERROR with field-level details for invalid body types", async () => {
     const res = await app.inject({
-      method: "POST", url: "/groups", headers: authHeader(), payload: { name: "" },
+      method: "POST",
+      url: "/groups", headers: authHeader(), payload: { name: "" },
     });
     expect(res.statusCode).toBe(400);
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.details)).toBe(true);
-    expect(body.details[0].field).toBe("name");
+    expect(Array.isArray(body.error.details)).toBe(true);
+    expect(body.error.details[0].field).toBe("name");
+  });
+
+  it("Zod validation errors include standardized 'issues' array", async () => {
+    const res = await app.inject({ method: "POST", url: "/auth/challenge", payload: {} });
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.code).toBe("VALIDATION_ERROR");
+    expect(Array.isArray(body.error.issues)).toBe(true);
+    expect(body.error.issues.length).toBeGreaterThan(0);
+    // Each issue has path, message, and code — no stack traces or internal fields
+    for (const issue of body.error.issues) {
+      expect(Array.isArray(issue.path)).toBe(true);
+      expect(typeof issue.message).toBe("string");
+      expect(typeof issue.code).toBe("string");
+      expect(issue).not.toHaveProperty("stack");
+    }
+  });
+
+  it("Zod validation error response has no stack traces", async () => {
+    const res = await app.inject({ method: "POST", url: "/auth/challenge", payload: {} });
+    const body = res.json();
+    expect(body.stack).toBeUndefined();
+    expect(body.error.issues?.[0]?.stack).toBeUndefined();
+    expect(body.error.details?.[0]?.stack).toBeUndefined();
   });
 
 
@@ -135,19 +158,24 @@ describe("authorization failures", () => {
   it("UNAUTHORIZED when no auth header", async () => {
     const res = await app.inject({ method: "GET", url: "/me" });
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
+    const body = res.json();
+    expect(body.error.code).toBe("UNAUTHORIZED");
   });
 
-  it("UNAUTHORIZED for malformed Bearer token", async () => {
+  // #16: a credential that cannot be verified at all is INVALID_TOKEN, so a
+  // client does not confuse it with its own expired (but once-valid) token.
+  it("INVALID_TOKEN for malformed Bearer token", async () => {
     const res = await app.inject({ method: "GET", url: "/me", headers: { authorization: "Bearer bad-token" } });
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
+    const body = res.json();
+    expect(body.error.code).toBe("INVALID_TOKEN");
+    expect(body.error.message).toBe("Invalid token");
   });
 
   it("UNAUTHORIZED when token is missing Bearer scheme", async () => {
     const res = await app.inject({ method: "GET", url: "/me", headers: { authorization: "Token xxx" } });
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("UNAUTHORIZED");
   });
 });
 
@@ -155,7 +183,8 @@ describe("not found failures", () => {
   it("NOT_FOUND for unknown route", async () => {
     const res = await app.inject({ method: "GET", url: "/nonexistent" });
     expect(res.statusCode).toBe(404);
-    expect(res.json().code).toBe("NOT_FOUND");
-    expect(res.json().message).toBe("Route not found");
+    const body = res.json();
+    expect(body.error.code).toBe("NOT_FOUND");
+    expect(body.error.message).toBe("Route not found");
   });
 });

@@ -4,6 +4,8 @@
 
 ## Checklist
 
+- [ ] Read and followed the [Contributing Guidelines](../CONTRIBUTING.md)
+- [ ] `npm run lint` passes (code formatting and ESLint rules)
 - [ ] `npm run build` passes
 - [ ] `npm test` passes (offline — DB/network mocked)
 - [ ] New endpoints validated with Zod + permission checks
@@ -14,3 +16,4 @@
 ## Related issues
 
 <!-- Closes #... -->
+

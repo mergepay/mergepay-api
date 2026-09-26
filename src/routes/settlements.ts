@@ -20,10 +20,18 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
+import {
+  openApiBody,
+  openApiEnvelope,
+  openApiErrorResponses,
+  openApiIdParams,
+  openApiResponse,
+} from "../lib/openapi";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
+import { requireGroupRole } from "../plugins/group-access";
 import { stellar, memoText } from "../services/stellar";
 import { validateSettlementXdr } from "../services/settlement-xdr";
 import { shortCode } from "../services/codes";
@@ -48,9 +56,10 @@ import {
   takeForPage,
 } from "../lib/pagination";
 import {
-  loadGroupBalancesWithSuggestions,
+  loadGroupBalancesWithSuggestionsByAsset,
   groupPrimaryAsset,
 } from "../services/group-balances";
+import { balanceAssetKey, type Suggestion } from "../services/settlement";
 import { validateAsset, validateAmount } from "../services/assets";
 import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
 import {
@@ -61,9 +70,15 @@ import {
 import {
   isTerminalSettlementStatus,
   resolveSettlementStatus,
+  toFailureInfo,
   toPublicStatus,
 } from "../services/settlement-status";
+import { applySettlementTransition } from "../services/settlement-machine";
 import { recordStatusTransitionInTransaction } from "../services/status-history";
+import {
+  assertPreflightResult,
+  evaluatePreflight,
+} from "../services/settlement-preflight";
 
 const settlementInclude = { from: true, to: true, statusHistory: true } as const;
 
@@ -81,6 +96,43 @@ const settlementIdParamSchema = z.object({
     .min(4)
     .max(64)
     .regex(/^[A-Za-z0-9_-]+$/, "Not a valid settlement identifier"),
+});
+
+/**
+ * Execution takes the settlement id in the body rather than the path. The
+ * idempotency reservation hashes the body, so putting every field that defines
+ * the request there is what makes "same key, different request" detectable at
+ * all — a path parameter would sit outside the hash.
+ */
+const executeBodySchema = z.object({
+  settlementId: z.string().min(1).max(64),
+  signedXdr: z.string().min(1),
+});
+
+/** Body of `POST /settlements/:id/confirm` — the wallet's signed envelope. */
+const confirmBodySchema = z.object({ signedXdr: z.string().min(1) });
+
+/** Request-body schemas used for OpenAPI documentation of the settlement
+ * creation routes (both routes validate the payload with Zod in-handler; the
+ * schemas here render the accepted shapes in the Swagger UI). */
+const settleBodyDocSchema = z.object({
+  assetCode: z.string().max(12).optional(),
+  assetIssuer: z.string().nullable().optional(),
+  // `.min(MIN)` rather than `.positive()`: under OpenAPI 3, zod-to-json-schema
+  // renders `.positive()` as the draft-04 `exclusiveMinimum: true` form, which
+  // @fastify/swagger rejects on a route schema. Bounds mirror
+  // `intentValiditySchema` (src/lib/time-bounds.ts) so the documented shape
+  // matches what the handler enforces.
+  validitySeconds: z.number().int().min(30).max(300).optional(),
+});
+
+const freeformSettleBodyDocSchema = z.object({
+  toUserId: z.string(),
+  amount: z.string(),
+  assetCode: z.string().max(12),
+  assetIssuer: z.string().nullable().optional(),
+  // Mirrors `intentValiditySchema` bounds (30-300s); see settleBodyDocSchema.
+  validitySeconds: z.number().int().min(30).max(300).optional(),
 });
 
 const settlementStatusQuerySchema = z.object({
@@ -107,9 +159,25 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // user rather than falling back to IP.
   const createLimit = rateLimited("settlementCreate");
   const confirmLimit = rateLimited("settlementConfirm");
+  const executeLimit = rateLimited("settlementExecute");
 
   // -- settle a specific expense share ----------------------------------------
-  app.post("/expenses/:id/settle", createLimit, async (req) => {
+  app.post(
+    "/expenses/:id/settle",
+    {
+      ...createLimit,
+      schema: {
+        tags: ["Settlements"],
+        summary: "Settle your share of an expense",
+        params: openApiIdParams(),
+        body: openApiBody(settleBodyDocSchema),
+        response: {
+          ...openApiEnvelope("settlement"),
+          ...openApiErrorResponses(400, 401, 403, 404, 409, 429),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: expenseId } = idParamSchema.parse(req.params);
     const body = z
@@ -133,6 +201,14 @@ export default async function settlementRoutes(app: FastifyInstance) {
     });
     if (!expense) throw Errors.notFound("Expense not found");
     await requireMembership(expense.groupId, auth.id);
+
+    const payerMembership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId: expense.groupId, userId: expense.payerUserId } },
+      select: { userId: true },
+    });
+    if (!payerMembership) {
+      throw Errors.badRequest("invalid_payer", "Expense payer is no longer an active group member");
+    }
 
     const myShare = expense.shares.find((s) => s.userId === auth.id);
     if (!myShare) throw Errors.badRequest("no_share", "You have no share in this expense");
@@ -162,6 +238,28 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.conflict("already_settled", "Your share is already settled");
         }
 
+        // Database-level duplicate guard: even if the request-level idempotency
+        // service is bypassed (e.g. no key, or a test double), the unique
+        // constraint on (expenseShareId, idempotencyKey) catches duplicates.
+        if (idempotencyKey) {
+          const existing = await tx.settlement.findFirst({
+            where: {
+              expenseShareId: myShare.id,
+              idempotencyKey,
+              status: { notIn: ["failed"] },
+            },
+            select: { id: true, shortCode: true, status: true },
+          });
+          if (existing) {
+            return {
+              settlement: serializeSettlement(existing),
+              xdr: null,
+              networkPassphrase: config.networkPassphrase,
+              duplicate: true,
+            };
+          }
+        }
+
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({
@@ -175,6 +273,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
             assetIssuer,
             status: "pending",
             memo: memoText(code),
+            idempotencyKey: idempotencyKey ?? undefined,
             expenseId: expense.id,
             expenseShareId: myShare.id,
             expiresAt,
@@ -192,6 +291,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
         await tx.expenseShare.update({
           where: { id: myShare.id },
           data: { status: "settling" },
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: expense.groupId,
+          action: "settlement.create",
+          entityType: "settlement",
+          entityId: settlement.id,
+          metadata: {
+            from: auth.id,
+            to: expense.payerUserId,
+            amount: myShare.shareAmount,
+            assetCode,
+          },
         });
 
         const xdr = await buildSettlementXdr({
@@ -216,10 +329,25 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- freeform settle-up against net balance ---------------------------------
-  app.post("/groups/:id/settlements", createLimit, async (req) => {
+  app.post(
+    "/groups/:id/settlements",
+    {
+      ...createLimit,
+      preHandler: requireGroupRole("member", { param: "id" }),
+      schema: {
+        tags: ["Settlements"],
+        summary: "Settle up against a group's net balance",
+        params: openApiIdParams(),
+        body: openApiBody(freeformSettleBodyDocSchema),
+        response: {
+          ...openApiEnvelope("settlement"),
+          ...openApiErrorResponses(400, 401, 403, 404, 429),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
     const body = z
       .object({
         toUserId: z.string(),
@@ -231,9 +359,6 @@ export default async function settlementRoutes(app: FastifyInstance) {
       .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
-
-    validateAmount(body.amount);
-    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     if (body.toUserId === auth.id) {
       throw Errors.badRequest("self_settle", "You cannot settle with yourself");
@@ -264,6 +389,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
             assetIssuer: body.assetIssuer ?? null,
             status: "pending",
             memo: memoText(code),
+            idempotencyKey: idempotencyKey ?? undefined,
             expiresAt,
           },
           include: settlementInclude,
@@ -274,6 +400,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
           entityId: settlement.id,
           newStatus: "pending",
           source: "api",
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId,
+          action: "settlement.create",
+          entityType: "settlement",
+          entityId: settlement.id,
+          metadata: {
+            from: auth.id,
+            to: body.toUserId,
+            amount: body.amount,
+            assetCode: body.assetCode,
+          },
         });
 
         const xdr = await buildSettlementXdr({
@@ -298,10 +438,27 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
-  app.post("/settlements/:id/confirm", confirmLimit, async (req) => {
+  app.post(
+    "/settlements/:id/confirm",
+    {
+      ...confirmLimit,
+      schema: {
+        tags: ["Settlements"],
+        summary: "Confirm a settlement with a signed transaction",
+        description:
+          "Validates the wallet's signed XDR against the original intent and submits it for on-chain execution. `Idempotency-Key` is required. Only the settlement's payer may confirm it.",
+        params: openApiIdParams(),
+        body: openApiBody(confirmBodySchema),
+        response: {
+          ...openApiEnvelope("settlement"),
+          ...openApiErrorResponses(400, 401, 403, 404, 409, 429),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
-    const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+    const body = confirmBodySchema.parse(req.body);
 
     // Required, not optional: this is the request that ends in a payment, and a
     // wallet or mobile client retrying after a timeout must never be able to
@@ -321,6 +478,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       include: settlementInclude,
     });
     if (!settlementRow) throw Errors.notFound("Settlement not found");
+    await requireMembership(settlementRow.groupId, auth.id);
     if (settlementRow.fromUserId !== auth.id) {
       throw Errors.forbidden("Only the payer can confirm this settlement");
     }
@@ -358,13 +516,63 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.forbidden("Only the payer can confirm this settlement");
         }
 
-        // Already accepted — return the current state rather than re-submitting
-        // or erroring, so a retry without the original key is still safe.
+        // Already accepted or in-flight — return the current state rather
+        // than re-submitting or erroring, so a retry without the original key
+        // is still safe. When a transaction hash exists, the worker already
+        // submitted to Horizon and is tracking the outcome; the confirm
+        // endpoint must not interfere.
         if (
           settlement.status === "completed" ||
           settlement.status === "confirmed" ||
-          settlement.status === "submitted"
+          settlement.status === "submitted" ||
+          settlement.status === "verifying" ||
+          settlement.status === "needs_review"
         ) {
+          // Safe Stellar timeout reconciliation: if the user's confirmation
+          // response was lost (network timeout, process crash), the settlement
+          // may already be on-chain. Verify the ledger before returning so the
+          // client gets an accurate picture rather than a stale "submitted".
+          if (settlement.stellarTxHash) {
+            try {
+              const onChain = await stellar.getTransaction(settlement.stellarTxHash);
+              if (onChain?.successful) {
+                await applySettlementTransition({
+                  settlementId: settlement.id,
+                  nextStatus: "confirmed",
+                  source: "system",
+                  extraData: {
+                    retryCount: 0,
+                    errorCategory: null,
+                    failureReason: null,
+                  },
+                  settleExpenseShare: true,
+                });
+                const refreshed = await tx.settlement.findUnique({
+                  where: { id },
+                  include: settlementInclude,
+                });
+                return { settlement: serializeSettlement(refreshed!) };
+              }
+              if (onChain && !onChain.successful) {
+                await applySettlementTransition({
+                  settlementId: settlement.id,
+                  nextStatus: "failed",
+                  source: "system",
+                  extraData: {
+                    failureReason: `Transaction ${settlement.stellarTxHash} failed on Stellar`,
+                  },
+                });
+                const refreshed = await tx.settlement.findUnique({
+                  where: { id },
+                  include: settlementInclude,
+                });
+                return { settlement: serializeSettlement(refreshed!) };
+              }
+            } catch {
+              // Horizon unreachable — return persisted state, not an error.
+              // The worker's reconciliation will keep watching the hash.
+            }
+          }
           return { settlement: serializeSettlement(settlement) };
         }
 
@@ -373,6 +581,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           // retry bookkeeping is reset below so the worker picks it up fresh.
           await auditTx(tx, {
             userId: auth.id,
+            groupId: settlement.groupId,
             action: "settlement.confirm.retry",
             entityType: "settlement",
             entityId: id,
@@ -392,7 +601,11 @@ export default async function settlementRoutes(app: FastifyInstance) {
             status: "submitted",
             submittedAt: new Date(),
             retryCount: 0,
+            // A re-signed settlement starts clean: leaving the previous
+            // attempt's category behind would report a live submission as
+            // having failed for a reason that no longer applies.
             failureReason: null,
+            failureCategory: null,
           },
         });
 
@@ -405,6 +618,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           });
           await auditTx(tx, {
             userId: auth.id,
+            groupId: settlement.groupId,
             action: "settlement.confirm",
             entityType: "settlement",
             entityId: id,
@@ -422,6 +636,161 @@ export default async function settlementRoutes(app: FastifyInstance) {
     });
   });
 
+  // -- execute (idempotent submission) ----------------------------------------
+  //
+  // The same effect as `POST /settlements/:id/confirm` — hand a signed envelope
+  // toward Horizon — but with idempotency enforced at the HTTP layer rather
+  // than around the transaction.
+  //
+  // The distinction matters for retries. `runIdempotent` replays the
+  // *operation's return value*; this route replays the *response the first
+  // attempt sent*, status code included, because a client that retried after a
+  // 202 and got back a 200 would draw a different conclusion about what
+  // happened to its payment. The `X-Idempotency-Key` preHandler (see
+  // src/plugins/idempotency.ts) reserves the key before the handler runs, so
+  // two concurrent retries resolve at the database's unique constraint and only
+  // one of them ever builds or submits a transaction.
+  //
+  // The key is mandatory here. This is the request that ends in money moving,
+  // and network latency between a client and this API is exactly the condition
+  // that produces an unacknowledged retry.
+  app.post(
+    "/api/settlements/execute",
+    {
+      ...executeLimit,
+      preHandler: app.idempotent({
+        scope: "settlement.execute",
+        required: true,
+      }),
+      schema: {
+        tags: ["Settlements"],
+        summary: "Execute a settlement (idempotent submission)",
+        description:
+          "Submits a signed envelope toward Horizon with idempotency enforced at the HTTP layer. `X-Idempotency-Key` is required. Responds 202 when this request accepted the submission and 200 when it was already in flight.",
+        body: openApiBody(executeBodySchema),
+        response: {
+          ...openApiEnvelope("settlement"),
+          202: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              settlement: { type: "object", additionalProperties: true },
+            },
+          },
+          ...openApiErrorResponses(400, 401, 403, 404, 409, 429),
+        },
+      },
+    },
+    async (req, reply) => {
+      const auth = requireUser(req);
+      const body = executeBodySchema.parse(req.body);
+
+      const settlementRow = await prisma.settlement.findUnique({
+        where: { id: body.settlementId },
+        include: settlementInclude,
+      });
+      if (!settlementRow) throw Errors.notFound("Settlement not found");
+      await requireMembership(settlementRow.groupId, auth.id);
+      if (settlementRow.fromUserId !== auth.id) {
+        throw Errors.forbidden("Only the payer can execute this settlement");
+      }
+
+      // Validate the envelope against the original intent before any state
+      // changes, so a transaction that does not match what the API authorized
+      // is rejected before it can be persisted or reach the worker — and so a
+      // validation failure is never cached as an idempotent success.
+      try {
+        validateSettlementXdr(body.signedXdr, settlementRow);
+      } catch (err) {
+        await audit({
+          userId: auth.id,
+          groupId: settlementRow.groupId,
+          action: "settlement.execute.validation_failed",
+          entityType: "settlement",
+          entityId: settlementRow.id,
+          outcome: "failure",
+          metadata: {
+            // The service's own stable text, never the envelope itself.
+            reason: err instanceof Error ? err.message : "validation failed",
+          },
+        });
+        throw err;
+      }
+
+      const result = await prisma.$transaction(async (tx) => {
+        const settlement = await tx.settlement.findUnique({
+          where: { id: body.settlementId },
+          include: settlementInclude,
+        });
+        if (!settlement) throw Errors.notFound("Settlement not found");
+
+        // Already accepted. Returning current state rather than re-submitting
+        // keeps a retry that lost its idempotency key safe too: the key is the
+        // first line of defence against a duplicate submission, not the only
+        // one.
+        if (
+          settlement.status === "completed" ||
+          settlement.status === "confirmed" ||
+          settlement.status === "submitted"
+        ) {
+          return {
+            settlement: serializeSettlement(settlement),
+            accepted: false,
+          };
+        }
+
+        // Conditional update, not a read-then-write: if a concurrent request
+        // moved the settlement off a submittable status between the read above
+        // and here, this affects zero rows and the winning state is returned
+        // instead of being clobbered.
+        const { count } = await tx.settlement.updateMany({
+          where: { id: settlement.id, status: { in: ["pending", "failed"] } },
+          data: {
+            transactionXdr: body.signedXdr,
+            status: "submitted",
+            submittedAt: new Date(),
+            retryCount: 0,
+            failureReason: null,
+          },
+        });
+
+        if (count > 0) {
+          await recordStatusTransitionInTransaction(tx, {
+            entityType: "settlement",
+            entityId: settlement.id,
+            newStatus: "submitted",
+            source: "api",
+          });
+          await auditTx(tx, {
+            userId: auth.id,
+            groupId: settlement.groupId,
+            action: "settlement.execute",
+            entityType: "settlement",
+            entityId: settlement.id,
+            metadata: { status: "submitted" },
+          });
+        }
+
+        const finalSettlement = await tx.settlement.findUniqueOrThrow({
+          where: { id: settlement.id },
+          include: settlementInclude,
+        });
+
+        return {
+          settlement: serializeSettlement(finalSettlement),
+          accepted: count > 0,
+        };
+      });
+
+      // 202 for a submission this request accepted, 200 for one that was
+      // already in flight. Both are cached against the idempotency key exactly
+      // as sent, so a retry cannot observe the status flipping underneath it.
+      return reply
+        .code(result.accepted ? 202 : 200)
+        .send({ settlement: result.settlement });
+    }
+  );
+
   // -- status -----------------------------------------------------------------
   //
   // The single source of truth a client polls after creating or signing a
@@ -437,7 +806,35 @@ export default async function settlementRoutes(app: FastifyInstance) {
   //
   // The response never includes a signed or unsigned XDR, a token, provider
   // credentials, or upstream error text — see src/services/settlement-status.ts.
-  app.get("/settlements/:id/status", async (req) => {
+  app.get(
+    "/settlements/:id/status",
+    {
+      schema: {
+        tags: ["Settlements"],
+        summary: "Get a settlement's status",
+        description:
+          "Returns the public, safe-to-expose status of a settlement (by cuid or short code), optionally refreshing against Horizon. Any member of the settlement's group may read it. Never returns an XDR, token, or provider error text.",
+        params: openApiIdParams(),
+        response: {
+          ...openApiResponse(
+            {
+              settlement: { type: "object", additionalProperties: true },
+              status: { type: "string" },
+              terminal: { type: "boolean" },
+              onChain: { type: "object", additionalProperties: true, nullable: true },
+              failure: { type: "object", additionalProperties: true, nullable: true },
+              expiresAt: { type: "string", nullable: true, format: "date-time" },
+              expiresInSeconds: { type: "number", nullable: true },
+              createdAt: { type: "string", format: "date-time" },
+              updatedAt: { type: "string", format: "date-time" },
+              checkedAt: { type: "string", format: "date-time" },
+            }
+          ),
+          ...openApiErrorResponses(400, 401, 403, 404),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = settlementIdParamSchema.parse(req.params);
     const { refresh } = settlementStatusQuerySchema.parse(req.query ?? {});
@@ -455,19 +852,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
 
     // Skipping the provider lookup is opt-in via `refresh=false`, for a client
     // that wants only the persisted state (e.g. rendering a list).
+    const persistedStatus = toPublicStatus(settlement);
     const resolved = refresh
       ? await resolveSettlementStatus(settlement)
       : {
-          status: toPublicStatus(settlement),
+          status: persistedStatus,
           onChain: {
             checked: false,
             found: false,
             successful: null,
             transactionHash: settlement.stellarTxHash ?? null,
           },
-          failure: settlement.failureReason
-            ? { reason: settlement.failureReason }
-            : null,
+          // Same helper the refreshing path uses, so skipping the Horizon
+          // lookup changes what is *known*, never how a failure is reported.
+          failure: toFailureInfo(settlement, persistedStatus),
           expiresAt: settlement.expiresAt
             ? settlement.expiresAt.toISOString()
             : null,
@@ -491,44 +889,229 @@ export default async function settlementRoutes(app: FastifyInstance) {
     };
   });
 
-  // -- balances + suggestions -------------------------------------------------
-  app.get("/groups/:id/balances", async (req) => {
-    const auth = requireUser(req);
+  // -- list settlements for a group ------------------------------------------
+  //
+  // Returns settlements scoped to the caller's group membership, ordered by
+  // the same deterministic (createdAt, id) pair every other list endpoint
+  // uses. The cursor carries no membership authority — the groupId filter
+  // always scopa the query independently.
+  app.get(
+    "/groups/:id/settlements",
+    {
+      preHandler: requireGroupRole("member", { param: "id" }),
+      schema: {
+        tags: ["Settlements"],
+        summary: "List settlements for a group",
+        description: "Returns paginated settlements scoped to the caller's group membership, ordered deterministically by creation timestamp and ID.",
+        params: openApiIdParams(),
+        response: {
+          200: {
+            type: "object",
+            required: ["settlements", "meta"],
+            properties: {
+              settlements: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              meta: { type: "object", additionalProperties: true },
+            },
+          },
+          ...openApiErrorResponses(400, 401, 403),
+        },
+      },
+    },
+    async (req) => {
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
 
-    const { balances, suggestions } = await loadGroupBalancesWithSuggestions(groupId);
+    const position = requireCursor(cursor);
+
+    const settlements = await prisma.settlement.findMany({
+      where: { groupId, ...cursorFilter(position, order) },
+      include: settlementInclude,
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
+    });
+
+    const { items, meta } = buildPage(settlements, limit, order);
+    return { settlements: items.map(serializeSettlement), meta };
+  });
+
+  // -- balances + suggestions -------------------------------------------------
+  app.get(
+    "/groups/:id/settlement/preview",
+    {
+      preHandler: requireGroupRole("member", { param: "id" }),
+      schema: {
+        tags: ["Settlements"],
+        summary: "Preview group settlement suggestions",
+        description: "Computes net member balances and generates optimized debt simplification transfers to settle all group obligations.",
+        params: openApiIdParams(),
+        response: {
+          200: {
+            type: "object",
+            required: ["assetCode", "operations"],
+            properties: {
+              assetCode: { type: "string" },
+              assetIssuer: { type: "string", nullable: true },
+              operations: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              assets: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+            },
+          },
+          ...openApiErrorResponses(400, 401, 403),
+        },
+      },
+    },
+    async (req) => {
+    const { id: groupId } = idParamSchema.parse(req.params);
+    const asset = await groupPrimaryAsset(groupId);
+    const byAsset = await loadGroupBalancesWithSuggestionsByAsset(groupId);
+
+    // Top level stays the primary asset's operations for backward
+    // compatibility. `assets` carries every asset the group holds, each with
+    // its own net balances and minimal settle-up transfers — an XLM operation
+    // can never settle a USDC debt.
+    const primary = byAsset.find(
+      (a) =>
+        balanceAssetKey(a.assetCode, a.assetIssuer) ===
+        balanceAssetKey(asset.assetCode, asset.assetIssuer)
+    );
+    const withAsset = (
+      assetCode: string,
+      assetIssuer: string | null,
+      suggestions: Suggestion[]
+    ) =>
+      suggestions.map((suggestion) => ({
+        ...suggestion,
+        assetCode,
+        assetIssuer,
+      }));
+
+    return {
+      assetCode: asset.assetCode,
+      assetIssuer: asset.assetIssuer,
+      operations: withAsset(
+        asset.assetCode,
+        asset.assetIssuer,
+        primary?.suggestions ?? []
+      ),
+      assets: byAsset.map((a) => ({
+        assetCode: a.assetCode,
+        assetIssuer: a.assetIssuer,
+        balances: a.balances,
+        operations: withAsset(a.assetCode, a.assetIssuer, a.suggestions),
+      })),
+    };
+  });
+
+  app.get(
+    "/groups/:id/balances",
+    {
+      preHandler: requireGroupRole("member", { param: "id" }),
+      schema: {
+        tags: ["Settlements"],
+        summary: "Get group member balances and settlement suggestions",
+        description: "Returns net member balances and suggested payment transfers for settling group balances.",
+        params: openApiIdParams(),
+        response: {
+          200: {
+            type: "object",
+            required: ["balances", "suggestions"],
+            properties: {
+              balances: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              suggestions: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              assets: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+            },
+          },
+          ...openApiErrorResponses(400, 401, 403),
+        },
+      },
+    },
+    async (req) => {
+    const { id: groupId } = idParamSchema.parse(req.params);
+
+    const asset = await groupPrimaryAsset(groupId);
+    const byAsset = await loadGroupBalancesWithSuggestionsByAsset(groupId);
 
     const userIds = new Set<string>();
-    balances.forEach((b) => userIds.add(b.userId));
-    suggestions.forEach((s) => {
-      userIds.add(s.fromUserId);
-      userIds.add(s.toUserId);
+    byAsset.forEach((a) => {
+      a.balances.forEach((b) => userIds.add(b.userId));
+      a.suggestions.forEach((s) => {
+        userIds.add(s.fromUserId);
+        userIds.add(s.toUserId);
+      });
     });
     const users = await prisma.user.findMany({
       where: { id: { in: [...userIds] } },
     });
     const userMap = new Map(users.map((u) => [u.id, u]));
 
-    const asset = await groupPrimaryAsset(groupId);
-
-    return {
-      balances: balances
+    const serializeBalances = (
+      assetCode: string,
+      balances: { userId: string; net: string }[]
+    ) =>
+      balances
         .filter((b) => userMap.has(b.userId))
         .map((b) => ({
           userId: b.userId,
           user: serializeUserSafe(userMap.get(b.userId)),
           net: b.net,
-          assetCode: asset.assetCode,
-        })),
-      suggestions: suggestions.map((s) => ({
+          assetCode,
+        }));
+    const serializeSuggestions = (
+      assetCode: string,
+      assetIssuer: string | null,
+      suggestions: Suggestion[]
+    ) =>
+      suggestions.map((s) => ({
         fromUserId: s.fromUserId,
         from: serializeUserSafe(userMap.get(s.fromUserId)),
         toUserId: s.toUserId,
         to: serializeUserSafe(userMap.get(s.toUserId)),
         amount: s.amount,
-        assetCode: asset.assetCode,
-        assetIssuer: asset.assetIssuer,
+        assetCode,
+        assetIssuer,
+      }));
+
+    const primary = byAsset.find(
+      (a) =>
+        balanceAssetKey(a.assetCode, a.assetIssuer) ===
+        balanceAssetKey(asset.assetCode, asset.assetIssuer)
+    );
+
+    return {
+      // Top level is the primary asset for backward compatibility; `assets`
+      // carries the full per-asset picture.
+      balances: serializeBalances(asset.assetCode, primary?.balances ?? []),
+      suggestions: serializeSuggestions(
+        asset.assetCode,
+        asset.assetIssuer,
+        primary?.suggestions ?? []
+      ),
+      assets: byAsset.map((a) => ({
+        assetCode: a.assetCode,
+        assetIssuer: a.assetIssuer,
+        balances: serializeBalances(a.assetCode, a.balances),
+        suggestions: serializeSuggestions(
+          a.assetCode,
+          a.assetIssuer,
+          a.suggestions
+        ),
       })),
     };
   });
@@ -540,11 +1123,12 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // using that identical total order, so the merged page obeys the shared
   // pagination contract: a cursor from any page resumes exactly where the last
   // one stopped, whichever table the boundary row came from.
-  app.get("/groups/:id/ledger", async (req) => {
-    const auth = requireUser(req);
+  app.get(
+    "/groups/:id/ledger",
+    { preHandler: requireGroupRole("member", { param: "id" }) },
+    async (req) => {
     const { id: groupId } = idParamSchema.parse(req.params);
     const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    await requireMembership(groupId, auth.id);
 
     const position = requireCursor(cursor);
     const where = { groupId, ...cursorFilter(position, order) };
@@ -628,13 +1212,31 @@ async function buildSettlementXdr(params: {
   memoCode: string;
   validitySeconds: number;
 }): Promise<string> {
-  const account = await stellar.loadAccount(params.fromPublicKey);
-  if (!account.exists) {
-    throw Errors.badRequest(
-      "account_unfunded",
-      "Your Stellar account is not funded yet. Fund it before settling."
+  // One account load serves both the preflight and the sequence number the
+  // envelope is built on, so the balance check and the transaction describe the
+  // same observation of the account rather than two Horizon reads apart.
+  let account;
+  try {
+    account = await stellar.loadAccount(params.fromPublicKey);
+  } catch {
+    throw Errors.upstream(
+      "Could not reach the Stellar network to check your balance. Try again shortly."
     );
   }
+
+  // Refuse before building an envelope the account cannot pay for. This does
+  // not replace signed-XDR validation — that still runs on whatever the wallet
+  // returns — and Horizon state can move between here and submission, so the
+  // worker's submission errors are still handled.
+  assertPreflightResult(
+    evaluatePreflight(account, {
+      sourcePublicKey: params.fromPublicKey,
+      assetCode: params.assetCode,
+      assetIssuer: params.assetIssuer,
+      amount: params.amount,
+    })
+  );
+
   return stellar.buildPayment({
     sourcePublicKey: params.fromPublicKey,
     sourceSequence: account.sequence,

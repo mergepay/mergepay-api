@@ -44,7 +44,7 @@ const h = vi.hoisted(() => {
   return {
     prisma,
     loadAccount: vi.fn(),
-    buildPayment: vi.fn(() => "unsigned-xdr"),
+    buildPayment: vi.fn(),
     submitPayment: vi.fn(async () => "hash_abc"),
   };
 });
@@ -78,6 +78,35 @@ function authHeader(userId = USER_ID) {
   return {
     authorization: `Bearer ${signToken({ id: userId, stellarPublicKey: PAYER_KEY })}`,
   };
+}
+
+/**
+ * Build a real unsigned payment XDR for use in buildPayment mocks.
+ * Needed because the deposit/withdraw routes now compute txHash from the XDR.
+ */
+function makeRealUnsignedXdr(params: {
+  source: string;
+  destination: string;
+  amount: string;
+  memoCode?: string;
+  validitySeconds?: number;
+}): string {
+  const source = new Account(params.source, "1");
+  return new TransactionBuilder(source, {
+    fee: String(Number(BASE_FEE) * 2),
+    networkPassphrase: config.networkPassphrase,
+  })
+    .addOperation(
+      Operation.payment({
+        destination: params.destination,
+        asset: Asset.native(),
+        amount: params.amount,
+      })
+    )
+    .addMemo(Memo.text(params.memoCode ? `MP:${params.memoCode}` : "MP:TEST"))
+    .setTimeout(params.validitySeconds ?? INTENT_VALIDITY_SECONDS)
+    .build()
+    .toXDR();
 }
 
 /**
@@ -193,11 +222,22 @@ beforeEach(async () => {
   h.loadAccount.mockResolvedValue({
     exists: true,
     sequence: "1",
-    balances: [],
-    signers: [],
+    // Funded well above the payment, the envelope fee, and the base reserve so
+    // settlement preflight (src/services/settlement-preflight.ts) passes and
+    // these tests exercise intent expiry rather than affordability.
+    balances: [{ assetCode: "XLM", assetIssuer: null, balance: "1000.0000000" }],
+    signers: [{ key: PAYER_KEY, weight: 1 }],
     thresholds: { low: 0, med: 0, high: 0 },
   });
-  h.buildPayment.mockReturnValue("unsigned-xdr");
+  h.buildPayment.mockImplementation((params: any) =>
+    makeRealUnsignedXdr({
+      source: params.sourcePublicKey ?? PAYER_KEY,
+      destination: params.destination,
+      amount: params.amount,
+      memoCode: params.memoCode,
+      validitySeconds: params.validitySeconds,
+    })
+  );
   h.submitPayment.mockResolvedValue("hash_abc");
   // Serves both the membership check and the recipient lookup (which includes
   // the user relation).
@@ -266,7 +306,7 @@ describe("creating an intent records a server-controlled expiry", () => {
       });
 
       expect(res.statusCode).toBe(400);
-      expect(res.json().error).toBe("VALIDATION_ERROR");
+      expect(res.json().error.code).toBe("VALIDATION_ERROR");
     }
     expect(h.buildPayment).not.toHaveBeenCalled();
     expect(h.loadAccount).not.toHaveBeenCalled();
@@ -358,9 +398,9 @@ describe("settlement confirm rejects an expired intent", () => {
 
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("INTENT_EXPIRED");
+    expect(body.error.code).toBe("INTENT_EXPIRED");
     expect(body.message).toMatch(/expired/i);
-    expect(body.details.clockSkewToleranceSeconds).toBe(CLOCK_SKEW_TOLERANCE_SECONDS);
+    expect(body.error.details.clockSkewToleranceSeconds).toBe(CLOCK_SKEW_TOLERANCE_SECONDS);
   });
 
   it("never stores the envelope or submits it when the intent has expired", async () => {
@@ -411,7 +451,7 @@ describe("settlement confirm rejects an expired intent", () => {
     });
 
     expect(res.statusCode).toBe(403);
-    expect(res.json().error).toBe("FORBIDDEN");
+    expect(res.json().error.code).toBe("FORBIDDEN");
   });
 
   it("distinguishes a missing settlement from an expired one", async () => {
@@ -425,7 +465,7 @@ describe("settlement confirm rejects an expired intent", () => {
     });
 
     expect(res.statusCode).toBe(404);
-    expect(res.json().error).toBe("NOT_FOUND");
+    expect(res.json().error.code).toBe("NOT_FOUND");
   });
 
   it("treats an intent with no recorded deadline as still valid", async () => {
@@ -462,19 +502,20 @@ describe("treasury confirm rejects an expired intent", () => {
     prisma.treasuryTransaction.update.mockResolvedValue(
       fakeTreasuryTx({ status: "confirmed", stellarTxHash: "hash_abc" })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(200);
     // The submission carries the recorded expiry, so the service re-validates
     // the envelope's own time bounds against it.
     expect(h.submitPayment).toHaveBeenCalledWith(
-      "signed-xdr-abc",
+      signedXdr,
       expect.objectContaining({
         expiresAt: expect.any(Date),
         resource: "treasury transaction",
@@ -486,16 +527,17 @@ describe("treasury confirm rejects an expired intent", () => {
     prisma.treasuryTransaction.findUnique.mockResolvedValue(
       fakeTreasuryTx({ expiresAt: longExpired() })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INTENT_EXPIRED");
+    expect(res.json().error.code).toBe("INTENT_EXPIRED");
     expect(h.submitPayment).not.toHaveBeenCalled();
     expect(prisma.treasuryTransaction.update).not.toHaveBeenCalled();
   });
@@ -508,16 +550,17 @@ describe("treasury confirm rejects an expired intent", () => {
         expiresAt: longExpired(),
       })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INTENT_EXPIRED");
+    expect(res.json().error.code).toBe("INTENT_EXPIRED");
     expect(h.submitPayment).not.toHaveBeenCalled();
   });
 });

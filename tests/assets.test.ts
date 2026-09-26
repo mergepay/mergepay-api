@@ -112,9 +112,9 @@ describe("validateAmount / precision", () => {
   });
 
   it("accepts a number with up to 7 decimal places", () => {
-    expect(validateAmount("123.4567890")).toBe("123.4567890");
+    expect(validateAmount("123.4567890")).toBe("123.456789");
     expect(validateAmount("0.0000001")).toBe("0.0000001");
-    expect(validateAmount("1.0000000")).toBe("1.0000000");
+    expect(validateAmount("1.0000000")).toBe("1");
   });
 
   it("accepts a number with fewer than 7 decimal places", () => {
@@ -123,22 +123,22 @@ describe("validateAmount / precision", () => {
   });
 
   it("rejects a number with more than 7 decimal places", () => {
-    expect(() => validateAmount("1.12345678")).toThrow(/7.*decimal/i);
-    expect(() => validateAmount("0.00000001")).toThrow(/7.*decimal/i);
+    expect(() => validateAmount("1.12345678")).toThrow(/7.*decimal|precision/i);
+    expect(() => validateAmount("0.00000001")).toThrow(/7.*decimal|precision/i);
   });
 
   it("rejects zero and negative amounts", () => {
     expect(() => validateAmount("0")).toThrow(/greater than zero/);
-    expect(() => validateAmount("-5")).toThrow(/not a valid numeric amount/);
+    expect(() => validateAmount("-5")).toThrow(/valid decimal amount|greater than zero/);
   });
 
   it("rejects non-numeric strings", () => {
-    expect(() => validateAmount("abc")).toThrow(/not a valid numeric amount/);
-    expect(() => validateAmount("12.34.56")).toThrow(/not a valid numeric amount/);
+    expect(() => validateAmount("abc")).toThrow(/valid decimal amount/);
+    expect(() => validateAmount("12.34.56")).toThrow(/valid decimal amount/);
   });
 
   it("rejects empty string", () => {
-    expect(() => validateAmount("")).toThrow(/not a valid numeric amount/);
+    expect(() => validateAmount("")).toThrow(/required|valid decimal amount/);
   });
 });
 

@@ -31,7 +31,9 @@ export function getCorrelationId(value: unknown): string {
 
 /** Resolve a correlation ID for a queued worker job. */
 export function getWorkerCorrelationId(originatingId?: unknown): string {
-  return getCorrelationId(originatingId);
+  return isValidCorrelationId(originatingId)
+    ? originatingId
+    : generateCorrelationId();
 }
 
 /**
@@ -66,10 +68,12 @@ export function jobCorrelationId(jobType: string, jobId: string): string {
 export function jobContext(
   jobType: string,
   jobId: string,
-  originatingCorrelationId?: string
+  originatingCorrelationId?: unknown
 ): CorrelationContext {
   return {
-    correlationId: originatingCorrelationId ?? jobCorrelationId(jobType, jobId),
+    correlationId: isValidCorrelationId(originatingCorrelationId)
+      ? originatingCorrelationId
+      : jobCorrelationId(jobType, jobId),
     jobId,
   };
 }

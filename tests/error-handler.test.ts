@@ -61,6 +61,16 @@ beforeAll(async () => {
     throw Errors.upstream("Anchor service unavailable");
   });
 
+  app.get("/test/horizon-rate-limit", async () => {
+    const err = new Error("Horizon rate limited");
+    Object.assign(err, {
+      response: { status: 429 },
+      operation: "Horizon.loadAccount",
+      name: "BadRequestError",
+    });
+    throw err;
+  });
+
   app.get("/test/with-details", async () => {
     throw new AppError(400, "VALIDATION_ERROR", "Bad input", [
       { field: "amount", message: "Required" },
@@ -89,7 +99,7 @@ describe("AppError transformation", () => {
     expect(body.code).toBe(ErrorCode.NOT_FOUND);
     expect(body.message).toBe("Thing not found");
     expect(body.requestId).toBeTruthy();
-    expect(body.details).toBeUndefined();
+    expect(body.error.details).toBeUndefined();
   });
 
   it("maps 401 UNAUTHORIZED correctly", async () => {
@@ -138,7 +148,17 @@ describe("AppError transformation", () => {
     expect(body.code).toBe("UPSTREAM_ERROR");
     expect(body.message).toBe("Anchor service unavailable");
     expect(body.requestId).toBeTruthy();
-    expect(body.details).toBeUndefined();
+    expect(body.error.details).toBeUndefined();
+  });
+
+  it("maps Horizon rate-limit exceptions to the stable upstream response", async () => {
+    const res = await app.inject({ method: "GET", url: "/test/horizon-rate-limit" });
+
+    expect(res.statusCode).toBe(429);
+    const body = res.json();
+    expect(body.code).toBe("RATE_LIMITED");
+    expect(body.message).toBe("Horizon is rate limiting requests. Please retry shortly.");
+    expect(body.requestId).toBeTruthy();
   });
 
   it("includes details when AppError has a details payload", async () => {
@@ -147,8 +167,8 @@ describe("AppError transformation", () => {
     expect(res.statusCode).toBe(400);
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.details)).toBe(true);
-    expect(body.details[0].field).toBe("amount");
+    expect(Array.isArray(body.error.details)).toBe(true);
+    expect(body.error.details[0].field).toBe("amount");
     expect(body.requestId).toBeTruthy();
   });
 
@@ -168,8 +188,8 @@ describe("ZodError (validation) transformation", () => {
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
     expect(body.message).toBeTruthy();
-    expect(Array.isArray(body.details)).toBe(true);
-    expect(body.details[0]).toMatchObject({
+    expect(Array.isArray(body.error.details)).toBe(true);
+    expect(body.error.details[0]).toMatchObject({
       field: expect.any(String),
       message: expect.any(String),
       code: expect.any(String),
@@ -190,9 +210,9 @@ describe("ZodError (validation) transformation", () => {
     expect(res.statusCode).toBe(400);
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.details)).toBe(true);
-    expect(body.details[0].field).toBe("user.age");
-    expect(body.details[0].message).toContain("18");
+    expect(Array.isArray(body.error.details)).toBe(true);
+    expect(body.error.details[0].field).toBe("user.age");
+    expect(body.error.details[0].message).toContain("18");
     expect(body.requestId).toBeTruthy();
   });
 });

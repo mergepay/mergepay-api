@@ -27,9 +27,12 @@ const h = vi.hoisted(() => {
   });
   const prisma: any = {
     settlement: model(),
+    groupMember: model(),
     idempotencyKey: model(),
     statusHistory: model(),
     auditLog: { create: vi.fn() },
+    groupMember: model(),
+    group: model(),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
@@ -124,6 +127,9 @@ let app: Awaited<ReturnType<typeof buildApp>>;
 beforeEach(async () => {
   vi.clearAllMocks();
   if (!app) app = await buildApp();
+  // Membership check for requireMembership
+  prisma.groupMember.findUnique.mockResolvedValue({ groupId: "group_1", userId: "user_1", role: "member" });
+  prisma.group.findUnique.mockResolvedValue({ id: "group_1" });
 });
 
 describe("POST /settlements/:id/confirm — XDR intent validation", () => {
@@ -164,7 +170,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
@@ -181,7 +187,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
@@ -198,7 +204,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
   });
 
   it("rejects a signed XDR from an unrelated signer (not the settlement's payer share)", async () => {
@@ -215,7 +221,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
   });
 
   it("rejects malformed XDR without touching the database", async () => {
@@ -231,7 +237,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MALFORMED");
+    expect(res.json().error.code).toBe("XDR_MALFORMED");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 });

@@ -1,32 +1,24 @@
-## Summary
+Feature: Standardize API error responses and structured logging
 
-Implements audit logging for expense creation and deletion as a security and transparency requirement. Every state-changing action is now recorded for later review.
+This draft PR standardizes API error responses across the application and aligns structured logging with the error contract.
 
-## Changes
+Summary of changes:
+- Added `src/utils/error-response.ts` providing a canonical `{ error: { code, message, timestamp, requestId?, details? } }` envelope.
+- Updated `src/plugins/error-handler.ts` and `src/app.ts` to return the canonical envelope for Zod, Fastify validation, `AppError`, provider/upstream, rate-limit, and not-found handlers.
+- Adjusted `onError` hook to log `warn` for expected/operational (4xx) errors and `error` for server (5xx) errors. Include full `err` object only on `error`-level logs.
+- Migrated numerous tests to assert the nested `error.code` and `error.details` shape.
 
-### Schema
-- The `AuditLog` model already existed in `prisma/schema.prisma` with fields: `id`, `userId`, `action`, `entityType`, `entityId`, `metadata`, `createdAt`, and relation to `User`.
+Notes:
+- I could not run tests locally in this environment because `vitest` is not installed here; CI should run the full test suite once this PR is opened.
+- This PR branch is `standardize-error-responses` and includes the changes described above.
 
-### Expense Routes (`src/routes/expenses.ts`)
-- **POST /groups/:id/expenses**: Wrapped expense creation in `prisma.$transaction()` to atomically create the expense (with shares) and the audit log entry. If audit log creation fails, the entire transaction rolls back.
-- **DELETE /expenses/:id**: Wrapped expense deletion in `prisma.$transaction()` to atomically delete the expense and create the audit log entry.
+Closes: #534
 
-### Audit Log Entries Created
-- **Expense creation**: `action: 'expense.create'`, `entityType: 'expense'`, `entityId: expense.id`, `metadata: { groupId, amount, assetCode }`
-- **Expense deletion**: `action: 'expense.delete'`, `entityType: 'expense'`, `entityId: expense.id`
+Checklist:
+- [x] Add canonical error envelope
+- [x] Refactor central error handler and app hook
+- [x] Migrate tests to new envelope
+- [ ] CI: run tests and fix remaining failures
+- [ ] (Optional) Remove any temporary compatibility layers after consumers migrate
 
-### Tests (`tests/routes.test.ts`)
-Added 3 new tests under `expense routes` describe block:
-1. **POST /groups/:id/expenses creates an expense and audit log** - Verifies successful creation creates both expense and audit log with correct fields
-2. **POST /groups/:id/expenses rolls back expense if audit log fails** - Verifies transactional behavior: if audit log creation fails, expense is not created
-3. **DELETE /expenses/:id deletes expense and creates audit log** - Verifies deletion creates audit log with correct fields
-
-## Acceptance Criteria Met
-- New AuditLog model in prisma/schema.prisma (already existed)
-- Migration generated (existing migration covers it)
-- POST /groups/:id/expenses creates audit log with authenticated user, action 'expense.create', resource type 'expense', resource ID, and metadata
-- If expense creation fails, no audit log is written (transactional)
-- Tests confirm audit log entry exists after successful creation
-- DELETE /expenses/:id also creates audit log entry
-
-Closes #15
+Please review and let me know if you want me to iterate on CI failures or keep the PR as a draft until test passing is confirmed by CI.

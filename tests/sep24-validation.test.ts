@@ -270,3 +270,100 @@ describe("POST /anchors/deposit — SEP-24 schema wiring", () => {
     expect(anchorService.getChallenge).toHaveBeenCalled();
   });
 });
+
+describe("POST /api/sep24/deposit & POST /api/sep24/withdraw — SEP-24 route validation", () => {
+  const prisma = h.prisma;
+  let app: Awaited<ReturnType<typeof buildApp>>;
+
+  const authHeader = () => ({
+    authorization: `Bearer ${signToken({
+      id: "user_1",
+      stellarPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    })}`,
+  });
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    if (!app) app = await buildApp();
+  });
+
+  it("rejects invalid refundMemo or refundMemoType pairing", () => {
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "USDC",
+        refundMemo: "REFUND1",
+      }).success
+    ).toBe(false);
+
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "USDC",
+        refundMemoType: "text",
+      }).success
+    ).toBe(false);
+
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "USDC",
+        refundMemo: "REFUND1",
+        refundMemoType: "text",
+      }).success
+    ).toBe(true);
+  });
+
+  it("POST /api/sep24/deposit — returns 400 for malformed assetCode", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/sep24/deposit",
+      headers: authHeader(),
+      payload: { assetCode: "INVALID_CODE_TOO_LONG" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("POST /api/sep24/withdraw — returns 400 when amount is missing for withdrawal", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/sep24/withdraw",
+      headers: authHeader(),
+      payload: { assetCode: "USDC" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("POST /api/sep24/deposit — accepts valid payload and initiates session", async () => {
+    const { anchorService } = await import("../src/services/anchor");
+    vi.mocked(anchorService.getToml).mockResolvedValue({
+      homeDomain: "testanchor.stellar.org",
+      webAuthEndpoint: "https://testanchor.stellar.org/auth",
+      transferServerSep24: "https://testanchor.stellar.org/sep24",
+      signingKey: goodKey,
+      assets: [],
+    } as any);
+    vi.mocked(anchorService.getChallenge).mockResolvedValue({} as any);
+    prisma.anchorSession.create.mockResolvedValue({
+      id: "session_sep24_1",
+      userId: "user_1",
+      anchorName: "Test",
+      kind: "deposit",
+      assetCode: "USDC",
+      interactiveUrl: null,
+      externalTransactionId: null,
+      status: "incomplete",
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    prisma.auditLog.create.mockResolvedValue({});
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/sep24/deposit",
+      headers: authHeader(),
+      payload: { assetCode: "USDC", amount: "10.00" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().session).toBeDefined();
+  });
+});

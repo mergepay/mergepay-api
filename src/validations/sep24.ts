@@ -55,6 +55,26 @@ function refineMemoPairing(
   }
 }
 
+function refineRefundMemoPairing(
+  value: { refundMemo?: string; refundMemoType?: "text" | "id" | "hash" },
+  ctx: z.RefinementCtx
+): void {
+  if (value.refundMemo && !value.refundMemoType) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["refundMemoType"],
+      message: "refundMemoType is required when refundMemo is supplied",
+    });
+  }
+  if (value.refundMemoType && !value.refundMemo) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["refundMemo"],
+      message: "refundMemo is required when refundMemoType is supplied",
+    });
+  }
+}
+
 const sharedFields = {
   assetCode: sep24AssetCodeSchema,
   assetIssuer: z.string().nullable().optional(),
@@ -65,6 +85,10 @@ const sharedFields = {
   memoType: sep24MemoTypeSchema.optional(),
   walletName: z.string().trim().min(1).max(120).optional(),
   anchorName: z.string().max(64).optional(),
+  refundAddress: sep24AccountSchema.optional(),
+  refundMemo: sep24MemoSchema,
+  refundMemoType: sep24MemoTypeSchema.optional(),
+  extraMetadata: z.record(z.string(), z.unknown()).optional(),
 };
 
 function validateNativeIssuer<
@@ -73,15 +97,20 @@ function validateNativeIssuer<
     assetIssuer?: string | null;
     memo?: string;
     memoType?: "text" | "id" | "hash";
+    refundMemo?: string;
+    refundMemoType?: "text" | "id" | "hash";
   }
 >(schema: z.ZodType<T>) {
-  return schema.refine(
-    (value) => !(value.assetCode === "XLM" && value.assetIssuer),
-    {
-      message: "XLM is a native asset and does not take an issuer",
-      path: ["assetIssuer"],
-    }
-  ).superRefine(refineMemoPairing);
+  return schema
+    .refine(
+      (value) => !(value.assetCode === "XLM" && value.assetIssuer),
+      {
+        message: "XLM is a native asset and does not take an issuer",
+        path: ["assetIssuer"],
+      }
+    )
+    .superRefine(refineMemoPairing)
+    .superRefine(refineRefundMemoPairing);
 }
 
 /** Strict request schema for starting either SEP-24 interactive flow. */

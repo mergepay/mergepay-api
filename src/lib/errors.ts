@@ -129,39 +129,19 @@ export const ErrorCode = {
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
 
-/**
- * Application error with a stable machine-readable code, HTTP status,
- * optional structured details, and an optional correlation request ID.
- *
- * The `requestId` is injected by the central error handler — callers do not
- * need to set it.
- */
-export class AppError extends Error {
-  /** HTTP status code (e.g. 404). */
-  readonly status: number;
-  /** Mirror of `status` — Fastify reads `statusCode` on error objects. */
-  readonly statusCode: number;
-  /** Machine-readable error code string (e.g. "NOT_FOUND"). */
-  readonly code: string;
-  /** Structured detail payload (e.g. Zod validation issues). */
-  readonly details?: unknown;
-  /** Correlation ID injected by the error handler, not set by callers. */
-  requestId?: string;
+export {
+  AppError,
+  NotFoundError,
+  ValidationError,
+  UnauthorizedError,
+  ForbiddenError,
+  ConflictError,
+  BadRequestError,
+  InternalServerError,
+} from "../errors/app-error";
 
-  constructor(
-    status: number,
-    code: string,
-    message: string,
-    details?: unknown,
-  ) {
-    super(message);
-    this.name = "AppError";
-    this.status = status;
-    this.statusCode = status;
-    this.code = code;
-    this.details = details;
-  }
-}
+import { AppError } from "../errors/app-error";
+
 
 /** Factory helpers — mirrors the original `Errors` object in src/errors.ts. */
 export const Errors = {

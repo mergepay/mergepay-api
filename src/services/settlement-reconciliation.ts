@@ -45,6 +45,13 @@ export interface ReconcilableSettlement {
   assetIssuer: string | null;
   /** Expected payment destination (the recipient's Stellar public key). */
   destinationPublicKey: string;
+  /**
+   * Persisted status at read time. Only `needs_review` changes behavior: a
+   * row still without a Horizon answer is demoted to `pending_confirmation`
+   * so the retry budget governs. Optional — omitting it preserves the
+   * pre-needs_review behavior (retryCount-only update on not-found).
+   */
+  status?: string;
 }
 
 /**
@@ -182,7 +189,7 @@ export async function reconcileSingleSettlement(
 }
 
 async function handleTransactionNotFound(
-  settlement: { id: string; retryCount: number },
+  settlement: { id: string; retryCount: number; status?: string },
   hash: string,
   maxRetries: number,
   recLog: ReturnType<typeof loggerWithContext>
@@ -219,7 +226,15 @@ async function handleTransactionNotFound(
 
   await prisma.settlement.update({
     where: { id: settlement.id },
-    data: { retryCount: nextRetryCount },
+    data: {
+      retryCount: nextRetryCount,
+      // A needs_review row still without a Horizon answer is demoted to
+      // pending_confirmation, so the bounded retry budget above — not an
+      // unbounded needs_review wait — decides when enough silence is enough.
+      // A conditional updateMany is deliberately not needed here: the caller
+      // holds the row's lease, which already excludes concurrent writers.
+      ...(settlement.status === "needs_review" ? { status: "pending_confirmation" } : {}),
+    },
   });
   recLog.debug(
     { id: settlement.id, hash, attempt: nextRetryCount, maxRetries },

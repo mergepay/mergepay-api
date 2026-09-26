@@ -1,9 +1,10 @@
 import { FastifyInstance } from "fastify";
 import fastifySwagger from "@fastify/swagger";
 import fastifySwaggerUi from "@fastify/swagger-ui";
+import fp from "fastify-plugin";
 import { config } from "../config";
 
-export default async function openAPIPlugin(app: FastifyInstance) {
+export default fp(async function openAPIPlugin(app: FastifyInstance) {
   await app.register(fastifySwagger, {
     openapi: {
       openapi: "3.0.0",
@@ -20,6 +21,32 @@ export default async function openAPIPlugin(app: FastifyInstance) {
         {
           url: config.API_URL,
           description: "API server",
+        },
+      ],
+      tags: [
+        {
+          name: "Auth",
+          description:
+            "SEP-10 Stellar authentication challenge, token verification, session lifecycle, and user profile management",
+        },
+        {
+          name: "SEP-24",
+          description:
+            "SEP-24 interactive deposit, withdrawal, anchor sessions, and callback endpoints",
+        },
+        {
+          name: "Expenses",
+          description: "Group expense creation, splits, receipt uploads, and management",
+        },
+        {
+          name: "Settlements",
+          description:
+            "Settlement intent generation, signatures, and Stellar transaction execution",
+        },
+        {
+          name: "Treasury",
+          description:
+            "Multi-signature treasury management, deposit/withdraw proposals, and signatures",
         },
       ],
       components: {
@@ -117,4 +144,4 @@ export default async function openAPIPlugin(app: FastifyInstance) {
       deepLinking: false,
     },
   });
-}
+});

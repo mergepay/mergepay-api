@@ -2,6 +2,38 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
+import { formatErrorResponse } from "../utils/error-response";
+import { toRequestLimitError } from "../lib/request-limits";
+import { TimeoutError, TransportError, toProviderError } from "../services/timeout";
+
+function isHorizonError(error: unknown): error is Error & {
+  response?: { status?: number };
+  status?: number;
+  statusCode?: number;
+  operation?: string;
+  code?: string;
+} {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as Record<string, unknown>;
+  const responseStatus = typeof candidate.response === "object" && candidate.response
+    ? (candidate.response as { status?: number }).status
+    : undefined;
+  const status = typeof candidate.status === "number" ? candidate.status : undefined;
+  const code = typeof candidate.code === "string" ? candidate.code : undefined;
+  const operation = typeof candidate.operation === "string" ? candidate.operation : undefined;
+  const name = typeof candidate.name === "string" ? candidate.name : undefined;
+
+  return (
+    typeof responseStatus === "number" ||
+    typeof status === "number" ||
+    typeof code === "string" ||
+    typeof operation === "string" ||
+    name === "TimeoutError" ||
+    name === "TransportError" ||
+    name === "BadRequestError" ||
+    name === "NotFoundError"
+  );
+}
 
 export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
@@ -13,57 +45,143 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         message: e.message,
         code: e.code,
       }));
+      const issues = err.errors.map((e) => ({
+        path: e.path,
+        message: e.message,
+        code: e.code,
+      }));
       const first = err.errors[0];
       const field = first?.path.join(".");
       const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
 
-      return reply.code(400).send({
-        code: "VALIDATION_ERROR",
-        error: "VALIDATION_ERROR",
-        message,
-        requestId,
-        details,
-      });
+      return reply.code(400).send(
+        formatErrorResponse("VALIDATION_ERROR", message, requestId, details, issues)
+      );
+    }
+
+    // A request that failed Fastify's own JSON-schema validation (from a
+    // route's `schema` / OpenAPI body-schema annotation) is a validation
+    // error like any other, so it returns the same VALIDATION_ERROR contract
+    // the Zod-based handlers use. Failing that — falling into the generic 4xx
+    // branch below — would let two identical mistakes on two routes surface
+    // with two different codes.
+    if ((err as any).code === "FST_ERR_VALIDATION") {
+      const details = Array.isArray((err as any).validation)
+        ? (err as any).validation.map((v: any) => ({
+            field: (v?.instancePath ?? "").replace(/^\//, "") || undefined,
+            message: v?.message ?? "Validation failed",
+          }))
+        : undefined;
+      return reply.code(400).send(
+        formatErrorResponse("VALIDATION_ERROR", "Validation failed", requestId, details)
+      );
+    }
+
+    // A body Fastify could not parse at all (malformed JSON) or an empty body
+    // sent where JSON was required. Surfaced here so it carries the same
+    // envelope as every other error instead of falling into the generic 4xx
+    // branch, which echoes the parser's own message — text that can quote the
+    // malformed input back to the client. Fixed 400 text, no parse details.
+    //
+    // Malformed JSON arrives as the SyntaxError thrown by JSON.parse with
+    // statusCode 400 set by Fastify's content-type parser — a shape nothing
+    // else in this pipeline produces, and one stable across parser message
+    // formats (which change between V8 releases and are deliberately not
+    // matched here).
+    if (
+      (err as any).code === "FST_ERR_CTP_EMPTY_JSON_BODY" ||
+      (err instanceof SyntaxError && (err as any).statusCode === 400)
+    ) {
+      return reply.code(400).send(
+        formatErrorResponse("VALIDATION_ERROR", "Request body must be valid JSON.", requestId)
+      );
     }
 
     if (err instanceof AppError) {
-      const body: Record<string, unknown> = {
-        code: err.code,
-        error: err.code,
-        message: err.message,
-        requestId,
-      };
-      if (err.details !== undefined) {
-        body.details = err.details;
+      return reply.code(err.status).send(
+        formatErrorResponse(err.code, err.message, requestId, err.details)
+      );
+    }
+
+    // A timeout or transport failure that escaped a handler still means the
+    // upstream is unavailable, not that this process has a bug — answer 502
+    // with the safe envelope rather than the generic 500, and never echo the
+    // upstream's own error text.
+    if (err instanceof TimeoutError || err instanceof TransportError) {
+      const converted = toProviderError(err, {
+        provider: "upstream",
+        operation: "route",
+        fallbackMessage: "The upstream service is unavailable",
+      });
+      return reply.code(converted.status).send(
+        formatErrorResponse(converted.code, converted.message, requestId)
+      );
+    }
+
+    // Size and shape limits rejected by Fastify or @fastify/multipart before a
+    // handler ever ran. Without this they fall through to the generic 4xx
+    // branch below, which echoes the framework's own wording and leaves clients
+    // no stable code to branch on. See src/lib/request-limits.ts.
+    const limitError = toRequestLimitError(err);
+    if (limitError) {
+      return reply.code(limitError.status).send(
+        formatErrorResponse(limitError.code, limitError.message, requestId)
+      );
+    }
+
+    const upstreamStatus =
+      (err as unknown as Record<string, unknown>).response && typeof (err as any).response === "object"
+        ? (err as any).response.status
+        : (err as any).statusCode ?? (err as any).status;
+
+    if (isHorizonError(err) && typeof upstreamStatus === "number") {
+      const operation = (err as any).operation ?? "Horizon request";
+      // Log upstream incidents at WARN without including full upstream
+      // error objects to avoid leaking potentially sensitive payloads.
+      req.log.warn(
+        {
+          requestId,
+          operation,
+          statusCode: upstreamStatus,
+          errorCode: (err as any).code ?? "UPSTREAM_ERROR",
+          message: (err as any).message,
+        },
+        "Horizon upstream failure"
+      );
+
+      if (upstreamStatus === 429) {
+        return reply.code(429).send(
+          formatErrorResponse("RATE_LIMITED", "Horizon is rate limiting requests. Please retry shortly.", requestId)
+        );
       }
-      return reply.code(err.status).send(body);
+
+      if (upstreamStatus >= 500 || upstreamStatus === 408) {
+        return reply.code(502).send(
+          formatErrorResponse("UPSTREAM_ERROR", `${operation} is temporarily unavailable. Please retry shortly.`, requestId)
+        );
+      }
+
+      return reply.code(502).send(
+        formatErrorResponse("UPSTREAM_ERROR", `${operation} failed while contacting the Stellar network.`, requestId)
+      );
     }
 
     if ((err as any).statusCode === 429) {
-      return reply.code(429).send({
-        code: "RATE_LIMITED",
-        error: "RATE_LIMITED",
-        message: "Too many requests, slow down.",
-        requestId,
-      });
+      return reply.code(429).send(
+        formatErrorResponse("RATE_LIMITED", "Too many requests, slow down.", requestId)
+      );
     }
 
     if ((err as any).statusCode && (err as any).statusCode < 500) {
       const status: number = (err as any).statusCode;
-      return reply.code(status).send({
-        code: "BAD_REQUEST",
-        error: "BAD_REQUEST",
-        message: err.message,
-        requestId,
-      });
+      return reply.code(status).send(
+        formatErrorResponse("BAD_REQUEST", err.message, requestId)
+      );
     }
 
     app.log.error({ err, requestId }, "Unhandled error");
-    return reply.code(500).send({
-      code: "INTERNAL_ERROR",
-      error: "INTERNAL_ERROR",
-      message: "Something went wrong.",
-      requestId,
-    });
+    return reply.code(500).send(
+      formatErrorResponse("INTERNAL_ERROR", "Something went wrong.", requestId)
+    );
   });
 });

@@ -32,6 +32,8 @@ export interface SettlementIntentRecord {
   assetIssuer: string | null;
   /** Server-controlled signing deadline; null on rows predating expiry tracking. */
   expiresAt?: Date | null;
+  /** Sequence used to build the persisted unsigned payment intent, when stored. */
+  sourceSequence?: string;
   from: { stellarPublicKey: string };
   to: { stellarPublicKey: string };
 }
@@ -51,6 +53,7 @@ export function settlementPaymentIntent(
     asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
     amount: String(settlement.amount),
     memoCode: settlement.shortCode,
+    sourceSequence: settlement.sourceSequence,
     expiresAt: settlement.expiresAt ?? null,
     resource: "settlement",
   };

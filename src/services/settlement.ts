@@ -203,6 +203,11 @@ export function suggestSettlements(balances: NetBalance[]): Suggestion[] {
   return suggestions;
 }
 
+/** Public name used by the settlement preview API. */
+export function calculateSimplifiedDebts(balances: NetBalance[]): Suggestion[] {
+  return suggestSettlements(balances);
+}
+
 /** Convenience: are all balances effectively zero? */
 export function isAllSettled(balances: NetBalance[]): boolean {
   return balances.every((b) => bigIntAbs(toStroops(b.net)) === 0n);

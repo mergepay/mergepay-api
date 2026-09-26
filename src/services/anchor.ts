@@ -32,10 +32,25 @@
 
 import toml from "toml";
 import { z } from "zod";
+import pino from "pino";
 import { config } from "../config";
-import { Errors } from "../errors";
-import { fetchWithTimeout } from "./timeout";
+import { AppError } from "../errors";
+import {
+  ProviderError,
+  type ProviderFailureCategory,
+} from "../lib/provider-error";
+import { fetchWithTimeout, toProviderError } from "./timeout";
 import { anchorCircuit } from "./anchor-circuit";
+import { safeFailureMessage } from "./job-retry";
+import { isSep24TransactionStatus } from "./sep24-types";
+import {
+  classifyUpstreamFailure,
+  isRetryableFailure,
+  logRetryAttempt,
+  type UpstreamFailureKind,
+  upstreamCauseOf,
+  withRetry,
+} from "./retry";
 
 export interface AnchorToml {
   homeDomain: string;
@@ -89,6 +104,18 @@ export interface PollResult {
   message: string;
   /** True if the poll encountered an error (timeout, network, malformed). */
   isError: boolean;
+  /**
+   * Normalized provider failure category for a failed poll — lets the worker
+   * distinguish transient outages from permanent rejections without parsing
+   * message text. Undefined on success.
+   */
+  category?: ProviderFailureCategory;
+  /**
+   * Whether a failed poll can ever succeed on retry. "permanent" covers
+   * provider rejections and malformed responses; "transient" covers timeouts,
+   * transport failures, and server/rate-limit outages. Undefined on success.
+   */
+  errorCategory?: "permanent" | "transient";
   /** Anchor-provided transaction JSON for debugging (sanitized). */
   transaction?: Record<string, unknown>;
   /** SEP-24 amount_in / amount_out / amount_fee if available. */
@@ -97,6 +124,11 @@ export interface PollResult {
   amountFee?: string;
   /** SEP-24 stellar_transaction_hash if available. */
   stellarTransactionHash?: string;
+  /**
+   * False when the anchor returned a status string outside the known SEP-24
+   * set (mapped to a safe pending state). Undefined on failed polls.
+   */
+  recognized?: boolean;
 }
 
 // ─── Zod schemas for anchor responses ───────────────────────────────────────
@@ -115,54 +147,215 @@ const interactiveResponseSchema = z.object({
   id: z.string(),
 });
 
-const sep24TransactionResponseSchema = z.object({
-  transaction: z.object({
-    status: z.string(),
-    id: z.string().optional(),
-    kind: z.string().optional(),
-    amount_in: z.string().optional(),
-    amount_out: z.string().optional(),
-    amount_fee: z.string().optional(),
-    started_at: z.string().optional(),
-    completed_at: z.string().optional(),
-    stellar_transaction_hash: z.string().optional(),
-    external_transaction_id: z.string().optional(),
-    message: z.string().optional(),
-    refunds: z.any().optional(),
-  }),
-});
+const sep24TransactionResponseSchema = z
+  .object({
+    transaction: z
+      .object({
+        status: z.string().min(1),
+        id: z.string().optional(),
+        kind: z.string().optional(),
+        amount_in: z.union([z.string(), z.number()]).optional(),
+        amount_out: z.union([z.string(), z.number()]).optional(),
+        amount_fee: z.union([z.string(), z.number()]).optional(),
+        started_at: z.string().optional(),
+        completed_at: z.string().optional(),
+        stellar_transaction_hash: z.string().optional(),
+        external_transaction_id: z.string().optional(),
+        message: z.string().optional(),
+        refunds: z.any().optional(),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((data, ctx) => {
+    // A transaction without a usable status is malformed — never accept a
+    // blank/whitespace status that would silently round-trip to pending.
+    const raw = data.transaction.status.trim();
+    if (!raw) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["transaction", "status"],
+        message: "transaction status must be a non-empty string",
+      });
+    }
+  });
+
+// ─── Retry policy for anchor reads ──────────────────────────
+
+/**
+ * Structured sink for retry telemetry. Anchor calls run from routes and from
+ * the reconciliation worker alike, so there is no request logger to borrow;
+ * attempt metadata goes to the console with the operation and attempt number
+ * and nothing from the anchor's response body.
+ */
+const retryLog = {
+  warn(entry: object, message: string): void {
+    console.warn(`[anchor] ${message}`, JSON.stringify(entry));
+  },
+};
+
+/**
+ * A non-OK anchor response, raised so the retry policy can classify it by
+ * status. `fetch` resolves for 4xx and 5xx alike, so without this the policy
+ * would see a successful attempt and a 503 would never be retried.
+ *
+ * The status is all that crosses this boundary — the anchor's body is not
+ * attached, since it reaches the client only as a stable UPSTREAM_ERROR.
+ */
+class AnchorHttpError extends Error {
+  readonly status: number;
+  /**
+   * `withTimeout` passes an error through untouched only when it carries both
+   * `statusCode` and `code` — its test for an intentional application error.
+   * Without them this would be rewrapped as a `TransportError` and a 4xx would
+   * be retried as though the connection had failed.
+   */
+  readonly statusCode: number;
+  readonly code = "UPSTREAM_ERROR";
+
+  constructor(operation: string, status: number) {
+    super(`Anchor "${operation}" responded with HTTP ${status}`);
+    this.name = "AnchorHttpError";
+    this.status = status;
+    this.statusCode = status;
+  }
+}
+
+/**
+ * Fetch an anchor **read** endpoint with a per-attempt timeout and bounded
+ * retries. 5xx and transport failures are repeated with backoff; 4xx — 429
+ * included — surface immediately. See `src/services/retry.ts` for the rules
+ * governing which calls may use this and which must not.
+ */
+async function fetchReadWithRetry(
+  url: string,
+  operation: string,
+  timeoutMs: number,
+  init?: RequestInit
+): Promise<Response> {
+  return withRetry(
+    {
+      operation,
+      timeoutMs,
+      onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
+    },
+    async (signal) => {
+      const response = await fetch(url, { ...init, signal });
+      // Surface the status as a throw so retry classification can see it; the
+      // caller still gets the Response back when the attempt succeeds.
+      if (!response.ok) throw new AnchorHttpError(operation, response.status);
+      return response;
+    }
+  );
+}
 
 // ─── Service implementation ─────────────────────────────────────────────────
 
+const PROVIDER = "anchor";
+
+/** Classify a non-OK anchor HTTP status into a provider failure category. */
+function httpFailureCategory(status: number): ProviderFailureCategory {
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "unavailable";
+  return "rejected";
+}
+
+/** Map a retry classification onto the provider category the worker persists. */
+const PROVIDER_CATEGORY_BY_KIND: Record<UpstreamFailureKind, ProviderFailureCategory> = {
+  timeout: "timeout",
+  transport: "transport",
+  server_error: "unavailable",
+  rate_limited: "rate_limited",
+  client_error: "rejected",
+  unknown: "unavailable",
+};
+
+/** Whether a provider category is a permanent rejection vs a transient outage. */
+function errorCategoryOf(
+  category: ProviderFailureCategory
+): "permanent" | "transient" {
+  return category === "rejected" || category === "malformed" ? "permanent" : "transient";
+}
+
+/**
+ * fetchWithTimeout with its typed failures converted to ProviderError.
+ * The original error never escapes — timeout/transport details stay in the
+ * category, not in client-visible text.
+ */
+async function fetchAnchor(
+  operation: string,
+  url: string,
+  timeoutMs: number,
+  init?: RequestInit
+): Promise<Response> {
+  try {
+    return await fetchWithTimeout(url, operation, timeoutMs, init);
+  } catch (err) {
+    throw toProviderError(err, {
+      provider: PROVIDER,
+      operation,
+      fallbackMessage: `Anchor request failed (${operation})`,
+    });
+  }
+}
+
+/** Parse an anchor response body as JSON, mapping non-JSON to malformed. */
+async function readAnchorJson(operation: string, res: Response): Promise<unknown> {
+  try {
+    return await res.json();
+  } catch {
+    throw new ProviderError({
+      category: "malformed",
+      provider: PROVIDER,
+      operation,
+      message: "Anchor returned a malformed (non-JSON) response",
+    });
+  }
+}
+
 export const anchorService = {
-  /** Fetch & parse the anchor's stellar.toml (cached 5 min). */
+  /**
+   * Fetch & parse the anchor's stellar.toml (cached 5 min).
+   *
+   * A read, so transient failures are retried before the circuit breaker sees
+   * a failure: one dropped connection to an otherwise healthy anchor should
+   * not count toward opening the circuit. Only an exhausted attempt budget —
+   * or a permanent 4xx — records a failure against the provider.
+   */
   async getToml(homeDomain: string): Promise<AnchorToml> {
     const cached = tomlCache.get(homeDomain);
     if (cached && Date.now() - cached.at < TOML_TTL) return cached.value;
 
     const provider = `toml:${homeDomain}`;
     if (anchorCircuit.isOpen(provider)) {
-      throw Errors.upstream(`Circuit open for anchor ${homeDomain}`);
+      throw new ProviderError({
+        category: "unavailable",
+        provider: PROVIDER,
+        operation: "Anchor.getToml",
+        message: `Circuit open for anchor ${homeDomain}`,
+      });
     }
 
     const url = `https://${homeDomain}/.well-known/stellar.toml`;
     let res: Response;
     try {
-      res = await fetchWithTimeout(url, "Anchor.getToml", config.ANCHOR_TOML_TIMEOUT_MS);
+      res = await fetchReadWithRetry(url, "Anchor.getToml", config.ANCHOR_TOML_TIMEOUT_MS);
     } catch (err) {
       anchorCircuit.recordFailure(provider);
       throw err;
     }
-    if (!res.ok) {
-      anchorCircuit.recordFailure(provider);
-      throw Errors.upstream(`Could not load stellar.toml for ${homeDomain}`);
-    }
     let parsed: any;
     try {
       parsed = toml.parse(await res.text());
-    } catch {
+    } catch (err) {
       anchorCircuit.recordFailure(provider);
-      throw Errors.upstream("Anchor returned invalid stellar.toml");
+      if (err instanceof AppError) throw err;
+      throw new ProviderError({
+        category: "malformed",
+        provider: PROVIDER,
+        operation: "Anchor.getToml",
+        message: "Anchor returned invalid stellar.toml",
+      });
     }
 
     const currencies = Array.isArray(parsed.CURRENCIES) ? parsed.CURRENCIES : [];
@@ -179,7 +372,12 @@ export const anchorService = {
       typeof parsed.SIGNING_KEY !== "string"
     ) {
       anchorCircuit.recordFailure(provider);
-      throw Errors.upstream("Anchor stellar.toml is missing required SEP-24 fields");
+      throw new ProviderError({
+        category: "malformed",
+        provider: PROVIDER,
+        operation: "Anchor.getToml",
+        message: "Anchor stellar.toml is missing required SEP-24 fields",
+      });
     }
     anchorCircuit.recordSuccess(provider);
 
@@ -198,38 +396,80 @@ export const anchorService = {
     return this.getToml(config.ANCHOR_HOME_DOMAIN);
   },
 
-  /** Step 1: get a SEP-10 challenge from the anchor for the user account. */
+  /**
+   * Step 1: get a SEP-10 challenge from the anchor for the user account.
+   *
+   * A read: the challenge is issued fresh per request and an abandoned one
+   * simply expires unused, so repeating the call creates no lasting state.
+   */
   async getChallenge(
     webAuthEndpoint: string,
     account: string
   ): Promise<{ transaction: string; networkPassphrase: string }> {
+    const operation = "Anchor.getChallenge";
     const url = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`;
-    const res = await fetchWithTimeout(url, "Anchor.getChallenge", config.ANCHOR_CHALLENGE_TIMEOUT_MS);
-    if (!res.ok) throw Errors.upstream("Anchor SEP-10 challenge request failed");
-    const data = parseJson(challengeResponseSchema, await res.json());
+    let res: Response;
+    try {
+      // A single attempt, not the bounded retry wrapper: the challenge is
+      // issued fresh per request and an abandoned one expires unused, so the
+      // timeout/transport error is converted straight into a typed
+      // ProviderError (never leaking the endpoint URL).
+      res = await fetchWithTimeout(url, operation, config.ANCHOR_CHALLENGE_TIMEOUT_MS);
+    } catch (err) {
+      throw toProviderError(err, {
+        provider: PROVIDER,
+        operation,
+        fallbackMessage: "Anchor SEP-10 challenge request failed",
+      });
+    }
+    if (!res.ok) {
+      throw new ProviderError({
+        category: httpFailureCategory(res.status),
+        provider: PROVIDER,
+        operation,
+        message: "Anchor SEP-10 challenge request failed",
+      });
+    }
+    const data = parseJson(operation, challengeResponseSchema, await readAnchorJson(operation, res));
     return {
       transaction: data.transaction,
       networkPassphrase: data.network_passphrase ?? config.networkPassphrase,
     };
   },
 
-  /** Step 2: exchange the signed challenge for an anchor JWT. */
+  /**
+   * Step 2: exchange the signed challenge for an anchor JWT.
+   *
+   * Deliberately a single attempt. The challenge is single-use: an anchor that
+   * consumed it and lost the response will reject the repeat as a replay, so a
+   * retry turns a recoverable timeout into a hard authentication failure. The
+   * caller restarts from `getChallenge` instead.
+   */
   async getToken(webAuthEndpoint: string, signedXdr: string): Promise<string> {
-    const res = await fetchWithTimeout(
-      webAuthEndpoint,
-      "Anchor.getToken",
-      config.ANCHOR_TOKEN_TIMEOUT_MS,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transaction: signedXdr }),
-      }
-    );
-    if (!res.ok) throw Errors.upstream("Anchor SEP-10 token exchange failed");
-    return parseJson(tokenResponseSchema, await res.json()).token;
+    const operation = "Anchor.getToken";
+    const res = await fetchAnchor(operation, webAuthEndpoint, config.ANCHOR_TOKEN_TIMEOUT_MS, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transaction: signedXdr }),
+    });
+    if (!res.ok) {
+      throw new ProviderError({
+        category: httpFailureCategory(res.status),
+        provider: PROVIDER,
+        operation,
+        message: "Anchor SEP-10 token exchange failed",
+      });
+    }
+    return parseJson(operation, tokenResponseSchema, await readAnchorJson(operation, res)).token;
   },
 
-  /** Start a SEP-24 interactive deposit or withdrawal flow. */
+  /**
+   * Start a SEP-24 interactive deposit or withdrawal flow.
+   *
+   * Deliberately a single attempt. This creates a transaction record on the
+   * anchor side; repeating it after a lost response leaves the user with two
+   * open anchor sessions for one intent, only one of which we track.
+   */
   async startInteractive(params: {
     transferServer: string;
     token: string;
@@ -237,26 +477,29 @@ export const anchorService = {
     assetCode: string;
     account: string;
   }): Promise<{ url: string; id: string }> {
+    const operation = "Anchor.startInteractive";
     const path = params.kind === "deposit" ? "deposit" : "withdraw";
     const url = `${params.transferServer}/transactions/${path}/interactive`;
-    const res = await fetchWithTimeout(
-      url,
-      "Anchor.startInteractive",
-      config.ANCHOR_INTERACTIVE_TIMEOUT_MS,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${params.token}`,
-        },
-        body: JSON.stringify({
-          asset_code: params.assetCode,
-          account: params.account,
-        }),
-      }
-    );
-    if (!res.ok) throw Errors.upstream("Anchor interactive flow request failed");
-    return parseJson(interactiveResponseSchema, await res.json());
+    const res = await fetchAnchor(operation, url, config.ANCHOR_INTERACTIVE_TIMEOUT_MS, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.token}`,
+      },
+      body: JSON.stringify({
+        asset_code: params.assetCode,
+        account: params.account,
+      }),
+    });
+    if (!res.ok) {
+      throw new ProviderError({
+        category: httpFailureCategory(res.status),
+        provider: PROVIDER,
+        operation,
+        message: "Anchor interactive flow request failed",
+      });
+    }
+    return parseJson(operation, interactiveResponseSchema, await readAnchorJson(operation, res));
   },
 
   /**
@@ -264,6 +507,11 @@ export const anchorService = {
    *
    * Returns a raw status string or null if the anchor responded with a
    * non-OK status or the transaction was not found.
+   *
+   * A read, so transient failures are retried within the call. The circuit
+   * breaker only records a failure once the attempt budget is exhausted —
+   * counting each individual attempt would open the circuit after a single
+   * bad poll rather than after a genuinely unhealthy anchor.
    */
   async getTransactionStatus(params: {
     transferServer: string;
@@ -280,22 +528,24 @@ export const anchorService = {
     )}`;
     let res: Response;
     try {
-      res = await fetchWithTimeout(url, "Anchor.getTransactionStatus", config.ANCHOR_POLL_TIMEOUT_MS, {
-        headers: { Authorization: `Bearer ${params.token}` },
-      });
+      res = await fetchReadWithRetry(
+        url,
+        "Anchor.getTransactionStatus",
+        config.ANCHOR_POLL_TIMEOUT_MS,
+        { headers: { Authorization: `Bearer ${params.token}` } }
+      );
       anchorCircuit.recordSuccess(provider);
     } catch {
       anchorCircuit.recordFailure(provider);
       return null;
     }
 
-    if (!res.ok) {
-      anchorCircuit.recordFailure(provider);
-      return null;
-    }
-
     try {
-      const data = parseJson(sep24TransactionResponseSchema, await res.json());
+      const data = parseJson(
+        "Anchor.getTransactionStatus",
+        sep24TransactionResponseSchema,
+        await res.json()
+      );
       const rawStatus = data.transaction?.status;
       return rawStatus ? rawStatus.trim().toLowerCase() : null;
     } catch {
@@ -310,6 +560,12 @@ export const anchorService = {
    * This is the primary method the worker should call. It wraps
    * getTransactionStatus with a timeout, parses the full transaction
    * response, and returns a normalised PollResult.
+   *
+   * A read, so transient failures are retried inside the call before a
+   * `PollResult` with `isError` is returned. The worker's own retry schedule
+   * therefore governs genuinely unavailable anchors rather than momentary
+   * blips, and the circuit breaker counts one failure per exhausted budget
+   * rather than one per attempt.
    */
   async pollTransaction(params: {
     transferServer: string;
@@ -325,6 +581,8 @@ export const anchorService = {
         status: "pending_anchor",
         message: "Anchor circuit is open",
         isError: true,
+        category: "unavailable",
+        errorCategory: "transient",
       };
     }
 
@@ -332,28 +590,29 @@ export const anchorService = {
 
     let response: Response;
     try {
-      response = await fetchWithTimeout(url, "Anchor.pollTransaction", timeoutMs, {
+      response = await fetchReadWithRetry(url, "Anchor.pollTransaction", timeoutMs, {
         headers: { Authorization: `Bearer ${params.token}` },
       });
       anchorCircuit.recordSuccess(provider);
     } catch (err: unknown) {
       anchorCircuit.recordFailure(provider);
-      const message = err instanceof Error ? err.message : String(err);
+      // The retry wrapper maps every failure to a stable upstream error, so the
+      // anchor's HTTP status is read back off the preserved cause to keep the
+      // previous poll-result message intact.
+      const cause = upstreamCauseOf(err) ?? err;
+      const kind = classifyUpstreamFailure(cause);
+      const message =
+        cause instanceof AnchorHttpError
+          ? `Anchor returned HTTP ${cause.status}`
+          : `Anchor poll failed: ${err instanceof Error ? err.message : String(err)}`;
+      const category = PROVIDER_CATEGORY_BY_KIND[kind];
       return {
         rawStatus: null,
         status: "pending_anchor",
-        message: `Anchor poll failed: ${message}`,
+        message,
         isError: true,
-      };
-    }
-
-    if (!response.ok) {
-      anchorCircuit.recordFailure(provider);
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: `Anchor returned HTTP ${response.status}`,
-        isError: true,
+        category,
+        errorCategory: errorCategoryOf(category),
       };
     }
 
@@ -367,19 +626,33 @@ export const anchorService = {
         status: "pending_anchor",
         message: "Anchor returned malformed (non-JSON) response",
         isError: true,
+        category: "malformed",
+        errorCategory: "permanent",
       };
     }
 
-    const tx = json.transaction as Record<string, unknown> | undefined;
-    if (!tx) {
+    const parseResult = sep24TransactionResponseSchema.safeParse(json);
+    if (!parseResult.success) {
+      anchorCircuit.recordFailure(provider);
+      const issues = parseResult.error.issues;
+      const hasMissingTx = issues.some((i) => i.path.length === 0 || i.path[0] === "transaction");
+      const hasMissingStatus = issues.some((i) => i.path.join(".") === "transaction.status");
+      const detail = hasMissingStatus
+        ? "missing transaction status"
+        : hasMissingTx
+          ? "missing 'transaction'"
+          : "invalid fields";
       return {
         rawStatus: null,
         status: "pending_anchor",
-        message: "Anchor response missing 'transaction' field",
+        message: `Anchor returned invalid or malformed response: ${detail}`,
         isError: true,
+        category: "malformed",
+        errorCategory: "permanent",
       };
     }
 
+    const tx = parseResult.data.transaction;
     const rawStatus =
       typeof tx.status === "string" ? tx.status : (json.status as string | undefined) ?? null;
     if (!rawStatus) {
@@ -388,8 +661,15 @@ export const anchorService = {
         status: "pending_anchor",
         message: "Anchor response missing transaction status",
         isError: true,
+        category: "malformed",
+        errorCategory: "permanent",
       };
     }
+
+    // Distinguish a genuinely new anchor status (kept pending, logged loudly)
+    // from the statuses we know how to interpret.
+    const recognized = isSep24TransactionStatus(rawStatus);
+    const mappedStatus = mapAnchorStatus(rawStatus);
 
     // Sanitise — only carry forward benign fields for debugging
     const sanitizedTx: Record<string, unknown> = {
@@ -403,17 +683,32 @@ export const anchorService = {
       completed_at: tx.completed_at,
       stellar_transaction_hash: tx.stellar_transaction_hash,
       external_transaction_id: tx.external_transaction_id,
-      message: tx.message,
+      message: typeof tx.message === "string" ? safeFailureMessage(tx.message) : undefined,
       refunds: tx.refunds,
     };
 
-    const mappedStatus = mapAnchorStatus(rawStatus);
+    let displayMessage = `SEP-24 status: ${rawStatus} → ${mappedStatus}`;
+    if (mappedStatus === "error" && typeof tx.message === "string") {
+      displayMessage = safeFailureMessage(tx.message);
+    }
+
+    if (!recognized) {
+      retryLog.warn(
+        {
+          rawStatus,
+          mappedStatus,
+          externalTransactionId: params.id,
+        },
+        `SEP-24 transaction reported an unknown status: ${rawStatus} — mapping to ${mappedStatus} and will keep polling`
+      );
+    }
 
     return {
       rawStatus,
       status: mappedStatus,
-      message: `SEP-24 status: ${rawStatus} → ${mappedStatus}`,
+      message: displayMessage,
       isError: false,
+      recognized,
       transaction: sanitizedTx,
       amountIn:
         typeof tx.amount_in === "string" || typeof tx.amount_in === "number"
@@ -439,64 +734,42 @@ export const anchorService = {
 // ─── Status mapping ─────────────────────────────────────────────────────────
 
 /**
+ * The exhaustive set of SEP-24 transaction statuses (lowercased) that we
+ * understand and map explicitly. Re-exported from ./sep24-types — the single
+ * source of truth shared with the anchor-session state machine and both
+ * callback handlers — so it can no longer drift from the type union.
+ *
+ * See: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md#transaction-history
+ */
+export {
+  KNOWN_SEP24_STATUSES,
+  isSep24TransactionStatus as isKnownSep24Status,
+} from "./sep24-types";
+
+/**
  * Map a raw SEP-24 status string to Mergepay's internal status.
  *
- * Rule: If the upstream returns a status we do not recognise, we map it to
- * "pending_anchor" (a safe intermediate) instead of erroring out, because
- * a future anchor deployment might introduce new intermediate states.
+ * Every status in the canonical union maps to itself. An unrecognised status
+ * (including the deprecated `pending_external` /
+ * `pending_user_transfer_complete`, which `isRecognisedSep24Status` still
+ * accepts) is mapped to "pending_anchor" — a safe intermediate — instead of
+ * erroring out, because a future anchor deployment might introduce new
+ * intermediate states. `isKnownSep24Status` lets callers tell a genuine
+ * pending state from a foreign one.
  *
- * Terminal states (completed, error, refunded, expired, no_market,
- * too_small, too_large) are idempotent — the worker must never overwrite
- * them once set.
+ * Terminal states (completed, error, refunded, expired, no_market, too_small,
+ * too_large) are idempotent — the worker must never overwrite them once set.
  */
 export function mapAnchorStatus(raw: string): string {
-  switch (raw) {
-    // ── Terminal (success) ──
-    case "completed":
-      return "completed";
+  const normalized = raw ? raw.trim().toLowerCase() : "";
 
-    // ── Terminal (failure) ──
-    case "error":
-      return "error";
-    case "refunded":
-      return "refunded";
-    case "expired":
-      return "expired";
-    case "no_market":
-      return "no_market";
-    case "too_small":
-      return "too_small";
-    case "too_large":
-      return "too_large";
+  if (isSep24TransactionStatus(normalized)) return normalized;
 
-    // ── Intermediate (requires user action) ──
-    case "pending_user_transfer_start":
-      return "pending_user_transfer_start";
-    case "pending_user":
-      return "pending_user";
-    case "pending_transaction_info_update":
-      return "pending_transaction_info_update";
-    case "pending_receiver":
-      return "pending_receiver";
-    case "pending_sender":
-      return "pending_sender";
-
-    // ── Intermediate (anchor / stellar) ──
-    case "pending_stellar":
-      return "pending_stellar";
-    case "pending_trust":
-      return "pending_trust";
-    case "pending_anchor":
-      return "pending_anchor";
-
-    // ── Initial ──
-    case "incomplete":
-      return "incomplete";
-
-    // ── Unknown → safe default ──
-    default:
-      return "pending_anchor";
-  }
+  retryLog.warn(
+    { rawStatus: raw, mappedStatus: "pending_anchor" },
+    `Unknown SEP-24 status received: ${raw} — mapping to pending_anchor`
+  );
+  return "pending_anchor";
 }
 
 /** Whether a normalized status is terminal and no longer needs polling. */
@@ -506,10 +779,15 @@ export function isTerminalAnchorStatus(status: string): boolean {
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
-function parseJson<T>(schema: z.ZodSchema<T>, data: unknown): T {
+function parseJson<T>(operation: string, schema: z.ZodSchema<T>, data: unknown): T {
   const result = schema.safeParse(data);
   if (!result.success) {
-    throw Errors.upstream("Anchor returned an unexpected response format");
+    throw new ProviderError({
+      category: "malformed",
+      provider: PROVIDER,
+      operation,
+      message: "Anchor returned an unexpected response format",
+    });
   }
   return result.data;
 }

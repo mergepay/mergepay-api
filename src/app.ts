@@ -1,4 +1,4 @@
-import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
+import Fastify, { FastifyInstance, FastifyRequest, FastifyServerOptions } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -9,6 +9,7 @@ import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
+import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
 import openAPIPlugin from "./plugins/openapi";
 import { validateAssetConfig } from "./services/assets";
@@ -18,16 +19,27 @@ import expenseRoutes from "./routes/expenses";
 import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
 import treasuryProposalRoutes from "./routes/treasury-proposals";
+import treasurySignatureRoutes from "./routes/treasury-signatures";
 import anchorRoutes from "./routes/anchors";
 import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import auditLogRoutes from "./routes/audit-log";
+import sep24Routes from "./routes/sep24";
+import webhookRoutes from "./routes/webhooks";
+import exchangeRateRoutes from "./routes/exchange-rates";
 import userGroupsRoutes from "./routes/user-groups";
+import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
+import { formatErrorResponse } from "./utils/error-response";
 import { rateLimitPolicies } from "./lib/rate-limit";
+import { stellarErrorSerializer } from "./lib/stellar-serializer";
+import { reqSerializer, resSerializer } from "./lib/serializers";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
+import { installMultipartGuard } from "./lib/multipart-guard";
+import { nanoid } from "nanoid";
+import { AppError, ErrorCode } from "./lib/errors";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -49,21 +61,51 @@ function globalRateLimitKey(request: FastifyRequest): string {
   return `global:ip:${request.ip}`;
 }
 
-export async function buildApp(): Promise<FastifyInstance> {
+/**
+ * Build-time overrides.
+ *
+ * `logger` exists so tests can inject a Pino instance that writes into an
+ * in-memory stream: under test the default logger is disabled (see the
+ * `config.isTest` branch below), so without an injection point there is
+ * nothing for the error-handling tests to assert against. Production callers
+ * pass no options and keep the configured logger.
+ */
+export interface BuildAppOptions {
+  logger?: FastifyServerOptions["logger"];
+}
+
+export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
   validateAssetConfig();
 
+  // Contains a @fastify/busboy defect that turns a truncated multipart body
+  // into an uncaught exception. See src/lib/multipart-guard.ts.
+  installMultipartGuard();
+
   const app = Fastify({
-    // Disable Fastify's unvalidated request-id header handling. The incoming
-    // values are validated by genReqId before becoming request.id.
-    requestIdHeader: false,
-    genReqId: (request) =>
-      getCorrelationId(
-        request.headers["x-correlation-id"] ?? request.headers["x-request-id"]
-      ),
-    logger: config.isTest
-      ? false
-      : {
-          level: process.env.LOG_LEVEL ?? "info",
+    requestIdHeader: "x-request-id",
+    genReqId: (request) => {
+      const incomingRequestId = request.headers["x-request-id"];
+      const incomingCorrelationId = request.headers["x-correlation-id"];
+      const preferred =
+        typeof incomingRequestId === "string" && incomingRequestId.trim()
+          ? incomingRequestId
+          : typeof incomingCorrelationId === "string" && incomingCorrelationId.trim()
+            ? incomingCorrelationId
+            : `req-${nanoid(16)}`;
+
+      return getCorrelationId(preferred);
+    },
+    logger:
+      options.logger ??
+      (config.isTest
+        ? false
+        : {
+          level: config.LOG_LEVEL,
+          serializers: {
+            err: stellarErrorSerializer as any,
+            req: reqSerializer as any,
+            res: resSerializer as any,
+          },
           redact: {
             paths: [
               "req.headers.authorization",
@@ -90,23 +132,28 @@ export async function buildApp(): Promise<FastifyInstance> {
             config.NODE_ENV === "development"
               ? { target: "pino-pretty", options: { colorize: true } }
               : undefined,
-        },
+        }),
     bodyLimit: config.JSON_BODY_LIMIT_BYTES,
   });
 
   app.addHook("onRequest", async (request, reply) => {
-    const correlationId = getCorrelationId(request.id);
-    reply.header("x-request-id", correlationId);
+    const requestId = request.id;
+    const correlationId = getCorrelationId(requestId);
+    reply.header("x-request-id", requestId);
     reply.header("x-correlation-id", correlationId);
-    request.log.info({ correlationId }, "request received");
+    request.log = request.log.child({ reqId: requestId, correlationId });
+    request.log.info({ requestId, correlationId }, "request received");
   });
 
   app.addHook("onResponse", async (request, reply) => {
-    const correlationId = getCorrelationId(request.id);
-    reply.header("x-request-id", correlationId);
+    const requestId = request.id;
+    const correlationId = getCorrelationId(requestId);
+    reply.header("x-request-id", requestId);
     reply.header("x-correlation-id", correlationId);
+    request.log = request.log.child({ reqId: requestId, correlationId });
     request.log.info(
       {
+        requestId,
         correlationId,
         statusCode: reply.statusCode,
         method: request.method,
@@ -117,23 +164,66 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   app.addHook("onError", async (request, _reply, error) => {
-    request.log.error(
-      {
-        correlationId: getCorrelationId(request.id),
-        statusCode: (error as Error & { statusCode?: number }).statusCode ?? 500,
-        errorCode: (error as { code?: string }).code ?? "INTERNAL_ERROR",
-      },
-      "request failed"
-    );
+    const statusCode = (error as any).statusCode ?? (error as any).status ?? 500;
+    const errorCode = (error as any).code ?? "INTERNAL_ERROR";
+    const correlationId = getCorrelationId(request.id);
+
+    const logData: Record<string, unknown> = {
+      correlationId,
+      statusCode,
+      errorCode,
+    };
+    if (statusCode >= 500) {
+      // Include the error object (and its stack) for unexpected server faults.
+      request.log.error({ ...logData, err: error }, "request failed");
+    } else {
+      // Client errors are expected rejections: warn level, no stack.
+      request.log.warn(logData, "request failed");
+    }
   });
 
-  await app.register(helmet, { contentSecurityPolicy: false });
+  // Security headers via @fastify/helmet. CSP is left permissive for a JSON API:
+  // there is no rendered HTML, so we only lock down the vectors that matter for
+  // an API backend (frame embedding, MIME sniffing, referrer leakage) and let
+  // the SPA on Vercel own its own CSP for its own documents. `frameguard` denies
+  // embedding entirely — the API is never loaded in an <iframe>. `contentSecurityPolicy`
+  // is enabled with a baseline `default-src 'none'` so any accidental inline
+  // content is inert, without breaking JSON clients that only read headers/body.
+  const cspDirectives: Record<string, string[]> = {
+    defaultSrc: ["'none'"],
+    frameAncestors: ["'none'"],
+  };
+  await app.register(helmet, {
+    contentSecurityPolicy: {
+      directives: cspDirectives,
+    },
+    frameguard: { action: "deny" },
+    // Disabled on purpose: `require-corp` (helmet's default) would force the
+    // SPA's fetch() clients to negotiate CORP headers and break API calls.
+    crossOriginEmbedderPolicy: false,
+    // API responses are always JSON; never let a browser MIME-sniff them.
+    noSniff: true,
+    // Don't leak the full URL in the Referer header to third parties.
+    referrerPolicy: { policy: "no-referrer" },
+    // Block the page from being used as a cross-origin opener.
+    crossOriginOpenerPolicy: { policy: "same-origin" },
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    // Harden the connection by opting into HTTPS upgrades where supported.
+    hsts: {
+      maxAge: 60 * 60 * 24 * 365,
+      includeSubDomains: true,
+      preload: true,
+    },
+  });
   const allowAll = config.WEB_URL === "*";
   const allowed = config.WEB_URL
     .split(",")
     .map((o) => o.trim().replace(/\/+$/, ""))
     .filter(Boolean);
   const allowVercelPreviews = allowed.some((o) => o.endsWith(".vercel.app"));
+  const allowMethods = config.CORS_ALLOW_METHODS.split(",").map((m) => m.trim().toUpperCase());
+  const allowHeaders = config.CORS_ALLOW_HEADERS.split(",").map((h) => h.trim());
+  const exposeHeaders = config.CORS_EXPOSE_HEADERS.split(",").map((h) => h.trim());
   await app.register(cors, {
     origin: allowAll
       ? true
@@ -146,7 +236,11 @@ export async function buildApp(): Promise<FastifyInstance> {
           }
           return cb(null, false);
         },
-    credentials: false,
+    credentials: config.CORS_ALLOW_CREDENTIALS,
+    methods: allowMethods,
+    allowedHeaders: allowHeaders,
+    exposedHeaders: exposeHeaders,
+    maxAge: config.CORS_MAX_AGE,
   });
   // Global default limit. Sensitive routes (SEP-10 auth, settlement and
   // treasury submission, anchor initiation and polling) override this with
@@ -165,20 +259,40 @@ export async function buildApp(): Promise<FastifyInstance> {
     timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: globalRateLimitKey,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
-    errorResponseBuilder: (request: FastifyRequest) => ({
-      statusCode: 429,
-      code: "RATE_LIMITED",
-      error: "RATE_LIMITED",
-      message: "Too many requests. Please retry later.",
-      requestId: request.id,
-    }),
+    errorResponseBuilder: () =>
+      // Must be a real Error (AppError), not a bare payload object:
+      // @fastify/rate-limit *throws* whatever this builder returns, and
+      // Fastify's error pipeline — the central error handler below, which
+      // stamps the requestId and the standard JSON envelope — only engages
+      // for Error instances. A bare object bypassed the handler entirely and
+      // surfaced as a 500 INTERNAL_ERROR with the 429 headers already set,
+      // which is precisely the incoherence this builder exists to avoid.
+      // (The builder's request argument is intentionally unused: the error
+      // handler owns the requestId.)
+      new AppError(
+        429,
+        ErrorCode.RATE_LIMITED,
+        "Too many requests. Please retry later."
+      ),
   });
+  // Multipart limits, all explicit. Only /uploads/receipt consumes a multipart
+  // body (the SEP-24 anchor flow is JSON end to end), so these bound that one
+  // route without touching the JSON routes, which keep their own bodyLimit.
+  //
+  // `throwFileSizeLimit` makes an oversized file an error the route can answer
+  // rather than a silently truncated stream — a truncated receipt would other-
+  // wise be written to disk as though it were complete. Each limit maps to its
+  // own client error in src/lib/request-limits.ts.
   await app.register(multipart, {
     limits: {
       fileSize: config.MULTIPART_FILE_SIZE_BYTES,
       files: config.MULTIPART_MAX_FILES,
+      // Bounds a single non-file field. busboy buffers field values in memory,
+      // so without this a form field is an unbounded allocation.
+      fieldSize: config.MULTIPART_FIELD_SIZE_BYTES,
       parts: config.MULTIPART_MAX_FIELDS,
     },
+    throwFileSizeLimit: true,
   });
 
   // Cap the request body on routes that take signed envelopes or credentials,
@@ -192,13 +306,18 @@ export async function buildApp(): Promise<FastifyInstance> {
     "/expenses/:id/settle",
     "/groups/:id/settlements",
     "/settlements/:id/confirm",
+    "/api/settlements/execute",
     "/groups/:id/treasury/deposit",
     "/groups/:id/treasury/withdraw",
     "/treasury-transactions/:id/confirm",
+    "/api/treasury/proposals",
+    "/api/treasury/proposals/:id/signatures",
     "/anchors/deposit",
     "/anchors/withdraw",
     "/anchors/sessions/:id/complete",
     "/anchors/webhook",
+    "/api/webhooks/sep24",
+    "/api/sep24/callback",
   ]);
 
   app.addHook("onRoute", (routeOptions) => {
@@ -220,31 +339,31 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(loggingPlugin);
   await app.register(authPlugin);
   await app.register(errorHandlerPlugin);
+  // Registered with fastify-plugin, so `app.idempotent` is visible to every
+  // route plugin below rather than only inside this scope.
+  await app.register(idempotencyPlugin);
   await app.register(openAPIPlugin);
 
   app.setNotFoundHandler((req, reply) => {
     const correlationId = getCorrelationId(req.id);
     reply.header("x-request-id", correlationId);
     reply.header("x-correlation-id", correlationId);
-    reply.code(404).send({
-      code: "NOT_FOUND",
-      message: "Route not found",
-      requestId: correlationId,
-    });
+    reply.code(404).send(formatErrorResponse("NOT_FOUND", "Route not found", correlationId));
   });
+
+  await app.register(healthRoutes);
 
   const liveness = async () => ({
     status: "ok",
     timestamp: new Date().toISOString(),
   });
-  app.get("/health", liveness);
   app.get("/health/live", liveness);
 
-  const { getReadiness } = await import("./services/health.js");
-  app.get("/health/ready", async (request, reply) => {
-    const readiness = await getReadiness();
-    const statusCode = readiness.status === "ok" ? 200 : 503;
-    return reply.code(statusCode).send(readiness);
+  const { getDeepHealth } = await import("./services/health.js");
+  app.get("/health/deep", async (request, reply) => {
+    const deepHealth = await getDeepHealth();
+    const statusCode = deepHealth.status === "ok" ? 200 : 503;
+    return reply.code(statusCode).send(deepHealth);
   });
 
   await app.register(authRoutes);
@@ -253,12 +372,16 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(settlementRoutes);
   await app.register(treasuryRoutes);
   await app.register(treasuryProposalRoutes);
+  await app.register(treasurySignatureRoutes);
   await app.register(anchorRoutes);
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
   await app.register(userGroupsRoutes);
   await app.register(auditLogRoutes);
+  await app.register(sep24Routes);
+  await app.register(webhookRoutes);
+  await app.register(exchangeRateRoutes);
 
   return app;
 }

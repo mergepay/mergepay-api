@@ -8,6 +8,10 @@ const h = vi.hoisted(() => {
       findMany: vi.fn(),
       update: vi.fn(),
     },
+    withdrawal: {
+      findUnique: vi.fn(async () => null),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+    },
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
     $disconnect: vi.fn(),
@@ -140,6 +144,45 @@ describe("POST /anchors/webhook — status transitions", () => {
     expect(res.statusCode).toBe(200);
     expect(prisma.anchorSession.update).not.toHaveBeenCalled();
   });
+
+  it("also reconciles a Withdrawal row matched by anchorTxId", async () => {
+    prisma.anchorSession.findMany.mockResolvedValue([]);
+    const withdrawalRow = { id: "wth_1", userId: "user_1", status: "processing" };
+    // Called once by the webhook handler (lookup by anchorTxId), then again
+    // inside applyWithdrawalTransition (lookup by id).
+    prisma.withdrawal.findUnique
+      .mockResolvedValueOnce(withdrawalRow)
+      .mockResolvedValueOnce(withdrawalRow);
+
+    const res = await post({ transaction: { id: "ANCH-TX-1", status: "completed" } });
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.withdrawal.findUnique).toHaveBeenCalledWith({
+      where: { anchorTxId: "ANCH-TX-1" },
+    });
+    expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
+      where: { id: "wth_1", status: "processing" },
+      data: { status: "completed" },
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "withdrawal.status_changed",
+        entityType: "withdrawal",
+        entityId: "wth_1",
+        metadata: { from: "processing", to: "completed", source: "webhook" },
+      }),
+    });
+  });
+
+  it("does nothing when no withdrawal matches the external transaction id either", async () => {
+    prisma.anchorSession.findMany.mockResolvedValue([]);
+    prisma.withdrawal.findUnique.mockResolvedValueOnce(null);
+
+    const res = await post({ transaction: { id: "unknown_ext", status: "completed" } });
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+  });
 });
 
 describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
@@ -211,5 +254,48 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
 
     expect(res.statusCode).toBe(404);
     expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /anchors/sessions/:id", () => {
+  it("returns 200 and the serialized session for the owner", async () => {
+    prisma.anchorSession.findUnique.mockResolvedValue(
+      fakeSession({ id: "session_1", userId: "user_1" })
+    );
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/anchors/sessions/session_1",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().session.id).toBe("session_1");
+  });
+
+  it("returns 404 if the session does not exist", async () => {
+    prisma.anchorSession.findUnique.mockResolvedValue(null);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/anchors/sessions/missing_session",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 404 if the session belongs to another user", async () => {
+    prisma.anchorSession.findUnique.mockResolvedValue(
+      fakeSession({ id: "session_1", userId: "someone_else" })
+    );
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/anchors/sessions/session_1",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(404);
   });
 });

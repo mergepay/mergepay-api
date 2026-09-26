@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "../db";
 import { config } from "../config";
 import { requireUser } from "../plugins/auth";
+import { expenseStatusFilter } from "../services/expenses";
 import { serializeExpense, serializeSettlement } from "../serializers";
 import {
   paginationQuerySchema,
@@ -12,9 +13,10 @@ import {
   encodeCursor,
   type CursorPosition,
 } from "../lib/pagination";
+import { assetCodeSchema } from "../schemas/asset";
 
 const historyQuerySchema = paginationQuerySchema.extend({
-  assetCode: z.string().optional(),
+  assetCode: assetCodeSchema.optional(),
   status: z.string().optional(),
   fromDate: z.string().datetime().optional(),
   toDate: z.string().datetime().optional(),
@@ -57,7 +59,10 @@ export default async function historyRoutes(app: FastifyInstance) {
             cursorCondition,
             assetFilter,
             dateFilter,
-            ...(query.status ? [{ status: query.status }] : []),
+            // `Expense` has no status column — settlement is tracked per
+            // participant on `ExpenseShare`. Filtering the expense row
+            // directly threw a Prisma validation error for any `?status=`.
+            ...(query.status ? [expenseStatusFilter(query.status)] : []),
           ],
         },
         include: { payer: true, shares: { include: { user: true } } },

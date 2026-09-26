@@ -4,6 +4,7 @@ export const WEBHOOK_EVENT_TYPES = [
   "expense.created",
   "expense.settled",
   "settlement.completed",
+  "settlement.confirmed",
   "settlement.failed",
   "treasury.proposal.created",
   "treasury.proposal.signed",

@@ -22,6 +22,55 @@ describe("computeShares", () => {
     expect(shares[1].shareAmount).toBe("3.3333333");
   });
 
+  it("splits evenly when the amount divides exactly", () => {
+    const shares = computeShares("9", "equal", [
+      { userId: "a" },
+      { userId: "b" },
+      { userId: "c" },
+    ]);
+    expect(shares.map((s) => s.shareAmount)).toEqual(["3", "3", "3"]);
+  });
+
+  it("keeps sub-stroop splits exact with a 1-stroop remainder", () => {
+    const shares = computeShares("0.01", "equal", [
+      { userId: "a" },
+      { userId: "b" },
+      { userId: "c" },
+    ]);
+    const sum = shares.reduce((s, c) => s + toStroops(c.shareAmount), 0n);
+    expect(sum).toBe(toStroops("0.01"));
+    expect(shares[0].shareAmount).toBe("0.0033334");
+    expect(shares[1].shareAmount).toBe("0.0033333");
+  });
+
+  it("handles a single participant", () => {
+    const shares = computeShares("42.5", "equal", [{ userId: "a" }]);
+    expect(shares).toEqual([{ userId: "a", shareAmount: "42.5" }]);
+  });
+
+  it("accepts a single custom share equal to the total", () => {
+    const shares = computeShares("30", "custom", [{ userId: "a", amount: "30" }]);
+    expect(shares).toEqual([{ userId: "a", shareAmount: "30" }]);
+  });
+
+  it("rejects a zero amount", () => {
+    expect(() => computeShares("0", "equal", [{ userId: "a" }])).toThrow(
+      /greater than zero/
+    );
+  });
+
+  it("rejects a negative amount", () => {
+    expect(() => computeShares("-10", "equal", [{ userId: "a" }])).toThrow(
+      /greater than zero/
+    );
+  });
+
+  it("rejects an empty participant list", () => {
+    expect(() => computeShares("10", "equal", [])).toThrow(
+      /At least one participant/
+    );
+  });
+
   it("accepts custom amounts that sum to the total", () => {
     const shares = computeShares("30", "custom", [
       { userId: "a", amount: "10" },
@@ -44,6 +93,25 @@ describe("computeShares", () => {
       { userId: "a", percent: 33.33 },
       { userId: "b", percent: 33.33 },
       { userId: "c", percent: 33.34 },
+    ]);
+    const sum = shares.reduce((s, c) => s + toStroops(c.shareAmount), 0n);
+    expect(sum).toBe(toStroops("100"));
+  });
+
+  it("assigns exact percentage shares for a 3-way split", () => {
+    const shares = computeShares("100", "percentage", [
+      { userId: "a", percent: 33.33 },
+      { userId: "b", percent: 33.33 },
+      { userId: "c", percent: 33.34 },
+    ]);
+    expect(shares.map((s) => s.shareAmount)).toEqual(["33.33", "33.33", "33.34"]);
+  });
+
+  it("accepts percentages within the 0.001 tolerance", () => {
+    const shares = computeShares("100", "percentage", [
+      { userId: "a", percent: 33.333 },
+      { userId: "b", percent: 33.333 },
+      { userId: "c", percent: 33.334 },
     ]);
     const sum = shares.reduce((s, c) => s + toStroops(c.shareAmount), 0n);
     expect(sum).toBe(toStroops("100"));

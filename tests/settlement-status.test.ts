@@ -236,7 +236,7 @@ describe("GET /settlements/:id/status — access", () => {
 
     expect(res.statusCode).toBe(403);
     const body = res.json();
-    expect(body.error).toBe("FORBIDDEN");
+    expect(body.error.code).toBe("FORBIDDEN");
     // No amount, party, group, asset, or hash in the refusal. The requestId is
     // a random correlation id that legitimately appears on every error response
     // (and is not settlement data), so exclude it — otherwise a short token like
@@ -273,7 +273,7 @@ describe("GET /settlements/:id/status — access", () => {
 
     expect(res.statusCode).toBe(404);
     const body = res.json();
-    expect(body.error).toBe("NOT_FOUND");
+    expect(body.error.code).toBe("NOT_FOUND");
     expect(body.message).toBe("Settlement not found");
     expect(body.requestId).toBeTruthy();
   });
@@ -285,7 +285,7 @@ describe("GET /settlements/:id/status — access", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("UNAUTHORIZED");
     expect(prisma.settlement.findFirst).not.toHaveBeenCalled();
   });
 
@@ -297,7 +297,7 @@ describe("GET /settlements/:id/status — access", () => {
         headers: authHeader(),
       });
       expect(res.statusCode).toBe(400);
-      expect(res.json().error).toBe("VALIDATION_ERROR");
+      expect(res.json().error.code).toBe("VALIDATION_ERROR");
     }
     expect(prisma.settlement.findFirst).not.toHaveBeenCalled();
   });
@@ -312,7 +312,7 @@ describe("GET /settlements/:id/status — access", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
   });
 });
 
@@ -385,18 +385,49 @@ describe("GET /settlements/:id/status — each public state", () => {
     expect(body.onChain.successful).toBe(false);
   });
 
-  it("failed: a persisted failure surfaces its scrubbed reason", async () => {
+  it("failed: a persisted failure surfaces its scrubbed reason and category", async () => {
     const body = await statusFor({
       status: "failed",
       stellarTxHash: null,
       failureReason: "Stellar rejected the transaction: tx_insufficient_balance",
+      failureCategory: "ledger_rejected",
     });
 
     expect(body.status).toBe("failed");
     expect(body.terminal).toBe(true);
     expect(body.failure).toEqual({
+      category: "ledger_rejected",
       reason: "Stellar rejected the transaction: tx_insufficient_balance",
     });
+  });
+
+  it("failed: a row predating the category column still answers usefully", async () => {
+    const body = await statusFor({
+      status: "failed",
+      stellarTxHash: null,
+      failureReason: "Stellar rejected the transaction: tx_insufficient_balance",
+      failureCategory: null,
+    });
+
+    expect(body.failure).toEqual({
+      category: "internal",
+      reason: "Stellar rejected the transaction: tx_insufficient_balance",
+    });
+  });
+
+  it("withholds a retry reason from a settlement that has not failed", async () => {
+    // The worker records each attempt's reason before deciding to retry.
+    // Reporting it on an in-flight settlement would call a live payment broken.
+    h.getTransaction.mockResolvedValue(null);
+    const body = await statusFor({
+      status: "submitted",
+      stellarTxHash: "hash_pending",
+      failureReason: "attempt 1 timed out",
+      failureCategory: "upstream",
+    });
+
+    expect(body.status).toBe("submitted");
+    expect(body.failure).toBeNull();
   });
 
   it("expired: the signing window closed before submission", async () => {

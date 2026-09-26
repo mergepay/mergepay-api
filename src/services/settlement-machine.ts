@@ -2,11 +2,14 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 import { AppError, Errors } from "../errors";
 import { auditTx } from "./audit";
+import { recordStatusTransitionInTransaction } from "./status-history";
+import { emitEvent, type WebhookEventType } from "./event";
 
 export type SettlementStatus =
   | "pending"
   | "submitted"
   | "verifying"
+  | "pending_confirmation"
   | "confirmed"
   | "failed"
   | "needs_review";
@@ -17,6 +20,7 @@ export const SETTLEMENT_STATUSES: readonly SettlementStatus[] = [
   "pending",
   "submitted",
   "verifying",
+  "pending_confirmation",
   "confirmed",
   "failed",
   "needs_review",
@@ -26,6 +30,7 @@ const ALLOWED_TRANSITIONS: Record<SettlementStatus, readonly SettlementStatus[]>
   pending: ["submitted", "failed"],
   submitted: ["verifying", "failed"],
   verifying: ["confirmed", "failed", "needs_review", "submitted"],
+  pending_confirmation: ["confirmed", "failed"],
   confirmed: [],
   failed: [],
   needs_review: ["confirmed", "failed"],
@@ -55,18 +60,41 @@ export interface SettlementTransitionResult<T> {
   changed: boolean;
 }
 
-export async function applySettlementTransition(params: {
+export interface ApplySettlementTransitionParams {
   settlementId: string;
   nextStatus: SettlementStatus;
   source: SettlementTransitionSource;
   extraData?: Prisma.SettlementUncheckedUpdateInput;
   ownerUserId?: string;
   tx?: Prisma.TransactionClient;
-}): Promise<SettlementTransitionResult<{ id: string; status: string }>> {
-  const { settlementId, nextStatus, source, extraData, ownerUserId, tx } = params;
+  /** If true and transitioning to confirmed, also mark the linked expenseShare as settled. */
+  settleExpenseShare?: boolean;
+}
+
+export async function applySettlementTransition(params: ApplySettlementTransitionParams): Promise<
+  SettlementTransitionResult<{ id: string; status: string; expenseShareId: string | null }>
+> {
+  const {
+    settlementId,
+    nextStatus,
+    source,
+    extraData,
+    ownerUserId,
+    tx,
+    settleExpenseShare = false,
+  } = params;
 
   async function execute(client: Prisma.TransactionClient) {
-    const settlement = await client.settlement.findUnique({ where: { id: settlementId } });
+    const settlement = await client.settlement.findUnique({
+      where: { id: settlementId },
+      select: {
+        id: true,
+        status: true,
+        fromUserId: true,
+        expenseShareId: true,
+        retryCount: true,
+      },
+    });
     if (!settlement) {
       throw Errors.notFound("Settlement not found");
     }
@@ -99,9 +127,29 @@ export async function applySettlementTransition(params: {
     if (nextStatus === "submitted") timestamps.submittedAt = now;
     if (nextStatus === "confirmed") timestamps.confirmedAt = now;
 
-    const updated = await client.settlement.update({
-      where: { id: settlementId },
+    const allowedFromStatuses = Object.entries(ALLOWED_TRANSITIONS)
+      .filter(([, tos]) => tos.includes(nextStatus))
+      .map(([from]) => from);
+
+    const updateResult = await client.settlement.updateMany({
+      where: {
+        id: settlementId,
+        status: { in: allowedFromStatuses as SettlementStatus[] },
+      },
       data: { ...extraData, ...timestamps, status: nextStatus },
+    });
+
+    if (updateResult.count === 0) {
+      const currentSettlement = await client.settlement.findUniqueOrThrow({
+        where: { id: settlementId },
+        select: { id: true, status: true, expenseShareId: true },
+      });
+      return { settlement: currentSettlement, changed: false };
+    }
+
+    const updated = await client.settlement.findUniqueOrThrow({
+      where: { id: settlementId },
+      select: { id: true, status: true, expenseShareId: true },
     });
 
     await auditTx(client, {
@@ -117,11 +165,98 @@ export async function applySettlementTransition(params: {
       },
     });
 
+    await recordStatusTransitionInTransaction(client, {
+      entityType: "settlement",
+      entityId: settlementId,
+      newStatus: nextStatus,
+      source,
+    });
+
+    if (settleExpenseShare && settlement.expenseShareId && nextStatus === "confirmed") {
+      await client.expenseShare.update({
+        where: { id: settlement.expenseShareId },
+        data: { status: "settled" },
+      });
+    }
+
     return { settlement: updated, changed: true };
   }
 
+  // The caller owns `tx` and it has not committed yet, so no event is emitted
+  // on that path — announcing from inside an open transaction risks telling an
+  // integration about a change that is later rolled back.
   if (tx) return execute(tx);
-  return prisma.$transaction((client) => execute(client));
+
+  const result = await prisma.$transaction((client) => execute(client));
+
+  if (result.changed) {
+    notifySettlementTransition(settlementId, nextStatus);
+  }
+
+  return result;
+}
+
+/** Settlement statuses external integrations are told about. */
+const NOTIFIED_STATUSES: Partial<Record<SettlementStatus, WebhookEventType>> = {
+  confirmed: "settlement.completed",
+  failed: "settlement.failed",
+};
+
+/**
+ * Announce a committed settlement transition on the event bus, which the
+ * webhook service turns into queued deliveries.
+ *
+ * Only terminal outcomes are published. An integration cares that a settlement
+ * completed or failed, not that it passed through an intermediate submission
+ * state, and publishing every step would spend a receiver's retry budget on
+ * transitions it has no action for.
+ */
+function notifySettlementTransition(
+  settlementId: string,
+  nextStatus: SettlementStatus
+): void {
+  const eventType = NOTIFIED_STATUSES[nextStatus];
+  if (!eventType) return;
+
+  // Deliberately not awaited: queueing must never turn an already-committed
+  // settlement transition into a failed request.
+  void (async () => {
+    try {
+      const row = await prisma.settlement.findUnique({
+        where: { id: settlementId },
+        select: {
+          id: true,
+          groupId: true,
+          shortCode: true,
+          amount: true,
+          assetCode: true,
+          assetIssuer: true,
+          status: true,
+          stellarTxHash: true,
+          failureReason: true,
+        },
+      });
+      if (!row) return;
+
+      emitEvent({
+        eventType,
+        groupId: row.groupId,
+        payload: {
+          settlementId: row.id,
+          shortCode: row.shortCode,
+          groupId: row.groupId,
+          status: row.status,
+          amount: String(row.amount),
+          assetCode: row.assetCode,
+          assetIssuer: row.assetIssuer,
+          stellarTxHash: row.stellarTxHash,
+          failureReason: row.failureReason,
+        },
+      });
+    } catch {
+      // A failed announcement must not surface as a settlement error.
+    }
+  })();
 }
 
 export type ErrorClassification = "transient" | "permanent";

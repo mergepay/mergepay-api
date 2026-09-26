@@ -1,19 +1,48 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let currentSettlementState: Record<string, any> | null = null;
 let currentAnchorState: Record<string, any> | null = null;
 
 const h = vi.hoisted(() => {
+  let updateManyCount = 1;
   const settlement = {
     findMany: vi.fn(),
     findUnique: vi.fn(() => currentSettlementState),
+    findUniqueOrThrow: vi.fn(() => currentSettlementState),
     update: vi.fn(async ({ data }: any) => {
       if (currentSettlementState) {
         currentSettlementState = { ...currentSettlementState, ...data };
       }
       return currentSettlementState;
     }),
-    updateMany: vi.fn(async () => ({ count: 1 })),
+    updateMany: vi.fn(async ({ where, data }: any) => {
+      // Simulate a conditional update against the live row: the where clause
+      // must actually match, so lease claims in these tests are only won when
+      // status, retryCount, and the lease columns line up. This is what lets
+      // the concurrency test mean something — a stale claim (a second worker
+      // claiming on an old retryCount, or a row with a live lease) loses.
+      const row = currentSettlementState;
+      if (!row) {
+        updateManyCount = 0;
+        return { count: 0 };
+      }
+      if (where.status?.in && !where.status.in.includes(row.status)) {
+        updateManyCount = 0;
+        return { count: 0 };
+      }
+      if (where.retryCount !== undefined && where.retryCount !== row.retryCount) {
+        updateManyCount = 0;
+        return { count: 0 };
+      }
+      if (where.AND && !where.AND.every((clause: any) => clauseMatches(row, clause))) {
+        updateManyCount = 0;
+        return { count: 0 };
+      }
+      updateManyCount = 1;
+      currentSettlementState = { ...row, ...data };
+      return { count: 1 };
+    }),
+    getUpdateManyCount: () => updateManyCount,
   };
   const anchorSession = {
     findMany: vi.fn(),
@@ -21,11 +50,21 @@ const h = vi.hoisted(() => {
     update: vi.fn(async () => undefined),
     updateMany: vi.fn(async () => ({ count: 1 })),
   };
+  const expenseShare = {
+    update: vi.fn(),
+  };
   const auditLog = { create: vi.fn() };
+  const statusHistory = {
+    findFirst: vi.fn(),
+    create: vi.fn(),
+  };
   const prisma: any = {
     settlement,
     anchorSession,
+    expenseShare,
     auditLog,
+    statusHistory,
+    $executeRaw: vi.fn(async () => 1),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
@@ -36,9 +75,28 @@ const h = vi.hoisted(() => {
     prisma,
     submitPayment: vi.fn(),
     getTransaction: vi.fn(),
+    hashOf: vi.fn(),
+    reconcileSingleSettlement: vi.fn(),
+    verifyTransactionMemo: vi.fn(),
+    getTransactionPayments: vi.fn(),
+    verifyPaymentOperation: vi.fn(),
     audit: vi.fn(),
+    logger: (() => {
+      const logger: any = {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      };
+      logger.child = vi.fn(() => logger);
+      return logger;
+    })(),
   };
 });
+
+// Capture pino output so batch summary logs can be asserted on; every module
+// that constructs a logger at load time shares this instance.
+vi.mock("pino", () => ({ default: vi.fn(() => h.logger) }));
 
 vi.mock("../src/db", () => ({ prisma: h.prisma }));
 vi.mock("../src/services/stellar", () => ({
@@ -47,15 +105,25 @@ vi.mock("../src/services/stellar", () => ({
     buildPayment: vi.fn(),
     submitPayment: h.submitPayment,
     getTransaction: h.getTransaction,
+    hashOf: h.hashOf,
   },
 }));
 vi.mock("../src/services/audit", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/services/audit")>();
   return { ...actual, audit: h.audit };
 });
-vi.mock("../src/services/settlement-reconciliation", () => ({
-  reconcileSettlements: vi.fn(),
+vi.mock("../src/services/horizonService", () => ({
+  verifyTransactionMemo: h.verifyTransactionMemo,
+  getTransactionPayments: h.getTransactionPayments,
+  verifyPaymentOperation: h.verifyPaymentOperation,
 }));
+// The real reconciliation service runs so the worker's outcome aggregation and
+// lease flow are exercised end to end; only the Horizon boundary it owns is
+// mocked here (getTransaction etc. are already mocked above).
+vi.mock("../src/services/settlement-reconciliation", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/services/settlement-reconciliation")>();
+  return { ...actual, reconcileSingleSettlement: h.reconcileSingleSettlement };
+});
 vi.mock("../src/worker/reconciliation", () => ({
   runReconciliation: vi.fn(),
   startReconciliation: vi.fn(() => () => {}),
@@ -87,9 +155,46 @@ vi.mock("../src/services/anchor", () => ({
   ]),
 }));
 
-import { processSubmittedSettlements, reconcileAnchors, setDelayFn, SETTLEMENT_MAX_RETRIES } from "../src/worker/index";
+import {
+  processSubmittedSettlements,
+  reconcileAnchors,
+  reconcilePendingSettlements,
+  recoverStaleSettlements,
+  setDelayFn,
+  SETTLEMENT_MAX_RETRIES,
+  startWorker,
+} from "../src/worker/index";
+import { startReconciliation } from "../src/worker/reconciliation";
+import { RECONCILIATION_MAX_RETRIES } from "../src/services/settlement-reconciliation";
 import { anchorService } from "../src/services/anchor";
+import { TimeoutError } from "../src/services/timeout";
 import { AppError } from "../src/errors";
+
+/**
+ * Evaluate one Prisma `AND` clause ({ OR: [...] } shape used by the lease
+ * claim/recovery queries) against the simulated row state.
+ */
+function clauseMatches(row: Record<string, any>, clause: any): boolean {
+  if (!clause?.OR) return true;
+  return clause.OR.some((branch: any) => {
+    for (const [key, condition] of Object.entries(branch)) {
+      const value = row[key];
+      if (condition !== null && typeof condition === "object" && condition !== null) {
+        const op = condition as Record<string, any>;
+        if ("lte" in op && !(value !== null && value !== undefined && value <= op.lte)) return false;
+        if ("lt" in op && !(value !== null && value !== undefined && value < op.lt)) return false;
+      } else if ((value ?? null) !== (condition ?? null)) {
+        // `?? null`: fixtures omit NULL-able columns (leaseExpiresAt,
+        // nextAttemptAt, ...) that a real Prisma row reports as null. A claim
+        // requiring `leaseExpiresAt: null` must match such a row — that is the
+        // normal first-claim path — while a live lease (a real Date) still
+        // blocks it.
+        return false;
+      }
+    }
+    return true;
+  });
+}
 
 function mockAnchorService() {
   const anchorServiceMock = vi.mocked(anchorService);
@@ -171,9 +276,11 @@ describe("reconcileAnchors", () => {
 
     await reconcileAnchors();
 
-    expect(h.prisma.anchorSession.update).toHaveBeenCalledWith(
+    // Status advancement uses a conditional updateMany guarded on the status
+    // this worker observed, so a stale writer can never land a regression.
+    expect(h.prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "as_1" },
+        where: { id: "as_1", status: "pending_anchor" },
         data: expect.objectContaining({
           status: "completed",
           lastPolledAt: expect.any(Date),
@@ -225,6 +332,20 @@ describe("processSubmittedSettlements", () => {
     const s = { ...baseSettlement, ...over };
     currentSettlementState = { ...s };
     h.prisma.settlement.findMany.mockResolvedValue([s]);
+    // Default mocks for horizon verification
+    h.verifyTransactionMemo.mockReturnValue(null);
+    h.getTransactionPayments.mockResolvedValue([
+      {
+        id: "op_1",
+        type: "payment",
+        to: "GTO",
+        asset_type: "credit_alphanum4",
+        asset_code: "USDC",
+        asset_issuer: null,
+        amount: "10.00",
+      },
+    ]);
+    h.verifyPaymentOperation.mockReturnValue(null);
     return s;
   }
 
@@ -274,8 +395,8 @@ describe("processSubmittedSettlements", () => {
     await promise;
 
     expect(currentSettlementState?.status).toBe("confirmed");
-    const updateCalls = h.prisma.settlement.update.mock.calls;
-    const statuses = updateCalls.map((c: any[]) => c[0].data.status);
+    const updateManyCalls = h.prisma.settlement.updateMany.mock.calls;
+    const statuses = updateManyCalls.map((c: any[]) => c[0].data?.status);
     expect(statuses).toContain("verifying");
     expect(statuses).toContain("confirmed");
     expect(statuses.indexOf("verifying")).toBeLessThan(statuses.indexOf("confirmed"));
@@ -292,6 +413,82 @@ describe("processSubmittedSettlements", () => {
 
     expect(currentSettlementState?.status).toBe("failed");
     expect(currentSettlementState?.failureReason).toBeTruthy();
+    // A transaction the network applied and that failed there is a ledger
+    // rejection, not a validation or funding problem.
+    expect(currentSettlementState?.failureCategory).toBe("ledger_rejected");
+  });
+
+  it("records an expired signing window as its own failure category", async () => {
+    setupSettlement({
+      status: "submitted",
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.failureCategory).toBe("expired");
+    // An expired envelope must never reach Horizon.
+    expect(h.submitPayment).not.toHaveBeenCalled();
+  });
+
+  it("records a settlement with no signed envelope as a validation failure", async () => {
+    setupSettlement({ status: "submitted", transactionXdr: null });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.failureCategory).toBe("validation");
+  });
+
+  it("classifies a permanent submission error from the error itself", async () => {
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(
+      new Error("Stellar rejected the transaction: op_underfunded")
+    );
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(currentSettlementState?.status).toBe("failed");
+    // op_underfunded is a funding problem even though the message also reads
+    // as a rejection — the payer's remedy is to add funds.
+    expect(currentSettlementState?.failureCategory).toBe("insufficient_funds");
+  });
+
+  it("keeps a failed settlement failed across a worker restart", async () => {
+    // A terminal failure is durable state, not process memory: a restarted
+    // worker must not pick the row back up and report it as pending.
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(
+      new Error("Stellar rejected the transaction: tx_bad_seq")
+    );
+
+    const first = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await first;
+
+    expect(currentSettlementState?.status).toBe("failed");
+    const recordedCategory = currentSettlementState?.failureCategory;
+    expect(recordedCategory).toBe("ledger_rejected");
+
+    // Restart: the worker queries only submittable statuses, so a failed row
+    // is not returned at all and its recorded failure stands.
+    h.prisma.settlement.findMany.mockResolvedValue([]);
+    h.submitPayment.mockClear();
+
+    const second = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await second;
+
+    expect(h.submitPayment).not.toHaveBeenCalled();
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.failureCategory).toBe(recordedCategory);
   });
 
   it("marks as needs_review when Horizon verification times out", async () => {
@@ -339,7 +536,13 @@ describe("processSubmittedSettlements", () => {
       .mockRejectedValueOnce(new Error("timeout"))
       .mockRejectedValueOnce(new Error("connection reset"))
       .mockResolvedValueOnce("hash_456");
-    h.getTransaction.mockResolvedValue({ successful: true });
+    // Both failed attempts lost their response, so the worker checks the
+    // ledger by envelope hash; nothing is there, so they retry as transient.
+    h.hashOf.mockReturnValue("hash_retry");
+    h.getTransaction
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({ successful: true });
 
     // Use fake timers to control delay
     const delays: number[] = [];
@@ -348,7 +551,9 @@ describe("processSubmittedSettlements", () => {
       return Promise.resolve();
     });
 
-    await processSubmittedSettlements();
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
 
     expect(h.submitPayment).toHaveBeenCalledTimes(3);
     // Verify exponential backoff (should increase)
@@ -360,16 +565,20 @@ describe("processSubmittedSettlements", () => {
   it("marks as failed when all retries are exhausted", async () => {
     setupSettlement({ status: "submitted" });
     h.submitPayment.mockRejectedValue(new Error("timeout"));
+    h.hashOf.mockReturnValue("hash_exhausted");
+    h.getTransaction.mockResolvedValue(null);
 
     setDelayFn(() => Promise.resolve());
 
-    await processSubmittedSettlements();
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
 
     expect(h.submitPayment).toHaveBeenCalledTimes(SETTLEMENT_MAX_RETRIES);
     // The final update should mark it as failed with permanent category (retries exhausted)
-    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "settle_1" },
+        where: expect.objectContaining({ id: "settle_1" }),
         data: expect.objectContaining({
           status: "failed",
           failureReason: expect.any(String),
@@ -390,6 +599,134 @@ describe("processSubmittedSettlements", () => {
 
     expect(h.submitPayment).toHaveBeenCalledTimes(1);
     expect(currentSettlementState?.status).toBe("failed");
+  });
+
+  it("does not resubmit when the submission response was lost but the transaction already applied", async () => {
+    // A timeout means we never learned the outcome. The worker must check
+    // Horizon by the envelope's deterministic hash and find the payment
+    // already on the ledger — resubmitting would be a double payment.
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(new TimeoutError("Horizon.submit", 30000));
+    h.hashOf.mockReturnValue("hash_lost");
+    h.getTransaction.mockResolvedValue({ successful: true });
+
+    await processSubmittedSettlements();
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(1);
+    expect(h.getTransaction).toHaveBeenCalledWith("hash_lost");
+    expect(currentSettlementState?.status).toBe("confirmed");
+    expect(currentSettlementState?.stellarTxHash).toBe("hash_lost");
+  });
+
+  it("fails permanently when a lost submission's transaction failed on the ledger", async () => {
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(new TimeoutError("Horizon.submit", 30000));
+    h.hashOf.mockReturnValue("hash_failed");
+    h.getTransaction.mockResolvedValue({ successful: false });
+
+    await processSubmittedSettlements();
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(1);
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.failureReason).toContain("hash_failed");
+  });
+
+  it("retries as transient when the ledger has no record of a lost submission", async () => {
+    // Horizon has no record of the envelope, so nothing applied and the
+    // failure is safe to retry rather than handed to a human.
+    setupSettlement({ status: "submitted" });
+    h.submitPayment
+      .mockRejectedValueOnce(new TimeoutError("Horizon.submit", 30000))
+      .mockResolvedValueOnce("hash_retried");
+    h.hashOf.mockReturnValue("hash_unknown");
+    h.getTransaction
+      .mockResolvedValueOnce(null) // alreadyApplied: not on the ledger
+      .mockResolvedValueOnce({ successful: true }); // confirmation poll
+    setDelayFn(() => Promise.resolve());
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(2);
+    expect(currentSettlementState?.status).toBe("confirmed");
+    expect(currentSettlementState?.stellarTxHash).toBe("hash_retried");
+  });
+
+  it("persists nextAttemptAt, retryCount, and errorCategory when scheduling a retry", async () => {
+    setupSettlement({ status: "submitted" });
+    h.submitPayment
+      .mockRejectedValueOnce(new TimeoutError("Horizon.submit", 30000))
+      .mockResolvedValueOnce("hash_ok");
+    h.hashOf.mockReturnValue("hash_none");
+    h.getTransaction
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ successful: true });
+    setDelayFn(() => Promise.resolve());
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    const retryUpdate = h.prisma.settlement.update.mock.calls.find(
+      (call: any[]) =>
+        call[0].data?.nextAttemptAt && call[0].data?.retryCount === 1
+    );
+    expect(retryUpdate).toBeTruthy();
+    expect(retryUpdate![0].data.errorCategory).toBe("transient");
+    expect(retryUpdate![0].data.nextAttemptAt).toBeInstanceOf(Date);
+    expect((retryUpdate![0].data.nextAttemptAt as Date).getTime()).toBeGreaterThan(
+      Date.now() - 1000
+    );
+    expect(currentSettlementState?.status).toBe("confirmed");
+  });
+
+  it("resumes from the persisted retry count after a restart", async () => {
+    // A worker restarted after one failed attempt must continue at attempt 2
+    // from the persisted retryCount, not reset the budget to 1.
+    setupSettlement({ status: "submitted", retryCount: 1 });
+    h.submitPayment.mockResolvedValue("hash_after_restart");
+    h.getTransaction.mockResolvedValue({ successful: true });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(1);
+    expect(currentSettlementState?.status).toBe("confirmed");
+    const attemptUpdate = h.prisma.settlement.update.mock.calls.find(
+      (call: any[]) => call[0].data?.retryCount === 2
+    );
+    expect(attemptUpdate).toBeTruthy();
+  });
+
+  it("stores a sanitized failure reason on terminal failure", async () => {
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(
+      new Error("op_underfunded: secret=hunter2 xdr=AAAAAgAAAABlongenvelope")
+    );
+    setDelayFn(() => Promise.resolve());
+
+    await processSubmittedSettlements();
+
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.failureReason).not.toMatch(/hunter2/);
+    expect(currentSettlementState?.failureReason).not.toMatch(/AAAAAgAAAAB/);
+    expect(currentSettlementState?.failureReason).toContain("[redacted]");
+  });
+
+  it("leaves no dangling timers after retry scheduling completes", async () => {
+    // Retry delays are awaited inline and the only worker timer is the single
+    // cycle timer in startWorker; a fully processed job must leave nothing
+    // scheduled behind it.
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(new Error("service unavailable"));
+    setDelayFn(() => Promise.resolve());
+
+    await processSubmittedSettlements();
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(SETTLEMENT_MAX_RETRIES);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("passes the settlement's own recorded intent to submitPayment so it is re-validated before submission", async () => {
@@ -466,24 +803,286 @@ describe("processSubmittedSettlements", () => {
     // classifySettlementError, so the worker must not burn retries on an
     // XDR that will never become valid.
     expect(h.submitPayment).toHaveBeenCalledTimes(1);
-    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "settle_6" },
+        where: expect.objectContaining({ id: "settle_6" }),
         data: expect.objectContaining({ status: "failed" }),
       })
     );
   });
 
-  // Note: two "ambiguous submission outcome" cases (a submitPayment call that
-  // itself errors, e.g. on our own connection timeout, but whose transaction
-  // was actually applied to Stellar anyway) were previously specified here
-  // against an `h.hashOf` mock that was never declared anywhere in this
-  // file's `vi.hoisted` setup, and no corresponding `hashOf` — a function to
-  // compute a signed XDR's transaction hash locally, without needing
-  // Stellar's submission response, so Horizon can be queried directly for it
-  // — exists anywhere in src/services/stellar.ts. That's a real, valuable
-  // reliability feature (detecting "we don't know if this landed" instead of
-  // blindly retrying and relying on Stellar's sequence-number replay
-  // protection alone) but a distinct one from SEP-24 anchor reconciliation;
-  // it belongs with the settlement-submission-resilience work, not here.
+  // Note: the "ambiguous submission outcome" cases (a submitPayment call that
+  // errors, e.g. on our own connection timeout, but whose transaction was
+  // actually applied to Stellar anyway) are covered above under "does not
+  // resubmit when the submission response was lost..." etc., now that the
+  // worker's alreadyApplied path (stellar.hashOf + getTransaction) exists.
+});
+
+describe("reconcilePendingSettlements", () => {
+  function pendingRow(over: Record<string, any> = {}) {
+    return {
+      id: "pc_1",
+      shortCode: "PC0001",
+      groupId: "group_1",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "12.5000000",
+      assetCode: "XLM",
+      assetIssuer: null,
+      transactionXdr: "AAAA...",
+      stellarTxHash: "pchash0001",
+      status: "pending_confirmation",
+      retryCount: 0,
+      failureReason: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: null,
+      claimedBy: null,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+      to: { stellarPublicKey: "GTO" },
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    h.reconcileSingleSettlement.mockReset();
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("claims, reconciles, and releases each pending_confirmation row", async () => {
+    const row = pendingRow({ id: "pc_a", stellarTxHash: "hash_a" });
+    currentSettlementState = { ...row };
+    h.prisma.settlement.findMany.mockResolvedValue([row]);
+    h.reconcileSingleSettlement.mockResolvedValue("confirmed");
+
+    await reconcilePendingSettlements();
+
+    // Claim first: the row is taken with a lease before any Horizon work.
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: "pc_a",
+          status: { in: ["pending_confirmation"] },
+        }),
+        data: expect.objectContaining({ leaseExpiresAt: expect.any(Date) }),
+      })
+    );
+    expect(h.reconcileSingleSettlement).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "pc_a", stellarTxHash: "hash_a" }),
+      RECONCILIATION_MAX_RETRIES,
+      expect.objectContaining({ jobId: "pc_a" })
+    );
+    // Release last: the lease is dropped so the next cycle can pick it up.
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "pc_a", claimedBy: expect.any(String) },
+        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+      })
+    );
+  });
+
+  it("never reconciles a row it could not claim", async () => {
+    // The row's lease is held live by another worker — updateMany (the
+    // conditional claim) returns count 0, so Horizon must never be asked.
+    const row = pendingRow({ id: "pc_b", leaseExpiresAt: new Date(Date.now() + 60_000) });
+    currentSettlementState = { ...row };
+    h.prisma.settlement.findMany.mockResolvedValue([row]);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 0 });
+
+    await reconcilePendingSettlements();
+
+    expect(h.reconcileSingleSettlement).not.toHaveBeenCalled();
+  });
+
+  it("leaves not-found rows pending for the next cycle rather than failing them", async () => {
+    const row = pendingRow({ id: "pc_c", retryCount: 0 });
+    currentSettlementState = { ...row };
+    h.prisma.settlement.findMany.mockResolvedValue([row]);
+    h.reconcileSingleSettlement.mockResolvedValue("pending");
+
+    await reconcilePendingSettlements();
+
+    // The "pending" outcome is echoed back by the service; the worker must
+    // not escalate it — the row keeps its status and the retry budget lives
+    // in reconcileSingleSettlement (handleTransactionNotFound).
+    expect(h.prisma.settlement.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "failed" }),
+      })
+    );
+    expect(currentSettlementState?.status).toBe("pending_confirmation");
+  });
+
+  it("logs a per-batch summary of the three outcomes", async () => {
+    h.prisma.settlement.findMany.mockResolvedValue([
+      pendingRow({ id: "pc_ok", stellarTxHash: "h1" }),
+      pendingRow({ id: "pc_fail", stellarTxHash: "h2" }),
+      pendingRow({ id: "pc_wait", stellarTxHash: "h3" }),
+    ]);
+    currentSettlementState = pendingRow();
+    h.reconcileSingleSettlement
+      .mockResolvedValueOnce("confirmed")
+      .mockResolvedValueOnce("failed")
+      .mockResolvedValueOnce("pending");
+
+    await reconcilePendingSettlements();
+
+    const batchLog = h.logger.info.mock.calls.find(
+      ([, msg]: unknown[]) => msg === "reconciled pending_confirmation settlements against Horizon"
+    );
+    expect(batchLog).toBeDefined();
+    const [fields] = batchLog as [Record<string, unknown>, string];
+    expect(fields).toMatchObject({
+      jobType: "reconciliation",
+      outcome: "batch_reconciled",
+      checked: 3,
+      confirmed: 1,
+      failed: 1,
+      stillPending: 1,
+    });
+  });
+
+  it("reconciles nothing when there are no pending_confirmation rows", async () => {
+    h.prisma.settlement.findMany.mockResolvedValue([]);
+
+    await reconcilePendingSettlements();
+
+    // The candidate query only surfaces rows that were actually submitted
+    // (a hash exists) and are not currently leased by another worker.
+    expect(h.prisma.settlement.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          status: { in: ["pending_confirmation"] },
+          stellarTxHash: { not: null },
+          AND: [{ OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: expect.any(Date) } }] }],
+        },
+      })
+    );
+    expect(h.prisma.settlement.updateMany).not.toHaveBeenCalled();
+    expect(h.reconcileSingleSettlement).not.toHaveBeenCalled();
+  });
+
+  it("processes rows one at a time — a second claim cannot win mid-flight", async () => {
+    // The concurrency property: reconciliation runs sequentially under a
+    // claim, so within one process two ticks can never interleave on the
+    // same row. While worker 1 is inside its Horizon call, worker 2 runs the
+    // same batch and attempts the real claim shape — it must lose because
+    // worker 1's lease is live (the row carries a future leaseExpiresAt).
+    const row = pendingRow({ id: "pc_seq", retryCount: 0 });
+    let firstInside = false;
+    currentSettlementState = { ...row };
+    h.prisma.settlement.findMany.mockResolvedValue([row]);
+    h.reconcileSingleSettlement.mockImplementation(async () => {
+      firstInside = true;
+      // Same where-shape claimPendingConfirmation issues.
+      const { count } = await h.prisma.settlement.updateMany({
+        where: {
+          id: row.id,
+          status: { in: ["pending_confirmation"] },
+          retryCount: row.retryCount,
+          AND: [
+            { OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: new Date() } }] },
+          ],
+        },
+        data: { claimedBy: "second-worker", leaseExpiresAt: new Date() },
+      });
+      expect(count).toBe(0); // claim lost to the live lease
+      return "confirmed";
+    });
+
+    await reconcilePendingSettlements();
+
+    expect(firstInside).toBe(true);
+  });
+});
+
+describe("recoverStaleSettlements", () => {
+  it("recovers pending_confirmation rows whose lease has lapsed", async () => {
+    currentSettlementState = {
+      id: "pc_stale",
+      status: "pending_confirmation",
+      claimedBy: "dead-worker",
+      leaseExpiresAt: new Date(Date.now() - 1000),
+    };
+
+    await recoverStaleSettlements();
+
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { in: expect.arrayContaining(["pending_confirmation"]) },
+          leaseExpiresAt: { lt: expect.any(Date) },
+        }),
+        data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+      })
+    );
+  });
+});
+
+describe("startWorker shutdown", () => {
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+  });
+  afterEach(() => {
+    exitSpy.mockRestore();
+  });
+
+  it("releases its claims and stops the loop on shutdown", async () => {
+    h.prisma.settlement.findMany.mockResolvedValue([]);
+    h.prisma.anchorSession.findMany.mockResolvedValue([]);
+    const stop = vi.fn();
+    vi.mocked(startReconciliation).mockReturnValue(stop);
+
+    const shutdown = await startWorker();
+    // Let the first cycle finish and the loop reach its wait point.
+    await vi.advanceTimersByTimeAsync(0);
+    await shutdown();
+
+    expect(stop).toHaveBeenCalled();
+    // Both job families' claims are released so the next worker can pick the
+    // work up immediately instead of waiting for the leases to lapse.
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { claimedBy: expect.any(String) } })
+    );
+    expect(h.prisma.anchorSession.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { claimedBy: expect.any(String) } })
+    );
+    // No cycle timer is left behind to keep the process alive.
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not claim new jobs once shutdown has begun", async () => {
+    h.prisma.settlement.findMany.mockResolvedValue([]);
+    const shutdown = await startWorker();
+    await vi.advanceTimersByTimeAsync(0);
+    await shutdown();
+
+    // A job that becomes eligible after shutdown must not be claimed or
+    // submitted — an in-flight shutdown must not start new work.
+    const settlement = {
+      id: "settle_shutdown",
+      shortCode: "SDWN1",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "10.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROM" },
+      to: { stellarPublicKey: "GTO" },
+    };
+    currentSettlementState = { ...settlement };
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.submitPayment.mockResolvedValue("hash_x");
+    h.getTransaction.mockResolvedValue({ successful: true });
+
+    await processSubmittedSettlements();
+
+    expect(h.submitPayment).not.toHaveBeenCalled();
+  });
 });

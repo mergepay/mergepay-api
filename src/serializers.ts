@@ -152,6 +152,37 @@ export function serializeTreasuryProposal(p: any) {
   };
 }
 
+export function serializeTreasurySignature(s: any) {
+  return {
+    id: s.id,
+    signerPublicKey: s.signerPublicKey,
+    weight: s.weight,
+    createdAt: iso(s.createdAt),
+  };
+}
+
+export function serializeTreasuryTxProposal(p: any) {
+  return {
+    id: p.id,
+    groupId: p.groupId,
+    creatorId: p.creatorId,
+    xdr: p.xdr,
+    sourceAccount: p.sourceAccount,
+    requiredWeight: p.requiredWeight,
+    signatures: Array.isArray(p.signatures)
+      ? p.signatures.map(serializeTreasurySignature)
+      : [],
+    totalWeight: Array.isArray(p.signatures)
+      ? p.signatures.reduce((sum: number, s: any) => sum + s.weight, 0)
+      : undefined,
+    status: p.status,
+    stellarTxHash: p.stellarTxHash ?? null,
+    failureReason: p.failureReason ?? null,
+    createdAt: iso(p.createdAt),
+    updatedAt: iso(p.updatedAt),
+  };
+}
+
 export function serializeInvitation(i: any) {
   return {
     id: i.id,

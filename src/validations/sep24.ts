@@ -9,7 +9,9 @@
  *   - asset code: alphanumeric, 1-12 chars (upper-cased on parse);
  *   - amount: a positive, precision-safe Stellar decimal when supplied;
  *   - account / `to`: a checksum-validated ed25519 Stellar public key;
- *   - memo: a short, alphanumeric anchor memo (no arbitrary bytes).
+ *   - memo: a short, alphanumeric anchor memo (no arbitrary bytes);
+ *   - unexpected fields: rejected outright — both request objects are strict,
+ *     so a misspelled or unsupported field is a 400, never a silent drop.
  *
  * Supported-asset and network checks intentionally stay in the handler via
  * `validateAsset` (src/services/assets.ts) so they keep their existing error
@@ -24,13 +26,35 @@ import {
 /** A Stellar public key ("G…"), checksum-validated via StrKey. Alias for readability. */
 export const sep24AccountSchema = stellarPublicKeySchema;
 
-/** SEP-24 asset code: alphanumeric, 1-12 chars, normalised to upper case. */
-export const sep24AssetCodeSchema = z
+/**
+ * SEP-24 asset code *shape*: alphanumeric, 1-12 chars. Format only — callers
+ * that want case normalisation use `sep24AssetCodeSchema`; callers with their
+ * own exact-match support list (POST /withdraw keeps a case-sensitive
+ * `UNSUPPORTED_ASSET` contract) validate the shape here and match there.
+ */
+export const sep24AssetCodeShapeSchema = z
   .string()
   .min(1, "assetCode is required")
   .max(12, "assetCode must be at most 12 characters")
-  .regex(/^[A-Za-z0-9]+$/, "assetCode may only contain letters and digits")
-  .transform((value) => value.toUpperCase());
+  .regex(/^[A-Za-z0-9]+$/, "assetCode may only contain letters and digits");
+
+/** SEP-24 asset code: alphanumeric, 1-12 chars, normalised to upper case. */
+export const sep24AssetCodeSchema = sep24AssetCodeShapeSchema.transform((value) =>
+  value.toUpperCase()
+);
+
+/**
+ * SEP-24 amount *shape*: a plain decimal with at most 7 fractional digits.
+ * Deliberately positivity-agnostic — `POST /withdraw` owns its
+ * `INVALID_AMOUNT` error contract for zero/negative values in the handler
+ * (see src/routes/withdraw.ts), so shape and positivity are validated in
+ * sequence rather than one swallowing the other's error code.
+ */
+export const sep24AmountShapeSchema = z
+  .string()
+  .min(1, "amount is required")
+  .max(40, "amount is too long")
+  .regex(/^\d+(?:\.\d{1,7})?$/, "amount must be a decimal with at most 7 decimal places");
 
 /** SEP-24 amount: positive decimal with Stellar's 7-decimal precision. */
 export const sep24AmountSchema = stellarAmountSchema;
@@ -61,6 +85,9 @@ export const sep24InteractiveRequestSchema = z
     memo: sep24MemoSchema,
     anchorName: z.string().max(64).optional(),
   })
+  // Strict: a misspelled or unsupported field is a client bug that would
+  // otherwise be silently stripped, so it is rejected with the standard 400.
+  .strict()
   .refine(
     (val) => {
       // A native asset (XLM) must never be given an issuer.
@@ -88,6 +115,8 @@ export const sep24WithdrawRequestSchema = z
     memo: sep24MemoSchema,
     anchorName: z.string().max(64).optional(),
   })
+  // Strict: see sep24InteractiveRequestSchema.
+  .strict()
   .refine(
     (val) => !(val.assetCode === "XLM" && val.assetIssuer),
     {

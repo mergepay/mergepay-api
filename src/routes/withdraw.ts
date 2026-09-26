@@ -10,14 +10,31 @@ import { stellar } from "../services/stellar";
 import { auditTx } from "../services/audit";
 import { applyWithdrawalTransition } from "../services/withdrawal-status";
 import { isPositive } from "../services/money";
+import {
+  sep24AmountShapeSchema,
+  sep24AssetCodeShapeSchema,
+} from "../validations/sep24";
 
 const SUPPORTED_ASSET_CODES = ["USDC", "XLM"] as const;
 
-const withdrawalBody = z.object({
-  amount: z.string().min(1),
-  assetCode: z.string().min(1),
-  memo: mpMemoSchema.optional(),
-});
+/**
+ * `POST /withdraw` is a concrete SEP-24 withdrawal request, so its body is
+ * validated with the shared SEP-24 shape rules from src/validations/sep24.ts
+ * — decimal amount with at most 7 fractional digits, alphanumeric asset code —
+ * and the object is strict: an unexpected field is a structured 400 instead
+ * of being silently stripped.
+ *
+ * Positivity and asset *support* stay in the handler below: they carry their
+ * own established error codes (`INVALID_AMOUNT`, `UNSUPPORTED_ASSET`) that a
+ * schema-level failure would otherwise swallow.
+ */
+const withdrawalBody = z
+  .object({
+    amount: sep24AmountShapeSchema,
+    assetCode: sep24AssetCodeShapeSchema,
+    memo: mpMemoSchema.optional(),
+  })
+  .strict();
 
 function units(value: string): bigint {
   const [whole, fraction = ""] = value.split(".");

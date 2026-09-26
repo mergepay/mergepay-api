@@ -56,6 +56,7 @@ import {
   reconcileSingleSettlement,
   type ReconcilableSettlement,
 } from "../src/services/settlement-reconciliation";
+import { config } from "../src/config";
 
 function pendingConfirmationSettlement(over: Record<string, any> = {}) {
   return {
@@ -275,6 +276,41 @@ describe("reconcileSingleSettlement", () => {
     );
     // Audit not called — just a retry, not a terminal state
     expect(h.audit).not.toHaveBeenCalled();
+  });
+
+  it("expires an unresolved settlement after its pending-age threshold", async () => {
+    h.getTransaction.mockResolvedValue(null);
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1", status: "expired", expenseShareId: null
+    });
+    h.prisma.settlement.findUnique.mockResolvedValue({
+      id: "settle_1",
+      status: "pending_confirmation",
+      fromUserId: "user_1",
+      expenseShareId: null,
+      retryCount: 0,
+    });
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({
+        stellarTxHash: "hash_expired",
+        pendingSince: new Date(Date.now() - config.WORKER_PENDING_SETTLEMENT_MAX_AGE_MS - 1),
+      }),
+      10
+    );
+
+    expect(outcome).toBe("expired");
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "settle_1" }),
+        data: expect.objectContaining({
+          status: "expired",
+          retryCount: 1,
+          failureReason: expect.stringContaining("pending limit expired"),
+        }),
+      })
+    );
   });
 
   it("fails the settlement when retries are exhausted and tx not visible", async () => {

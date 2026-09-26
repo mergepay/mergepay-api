@@ -1,5 +1,6 @@
 import pino from "pino";
 import { prisma } from "../db";
+import { config } from "../config";
 import { stellar } from "./stellar";
 import { audit } from "./audit";
 import { Errors } from "../errors";
@@ -20,11 +21,11 @@ const log = pino({ name: "settlement-reconciliation" });
 export const RECONCILIATION_MAX_RETRIES = 10;
 
 /**
- * The three states one Horizon lookup can leave a settlement in. `pending`
- * means Horizon has not seen the transaction yet — it is not a failure and
- * the settlement stays in `pending_confirmation`.
+ * The outcomes one Horizon lookup can leave a settlement in. `pending` means
+ * Horizon has not seen the transaction yet; `expired` means that absence
+ * continued beyond the configured pending-age limit.
  */
-export type SettlementReconciliationOutcome = "confirmed" | "failed" | "pending";
+export type SettlementReconciliationOutcome = "confirmed" | "failed" | "pending" | "expired";
 
 /**
  * Parameters needed for full settlement verification against Horizon.
@@ -59,6 +60,8 @@ export interface ReconcilableSettlement {
    * pre-needs_review behavior (retryCount-only update on not-found).
    */
   status?: string;
+  /** Time the transaction was submitted; used to expire unresolved jobs. */
+  pendingSince?: Date | null;
 }
 
 /**
@@ -74,6 +77,7 @@ export interface ReconcilableSettlement {
  *                                             retryCount incremented
  *                                             → `pending`
  *                                             If retries exhausted → `failed`
+ *                                             If pending-age limit elapsed → `expired`
  *   Verification failure (mismatch)        → `failed`     (terminal)
  *
  * Returns the observed outcome so the calling worker can aggregate batch
@@ -226,12 +230,32 @@ export async function reconcileSingleSettlement(
 }
 
 async function handleTransactionNotFound(
-  settlement: { id: string; retryCount: number; status?: string },
+  settlement: { id: string; retryCount: number; status?: string; pendingSince?: Date | null },
   hash: string,
   maxRetries: number,
   recLog: ReturnType<typeof loggerWithContext>
 ): Promise<SettlementReconciliationOutcome> {
   const nextRetryCount = settlement.retryCount + 1;
+
+  if (
+    settlement.pendingSince &&
+    Date.now() - settlement.pendingSince.getTime() >= config.WORKER_PENDING_SETTLEMENT_MAX_AGE_MS
+  ) {
+    await applySettlementTransition({
+      settlementId: settlement.id,
+      nextStatus: "expired",
+      source: "worker",
+      extraData: {
+        failureReason: `Transaction ${hash} was not found on Stellar before the pending limit expired`,
+        retryCount: nextRetryCount,
+      },
+    });
+    recLog.info(
+      { id: settlement.id, hash, pendingSince: settlement.pendingSince },
+      "settlement expired after remaining unconfirmed beyond the pending limit"
+    );
+    return "expired";
+  }
 
   if (nextRetryCount > maxRetries) {
     await applySettlementTransition({

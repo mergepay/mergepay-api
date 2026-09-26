@@ -62,6 +62,12 @@ function authHeader() {
   return { authorization: `Bearer ${token}` };
 }
 
+async function buildAppWithGlobalRateLimitProbe() {
+  const app = await buildApp();
+  app.get("/test/global-rate-limit", async () => ({ ok: true }));
+  return app;
+}
+
 beforeEach(async () => {
   vi.clearAllMocks();
   // The confirmation handler rejects a non-payer with 403 after the
@@ -103,10 +109,10 @@ function expectStandardRateLimitBody(res: { json: () => any; headers: Record<str
 
 describe("global tier (real app)", () => {
   it("spends the budget on under-limit requests, reporting remaining", async () => {
-    const app = await buildApp();
+    const app = await buildAppWithGlobalRateLimitProbe();
     const { max } = rateLimitPolicies().global;
 
-    const first = await app.inject({ method: "GET", url: "/health/live" });
+    const first = await app.inject({ method: "GET", url: "/test/global-rate-limit" });
     expect(first.statusCode).toBe(200);
     expect(first.headers["x-ratelimit-limit"]).toBe(String(max));
     expect(first.headers["x-ratelimit-remaining"]).toBe(String(max - 1));
@@ -115,15 +121,15 @@ describe("global tier (real app)", () => {
   });
 
   it("answers the request that crosses the limit with 429, headers, and the standard error body", async () => {
-    const app = await buildApp();
+    const app = await buildAppWithGlobalRateLimitProbe();
     const { max } = rateLimitPolicies().global;
 
     for (let i = 0; i < max; i++) {
-      const res = await app.inject({ method: "GET", url: "/health/live" });
+      const res = await app.inject({ method: "GET", url: "/test/global-rate-limit" });
       expect(res.statusCode).toBe(200);
     }
 
-    const limited = await app.inject({ method: "GET", url: "/health/live" });
+    const limited = await app.inject({ method: "GET", url: "/test/global-rate-limit" });
     expect(limited.statusCode).toBe(429);
     expect(limited.headers["x-ratelimit-limit"]).toBe(String(max));
     expect(limited.headers["x-ratelimit-remaining"]).toBe("0");

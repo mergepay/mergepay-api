@@ -3,9 +3,20 @@ import { describe, it, expect } from "vitest";
 import {
   reqSerializer,
   resSerializer,
+  txHashSerializer,
+  isStellarTxHash,
+  truncateStellarTxHash,
+  stellarTxHashSerializers,
+  STELLAR_TX_HASH_HEX_LENGTH,
+  MISSING_TX_HASH,
+  INVALID_TX_HASH,
   type SerializedRequest,
   type SerializedResponse,
 } from "../src/lib/serializers";
+
+/** A well-formed Stellar transaction hash: 64 lowercase hex characters. */
+const VALID_TX_HASH =
+  "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
 
 // ─── reqSerializer ──────────────────────────────────────────────────────────
 
@@ -154,6 +165,18 @@ describe("reqSerializer", () => {
     const result: SerializedRequest = reqSerializer(req);
     expect(result.headers.Authorization).toBe("[REDACTED]");
   });
+
+  it("keeps the request id so a logged request stays correlatable", () => {
+    const req = {
+      id: "req-abc123",
+      method: "GET",
+      url: "/health",
+      headers: {},
+    };
+
+    const result: SerializedRequest = reqSerializer(req);
+    expect(result.id).toBe("req-abc123");
+  });
 });
 
 // ─── resSerializer ──────────────────────────────────────────────────────────
@@ -236,5 +259,121 @@ describe("resSerializer", () => {
 
     const result: SerializedResponse = resSerializer(res);
     expect(result.headers["Set-Cookie"]).toBe("[REDACTED]");
+  });
+
+  it("reads headers from a Fastify reply, which exposes them via getHeaders()", () => {
+    // Pino hands the serializer the reply itself, not a Node response: a reply
+    // has no `headers` property, so without this the set-cookie on the wire
+    // would never even be seen, let alone redacted.
+    const res = {
+      statusCode: 201,
+      getHeaders: () => ({
+        "set-cookie": ["session=abc123; HttpOnly"],
+        "content-type": "application/json; charset=utf-8",
+      }),
+    };
+
+    const result: SerializedResponse = resSerializer(res);
+    expect(result.statusCode).toBe(201);
+    expect(result.headers["set-cookie"]).toBe("[REDACTED]");
+    expect(result.headers["content-type"]).toBe("application/json; charset=utf-8");
+  });
+
+  it("survives a getHeaders() that throws", () => {
+    const res = {
+      statusCode: 500,
+      getHeaders: () => {
+        throw new Error("socket is gone");
+      },
+    };
+
+    const result: SerializedResponse = resSerializer(res);
+    expect(result.statusCode).toBe(500);
+    expect(result.headers).toEqual({});
+  });
+});
+
+// ─── txHashSerializer ───────────────────────────────────────────────────────
+
+describe("txHashSerializer", () => {
+  it("shortens a well-formed hash to head…tail", () => {
+    expect(txHashSerializer(VALID_TX_HASH)).toBe("a1b2c3d4…ddeeff00");
+  });
+
+  it("normalizes uppercase hex to lowercase", () => {
+    expect(txHashSerializer(VALID_TX_HASH.toUpperCase())).toBe(
+      "a1b2c3d4…ddeeff00"
+    );
+  });
+
+  it("trims surrounding whitespace before serializing", () => {
+    expect(txHashSerializer(`  ${VALID_TX_HASH}\n`)).toBe("a1b2c3d4…ddeeff00");
+  });
+
+  it("does not echo malformed values", () => {
+    // Too short, non-hex, and wrong-length inputs all collapse to a sentinel.
+    expect(txHashSerializer("deadbeef")).toBe(INVALID_TX_HASH);
+    expect(txHashSerializer("z".repeat(STELLAR_TX_HASH_HEX_LENGTH))).toBe(
+      INVALID_TX_HASH
+    );
+    expect(txHashSerializer(VALID_TX_HASH.slice(0, 63))).toBe(INVALID_TX_HASH);
+  });
+
+  it("handles non-string and nullish inputs without throwing", () => {
+    expect(txHashSerializer(42)).toBe(INVALID_TX_HASH);
+    expect(txHashSerializer({ hash: VALID_TX_HASH })).toBe(INVALID_TX_HASH);
+    expect(txHashSerializer([])).toBe(INVALID_TX_HASH);
+    expect(txHashSerializer(null)).toBe(MISSING_TX_HASH);
+    expect(txHashSerializer(undefined)).toBe(MISSING_TX_HASH);
+  });
+});
+
+// ─── isStellarTxHash ────────────────────────────────────────────────────────
+
+describe("isStellarTxHash", () => {
+  it("accepts 64-character hex in either case, with padding", () => {
+    expect(isStellarTxHash(VALID_TX_HASH)).toBe(true);
+    expect(isStellarTxHash(VALID_TX_HASH.toUpperCase())).toBe(true);
+    expect(isStellarTxHash(` ${VALID_TX_HASH} `)).toBe(true);
+  });
+
+  it("rejects malformed and non-string values", () => {
+    expect(isStellarTxHash(VALID_TX_HASH.slice(0, 63))).toBe(false);
+    expect(isStellarTxHash(`${VALID_TX_HASH}a`)).toBe(false);
+    expect(isStellarTxHash("not-a-hash")).toBe(false);
+    expect(isStellarTxHash(null)).toBe(false);
+    expect(isStellarTxHash(123)).toBe(false);
+    expect(isStellarTxHash(undefined)).toBe(false);
+  });
+});
+
+// ─── truncateStellarTxHash ──────────────────────────────────────────────────
+
+describe("truncateStellarTxHash", () => {
+  it("keeps the leading and trailing characters of a full hash", () => {
+    expect(truncateStellarTxHash(VALID_TX_HASH)).toBe("a1b2c3d4…ddeeff00");
+  });
+
+  it("leaves short values untouched", () => {
+    expect(truncateStellarTxHash("abc")).toBe("abc");
+  });
+});
+
+// ─── stellarTxHashSerializers ───────────────────────────────────────────────
+
+describe("stellarTxHashSerializers", () => {
+  it("maps every known Stellar hash field to the serializer", () => {
+    for (const key of [
+      "txHash",
+      "stellarTxHash",
+      "intendedTxHash",
+      "transactionHash",
+      "stellarTransactionHash",
+    ]) {
+      expect(stellarTxHashSerializers[key]).toBe(txHashSerializer);
+      expect(stellarTxHashSerializers[key](VALID_TX_HASH)).toBe(
+        "a1b2c3d4…ddeeff00"
+      );
+    }
   });
 });

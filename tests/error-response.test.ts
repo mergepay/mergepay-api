@@ -30,7 +30,10 @@ vi.mock("../src/services/stellar", async (importActual) => {
 
 import { buildApp } from "../src/app";
 import { AppError, Errors, ErrorCode } from "../src/lib/errors";
-import { formatErrorResponse } from "../src/utils/error-response";
+import {
+  formatErrorResponse,
+  type FormattedErrorResponse,
+} from "../src/utils/error-response";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -39,7 +42,11 @@ import { z } from "zod";
 
 describe("formatErrorResponse helper", () => {
   it("builds a payload with code, message, timestamp, and requestId", () => {
-    const payload = formatErrorResponse("NOT_FOUND", "Thing not found", "req-abc123");
+    const payload: FormattedErrorResponse = formatErrorResponse(
+      "NOT_FOUND",
+      "Thing not found",
+      "req-abc123"
+    );
 
     expect(payload.error).toEqual({
       code: "NOT_FOUND",

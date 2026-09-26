@@ -29,6 +29,8 @@ export const AuditAction = {
   TREASURY_CONFIRM: "treasury.confirm",
   TREASURY_CONFIRM_FAILED: "treasury.confirm.failed",
   TREASURY_SIGNER_VALIDATION: "treasury.signer_validation",
+  TREASURY_TRANSACTION_CONFIRMED: "treasury.transaction.confirmed",
+  TREASURY_TRANSACTION_FAILED: "treasury.transaction.failed",
 
   // ── Treasury proposals (multisig) ───────────────────────────────────
   TREASURY_PROPOSAL_CREATED: "treasury.proposal.created",

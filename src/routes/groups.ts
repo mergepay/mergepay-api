@@ -6,6 +6,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
+import { groupMembership, requireGroupRole } from "../plugins/group-access";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
 import { ADMIN_AUDIT_ACTIONS, auditTx } from "../services/audit";
@@ -105,11 +106,11 @@ export default async function groupRoutes(app: FastifyInstance) {
         tags: ["Groups"],
         summary: "Create a group",
         description:
-          "Creates a group owned by the caller, who is added to it as its first admin.",
+          "Creates a group owned by the caller, who is added to it as its first admin. 409 if a unique constraint rejects the write (e.g. a duplicate first membership).",
         body: openApiBody(createGroupSchema),
         response: {
           ...openApiEnvelope("group"),
-          ...openApiErrorResponses(400, 401),
+          ...openApiErrorResponses(400, 401, 409),
         },
       },
     },
@@ -220,6 +221,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/balance",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Get a group's on-chain treasury balances",
@@ -248,9 +250,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id } = groupIdParamsSchema.parse(req.params);
-    await requireMembership(id, auth.id);
 
     const cached = groupBalanceCache.get(id);
     if (cached && cached.expiresAt > Date.now()) {
@@ -293,6 +293,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Get a group's detail and members",
@@ -317,10 +318,9 @@ export default async function groupRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id } = groupParamsSchema.parse(req.params);
     const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
-    const ctx = await requireMembership(id, auth.id);
+    const ctx = groupMembership(req);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group) throw Errors.notFound("Group not found");
@@ -372,6 +372,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/invite",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Invite a user to a group",
@@ -565,6 +566,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/leave",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Leave a group",
@@ -617,6 +619,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.patch(
     "/groups/:id/members/:memberId",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Update a group member's role",
@@ -666,6 +669,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.delete(
     "/groups/:id/members/:memberId",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Remove a member from a group",
@@ -688,7 +692,6 @@ export default async function groupRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id, memberId } = groupMemberParamsSchema.parse(req.params);
-    await requireAdmin(id, auth.id);
 
     if (memberId === auth.id) {
       throw Errors.badRequest(
@@ -753,6 +756,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/members/role",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Change a member's role",
@@ -835,6 +839,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/archive",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Archive a group",

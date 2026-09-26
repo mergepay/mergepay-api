@@ -8,6 +8,7 @@ import path from "node:path";
 import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
+import groupAccessPlugin from "./plugins/group-access";
 import errorHandlerPlugin from "./plugins/error-handler";
 import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
@@ -32,10 +33,9 @@ import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { formatErrorResponse } from "./utils/error-response";
-import { rateLimitPolicies } from "./lib/rate-limit";
+import { isGlobalRateLimitExempt, rateLimitPolicies } from "./lib/rate-limit";
 import { AppError, ErrorCode } from "./lib/errors";
-import { stellarErrorSerializer } from "./lib/stellar-serializer";
-import { reqSerializer, resSerializer } from "./lib/serializers";
+import { buildLoggerOptions, nullLogDestination } from "./lib/logger";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
@@ -65,10 +65,9 @@ function globalRateLimitKey(request: FastifyRequest): string {
  * Build-time overrides.
  *
  * `logger` exists so tests can inject a Pino instance that writes into an
- * in-memory stream: under test the default logger is disabled (see the
- * `config.isTest` branch below), so without an injection point there is
- * nothing for the error-handling tests to assert against. Production callers
- * pass no options and keep the configured logger.
+ * in-memory stream: without an injection point there would be nothing for the
+ * error-handling tests to assert against. Production callers pass no options
+ * and keep the configured logger.
  */
 export interface BuildAppOptions {
   logger?: FastifyServerOptions["logger"];
@@ -80,6 +79,21 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // Contains a @fastify/busboy defect that turns a truncated multipart body
   // into an uncaught exception. See src/lib/multipart-guard.ts.
   installMultipartGuard();
+
+  // The logger is configured from the shared option set in src/lib/logger.ts so
+  // the request, response, and error serializers apply to every log line this
+  // instance emits — including the "incoming request" / "request completed"
+  // lines Fastify writes itself, which are the ones that would otherwise carry
+  // a raw Authorization header into the log.
+  //
+  // Under test the same configuration is used, only pointed at a destination
+  // that discards its input: the serializers run on every request the suite
+  // makes, so one that throws — or a credential that slips past redaction —
+  // fails `npm test`, while the run itself stays quiet.
+  const loggerOptions = buildLoggerOptions({
+    level: config.LOG_LEVEL,
+    pretty: config.NODE_ENV === "development" && !config.isTest,
+  });
 
   const app = Fastify({
     requestIdHeader: "x-request-id",
@@ -98,41 +112,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     logger:
       options.logger ??
       (config.isTest
-        ? false
-        : {
-          level: config.LOG_LEVEL,
-          serializers: {
-            err: stellarErrorSerializer as any,
-            req: reqSerializer as any,
-            res: resSerializer as any,
-          },
-          redact: {
-            paths: [
-              "req.headers.authorization",
-              "req.headers.cookie",
-              "authorization",
-              "cookie",
-              "token",
-              "accessToken",
-              "refreshToken",
-              "signedXdr",
-              "transactionXdr",
-              "privateKey",
-              "secret",
-              "password",
-              "body.token",
-              "body.signedXdr",
-              "body.transactionXdr",
-              "body.privateKey",
-              "body.password",
-            ],
-            censor: "[REDACTED]",
-          },
-          transport:
-            config.NODE_ENV === "development"
-              ? { target: "pino-pretty", options: { colorize: true } }
-              : undefined,
-        }),
+        ? { ...loggerOptions, stream: nullLogDestination() }
+        : loggerOptions),
     bodyLimit: config.JSON_BODY_LIMIT_BYTES,
   });
 
@@ -265,6 +246,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     max: config.RATE_LIMIT_GLOBAL_MAX,
     timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: globalRateLimitKey,
+    allowList: isGlobalRateLimitExempt,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: () =>
       // Must be a real Error (AppError), not a bare payload object:
@@ -347,6 +329,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   await app.register(loggingPlugin);
   await app.register(authPlugin);
+  // Must come after the rate-limit registration above: its onRoute hook
+  // moves each group guard behind the limiter in the route's preHandler chain.
+  await app.register(groupAccessPlugin);
   await app.register(errorHandlerPlugin);
   // Registered with fastify-plugin, so `app.idempotent` is visible to every
   // route plugin below rather than only inside this scope.

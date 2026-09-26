@@ -1,11 +1,52 @@
 /**
- * Zod validation schema for SEP-10 authentication challenge verification.
+ * Zod validation schemas for the SEP-10 authentication endpoints.
  *
- * Validates the `/auth/verify` request body, ensuring the transaction is
- * canonical base64 before it reaches the XDR and signature checks in
- * src/services/sep10.ts.
+ * `/auth/challenge` and `/auth/verify` parse their body and query string
+ * against these strict schemas before any challenge is built or any XDR,
+ * signature, or database work happens in src/services/sep10.ts. Unknown keys
+ * are rejected rather than stripped, so a misspelled or smuggled field fails
+ * loudly with 400 VALIDATION_ERROR instead of being silently ignored.
+ *
+ * Neither endpoint reads a request header: the client is identified solely by
+ * the body, and rate limiting is keyed by IP. There is deliberately no header
+ * schema — validating headers the handler never consumes would only reject
+ * ordinary proxies and user agents.
  */
 import { z } from "zod";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
+
+/** A Stellar ed25519 public key is always exactly 56 characters (G + 55). */
+const STELLAR_ACCOUNT_ID_LENGTH = 56;
+
+/**
+ * SEP-10 challenge request payload (`POST /auth/challenge`).
+ *
+ * `account` is the client's Stellar public key. The length check runs before
+ * the checksum refinement so an oversized string is rejected cheaply.
+ */
+export const sep10ChallengeRequestSchema = z
+  .object({
+    account: z
+      .string({
+        required_error: "account is required",
+        invalid_type_error: "account must be a string",
+      })
+      .length(
+        STELLAR_ACCOUNT_ID_LENGTH,
+        `account must be a ${STELLAR_ACCOUNT_ID_LENGTH}-character Stellar public key`
+      )
+      .pipe(stellarAccountIdSchema),
+  })
+  .strict();
+
+/**
+ * Query string for both SEP-10 POST endpoints. They take all input in the
+ * body, so any query parameter is a client mistake — most often a SEP-10
+ * `GET /auth?account=...` habit — and is rejected rather than ignored.
+ */
+export const sep10QuerySchema = z.object({}).strict();
+
+export type Sep10ChallengeRequest = z.infer<typeof sep10ChallengeRequestSchema>;
 
 const sep10DomainSchema = z
   .string()
@@ -39,13 +80,16 @@ const transactionXdrSchema = z
  *
  * Optional SEP-10 `home_domain` and `client_domain` values are format-checked.
  * The legacy `clientDomain` spelling remains accepted for existing clients.
+ * Any other key is rejected.
  */
-export const sep10VerifyRequestSchema = z.object({
-  transaction: transactionXdrSchema,
-  home_domain: sep10DomainSchema.optional(),
-  client_domain: sep10DomainSchema.optional(),
-  // Accept the original API spelling for existing clients.
-  clientDomain: sep10DomainSchema.optional(),
-});
+export const sep10VerifyRequestSchema = z
+  .object({
+    transaction: transactionXdrSchema,
+    home_domain: sep10DomainSchema.optional(),
+    client_domain: sep10DomainSchema.optional(),
+    // Accept the original API spelling for existing clients.
+    clientDomain: sep10DomainSchema.optional(),
+  })
+  .strict();
 
 export type Sep10VerifyRequest = z.infer<typeof sep10VerifyRequestSchema>;

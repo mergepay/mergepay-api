@@ -30,13 +30,14 @@ function validateIssuedAsset(code: string, issuer: string): { code: string; issu
  * Formats a Stellar asset representation into a canonical string identifier.
  *
  * Standard representation rules:
- * - Native assets (XLM / native) are formatted strictly as `"native"`.
+ * - Native assets (XLM / native) are formatted strictly as `"XLM"`.
  * - Issued credit assets are formatted strictly as `"<code>:<issuer>"`.
  *
  * @param asset - A Stellar Asset instance, an object with code and optional issuer,
- *                or the asset code string.
+ *                or the asset code string. When a plain string is passed it is
+ *                treated as the asset code.
  * @param issuer - Optional issuer account public key when passing code as the first argument.
- * @returns Canonical asset string identifier (e.g. "native" or "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5").
+ * @returns Canonical asset string identifier (e.g. "XLM" or "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5").
  *
  * @throws {Error} If the asset input is missing, or a non-native asset is missing its issuing account.
  */
@@ -51,7 +52,7 @@ export function formatAssetIdentifier(
   // 1. Instance of Stellar SDK Asset
   if (asset instanceof Asset) {
     if (asset.isNative()) {
-      return "native";
+      return "XLM";
     }
     const assetIssuer = asset.getIssuer();
     const assetCode = asset.getCode();
@@ -70,14 +71,14 @@ export function formatAssetIdentifier(
 
     if (code.toUpperCase() === "XLM" || code.toLowerCase() === "native") {
       if (!asset.issuer && !issuer) {
-        return "native";
+        return "XLM";
       }
     }
 
     const effectiveIssuer = asset.issuer?.trim() || issuer?.trim();
     if (!effectiveIssuer) {
       if (code.toUpperCase() === "XLM" || code.toLowerCase() === "native") {
-        return "native";
+        return "XLM";
       }
       throw new Error(`Asset ${code} requires a valid issuer public key`);
     }
@@ -94,7 +95,7 @@ export function formatAssetIdentifier(
     }
 
     if (trimmed.toLowerCase() === "native" || (trimmed.toUpperCase() === "XLM" && !issuer)) {
-      return "native";
+      return "XLM";
     }
 
     // Check if already in <code>:<issuer> format
@@ -104,7 +105,7 @@ export function formatAssetIdentifier(
         const c = parts[0].trim();
         const i = parts[1].trim();
         if (c.toLowerCase() === "native" || c.toUpperCase() === "XLM") {
-          if (!i || i.toLowerCase() === "native") return "native";
+          if (!i || i.toLowerCase() === "native") return "XLM";
         }
         const validated = validateIssuedAsset(c, i);
         return `${validated.code}:${validated.issuer}`;
@@ -116,7 +117,7 @@ export function formatAssetIdentifier(
     const effectiveIssuer = issuer?.trim();
     if (!effectiveIssuer) {
       if (trimmed.toUpperCase() === "XLM" || trimmed.toLowerCase() === "native") {
-        return "native";
+        return "XLM";
       }
       throw new Error(`Asset ${trimmed} requires a valid issuer public key`);
     }

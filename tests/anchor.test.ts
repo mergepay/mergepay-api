@@ -505,7 +505,7 @@ describe("retry / backoff via fetchReadWithRetry", () => {
       h.fetchMock
         .mockResolvedValueOnce(jsonResponse({ error: "internal" }, 500))
         .mockResolvedValueOnce(
-          jsonResponse({ transaction: { status: "pending_anchor", id: "tx_1" } })
+          jsonResponse({ transaction: { id: "tx_1", kind: "deposit", status: "pending_anchor" } })
         );
 
       const result = await anchorService.getTransactionStatus({
@@ -581,7 +581,7 @@ describe("retry / backoff via fetchReadWithRetry", () => {
       h.fetchMock
         .mockRejectedValueOnce(new TypeError("fetch failed"))
         .mockResolvedValueOnce(
-          jsonResponse({ transaction: { status: "completed", id: "tx_1" } })
+          jsonResponse({ transaction: { id: "tx_1", kind: "deposit", status: "completed" } })
         );
 
       const result = await anchorService.getTransactionStatus({
@@ -611,7 +611,7 @@ describe("retry / backoff via fetchReadWithRetry", () => {
 
     it("records success on successful poll", async () => {
       h.fetchMock.mockResolvedValueOnce(
-        jsonResponse({ transaction: { status: "completed", id: "tx_1" } })
+        jsonResponse({ transaction: { id: "tx_1", kind: "deposit", status: "completed" } })
       );
 
       await anchorService.getTransactionStatus({
@@ -640,7 +640,7 @@ describe("anchorService.pollTransaction", () => {
           amount_in: "100.00",
           amount_out: "99.50",
           amount_fee: "0.50",
-          stellar_transaction_hash: "abc123hash",
+          stellar_transaction_id: "abc123hash",
           started_at: "2026-01-01T00:00:00Z",
           completed_at: "2026-01-01T00:05:00Z",
         },

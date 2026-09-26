@@ -5,8 +5,10 @@ const h = vi.hoisted(() => {
     anchorSession: {
       findUnique: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(async () => ({ count: 1 })),
     },
     auditLog: { create: vi.fn() },
+    statusHistory: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
   };
   return { prisma };
@@ -73,10 +75,9 @@ describe("canTransitionAnchorStatus / isTerminalAnchorStatus", () => {
 
 describe("applyAnchorSessionTransition", () => {
   it("applies an allowed transition and writes an audit record atomically", async () => {
-    prisma.anchorSession.findUnique.mockResolvedValue(fakeSession({ status: "pending_anchor" }));
-    prisma.anchorSession.update.mockResolvedValue(
-      fakeSession({ status: "completed" })
-    );
+    prisma.anchorSession.findUnique
+      .mockResolvedValueOnce(fakeSession({ status: "pending_anchor" }))
+      .mockResolvedValueOnce(fakeSession({ status: "completed" }));
 
     const result = await applyAnchorSessionTransition({
       sessionId: "session_1",
@@ -86,8 +87,8 @@ describe("applyAnchorSessionTransition", () => {
 
     expect(result.changed).toBe(true);
     expect(result.session.status).toBe("completed");
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith({
-      where: { id: "session_1" },
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith({
+      where: { id: "session_1", status: "pending_anchor" },
       data: { status: "completed" },
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
@@ -110,7 +111,7 @@ describe("applyAnchorSessionTransition", () => {
     });
 
     expect(result.changed).toBe(false);
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 
@@ -125,7 +126,7 @@ describe("applyAnchorSessionTransition", () => {
 
     expect(result.changed).toBe(false);
     expect(result.session.status).toBe("completed");
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 
@@ -141,7 +142,7 @@ describe("applyAnchorSessionTransition", () => {
     });
 
     expect(result.changed).toBe(false);
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("persists extra data alongside a duplicate status without re-auditing", async () => {
@@ -180,7 +181,7 @@ describe("applyAnchorSessionTransition", () => {
         ownerUserId: "user_1",
       })
     ).rejects.toMatchObject({ status: 403 });
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("throws not found for a missing session", async () => {

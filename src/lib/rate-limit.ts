@@ -190,6 +190,12 @@ export function rateLimited(name: Exclude<RateLimitPolicyName, "global">) {
         timeWindow: policy.timeWindow,
         hook: policy.hook,
         keyGenerator: policyKeyGenerator(policy),
+        onExceeded: (req: any, key: string) => {
+          req.log?.warn?.(
+            { key, policy: name, ip: req.ip, route: req.url },
+            `Rate limit exceeded for policy ${name}`
+          );
+        },
       },
     },
   };

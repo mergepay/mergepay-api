@@ -5,8 +5,9 @@ import {
   policyKeyGenerator,
   rateLimitPolicies,
   rateLimited,
+  type RouteRateLimitOptions,
   type RateLimitPolicyName,
-} from "../src/lib/rate-limit";
+} from "../src/config/ratelimit";
 import { config } from "../src/config";
 
 /**
@@ -120,7 +121,8 @@ describe("rate-limit policy table", () => {
 
   it("emits route options @fastify/rate-limit understands", () => {
     const options = rateLimited("settlementConfirm");
-    expect(options.config.rateLimit).toMatchObject({
+    const routeRateLimitOptions: RouteRateLimitOptions = options.config.rateLimit;
+    expect(routeRateLimitOptions).toMatchObject({
       max: config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX,
       timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
       hook: "preHandler",

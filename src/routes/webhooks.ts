@@ -87,6 +87,24 @@ async function sep24CallbackRoute(app: FastifyInstance) {
           keyGenerator: ipKey("sep24.webhook"),
         },
       },
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Process SEP-24 anchor webhook (HMAC-signed)",
+        description:
+          "Accepts SEP-24 transaction status callbacks authenticated with a pre-shared HMAC-SHA256 secret.",
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              received: { type: "boolean" },
+              status: { type: "string" },
+              matched: { type: "integer" },
+              updated: { type: "integer" },
+            },
+          },
+        },
+      },
     },
     async (req, reply) => {
       const rawBody = Buffer.isBuffer(req.body)

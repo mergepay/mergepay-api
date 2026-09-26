@@ -40,6 +40,7 @@ import crypto from "node:crypto";
 import { z } from "zod";
 import { config } from "../config";
 import { prisma } from "../db";
+import { sep24StellarTransactionHashSchema } from "../validations/sep24";
 import { audit } from "./audit";
 import { mapAnchorStatus } from "./anchor";
 import { applyAnchorSessionTransition } from "./anchor-status";
@@ -73,7 +74,7 @@ const transactionFields = z.object({
   amount_in: z.string().max(64).nullish(),
   amount_out: z.string().max(64).nullish(),
   amount_fee: z.string().max(64).nullish(),
-  stellar_transaction_id: z.string().max(128).nullish(),
+  stellar_transaction_id: sep24StellarTransactionHashSchema.nullish(),
   external_transaction_id: z.string().max(255).nullish(),
   message: z.string().max(1024).nullish(),
 });

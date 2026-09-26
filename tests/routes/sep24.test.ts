@@ -54,12 +54,13 @@ function anchorToken(over: Record<string, unknown> = {}, key = SIGNING_KEY) {
 
 function callback(
   payload: unknown,
-  token: string | null = anchorToken()
+  token: string | null = anchorToken(),
+  query = ""
 ) {
   clientAddress += 1;
   return app.inject({
     method: "POST",
-    url: "/api/sep24/callback",
+    url: `/api/sep24/callback${query}`,
     headers: {
       "content-type": "application/json",
       ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -204,6 +205,32 @@ describe("POST /api/sep24/callback — payload validation", () => {
     const res = await callback({ id: "anchor_tx_1", status: "completed" });
 
     expect(res.statusCode).toBe(200);
+  });
+
+  it("rejects an unexpected query parameter before database lookup", async () => {
+    const res = await callback(
+      { transaction: { id: "anchor_tx_1", status: "completed" } },
+      anchorToken(),
+      "?unexpected=value"
+    );
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(prisma.anchorSession.findMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed Stellar transaction hash before database lookup", async () => {
+    const res = await callback({
+      transaction: {
+        id: "anchor_tx_1",
+        status: "completed",
+        stellar_transaction_id: "not-a-stellar-hash",
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(prisma.anchorSession.findMany).not.toHaveBeenCalled();
   });
 
   it("ignores unknown anchor-specific fields", async () => {

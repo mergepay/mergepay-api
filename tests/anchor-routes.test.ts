@@ -107,10 +107,15 @@ describe("POST /anchors/webhook — status transitions", () => {
       where: { id: "session_1", status: "pending_anchor" },
       data: { status: "completed" },
     });
-    expect(prisma.auditLog.create).toHaveBeenCalledTimes(1);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "sep24.webhook.applied" }),
+    });
   });
 
-  it("ignores a duplicate delivery of the same status without re-auditing", async () => {
+  it("ignores a duplicate delivery without recording a status transition", async () => {
     prisma.anchorSession.findMany.mockResolvedValue([{ id: "session_1" }]);
     prisma.anchorSession.findUnique.mockResolvedValue(
       fakeSession({ status: "completed" })
@@ -120,7 +125,12 @@ describe("POST /anchors/webhook — status transitions", () => {
 
     expect(res.statusCode).toBe(200);
     expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
-    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "sep24.webhook.applied" }),
+    });
   });
 
   it("ignores an out-of-order regression from a terminal state", async () => {
@@ -135,7 +145,12 @@ describe("POST /anchors/webhook — status transitions", () => {
 
     expect(res.statusCode).toBe(200);
     expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
-    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "sep24.webhook.applied" }),
+    });
   });
 
   it("does nothing when no session matches the external transaction id", async () => {

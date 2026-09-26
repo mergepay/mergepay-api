@@ -29,6 +29,7 @@ import {
   verifyAnchorToken,
 } from "../services/sep24-anchor-token";
 import {
+  sep24CallbackQuerySchema,
   sep24DepositRequestSchema,
   sep24WithdrawRequestSchema,
 } from "../validations/sep24";
@@ -150,6 +151,7 @@ export default async function sep24Routes(app: FastifyInstance) {
         summary: "Process SEP-24 anchor callback",
         description:
           "Accepts and processes SEP-24 transaction status callbacks signed with the anchor SEP-10 JWT token.",
+        querystring: openApiBody(sep24CallbackQuerySchema),
         body: openApiBody(sep24CallbackSchema),
         response: {
           200: {
@@ -169,6 +171,8 @@ export default async function sep24Routes(app: FastifyInstance) {
       // Verified before the body is parsed, so an unauthenticated caller never
       // reaches the schema, the database, or the audit log.
       await verifyAnchorToken(req.headers.authorization);
+
+      sep24CallbackQuerySchema.parse(req.query ?? {});
 
       const callback = sep24CallbackSchema.parse(req.body ?? {});
       const result = await applySep24Callback(callback);

@@ -235,6 +235,22 @@ describe("POST /api/webhooks/sep24 — payload validation", () => {
     expect(prisma.anchorSession.findMany).not.toHaveBeenCalled();
   });
 
+  it("rejects a malformed Stellar transaction hash before database lookup", async () => {
+    const response = await post(
+      signedRequest({
+        transaction: {
+          id: "anchor_tx_1",
+          status: "completed",
+          stellar_transaction_id: "not-a-stellar-hash",
+        },
+      })
+    );
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(prisma.anchorSession.findMany).not.toHaveBeenCalled();
+  });
+
   it("accepts the flattened (non-enveloped) callback shape", async () => {
     prisma.anchorSession.findMany.mockResolvedValue([session()]);
     prisma.anchorSession.findUnique.mockResolvedValue(session());

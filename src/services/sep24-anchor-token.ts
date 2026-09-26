@@ -45,6 +45,7 @@ import { anchorService, mapAnchorStatus } from "./anchor";
 import { applyAnchorSessionTransition } from "./anchor-status";
 import { audit } from "./audit";
 import { isRecognisedSep24Status } from "./sep24-types";
+import { sep24StellarTransactionHashSchema } from "../validations/sep24";
 
 const log = pino({ name: "sep24" });
 
@@ -82,7 +83,7 @@ const transactionFields = z.object({
   amount_in: z.string().max(64).nullish(),
   amount_out: z.string().max(64).nullish(),
   amount_fee: z.string().max(64).nullish(),
-  stellar_transaction_id: z.string().max(128).nullish(),
+  stellar_transaction_id: sep24StellarTransactionHashSchema.nullish(),
   external_transaction_id: z.string().max(255).nullish(),
   message: z.string().max(1024).nullish(),
 });

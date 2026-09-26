@@ -5,6 +5,8 @@ import {
   isValidCodeChar,
   MP_PREFIX,
   MAX_MEMO_BYTES,
+  validateExpenseMemo,
+  parseExpenseCode,
 } from "../memo";
 
 describe("Stellar Memo Validation Utility (src/utils/memo)", () => {
@@ -153,6 +155,25 @@ describe("Stellar Memo Validation Utility (src/utils/memo)", () => {
       expect(isValidCodeChar("0")).toBe(false);
       expect(isValidCodeChar("I")).toBe(false);
       expect(isValidCodeChar("O")).toBe(false);
+    });
+
+    it("validates expense memos with the canonical MP: prefix and code rules", () => {
+      expect(validateExpenseMemo("MP:AB234")).toBe(true);
+      expect(validateExpenseMemo("MP:XYZ234789")).toBe(true);
+      expect(validateExpenseMemo("MP:A")).toBe(true);
+      expect(validateExpenseMemo("AB234")).toBe(false);
+      expect(validateExpenseMemo("mp:AB234")).toBe(false);
+      expect(validateExpenseMemo("MP:ab123")).toBe(false);
+    });
+
+    it("parses expense codes from valid memos and returns null for invalid ones", () => {
+      expect(parseExpenseCode("MP:AB234")).toBe("AB234");
+      expect(parseExpenseCode("MP:XYZ234789")).toBe("XYZ234789");
+      expect(parseExpenseCode("MP:")).toBeNull();
+      expect(parseExpenseCode("AB234")).toBeNull();
+      expect(parseExpenseCode("mp:AB234")).toBeNull();
+      expect(parseExpenseCode("MP:AB!234")).toBeNull();
+      expect(parseExpenseCode("MP:" + "A".repeat(26))).toBeNull();
     });
   });
 });

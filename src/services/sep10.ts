@@ -24,8 +24,14 @@
  *     conditional insert, so concurrent verifications of the same envelope
  *     resolve to one winner and the rest are rejected as replays.
  *
- * Failures are always the same generic 401. The SDK's message, the challenge
- * XDR, and any signature material are never echoed back or logged.
+ * Failures are always a 401, but not one uniform message: a challenge that is
+ * otherwise well-formed and correctly signed but arrived after its validity
+ * window is rejected with the dedicated CHALLENGE_EXPIRED error so a client
+ * knows the envelope was good and the only remedy is to request a fresh one.
+ * Signature and domain failures stay the generic UNAUTHORIZED — distinguishing
+ * them from expiry would hand an attacker a probe for which failures are
+ * structural rather than temporal. The SDK's message, the challenge XDR, and
+ * any signature material are never echoed back or logged either way.
  *
  * Successful verification returns the client's public key; minting the session
  * token stays in src/routes/auth.ts, whose claims contract is unchanged.
@@ -46,6 +52,9 @@ import { stellar } from "./stellar";
 
 /** How long a freshly built challenge stays signable. */
 export const CHALLENGE_VALIDITY_SECONDS = 300;
+
+/** The exact message the SDK raises when a challenge's own window has closed. */
+const EXPIRED_CHALLENGE_MESSAGE = "The transaction has expired";
 
 /** SEP-10 requires at least 32 bytes of server-chosen randomness in the nonce. */
 const MIN_NONCE_BYTES = 32;
@@ -71,6 +80,31 @@ export function serverKeypair(): Keypair {
 
 function invalidChallenge(): never {
   throw Errors.unauthorized("Invalid or expired authentication challenge");
+}
+
+/**
+ * The challenge was structurally valid and correctly signed but arrived after
+ * its validity window closed — rejected with its own error so a client can
+ * tell "sign again" from "you got something wrong". Follows the envelope
+ * structure of the transaction-intent expiry path (INTENT_EXPIRED,
+ * src/lib/time-bounds.ts).
+ */
+function expiredChallenge(): never {
+  throw Errors.challengeExpired(
+    "Authentication challenge has expired. Request a new challenge and sign it promptly.",
+    { challengeValiditySeconds: CHALLENGE_VALIDITY_SECONDS }
+  );
+}
+
+/**
+ * The challenge was well-formed, correctly sourced, and inside its window, but
+ * the signature material did not verify — wrong (or missing) client signature,
+ * or a funded account whose signers do not meet the medium threshold.
+ */
+function invalidSignature(): never {
+  throw Errors.unauthorized(
+    "Challenge signature verification failed. Ensure the challenge is signed by the account's signing key(s) before submitting."
+  );
 }
 
 function isValidAccount(account: string): boolean {
@@ -106,6 +140,23 @@ interface ChallengeOperation {
 }
 
 /**
+ * Extract the home domain name from a challenge envelope's first manageData
+ * operation. Returns null when the operation is missing or not a manageData
+ * type.
+ */
+function extractHomeDomain(tx: Transaction): string | null {
+  const operations = tx.operations as ChallengeOperation[];
+  const authOp = operations[0];
+  if (!authOp || authOp.type !== "manageData" || typeof authOp.name !== "string") {
+    return null;
+  }
+  // The name is `<homeDomain> auth` — strip the trailing ` auth` suffix.
+  const suffix = " auth";
+  if (!authOp.name.endsWith(suffix)) return null;
+  return authOp.name.slice(0, -suffix.length);
+}
+
+/**
  * Re-check the envelope against the shape this server issues.
  *
  * Deliberately redundant with `readChallengeTx`: an authentication bypass here
@@ -119,6 +170,13 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): vo
   // guarantees that, and it is part of the SEP-10 definition.
   if (String(tx.sequence) !== "0") invalidChallenge();
   if (!isValidAccount(clientAccountId)) invalidChallenge();
+
+  // Explicit home domain assertion: the first manageData operation must carry
+  // `<homeDomain> auth` where `homeDomain` matches the server configuration.
+  // This is a defense-in-depth check — the SDK also validates the home
+  // domain, but catching it here produces a clear, auditable rejection.
+  const homeDomain = extractHomeDomain(tx);
+  if (homeDomain !== config.SEP10_HOME_DOMAIN) invalidChallenge();
 
   // Time bounds arrive as decimal strings from the SDK; readTimeBounds
   // normalizes them and returns null for an envelope with none.
@@ -135,9 +193,13 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): vo
   // transaction intents applies, so a genuinely stale or not-yet-valid
   // challenge is still rejected.
   const now = nowSeconds();
+  if (bounds.maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= now) {
+    // The envelope is one we issued, correctly shaped, whose window has
+    // closed. Expired — the one failure a client can fix without debugging.
+    expiredChallenge();
+  }
   if (
     bounds.minTime > now + CLOCK_SKEW_TOLERANCE_SECONDS ||
-    bounds.maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= now ||
     bounds.maxTime >
       bounds.minTime + CHALLENGE_VALIDITY_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS
   ) {
@@ -195,7 +257,15 @@ function readChallenge(
       config.SEP10_HOME_DOMAIN,
       config.WEB_AUTH_DOMAIN
     );
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message === EXPIRED_CHALLENGE_MESSAGE) {
+      // The SDK's own expiry check fired: the envelope parsed as a valid
+      // challenge but its window has closed (granted a loose 300s grace
+      // period — our envelope validation re-checks expiry strictly below,
+      // where the tighter CHALLENGE_VALIDITY_SECONDS bound applies). The
+      // SDK's other failures stay opaque.
+      expiredChallenge();
+    }
     // The SDK's message can name internal details; never surface it.
     invalidChallenge();
   }
@@ -292,10 +362,14 @@ async function consumeChallenge(params: {
 /**
  * Verify a signed challenge and return the authenticated client public key.
  *
- * Rejects — always as a generic 401 — challenges that are malformed, expired,
- * not yet valid, built for the wrong network, home domain, web auth domain, or
- * server account, signed by the wrong client (or not at all), structurally
- * unlike a challenge this server issued, or already redeemed.
+ * Rejects — always with a 401 — challenges that are malformed, expired (code
+ * CHALLENGE_EXPIRED), not yet valid, built for the wrong network, home domain,
+ * web auth domain, or server account, signed by the wrong client (or not at
+ * all), structurally unlike a challenge this server issued, or already
+ * redeemed. Signature failures report a distinct message from expiry so a
+ * client with a correctly-built but unsigned envelope retries the signature;
+ * every other failure stays the generic UNAUTHORIZED with one uniform
+ * message, so rejections cannot be probed for which check failed.
  */
 export async function verifyChallenge(signedXdr: string): Promise<string> {
   const serverAccount = serverKeypair().publicKey();
@@ -344,7 +418,11 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
       );
     }
   } catch {
-    invalidChallenge();
+    // Structure, domains, and time bounds are already confirmed, so a
+    // threshold failure here means the signature material is wrong. Reported
+    // distinctly from expiry: the remedy is re-signing the same envelope,
+    // not minting a new challenge.
+    invalidSignature();
   }
 
   // Consumed last, so a challenge is only burned by an otherwise valid

@@ -56,7 +56,7 @@ describe("rate limiting — allowed and rejected requests", () => {
     });
     app.post("/protected", { preHandler: async (req) => {
       const userId = req.headers["x-user"] as string | undefined;
-      if (userId) (req as any).user = { id: userId };
+      if (userId) (req as any).user = { id: userId, stellarPublicKey: `GTEST_${userId}` };
     } }, async () => ({ ok: true }));
     await app.ready();
 

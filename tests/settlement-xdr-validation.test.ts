@@ -72,15 +72,17 @@ function buildCustomXdr({
   extraOperation = false,
   memo = "MP:ABC123",
   timeoutSeconds = 300,
+  sequence = "12345",
 }: {
   fee?: string;
   operationSource?: string;
   extraOperation?: boolean;
   memo?: string;
   timeoutSeconds?: number;
+  sequence?: string;
 } = {}): string {
   const txb = new TransactionBuilder(
-    new Account(settlement.from.stellarPublicKey, "12345"),
+    new Account(settlement.from.stellarPublicKey, sequence),
     { fee, networkPassphrase: config.networkPassphrase }
   ).addOperation(
     Operation.payment({
@@ -288,6 +290,13 @@ describe("validateSettlementXdr", () => {
     const signedXdr = sign(buildCustomXdr({ fee: "999" }));
 
     expect(() => validateSettlementXdr(signedXdr, settlement)).toThrow(/fee/i);
+  });
+
+  it("rejects an envelope with a different source sequence when the intent records one", () => {
+    const intentWithSequence = { ...settlement, sourceSequence: "12345" };
+    const signedXdr = sign(buildCustomXdr({ sequence: "12346" }));
+
+    expect(() => validateSettlementXdr(signedXdr, intentWithSequence)).toThrow(/sequence/i);
   });
 
   it("rejects an envelope signed for a different network", () => {

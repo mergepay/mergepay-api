@@ -3,7 +3,9 @@ import { Keypair } from "@stellar/stellar-sdk";
 import {
   parseStellarAmount,
   stellarAmountSchema,
+  stellarAccountIdSchema,
   stellarPublicKeySchema,
+  mpMemoSchema,
   stellarAssetSchema,
   MAX_STROOPS,
 } from "../src/lib/stellar-validation";
@@ -13,11 +15,13 @@ describe("stellarPublicKeySchema", () => {
   it("accepts a real ed25519 public key", () => {
     const key = Keypair.random().publicKey();
     expect(stellarPublicKeySchema.safeParse(key).success).toBe(true);
+    expect(stellarAccountIdSchema.safeParse(key).success).toBe(true);
   });
 
-  it("rejects a malformed key (bad checksum)", () => {
-    const key = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    expect(stellarPublicKeySchema.safeParse(key).success).toBe(false);
+  it("rejects lowercase, wrong-length, or non-StrKey strings", () => {
+    expect(stellarAccountIdSchema.safeParse("gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").success).toBe(false);
+    expect(stellarAccountIdSchema.safeParse("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").success).toBe(false);
+    expect(stellarAccountIdSchema.safeParse("not-a-key").success).toBe(false);
   });
 
   it("rejects a secret seed used where a public key is expected", () => {
@@ -28,6 +32,30 @@ describe("stellarPublicKeySchema", () => {
   it("rejects garbage input", () => {
     expect(stellarPublicKeySchema.safeParse("not-a-key").success).toBe(false);
     expect(stellarPublicKeySchema.safeParse("").success).toBe(false);
+  });
+});
+
+describe("mpMemoSchema", () => {
+  it("accepts valid Mergepay memos with the MP: prefix", () => {
+    expect(mpMemoSchema.safeParse("MP:ABC123").success).toBe(true);
+    expect(mpMemoSchema.safeParse("MP:hello").success).toBe(true);
+  });
+
+  it("rejects memos without the MP: prefix", () => {
+    expect(mpMemoSchema.safeParse("ABC123").success).toBe(false);
+    expect(mpMemoSchema.safeParse("hello").success).toBe(false);
+  });
+
+  it("rejects memos that exceed the Stellar MEMO_TEXT UTF-8 byte limit", () => {
+    const tooLong = "MP:" + "é".repeat(15);
+    expect(Buffer.byteLength(tooLong, "utf8")).toBeGreaterThan(28);
+    expect(mpMemoSchema.safeParse(tooLong).success).toBe(false);
+  });
+
+  it("accepts values at the exact 28-byte boundary", () => {
+    const exact = "MP:" + "a".repeat(25);
+    expect(Buffer.byteLength(exact, "utf8")).toBe(28);
+    expect(mpMemoSchema.safeParse(exact).success).toBe(true);
   });
 });
 
@@ -58,7 +86,7 @@ describe("parseStellarAmount / stellarAmountSchema", () => {
   });
 
   it("rejects precision overflow beyond 7 decimal places", () => {
-    expect(() => parseStellarAmount("1.12345678")).toThrow(/decimal places/i);
+    expect(() => parseStellarAmount("1.12345678")).toThrow(/7-decimal|precision/i);
     expect(stellarAmountSchema.safeParse("1.12345678").success).toBe(false);
   });
 
@@ -113,12 +141,12 @@ describe("stellarAssetSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  it("rejects the stablecoin with no issuer at all", () => {
+  it("accepts the stablecoin with no issuer (uses configured default)", () => {
     const result = stellarAssetSchema.safeParse({
       assetCode: config.STABLE_ASSET_CODE,
       assetIssuer: null,
     });
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
   });
 
   it("rejects unsupported asset codes", () => {

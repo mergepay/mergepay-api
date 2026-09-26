@@ -6,6 +6,7 @@
  */
 
 import { bigIntAbs, fromStroops, toStroops } from "./money";
+import { isSupportedAsset } from "../lib/money";
 
 export type SplitType = "equal" | "custom" | "percentage";
 
@@ -117,6 +118,64 @@ export interface NetBalance {
 }
 
 /**
+ * A share row tagged with the asset its amount is denominated in.
+ *
+ * A group can hold expenses in several assets (XLM and USDC), and a stroop of
+ * one is not worth a stroop of another. Every amount therefore carries the
+ * asset it belongs to so balances never net across currencies.
+ */
+export interface AssetBalanceShareRow extends BalanceShareRow {
+  assetCode: string;
+  assetIssuer: string | null;
+}
+
+/** A settlement row tagged with the asset it settles in. */
+export interface AssetBalanceSettlementRow extends BalanceSettlementRow {
+  assetCode: string;
+  assetIssuer: string | null;
+}
+
+/** Net balances for a single asset within a group. */
+export interface AssetNetBalances {
+  assetCode: string;
+  assetIssuer: string | null;
+  balances: NetBalance[];
+}
+
+/**
+ * Stable grouping key for an asset. The code is upper-cased so `xlm` and `XLM`
+ * group together, while the issuer is kept verbatim so two assets that share a
+ * code but not an issuer never collapse into one balance bucket.
+ */
+export function balanceAssetKey(
+  assetCode: string,
+  assetIssuer: string | null
+): string {
+  return `${assetCode.toUpperCase()}::${assetIssuer ?? ""}`;
+}
+
+/**
+ * Validate that a settlement asset is one Mergepay supports — native XLM, or
+ * the configured stablecoin (USDC).
+ *
+ * Throws on anything else so a stray asset code can never enter balance math
+ * or be attached to a settlement transaction. This is the service-level guard
+ * behind the request-level Zod checks (see `refineStellarAsset`); it exists for
+ * values that reach the engine from the database rather than a request body.
+ */
+export function assertSupportedSettlementAsset(
+  assetCode: string,
+  assetIssuer: string | null
+): void {
+  if (!isSupportedAsset(assetCode, assetIssuer)) {
+    throw new Error(
+      `Unsupported settlement asset "${assetCode}"` +
+        (assetIssuer ? ` (issuer ${assetIssuer})` : "")
+    );
+  }
+}
+
+/**
  * Net = (what others owe this user) - (what this user owes others).
  *
  * Each unsettled share where user != payer means the share owner owes the payer.
@@ -151,6 +210,73 @@ export function computeNetBalances(
     userId,
     net: fromStroops(stroops),
   }));
+}
+
+/**
+ * Net balances segregated by asset.
+ *
+ * Each distinct asset gets its own balance sheet: an XLM debt can never offset
+ * a USDC credit, because that would claim a debt was paid in a currency it was
+ * not denominated in. Rows are grouped by `(assetCode, assetIssuer)` and each
+ * group is netted independently with `computeNetBalances`.
+ *
+ * Every asset encountered is validated against the supported registry, so a
+ * bad code surfaces as an error instead of a quietly mis-grouped balance.
+ * Asset groups are returned in first-seen order, which keeps the output stable
+ * for a given input and lets callers pick a "primary" asset if they need one.
+ */
+export function computeNetBalancesByAsset(
+  shares: AssetBalanceShareRow[],
+  settlements: AssetBalanceSettlementRow[]
+): AssetNetBalances[] {
+  interface Group {
+    assetCode: string;
+    assetIssuer: string | null;
+    shares: BalanceShareRow[];
+    settlements: BalanceSettlementRow[];
+  }
+
+  const groups = new Map<string, Group>();
+
+  const groupFor = (
+    assetCode: string,
+    assetIssuer: string | null
+  ): Group => {
+    assertSupportedSettlementAsset(assetCode, assetIssuer);
+    const key = balanceAssetKey(assetCode, assetIssuer);
+    let group = groups.get(key);
+    if (!group) {
+      group = { assetCode, assetIssuer, shares: [], settlements: [] };
+      groups.set(key, group);
+    }
+    return group;
+  };
+
+  for (const s of shares) {
+    groupFor(s.assetCode, s.assetIssuer).shares.push({
+      payerUserId: s.payerUserId,
+      userId: s.userId,
+      shareAmount: s.shareAmount,
+      settled: s.settled,
+    });
+  }
+
+  for (const st of settlements) {
+    groupFor(st.assetCode, st.assetIssuer).settlements.push({
+      fromUserId: st.fromUserId,
+      toUserId: st.toUserId,
+      amount: st.amount,
+      confirmed: st.confirmed,
+    });
+  }
+
+  return [...groups.values()]
+    .map((g) => ({
+      assetCode: g.assetCode,
+      assetIssuer: g.assetIssuer,
+      balances: computeNetBalances(g.shares, g.settlements),
+    }))
+    .filter((g) => g.balances.length > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +327,11 @@ export function suggestSettlements(balances: NetBalance[]): Suggestion[] {
   }
 
   return suggestions;
+}
+
+/** Public name used by the settlement preview API. */
+export function calculateSimplifiedDebts(balances: NetBalance[]): Suggestion[] {
+  return suggestSettlements(balances);
 }
 
 /** Convenience: are all balances effectively zero? */

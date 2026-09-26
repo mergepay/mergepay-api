@@ -12,9 +12,12 @@ const h = vi.hoisted(() => {
   });
   const prisma: any = {
     settlement: model(),
+    groupMember: model(),
     idempotencyKey: model(),
     statusHistory: model(),
     auditLog: { create: vi.fn() },
+    groupMember: model(),
+    group: model(),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
@@ -104,9 +107,13 @@ beforeEach(async () => {
   if (!app) app = await buildApp();
 
   prisma.settlement.findUnique.mockResolvedValue(pendingSettlement());
+  prisma.groupMember.findUnique.mockResolvedValue({ groupId: "group_1", userId: "user_1", role: "member" });
   prisma.settlement.findUniqueOrThrow.mockResolvedValue(pendingSettlement());
   prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
   prisma.idempotencyKey.create.mockResolvedValue({});
+  // Membership check for requireMembership
+  prisma.groupMember.findUnique.mockResolvedValue({ groupId: "group_1", userId: "user_1", role: "member" });
+  prisma.group.findUnique.mockResolvedValue({ id: "group_1" });
 });
 
 describe("POST /settlements/:id/confirm — idempotency", () => {
@@ -119,7 +126,7 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("MISSING_IDEMPOTENCY_KEY");
+    expect(res.json().error.code).toBe("MISSING_IDEMPOTENCY_KEY");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
@@ -203,7 +210,7 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
     });
 
     expect(res.statusCode).toBe(409);
-    expect(res.json().error).toBe("IDEMPOTENCY_CONFLICT");
+    expect(res.json().error.code).toBe("IDEMPOTENCY_CONFLICT");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 

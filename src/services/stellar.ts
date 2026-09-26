@@ -26,7 +26,7 @@ import { Errors } from "../errors";
 import { ProviderError } from "../lib/provider-error";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
 import { withTimeout, toProviderError } from "./timeout";
-import { logRetryAttempt, withRetry } from "./retry";
+import { defaultReadPolicy, logRetryAttempt, withRetry, type RetryPolicy } from "./retry";
 import {
   INTENT_VALIDITY_SECONDS,
   assertTimeBoundsMatchIntent,
@@ -119,6 +119,22 @@ const retryLog = {
     console.warn(`[stellar] ${message}`, JSON.stringify(entry));
   },
 };
+
+/**
+ * Retry policy for Horizon *reads* (`loadAccount`, `getTransaction`).
+ *
+ * The shared read policy (UPSTREAM_RETRY_* — attempts, exponential backoff,
+ * jitter) plus 429: a Horizon read is a pure GET, so repeating it after the
+ * limiter's window cannot duplicate anything, and a brief throttle during a
+ * burst should not fail the request outright. Disable with
+ * HORIZON_RETRY_ON_RATE_LIMIT=false.
+ *
+ * Submissions never use this: repeating a submitTransaction after an unknown
+ * outcome is recovered by hash in the worker, not by retrying here.
+ */
+function horizonReadPolicy(): RetryPolicy {
+  return { ...defaultReadPolicy(), retryRateLimited: config.HORIZON_RETRY_ON_RATE_LIMIT };
+}
 
 /**
  * Horizon's 404, which the read helpers translate into a domain answer
@@ -229,6 +245,7 @@ export const stellar = {
         {
           operation: "Horizon.loadAccount",
           timeoutMs: config.HORIZON_ACCOUNT_TIMEOUT_MS,
+          policy: horizonReadPolicy(),
           isExpected: isNotFound,
           onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
         },
@@ -473,6 +490,7 @@ export const stellar = {
         {
           operation: "Horizon.getTransaction",
           timeoutMs: config.HORIZON_STATUS_TIMEOUT_MS,
+          policy: horizonReadPolicy(),
           isExpected: isNotFound,
           onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
         },

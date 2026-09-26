@@ -13,6 +13,9 @@
  *    preserved.
  *  - Response objects (`res`) — the `set-cookie` header is redacted while
  *    statusCode and non-sensitive headers are preserved.
+ *  - Stellar transaction hash fields (`txHash`, `stellarTxHash`, …) —
+ *    validated and shortened so full 64-character hashes do not clutter
+ *    structured output.
  *  - Credential-shaped top-level fields (`redact`) — a token or private key
  *    logged as its own key is censored even if it never passes through a
  *    serializer.
@@ -24,7 +27,12 @@ import pino from "pino";
 import type { LoggerOptions as PinoLoggerOptions } from "pino";
 import type { FastifyLoggerOptions } from "fastify";
 import { Writable } from "node:stream";
-import { errorSerializer, reqSerializer, resSerializer } from "./serializers";
+import {
+  errorSerializer,
+  reqSerializer,
+  resSerializer,
+  stellarTxHashSerializers,
+} from "./serializers";
 
 /**
  * The serializer map attached to every logger this module builds.
@@ -38,6 +46,7 @@ export const LOGGER_SERIALIZERS = {
   err: errorSerializer,
   req: reqSerializer,
   res: resSerializer,
+  ...stellarTxHashSerializers,
 } satisfies Record<string, pino.SerializerFn>;
 
 /** Replacement written in place of a redacted value. */

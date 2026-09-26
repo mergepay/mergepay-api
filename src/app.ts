@@ -8,6 +8,7 @@ import path from "node:path";
 import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
+import groupAccessPlugin from "./plugins/group-access";
 import errorHandlerPlugin from "./plugins/error-handler";
 import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
@@ -345,6 +346,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   await app.register(loggingPlugin);
   await app.register(authPlugin);
+  // Must come after the rate-limit registration above: its onRoute hook
+  // moves each group guard behind the limiter in the route's preHandler chain.
+  await app.register(groupAccessPlugin);
   await app.register(errorHandlerPlugin);
   // Registered with fastify-plugin, so `app.idempotent` is visible to every
   // route plugin below rather than only inside this scope.

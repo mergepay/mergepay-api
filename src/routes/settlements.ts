@@ -31,6 +31,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
+import { requireGroupRole } from "../plugins/group-access";
 import { stellar, memoText } from "../services/stellar";
 import { validateSettlementXdr } from "../services/settlement-xdr";
 import { shortCode } from "../services/codes";
@@ -332,6 +333,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
     "/groups/:id/settlements",
     {
       ...createLimit,
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Settlements"],
         summary: "Settle up against a group's net balance",
@@ -346,7 +348,6 @@ export default async function settlementRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
     const body = z
       .object({
         toUserId: z.string(),
@@ -897,6 +898,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/settlements",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Settlements"],
         summary: "List settlements for a group",
@@ -919,10 +921,8 @@ export default async function settlementRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
     const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    await requireMembership(groupId, auth.id);
 
     const position = requireCursor(cursor);
 
@@ -941,6 +941,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/settlement/preview",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Settlements"],
         summary: "Preview group settlement suggestions",
@@ -968,9 +969,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
     const asset = await groupPrimaryAsset(groupId);
     const byAsset = await loadGroupBalancesWithSuggestionsByAsset(groupId);
 
@@ -1014,6 +1013,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/balances",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Settlements"],
         summary: "Get group member balances and settlement suggestions",
@@ -1043,9 +1043,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const asset = await groupPrimaryAsset(groupId);
     const byAsset = await loadGroupBalancesWithSuggestionsByAsset(groupId);
@@ -1125,11 +1123,12 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // using that identical total order, so the merged page obeys the shared
   // pagination contract: a cursor from any page resumes exactly where the last
   // one stopped, whichever table the boundary row came from.
-  app.get("/groups/:id/ledger", async (req) => {
-    const auth = requireUser(req);
+  app.get(
+    "/groups/:id/ledger",
+    { preHandler: requireGroupRole("member", { param: "id" }) },
+    async (req) => {
     const { id: groupId } = idParamSchema.parse(req.params);
     const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    await requireMembership(groupId, auth.id);
 
     const position = requireCursor(cursor);
     const where = { groupId, ...cursorFilter(position, order) };

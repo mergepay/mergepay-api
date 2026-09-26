@@ -411,13 +411,19 @@ describe("group routes", () => {
     // StrKey (not just a regex) — Keypair.random() guarantees that.
     const validPubKey = Keypair.random().publicKey();
 
+    /**
+     * The caller's admin membership is read twice: once by the route's
+     * `requireGroupRole("admin")` guard, and again inside the transaction
+     * (the re-check that closes the concurrent-demotion window).
+     */
+    function callerIsAdmin(user: { id: string }) {
+      const row = { groupId: "group_1", userId: user.id, role: "admin" };
+      prisma.groupMember.findUnique.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+    }
+
     it("returns 201 and creates an invitation", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(null);
       prisma.invitation.findFirst.mockResolvedValueOnce(null);
       const invitation = {
@@ -468,8 +474,13 @@ describe("group routes", () => {
 
     it("returns 400 for an invalid public key", async () => {
       const user = fakeUser();
-      // No groupMember mock: the public key fails validation before the
-      // route ever opens a transaction or checks membership.
+      // The admin guard passes; the public key then fails validation before
+      // the route opens a transaction, so there is no second (in-tx) lookup.
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: user.id,
+        role: "admin",
+      });
 
       const res = await app.inject({
         method: "POST",
@@ -479,16 +490,13 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(400);
+      expect(prisma.invitation.create).not.toHaveBeenCalled();
     });
 
     it("returns 409 when invitee is already a member", async () => {
       const user = fakeUser();
       const inviteeUser = fakeUser({ id: "user_2", stellarPublicKey: validPubKey });
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(inviteeUser);
       prisma.groupMember.findUnique.mockResolvedValueOnce({
         groupId: "group_1",
@@ -509,11 +517,7 @@ describe("group routes", () => {
 
     it("returns 409 when a pending invitation already exists", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(null);
       prisma.invitation.findFirst.mockResolvedValueOnce({
         id: "existing_inv",

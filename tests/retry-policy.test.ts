@@ -208,7 +208,12 @@ describe("withRetry — end to end with an injected clock", () => {
 
   it("fails a 429 immediately under the default policy", async () => {
     const fn = vi.fn().mockRejectedValue(horizonError(429));
-    await expect(withRetry(opts(policy), fn)).rejects.toMatchObject({ code: "UPSTREAM_ERROR" });
+    await expect(withRetry(opts(policy), fn)).rejects.toMatchObject({
+      code: "SERVICE_UNAVAILABLE",
+      status: 503,
+      category: "rate_limited",
+      details: { hint: "Retry the request after a short delay." },
+    });
     expect(fn).toHaveBeenCalledTimes(1);
   });
 

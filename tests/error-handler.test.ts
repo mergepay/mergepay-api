@@ -64,7 +64,7 @@ beforeAll(async () => {
   app.get("/test/horizon-rate-limit", async () => {
     const err = new Error("Horizon rate limited");
     Object.assign(err, {
-      response: { status: 429 },
+      response: { status: 429, headers: { "retry-after": "7" } },
       operation: "Horizon.loadAccount",
       name: "BadRequestError",
     });
@@ -151,13 +151,17 @@ describe("AppError transformation", () => {
     expect(body.error.details).toBeUndefined();
   });
 
-  it("maps Horizon rate-limit exceptions to the stable upstream response", async () => {
+  it("maps Horizon rate-limit exceptions to a 503 response with retry guidance", async () => {
     const res = await app.inject({ method: "GET", url: "/test/horizon-rate-limit" });
 
-    expect(res.statusCode).toBe(429);
+    expect(res.statusCode).toBe(503);
+    expect(res.headers["retry-after"]).toBe("7");
     const body = res.json();
-    expect(body.code).toBe("RATE_LIMITED");
-    expect(body.message).toBe("Horizon is rate limiting requests. Please retry shortly.");
+    expect(body.code).toBe("SERVICE_UNAVAILABLE");
+    expect(body.error.details).toMatchObject({
+      hint: "Retry the request after a short delay.",
+      retryAfterSeconds: 7,
+    });
     expect(body.requestId).toBeTruthy();
   });
 

@@ -63,6 +63,7 @@
  */
 import { config } from "../config";
 import { Errors } from "../errors";
+import { ProviderError, retryAfterSeconds } from "../lib/provider-error";
 import { TimeoutError, TransportError, withTimeout } from "./timeout";
 
 export interface RetryPolicy {
@@ -169,33 +170,18 @@ export function upstreamStatusOf(error: unknown): number | null {
  * Horizon this is best-effort and backoff alone paces the retry.
  */
 export function retryAfterMs(error: unknown, now: number = Date.now()): number | null {
+  const seconds = retryAfterSeconds(unwrapUpstreamError(error), now);
+  if (seconds !== undefined) return seconds * 1000;
+
   const unwrapped = unwrapUpstreamError(error) as {
-    response?: { headers?: unknown };
-    headers?: unknown;
+    response?: { headers?: Record<string, unknown> };
+    headers?: Record<string, unknown>;
   } | null;
   const headers = unwrapped?.response?.headers ?? unwrapped?.headers;
-  if (!headers || typeof headers !== "object") return null;
-
-  const read = (name: string): string | null => {
-    const h = headers as { get?: (n: string) => unknown } & Record<string, unknown>;
-    const value =
-      typeof h.get === "function" ? h.get(name) : h[name] ?? h[name.toLowerCase()];
-    return typeof value === "string" || typeof value === "number" ? String(value).trim() : null;
-  };
-
-  const retryAfter = read("retry-after");
-  if (retryAfter) {
-    if (/^\d+$/.test(retryAfter)) return Number(retryAfter) * 1000;
-    // An HTTP-date always names its day/month/zone in letters. Requiring one
-    // keeps Date.parse from reading "-5" or "2" as a (year) date.
-    if (/[A-Za-z]/.test(retryAfter)) {
-      const date = Date.parse(retryAfter);
-      if (!Number.isNaN(date)) return Math.max(0, date - now);
-    }
-  }
-  const reset = read("x-ratelimit-reset");
-  if (reset && /^\d+$/.test(reset)) return Number(reset) * 1000;
-  return null;
+  const reset = headers && Object.entries(headers).find(([name]) => name.toLowerCase() === "x-ratelimit-reset")?.[1];
+  return (typeof reset === "string" || typeof reset === "number") && /^\d+$/.test(String(reset))
+    ? Number(reset) * 1000
+    : null;
 }
 
 /** Whether one failed attempt should be retried, and after how long. */
@@ -395,8 +381,16 @@ export function toUpstreamError(
   const kind = classifyUpstreamFailure(error);
 
   const mapped =
-    kind === "rate_limited"
-      ? Errors.upstream(`${operation} is rate limited upstream. Retry shortly.`)
+    kind === "rate_limited" && operation.startsWith("Horizon")
+      ? new ProviderError({
+          provider: "horizon",
+          operation,
+          message: "The upstream service is rate limiting requests. Please retry shortly.",
+          category: "rate_limited",
+          retryAfterSeconds: retryAfterSeconds(unwrapUpstreamError(error)),
+        })
+      : kind === "rate_limited"
+        ? Errors.upstream(`${operation} is rate limited upstream. Retry shortly.`)
       : kind === "timeout"
         ? Errors.upstream(
             `${operation} did not respond within its deadline after ${attempts} attempt(s)`

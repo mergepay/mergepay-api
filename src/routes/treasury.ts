@@ -7,6 +7,7 @@ import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
+import { requireGroupRole } from "../plugins/group-access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
@@ -55,6 +56,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/treasury/enable",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Enable group treasury",
@@ -137,6 +139,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/treasury",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Get group treasury status",
@@ -145,9 +148,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
@@ -166,6 +167,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/treasury/validate-signers",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Validate treasury signer configuration",
@@ -178,8 +180,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
-    
+
     const body = treasurySignerConfigSchema.parse(req.body);
 
     const group = await prisma.group.findUnique({ where: { id } });
@@ -220,6 +221,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     "/groups/:id/treasury/deposit",
     {
       ...rateLimited("settlementCreate"),
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Initiate treasury deposit",
@@ -230,7 +232,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -247,7 +248,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const group = await prisma.group.findUnique({ where: { id } });
-    await requireMembership(id, auth.id);
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
@@ -334,6 +334,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     "/groups/:id/treasury/withdraw",
     {
       ...rateLimited("settlementCreate"),
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Propose treasury withdrawal",
@@ -344,7 +345,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -364,7 +364,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     }
 
     const group = await prisma.group.findUnique({ where: { id } });
-    await requireMembership(id, auth.id);
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
@@ -593,6 +592,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/treasury/history",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Get treasury transaction history",
@@ -601,10 +601,8 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
     const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    await requireMembership(groupId, auth.id);
 
     const position = requireCursor(cursor);
 

@@ -10,6 +10,7 @@ const h = vi.hoisted(() => {
   const prisma: any = {
     anchorSession,
     auditLog: { create: vi.fn() },
+    statusHistory: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
     $disconnect: vi.fn(),
   };
@@ -147,7 +148,7 @@ describe("SEP-24 Status Mapping Consistency", () => {
     mockFetch.mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({
-        transaction: { id: "ext_1", status: "brand_new_future_status" },
+        transaction: { id: "ext_1", kind: "deposit", status: "brand_new_future_status" },
       }),
     });
 
@@ -170,7 +171,7 @@ describe("SEP-24 Status Mapping Consistency", () => {
     mockFetch.mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({
-        transaction: { id: "ext_1", status: "   " },
+        transaction: { id: "ext_1", kind: "deposit", status: "   " },
       }),
     });
 
@@ -236,12 +237,13 @@ describe("Anchor response validation & malformed response handling", () => {
     expect(result.errorCategory).toBe("permanent");
   });
 
-  it("accepts valid transaction response with number for amount_in", async () => {
+  it("drops a JSON-number amount_in (never a float) but still applies the status", async () => {
     mockFetch.mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({
         transaction: {
           id: "ext_1",
+          kind: "deposit",
           status: "completed",
           amount_in: 100.50, // number
         },
@@ -254,9 +256,11 @@ describe("Anchor response validation & malformed response handling", () => {
       id: "ext_1",
     });
 
+    // SEP-24 amounts are strings; a JSON number is already a float by the time
+    // it is parsed, so it is ignored rather than stringified into money.
     expect(result.isError).toBe(false);
     expect(result.status).toBe("completed");
-    expect(result.amountIn).toBe("100.5");
+    expect(result.amountIn).toBeUndefined();
   });
 });
 
@@ -340,6 +344,7 @@ describe("Stale updates and terminal-state protection", () => {
       json: () => Promise.resolve({
         transaction: {
           id: "ext_1",
+          kind: "deposit",
           status: "pending_anchor", // stale state
         },
       }),
@@ -361,6 +366,7 @@ describe("Stale updates and terminal-state protection", () => {
       json: () => Promise.resolve({
         transaction: {
           id: "ext_1",
+          kind: "deposit",
           status: "refunded",
         },
       }),
@@ -391,6 +397,7 @@ describe("Stale updates and terminal-state protection", () => {
       json: () => Promise.resolve({
         transaction: {
           id: "ext_1",
+          kind: "deposit",
           status: "pending_anchor",
         },
       }),

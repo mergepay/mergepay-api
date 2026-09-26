@@ -179,6 +179,9 @@ export const treasurySignaturesService = {
         entityId: created.id,
         metadata: {
           sourceAccount: created.sourceAccount,
+          // Hash of the caller-supplied unsigned envelope; every later
+          // signature is verified against it.
+          txHash: created.txHash,
           requiredWeight: created.requiredWeight,
         },
       });
@@ -363,7 +366,12 @@ export const treasurySignaturesService = {
             action: AuditAction.TREASURY_TX_PROPOSAL_SIGNATURE_ADDED,
             entityType: "treasury_tx_proposal",
             entityId: proposal.id,
-            metadata: { signerPublicKey: sig.publicKey, weight: sig.weight },
+            metadata: {
+              signerPublicKey: sig.publicKey,
+              // The transaction this signature contributes weight to.
+              txHash: proposal.txHash,
+              weight: sig.weight,
+            },
           });
         }
 

@@ -41,12 +41,35 @@ Every error — validation, authorization, rate limiting, upstream — uses one 
 | `FORBIDDEN` | 403 | Authenticated, but not permitted on this resource |
 | `NOT_FOUND` | 404 | The resource does not exist |
 | `RATE_LIMITED` | 429 | Per-route budget exhausted; `details.retryAfterSeconds` when available |
+| `DUPLICATE_RECORD` | 409 | A unique constraint rejected the write; `details.fields` names the columns |
 | `UPSTREAM_ERROR` | 502 | Horizon or an anchor failed |
+| `SERVICE_UNAVAILABLE` | 503 | The database is unreachable, so the request could not be attempted |
 
 `404` versus `403` is deliberate and consistent: a resource that does not exist
 is `404`; one that exists but is not the caller's is `403`. Clients need to
 distinguish "gone" from "not yours" to render a useful state, and the difference
 leaks only the existence of an opaque identifier — never any content.
+
+### Database failures
+
+A statement PostgreSQL rejects is translated centrally, so a write that breaks a
+constraint reads as what it is rather than as an outage. Defined in
+[../src/lib/prisma-error.ts](../src/lib/prisma-error.ts).
+
+| Database failure | Status | Code |
+| --- | --- | --- |
+| Unique constraint (a value already exists) | 409 | `DUPLICATE_RECORD` |
+| Foreign key, value too long, null or missing required field, failed check constraint | 400 | `VALIDATION_ERROR` |
+| Required record not found | 404 | `NOT_FOUND` |
+| Write conflict or deadlock | 409 | `CONFLICT` |
+| Database unreachable, refused, or timed out | 503 | `SERVICE_UNAVAILABLE` |
+| A malformed statement of our own | 500 | `INTERNAL_ERROR` |
+
+`DUPLICATE_RECORD` carries `details.fields` — the columns whose unique index
+rejected the write — so a client can point at the offending input. Prisma's own
+message, the statement it was executing, and the Postgres constraint name are
+never sent: the message is fixed prose, and the driver's text and the constraint
+name go to the log instead.
 
 ---
 

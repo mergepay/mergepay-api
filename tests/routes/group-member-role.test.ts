@@ -106,18 +106,25 @@ describe("POST /groups/:id/members/role — authorization", () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it("re-checks authorization inside the transaction, not only in the guard", async () => {
-    // The route's preHandler guard (issue #356) approves the caller on its
-    // first read; by the time the handler's transaction runs, the caller has
-    // been demoted. Only an in-transaction re-check can catch that — a check
-    // that ran once, outside the transaction, would let an ex-admin land one
-    // last write.
-    let callerReads = 0;
+  it("rejects a non-admin at the route guard, before any transaction opens", async () => {
+    arrangeMemberships("member", "member");
+
+    const res = await changeRole({ userId: TARGET_ID, role: "admin" });
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("re-checks authorization inside the transaction (demoted after the guard)", async () => {
+    // The guard sees an admin; by the time the transaction runs, a concurrent
+    // demotion has landed. The in-transaction re-check must still refuse, or
+    // an ex-admin could land one last write.
+    let callerLookups = 0;
     prisma.groupMember.findUnique.mockImplementation(async (args: any) => {
       const userId = args?.where?.groupId_userId?.userId;
       if (userId === ADMIN_ID) {
-        callerReads += 1;
-        return membership(ADMIN_ID, callerReads === 1 ? "admin" : "member");
+        callerLookups += 1;
+        return membership(ADMIN_ID, callerLookups === 1 ? "admin" : "member");
       }
       if (userId === TARGET_ID) return membership(TARGET_ID, "member");
       return null;
@@ -125,13 +132,11 @@ describe("POST /groups/:id/members/role — authorization", () => {
 
     const res = await changeRole({ userId: TARGET_ID, role: "admin" });
 
-    // The denial could only come from the second read — inside the
-    // transaction — so the transaction must have opened and the write must
-    // not have happened.
     expect(res.statusCode).toBe(403);
     expect(prisma.$transaction).toHaveBeenCalled();
+    expect(callerLookups).toBe(2);
     expect(prisma.groupMember.update).not.toHaveBeenCalled();
-    expect(callerReads).toBe(2);
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 });
 

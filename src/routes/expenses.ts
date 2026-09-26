@@ -13,6 +13,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { groupIdFromExpense } from "../plugins/authorization";
 import { requireMembership } from "../services/access";
+import { requireGroupRole } from "../plugins/group-access";
 import { computeShares, type SplitType } from "../services/settlement";
 import { shortCode } from "../services/codes";
 import { serializeExpense } from "../serializers";
@@ -51,7 +52,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/expenses",
     {
-      preHandler: [app.groupMemberGuard()],
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Expenses"],
         summary: "Create an expense in a group",
@@ -68,14 +69,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
     validateAmount(body.amount);
     const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
-    // When the payer is the caller, the membership check above already proved
+    // When the payer is the caller, the route's membership guard already proved
     // they are an active member — only a *different* payer needs a second
     // lookup.
     if (payerUserId !== auth.id) {
@@ -167,7 +167,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/expenses",
     {
-      preHandler: [app.groupMemberGuard()],
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Expenses"],
         summary: "List a group's expenses",
@@ -190,12 +190,11 @@ export default async function expenseRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
+    // Membership was checked by the route guard before any row is read, and
+    // the `groupId` filter the service applies is what scopes the page —
+    // never the cursor.
     const query = expenseListQuerySchema.parse(req.query ?? {});
-    // Membership is checked before any row is read, and the `groupId` filter
-    // the service applies is what scopes the page — never the cursor.
-    await requireMembership(groupId, auth.id);
 
     const { items, meta } = await listGroupExpenses(groupId, query, expenseInclude);
 

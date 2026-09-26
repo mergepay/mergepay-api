@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import Fastify from "fastify";
 import rateLimit from "@fastify/rate-limit";
 import { config } from "../src/config";
+import { isGlobalRateLimitExempt } from "../src/lib/rate-limit";
 
 describe("rate limit configuration", () => {
   it("gives SEP-10 challenge and verify distinct, independently configurable limits", () => {
@@ -36,21 +37,22 @@ describe("rate limit configuration", () => {
   });
 });
 
-describe("health endpoint rate limit exemption", () => {
-  it("allows unlimited requests to /health even when the global limit is exhausted", async () => {
+describe("health and metadata rate limit exemptions", () => {
+  it("keeps health and documentation endpoints available after global exhaustion", async () => {
     const app = Fastify({ logger: false });
     await app.register(rateLimit, {
       max: 2,
       timeWindow: 60_000,
       keyGenerator: (req) => `global:ip:${req.ip}`,
+      allowList: isGlobalRateLimitExempt,
     });
 
-    // /health is exempt from rate limiting — operational probes must always
-    // be reachable (e.g. Kubernetes liveness probes).
-    app.get("/health", { config: { rateLimit: false } }, async () => ({
+    app.get("/health", async () => ({
       status: "ok",
       timestamp: new Date().toISOString(),
     }));
+    app.get("/health/live", async () => ({ status: "ok" }));
+    app.get("/docs/json", async () => ({ openapi: "3.0.0" }));
     app.get("/other", async () => ({ ok: true }));
     await app.ready();
 
@@ -60,10 +62,12 @@ describe("health endpoint rate limit exemption", () => {
     const blocked = await app.inject({ method: "GET", url: "/other" });
     expect(blocked.statusCode).toBe(429);
 
-    // /health must still succeed — it is exempt.
+    // Operational and metadata endpoints remain available after exhaustion.
     const health = await app.inject({ method: "GET", url: "/health" });
     expect(health.statusCode).toBe(200);
     expect(health.json().status).toBe("ok");
+    expect((await app.inject({ method: "GET", url: "/health/live" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/docs/json" })).statusCode).toBe(200);
 
     await app.close();
   });

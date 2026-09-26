@@ -591,6 +591,19 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
     expect(body.threshold).toBe(1);
     expect(body.stellarTxHash).toBe("hash_xyz");
     expect(body.status).toBe("confirmed");
+
+    // The signature audit record is bound to the proposal's transaction hash
+    // so the entry can be tied back to the exact on-chain intent.
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "treasury.proposal.signed",
+          entityType: "treasury_proposal",
+          entityId: "prop_1",
+          metadata: expect.objectContaining({ txHash: proposalHash }),
+        }),
+      })
+    );
   });
 
   it("writes an audit event when Stellar submission fails", async () => {

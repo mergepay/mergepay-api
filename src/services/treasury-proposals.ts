@@ -201,6 +201,10 @@ export const treasuryProposalsService = {
         entityId: created.id,
         metadata: {
           sourceAccount: treasury.treasuryAccountPublicKey,
+          // The hash of the exact unsigned envelope this proposal binds every
+          // later approval to. Recorded at creation so the audit trail can be
+          // tied to the on-chain intent without re-deriving it from the XDR.
+          txHash: created.txHash,
           destination: params.destination,
           amount: params.amount,
           assetCode: params.assetCode,
@@ -485,6 +489,9 @@ export const treasuryProposalsService = {
             entityId: proposal.id,
             metadata: {
               signerPublicKey: pk,
+              // The transaction the signature is bound to — the same hash
+              // every approval is verified against.
+              txHash: proposal.txHash,
               signatureCount: verified.length,
               threshold: proposal.threshold,
             },

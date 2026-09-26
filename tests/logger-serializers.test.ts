@@ -105,11 +105,29 @@ afterAll(async () => {
 });
 
 describe("shared logger options", () => {
-  it("registers a serializer for requests, responses, and errors", () => {
-    expect(Object.keys(LOGGER_SERIALIZERS).sort()).toEqual(["err", "req", "res"]);
+  it("registers serializers for requests, responses, errors, and tx hashes", () => {
+    expect(Object.keys(LOGGER_SERIALIZERS).sort()).toEqual([
+      "err",
+      "intendedTxHash",
+      "req",
+      "res",
+      "stellarTransactionHash",
+      "stellarTxHash",
+      "transactionHash",
+      "txHash",
+    ]);
     for (const serializer of Object.values(LOGGER_SERIALIZERS)) {
       expect(typeof serializer).toBe("function");
     }
+  });
+
+  it("shortens Stellar transaction hashes through the shared serializer map", () => {
+    const hash =
+      "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+    expect(LOGGER_SERIALIZERS.txHash(hash)).toBe("a1b2c3d4…ddeeff00");
+    expect(LOGGER_SERIALIZERS.stellarTxHash("not-a-hash")).toBe(
+      "[invalid-tx-hash]"
+    );
   });
 
   it("censors the authorization and cookie headers, and credential-shaped fields", () => {

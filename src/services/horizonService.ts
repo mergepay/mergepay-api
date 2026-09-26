@@ -18,6 +18,11 @@ import {
   withHorizonRetry,
   type HorizonRetryPolicy,
 } from "./horizon-retry";
+import {
+  parseMemo,
+  validatePaymentMemo,
+  type PaymentMemoFailureReason,
+} from "../lib/memo";
 
 let _server: Horizon.Server | null = null;
 /**
@@ -228,23 +233,26 @@ export async function getTransactionPayments(
  * Checks:
  *  - Transaction exists (returns null for not-found, caller decides)
  *  - Transaction was successful on-chain
- *  - Transaction has a memo
- *  - Memo type is "text" (the only type Mergepay uses)
- *  - Memo content matches the expected value exactly
+ *  - The on-chain memo passes `validatePaymentMemo` (src/lib/memo.ts): it is
+ *    a `text` memo that parses as `MP:<code>` with exactly the expected code.
+ *    Missing, hash (well-formed or not), id, return, malformed, and
+ *    mismatched memos are all rejected, each with a distinct reason.
  *
- * Returns { verified: true } on success.
+ * Returns the verified on-chain memo and its parsed code on success.
  * Throws descriptive AppErrors on any verification failure.
  *
  * @param txHash - The hex transaction hash to fetch and verify.
  * @param expectedMemo - The exact memo expected on chain — the `MP:`-prefixed
  *   text the transaction was built with (see `memoText` in `stellar.ts`),
  *   e.g. `MP:SETL123`.
- * @returns `{ verified: true }` when the transaction exists, succeeded, and
- *   carries a text memo equal to `expectedMemo`.
+ * @returns `{ verified: true, memo, code }` — `memo` is the text read from
+ *   the ledger, so callers resolve records from what was actually paid.
  * @throws {AppError} `not_found` when Horizon has no such transaction yet.
- * @throws {AppError} `bad_request` (`transaction_verification_failed`) when the
- *   transaction failed on-chain, has no memo, uses a non-text memo type, or
- *   carries a different memo.
+ * @throws {AppError} `bad_request` (`transaction_verification_failed`) when
+ *   `expectedMemo` is not itself a valid `MP:<code>` memo, or when the
+ *   transaction failed on-chain or carries a memo that cannot be attributed
+ *   to `expectedMemo`. `details.memoFailure` carries the
+ *   {@link PaymentMemoFailureReason}.
  * @throws {TimeoutError} when the Horizon read exceeds its deadline.
  * @throws {TransportError} on a connection failure to Horizon.
  * @throws {AppError} `upstream` for other Horizon failures.
@@ -252,7 +260,15 @@ export async function getTransactionPayments(
 export async function verifyTransactionMemo(
   txHash: string,
   expectedMemo: string
-): Promise<{ verified: true }> {
+): Promise<{ verified: true; memo: string; code: string }> {
+  const expected = parseMemo(expectedMemo);
+  if (!expected.ok) {
+    throw Errors.badRequest(
+      "transaction_verification_failed",
+      `Expected memo is not a valid Mergepay reference: ${expected.message}`
+    );
+  }
+
   const tx = await getTransactionFromHorizon(txHash);
 
   if (tx === null) {
@@ -266,28 +282,18 @@ export async function verifyTransactionMemo(
     );
   }
 
-  if (!tx.memo_type || tx.memo_type === "none") {
-    throw Errors.badRequest(
-      "transaction_verification_failed",
-      "Transaction has no memo"
-    );
+  const result = validatePaymentMemo(
+    { memoType: tx.memo_type, memo: tx.memo },
+    expected.code
+  );
+  if (!result.ok) {
+    const details: { memoFailure: PaymentMemoFailureReason } = {
+      memoFailure: result.reason,
+    };
+    throw Errors.badRequest("transaction_verification_failed", result.message, details);
   }
 
-  if (tx.memo_type !== "text") {
-    throw Errors.badRequest(
-      "transaction_verification_failed",
-      `Unexpected memo type: expected "text", got "${tx.memo_type}"`
-    );
-  }
-
-  if (tx.memo !== expectedMemo) {
-    throw Errors.badRequest(
-      "transaction_verification_failed",
-      "Transaction memo does not match the expected settlement reference"
-    );
-  }
-
-  return { verified: true };
+  return { verified: true, memo: result.memo, code: result.code };
 }
 
 /**

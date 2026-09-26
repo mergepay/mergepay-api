@@ -5,11 +5,25 @@
  * and issued credit assets (e.g. USDC:<issuer>) across API responses, logging,
  * and internal payloads.
  */
-import { Asset } from "@stellar/stellar-sdk";
+import { Asset, StrKey } from "@stellar/stellar-sdk";
 
 export interface StellarAssetInput {
   code: string;
   issuer?: string | null;
+}
+
+function validateIssuedAsset(code: string, issuer: string): { code: string; issuer: string } {
+  const normalizedCode = code.trim();
+  const normalizedIssuer = issuer.trim();
+  if (!normalizedCode) {
+    throw new Error("Issued asset code cannot be empty");
+  }
+  if (!StrKey.isValidEd25519PublicKey(normalizedIssuer)) {
+    throw new Error(`Invalid issuer public key for asset ${normalizedCode}`);
+  }
+
+  const asset = new Asset(normalizedCode, normalizedIssuer);
+  return { code: asset.getCode(), issuer: asset.getIssuer()! };
 }
 
 /**
@@ -69,7 +83,8 @@ export function formatAssetIdentifier(
       throw new Error(`Asset ${code} requires a valid issuer public key`);
     }
 
-    return `${code}:${effectiveIssuer}`;
+    const validated = validateIssuedAsset(code, effectiveIssuer);
+    return `${validated.code}:${validated.issuer}`;
   }
 
   // 3. String representation
@@ -92,7 +107,8 @@ export function formatAssetIdentifier(
         if (c.toLowerCase() === "native" || c.toUpperCase() === "XLM") {
           if (!i || i.toLowerCase() === "native") return "XLM";
         }
-        return `${c}:${i}`;
+        const validated = validateIssuedAsset(c, i);
+        return `${validated.code}:${validated.issuer}`;
       }
       throw new Error(`Invalid asset identifier format: "${trimmed}"`);
     }
@@ -106,7 +122,8 @@ export function formatAssetIdentifier(
       throw new Error(`Asset ${trimmed} requires a valid issuer public key`);
     }
 
-    return `${trimmed}:${effectiveIssuer}`;
+    const validated = validateIssuedAsset(trimmed, effectiveIssuer);
+    return `${validated.code}:${validated.issuer}`;
   }
 
   throw new Error("Unsupported asset input type");
@@ -140,5 +157,5 @@ export function parseAssetIdentifier(identifier: string): { code: string; issuer
     throw new Error(`Invalid asset identifier components in: "${trimmed}"`);
   }
 
-  return { code, issuer };
+  return validateIssuedAsset(code, issuer);
 }

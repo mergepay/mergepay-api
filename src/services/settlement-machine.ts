@@ -12,6 +12,7 @@ export type SettlementStatus =
   | "pending_confirmation"
   | "confirmed"
   | "failed"
+  | "expired"
   | "needs_review";
 
 export type SettlementTransitionSource = "user" | "worker" | "system";
@@ -23,6 +24,7 @@ export const SETTLEMENT_STATUSES: readonly SettlementStatus[] = [
   "pending_confirmation",
   "confirmed",
   "failed",
+  "expired",
   "needs_review",
 ];
 
@@ -30,20 +32,21 @@ const ALLOWED_TRANSITIONS: Record<SettlementStatus, readonly SettlementStatus[]>
   pending: ["submitted", "failed"],
   submitted: ["verifying", "failed"],
   verifying: ["confirmed", "failed", "needs_review", "submitted"],
-  pending_confirmation: ["confirmed", "failed"],
+  pending_confirmation: ["confirmed", "failed", "expired"],
   confirmed: [],
   failed: [],
+  expired: [],
   // needs_review means a submission's on-chain outcome could not be observed
   // (Horizon had no record yet, or stopped answering) — never proof of payment
   // or failure. The worker's reconciliation job keeps checking the recorded
   // hash; when Horizon still has no answer, the row is demoted back to
   // pending_confirmation so the bounded reconciliation retry budget — not an
   // unbounded needs_review wait — decides when enough silence is enough.
-  needs_review: ["confirmed", "failed", "pending_confirmation"],
+  needs_review: ["confirmed", "failed", "pending_confirmation", "expired"],
 };
 
 export function isTerminalSettlementStatus(status: string): boolean {
-  return status === "confirmed" || status === "failed";
+  return status === "confirmed" || status === "failed" || status === "expired";
 }
 
 export function isSettlementRecoverable(status: string): boolean {

@@ -137,6 +137,8 @@ const schema = z.object({
   WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   // Maximum jobs of one kind pulled per cycle.
   WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
+  // A submitted settlement with no Horizon record after this duration expires.
+  WORKER_PENDING_SETTLEMENT_MAX_AGE_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
   // How long shutdown waits for the in-flight cycle to finish before it stops
   // waiting. Releasing a lease while its job is still submitting would let
   // another worker claim and resubmit the same payment, so shutdown drains

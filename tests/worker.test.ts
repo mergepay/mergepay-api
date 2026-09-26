@@ -839,6 +839,7 @@ describe("reconcilePendingSettlements", () => {
       nextAttemptAt: null,
       claimedBy: null,
       createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      submittedAt: new Date("2026-01-01T00:00:00.000Z"),
       updatedAt: new Date("2026-01-01T00:00:00.000Z"),
       to: { stellarPublicKey: "GTO" },
       ...over,
@@ -869,7 +870,12 @@ describe("reconcilePendingSettlements", () => {
       })
     );
     expect(h.reconcileSingleSettlement).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "pc_a", stellarTxHash: "hash_a", expenseId: "exp_1" }),
+      expect.objectContaining({
+        id: "pc_a",
+        stellarTxHash: "hash_a",
+        expenseId: "exp_1",
+        pendingSince: row.submittedAt,
+      }),
       RECONCILIATION_MAX_RETRIES,
       expect.objectContaining({ jobId: "pc_a" })
     );
@@ -919,12 +925,14 @@ describe("reconcilePendingSettlements", () => {
       pendingRow({ id: "pc_ok", stellarTxHash: "h1" }),
       pendingRow({ id: "pc_fail", stellarTxHash: "h2" }),
       pendingRow({ id: "pc_wait", stellarTxHash: "h3" }),
+      pendingRow({ id: "pc_expired", stellarTxHash: "h4" }),
     ]);
     currentSettlementState = pendingRow();
     h.reconcileSingleSettlement
       .mockResolvedValueOnce("confirmed")
       .mockResolvedValueOnce("failed")
-      .mockResolvedValueOnce("pending");
+      .mockResolvedValueOnce("pending")
+      .mockResolvedValueOnce("expired");
 
     await reconcilePendingSettlements();
 
@@ -936,10 +944,11 @@ describe("reconcilePendingSettlements", () => {
     expect(fields).toMatchObject({
       jobType: "reconciliation",
       outcome: "batch_reconciled",
-      checked: 3,
+      checked: 4,
       confirmed: 1,
       failed: 1,
       stillPending: 1,
+      expired: 1,
     });
   });
 

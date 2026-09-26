@@ -185,9 +185,12 @@ describe("DELETE /expenses/:id authorization", () => {
     shares: [{ status: "pending", userId: "payer_1" }],
   };
 
+  // The expense row is read twice per request: once by the route's
+  // preHandler guard resolver (issue #356), once again inside the handler's
+  // transaction — so every test below arranges it as a standing answer.
   it("returns 404 for a non-member and does not delete", async () => {
     membershipDb({});
-    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.expense.findUnique.mockResolvedValue(expense);
     const res = await app.inject({
       method: "DELETE",
       url: "/expenses/exp_1",
@@ -199,7 +202,7 @@ describe("DELETE /expenses/:id authorization", () => {
 
   it("returns 403 for a member who is neither the payer nor an admin", async () => {
     membershipDb({ "group_1:user_1": { role: "member" } });
-    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.expense.findUnique.mockResolvedValue(expense);
     const res = await app.inject({
       method: "DELETE",
       url: "/expenses/exp_1",
@@ -211,7 +214,7 @@ describe("DELETE /expenses/:id authorization", () => {
 
   it("allows an admin (who is not the payer) to delete, and audits it", async () => {
     membershipDb({ "group_1:user_1": { role: "admin" } });
-    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.expense.findUnique.mockResolvedValue(expense);
     prisma.expense.delete.mockResolvedValueOnce({});
     prisma.auditLog.create.mockResolvedValueOnce({});
 

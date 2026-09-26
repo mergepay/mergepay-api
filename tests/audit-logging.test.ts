@@ -366,11 +366,19 @@ describe("AC6: audit logging consistency", () => {
   describe("atomicity — audit failure rolls back mutation", () => {
     it("if auditLog.create throws, the group kick mutation is rolled back", async () => {
       prisma.groupMember.findUnique
+        // The preHandler admin guard reads the caller first (issue #356)…
         .mockResolvedValueOnce({
           groupId: "group_1",
           userId: userA.id,
           role: "admin",
         })
+        // …then the handler's in-transaction re-check reads them again…
+        .mockResolvedValueOnce({
+          groupId: "group_1",
+          userId: userA.id,
+          role: "admin",
+        })
+        // …and only then is the target's membership looked up.
         .mockResolvedValueOnce({
           groupId: "group_1",
           userId: userB.id,

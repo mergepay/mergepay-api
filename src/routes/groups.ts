@@ -96,6 +96,13 @@ const changeMemberRoleSchema = z.object({
 export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
+  // Route-level `groupMemberGuard` / `groupAdminGuard` hooks below (issue
+  // #356) run after `authenticate` and reject a non-member or non-admin
+  // before the handler starts. The handlers' own in-transaction checks stay:
+  // a preHandler is outside the handler's transaction, so only the in-tx
+  // check can make a mutation's authorization and its write one atomic step.
+  // See src/plugins/authorization.ts.
+
   // -- create -----------------------------------------------------------------
   app.post(
     "/groups",
@@ -220,6 +227,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/balance",
     {
+      preHandler: [app.groupMemberGuard()],
       schema: {
         tags: ["Groups"],
         summary: "Get a group's on-chain treasury balances",
@@ -293,6 +301,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id",
     {
+      preHandler: [app.groupMemberGuard()],
       schema: {
         tags: ["Groups"],
         summary: "Get a group's detail and members",
@@ -372,6 +381,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/invite",
     {
+      preHandler: [app.groupAdminGuard()],
       schema: {
         tags: ["Groups"],
         summary: "Invite a user to a group",
@@ -565,6 +575,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/leave",
     {
+      preHandler: [app.groupMemberGuard()],
       schema: {
         tags: ["Groups"],
         summary: "Leave a group",
@@ -617,6 +628,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.patch(
     "/groups/:id/members/:memberId",
     {
+      preHandler: [app.groupAdminGuard()],
       schema: {
         tags: ["Groups"],
         summary: "Update a group member's role",
@@ -666,6 +678,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.delete(
     "/groups/:id/members/:memberId",
     {
+      preHandler: [app.groupAdminGuard()],
       schema: {
         tags: ["Groups"],
         summary: "Remove a member from a group",
@@ -753,6 +766,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/members/role",
     {
+      preHandler: [app.groupAdminGuard()],
       schema: {
         tags: ["Groups"],
         summary: "Change a member's role",
@@ -835,6 +849,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/archive",
     {
+      preHandler: [app.groupAdminGuard()],
       schema: {
         tags: ["Groups"],
         summary: "Archive a group",

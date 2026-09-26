@@ -106,14 +106,32 @@ describe("POST /groups/:id/members/role — authorization", () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it("checks authorization inside the transaction", async () => {
-    arrangeMemberships("member", "member");
+  it("re-checks authorization inside the transaction, not only in the guard", async () => {
+    // The route's preHandler guard (issue #356) approves the caller on its
+    // first read; by the time the handler's transaction runs, the caller has
+    // been demoted. Only an in-transaction re-check can catch that — a check
+    // that ran once, outside the transaction, would let an ex-admin land one
+    // last write.
+    let callerReads = 0;
+    prisma.groupMember.findUnique.mockImplementation(async (args: any) => {
+      const userId = args?.where?.groupId_userId?.userId;
+      if (userId === ADMIN_ID) {
+        callerReads += 1;
+        return membership(ADMIN_ID, callerReads === 1 ? "admin" : "member");
+      }
+      if (userId === TARGET_ID) return membership(TARGET_ID, "member");
+      return null;
+    });
 
-    await changeRole({ userId: TARGET_ID, role: "admin" });
+    const res = await changeRole({ userId: TARGET_ID, role: "admin" });
 
-    // The admin check must not run before the transaction opens, or a
-    // concurrent demotion could let an ex-admin land one last write.
+    // The denial could only come from the second read — inside the
+    // transaction — so the transaction must have opened and the write must
+    // not have happened.
+    expect(res.statusCode).toBe(403);
     expect(prisma.$transaction).toHaveBeenCalled();
+    expect(prisma.groupMember.update).not.toHaveBeenCalled();
+    expect(callerReads).toBe(2);
   });
 });
 

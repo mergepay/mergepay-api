@@ -11,6 +11,7 @@ import {
 } from "../lib/openapi";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
+import { groupIdFromExpense } from "../plugins/authorization";
 import { requireMembership } from "../services/access";
 import { computeShares, type SplitType } from "../services/settlement";
 import { shortCode } from "../services/codes";
@@ -40,10 +41,17 @@ const expenseInclude = {
 export default async function expenseRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
+  // Every route below carries a `groupMemberGuard` (issue #356), which
+  // rejects a non-member before the handler reads or writes anything. Routes
+  // addressed by `/expenses/:id` resolve the group from the expense row; the
+  // handlers still re-check membership inside their transaction where the
+  // write happens — see src/plugins/authorization.ts.
+
   // -- create -----------------------------------------------------------------
   app.post(
     "/groups/:id/expenses",
     {
+      preHandler: [app.groupMemberGuard()],
       schema: {
         tags: ["Expenses"],
         summary: "Create an expense in a group",
@@ -159,6 +167,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/expenses",
     {
+      preHandler: [app.groupMemberGuard()],
       schema: {
         tags: ["Expenses"],
         summary: "List a group's expenses",
@@ -197,6 +206,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get(
     "/expenses/:id",
     {
+      preHandler: [app.groupMemberGuard({ groupId: groupIdFromExpense })],
       schema: {
         tags: ["Expenses"],
         summary: "Get an expense",
@@ -225,6 +235,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.patch(
     "/expenses/:id",
     {
+      preHandler: [app.groupMemberGuard({ groupId: groupIdFromExpense })],
       schema: {
         tags: ["Expenses"],
         summary: "Update an expense",
@@ -282,6 +293,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.delete(
     "/expenses/:id",
     {
+      preHandler: [app.groupMemberGuard({ groupId: groupIdFromExpense })],
       schema: {
         tags: ["Expenses"],
         summary: "Delete an expense",

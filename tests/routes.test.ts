@@ -368,7 +368,10 @@ describe("group routes", () => {
 
   it("GET /groups/:id returns the detail for a member", async () => {
     const user = fakeUser();
-    prisma.groupMember.findUnique.mockResolvedValueOnce({
+    // Read twice per request: once by the route's preHandler membership
+    // guard (issue #356), once by the handler's own check — so the caller's
+    // membership is arranged as a standing answer rather than a single shot.
+    prisma.groupMember.findUnique.mockResolvedValue({
       groupId: "group_1",
       userId: user.id,
       role: "admin",
@@ -413,7 +416,9 @@ describe("group routes", () => {
 
     it("returns 201 and creates an invitation", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
+      // The guard and the handler's in-transaction check both read the
+      // caller's membership, so it is arranged as a standing answer.
+      prisma.groupMember.findUnique.mockResolvedValue({
         groupId: "group_1",
         userId: user.id,
         role: "admin",
@@ -468,8 +473,14 @@ describe("group routes", () => {
 
     it("returns 400 for an invalid public key", async () => {
       const user = fakeUser();
-      // No groupMember mock: the public key fails validation before the
-      // route ever opens a transaction or checks membership.
+      // Membership is verified by the route's preHandler guard before the
+      // handler parses the body, so the caller is arranged as a member; the
+      // malformed key then fails the handler's own validation.
+      prisma.groupMember.findUnique.mockResolvedValue({
+        groupId: "group_1",
+        userId: user.id,
+        role: "admin",
+      });
 
       const res = await app.inject({
         method: "POST",
@@ -484,6 +495,13 @@ describe("group routes", () => {
     it("returns 409 when invitee is already a member", async () => {
       const user = fakeUser();
       const inviteeUser = fakeUser({ id: "user_2", stellarPublicKey: validPubKey });
+      // Two reads of the caller (preHandler guard, then the in-transaction
+      // re-check) precede the invitee's membership lookup.
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: user.id,
+        role: "admin",
+      });
       prisma.groupMember.findUnique.mockResolvedValueOnce({
         groupId: "group_1",
         userId: user.id,
@@ -509,7 +527,8 @@ describe("group routes", () => {
 
     it("returns 409 when a pending invitation already exists", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
+      // Standing membership: read by both the guard and the in-tx re-check.
+      prisma.groupMember.findUnique.mockResolvedValue({
         groupId: "group_1",
         userId: user.id,
         role: "admin",
@@ -534,6 +553,13 @@ describe("group routes", () => {
     it("DELETE /groups/:id/members/:memberId removes member and creates audit log", async () => {
       const admin = fakeUser({ id: "user_admin" });
       const targetUser = fakeUser({ id: "user_target" });
+      // Caller first (preHandler guard, then the handler's own admin check),
+      // then the target's membership row.
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: admin.id,
+        role: "admin",
+      });
       prisma.groupMember.findUnique.mockResolvedValueOnce({
         groupId: "group_1",
         userId: admin.id,
@@ -606,7 +632,9 @@ describe("expense routes", () => {
       { userId: user.id },
       { userId: "user_2" },
     ]);
-    prisma.groupMember.findUnique.mockResolvedValueOnce({
+    // Standing answer: the guard reads the caller's membership before the
+    // handler's own check does (issue #356).
+    prisma.groupMember.findUnique.mockResolvedValue({
       groupId,
       userId: user.id,
       role: "member",
@@ -672,7 +700,8 @@ describe("expense routes", () => {
       { userId: user.id },
       { userId: "user_2" },
     ]);
-    prisma.groupMember.findUnique.mockResolvedValueOnce({
+    // Standing answer for both the preHandler guard and the handler's check.
+    prisma.groupMember.findUnique.mockResolvedValue({
       groupId,
       userId: user.id,
       role: "member",
@@ -723,8 +752,10 @@ describe("expense routes", () => {
         { id: "share_2", expenseId, userId: "user_2", shareAmount: "50.00", status: "pending" },
       ],
     };
-    prisma.expense.findUnique.mockResolvedValueOnce(expense);
-    prisma.groupMember.findUnique.mockResolvedValueOnce({
+    // Read twice: once by the guard's expense resolver (issue #356), once
+    // again inside the handler's transaction — so both are standing answers.
+    prisma.expense.findUnique.mockResolvedValue(expense);
+    prisma.groupMember.findUnique.mockResolvedValue({
       groupId: "group_1",
       userId: user.id,
       role: "admin",

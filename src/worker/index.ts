@@ -833,6 +833,7 @@ export async function reconcilePendingSettlements(): Promise<void> {
           stellarTxHash: row.stellarTxHash,
           retryCount: row.retryCount,
           shortCode: row.shortCode,
+          expenseId: row.expenseId,
           amount: String(row.amount),
           assetCode: row.assetCode,
           assetIssuer: row.assetIssuer,

@@ -199,6 +199,9 @@ describe("DELETE /expenses/:id authorization", () => {
 
   it("returns 403 for a member who is neither the payer nor an admin", async () => {
     membershipDb({ "group_1:user_1": { role: "member" } });
+    // Read twice: the guard resolves the expense's group before the handler's
+    // in-transaction re-read.
+    prisma.expense.findUnique.mockResolvedValueOnce(expense);
     prisma.expense.findUnique.mockResolvedValueOnce(expense);
     const res = await app.inject({
       method: "DELETE",
@@ -211,6 +214,9 @@ describe("DELETE /expenses/:id authorization", () => {
 
   it("allows an admin (who is not the payer) to delete, and audits it", async () => {
     membershipDb({ "group_1:user_1": { role: "admin" } });
+    // Read twice: the guard resolves the expense's group before the handler's
+    // in-transaction re-read.
+    prisma.expense.findUnique.mockResolvedValueOnce(expense);
     prisma.expense.findUnique.mockResolvedValueOnce(expense);
     prisma.expense.delete.mockResolvedValueOnce({});
     prisma.auditLog.create.mockResolvedValueOnce({});

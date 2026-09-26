@@ -727,7 +727,16 @@ describe("expense routes", () => {
         { id: "share_2", expenseId, userId: "user_2", shareAmount: "50.00", status: "pending" },
       ],
     };
+    // The expense row and the admin membership are each read twice: once by
+    // the route's preHandler guard resolving the expense's group, once again
+    // by the handler's own in-transaction check and delete.
     prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
       userId: user.id,

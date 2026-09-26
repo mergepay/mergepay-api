@@ -11,6 +11,7 @@ import {
   verifyPaymentOperation,
   getTransactionPayments,
 } from "./horizonService";
+import { buildMemo, validateMemoAgainstActiveExpense } from "./memo";
 import { dispatchEvent } from "./webhook";
 
 const log = pino({ name: "settlement-reconciliation" });
@@ -37,6 +38,12 @@ export interface ReconcilableSettlement {
   retryCount: number;
   /** Settlement short code, used to derive the expected memo (MP:<code>). */
   shortCode: string;
+  /**
+   * Expense this settlement pays off. When present, verification resolves the
+   * parsed memo code against this record and refuses to confirm while the
+   * expense is missing or fully settled (see `validateMemoAgainstActiveExpense`).
+   */
+  expenseId?: string | null;
   /** Expected payment amount. */
   amount: string;
   /** Expected asset code (e.g. "XLM", "USDC"). */
@@ -45,6 +52,13 @@ export interface ReconcilableSettlement {
   assetIssuer: string | null;
   /** Expected payment destination (the recipient's Stellar public key). */
   destinationPublicKey: string;
+  /**
+   * Persisted status at read time. Only `needs_review` changes behavior: a
+   * row still without a Horizon answer is demoted to `pending_confirmation`
+   * so the retry budget governs. Optional — omitting it preserves the
+   * pre-needs_review behavior (retryCount-only update on not-found).
+   */
+  status?: string;
 }
 
 /**
@@ -84,8 +98,37 @@ export async function reconcileSingleSettlement(
 
   if (tx.successful) {
     try {
-      const expectedMemo = `MP:${settlement.shortCode}`;
-      await verifyTransactionMemo(hash, expectedMemo);
+      // Generate the expected memo through the shared helper rather than a
+      // raw template literal: an unusable short code is a verification
+      // failure, not a string that silently never matches on-chain.
+      const expectedMemo = buildMemo(settlement.shortCode);
+      if (!expectedMemo.ok) {
+        throw Errors.badRequest(
+          "transaction_verification_failed",
+          `Memo verification failed: ${expectedMemo.message}`
+        );
+      }
+      await verifyTransactionMemo(hash, expectedMemo.memo);
+
+      // The memo must still resolve to a *live* expense: parse it and check
+      // the settlement's expense record exists with shares still outstanding
+      // before this worker is allowed to confirm. Settlements created before
+      // expense linking have no record to validate against and skip this.
+      if (settlement.expenseId) {
+        const validation = await validateMemoAgainstActiveExpense(
+          expectedMemo.memo,
+          {
+            expectedCode: settlement.shortCode,
+            expenseId: settlement.expenseId,
+          }
+        );
+        if (!validation.ok) {
+          throw Errors.badRequest(
+            "transaction_verification_failed",
+            `Memo verification failed: ${validation.message}`
+          );
+        }
+      }
 
       const payments = await getTransactionPayments(hash);
       const paymentOp = payments.find((op) => op.type === "payment");
@@ -105,6 +148,7 @@ export async function reconcileSingleSettlement(
       if (
         err instanceof Error &&
         (err.message.includes("verification_failed") ||
+          err.message.includes("Memo verification failed") ||
           err.message.includes("does not match") ||
           err.message.includes("No payment operation") ||
           err.message.includes("Horizon request failed"))
@@ -182,7 +226,7 @@ export async function reconcileSingleSettlement(
 }
 
 async function handleTransactionNotFound(
-  settlement: { id: string; retryCount: number },
+  settlement: { id: string; retryCount: number; status?: string },
   hash: string,
   maxRetries: number,
   recLog: ReturnType<typeof loggerWithContext>
@@ -219,7 +263,15 @@ async function handleTransactionNotFound(
 
   await prisma.settlement.update({
     where: { id: settlement.id },
-    data: { retryCount: nextRetryCount },
+    data: {
+      retryCount: nextRetryCount,
+      // A needs_review row still without a Horizon answer is demoted to
+      // pending_confirmation, so the bounded retry budget above — not an
+      // unbounded needs_review wait — decides when enough silence is enough.
+      // A conditional updateMany is deliberately not needed here: the caller
+      // holds the row's lease, which already excludes concurrent writers.
+      ...(settlement.status === "needs_review" ? { status: "pending_confirmation" } : {}),
+    },
   });
   recLog.debug(
     { id: settlement.id, hash, attempt: nextRetryCount, maxRetries },

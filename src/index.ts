@@ -27,8 +27,15 @@ async function main() {
 
     try {
       app.log.info({ signal, timeoutMs }, "shutting down");
-      await app.close();
-      await prisma.$disconnect();
+      try {
+        await app.close();
+      } finally {
+        // The pool is released even when the HTTP server fails to close: a
+        // leaked connection pool is exactly what this teardown exists to
+        // prevent, and it must not hinge on the previous step succeeding.
+        await prisma.$disconnect();
+        app.log.info({ signal }, "database disconnected");
+      }
       app.log.info({ signal }, "shutdown complete");
     } catch (error) {
       app.log.error({ err: error, signal }, "shutdown failed");

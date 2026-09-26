@@ -1,6 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey, Transaction } from "@stellar/stellar-sdk";
+import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { config } from "../config";
@@ -29,6 +29,13 @@ import {
   takeForPage,
 } from "../lib/pagination";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
+import {
+  assertSignedXdrMatchesIntent,
+  getTreasuryAccount,
+  getTreasuryAccountSnapshot,
+  getTreasuryMultisigRequirement,
+  hashOfEnvelope,
+} from "../services/treasury-stellar";
 import {
   validateProposedSignerConfig,
   validateSignerChangeAgainstAccount,
@@ -145,16 +152,12 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
-    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
+    const view = await getTreasuryAccount(group.treasuryAccountPublicKey);
     return {
-      publicKey: group.treasuryAccountPublicKey,
-      balances: snapshot.balances.map((b) => ({
-        assetCode: b.assetCode,
-        assetIssuer: b.assetIssuer,
-        balance: b.balance,
-      })),
-      signers: snapshot.signers,
-      thresholds: snapshot.thresholds,
+      publicKey: view.publicKey,
+      balances: view.balances,
+      signers: view.signers,
+      thresholds: view.thresholds,
     };
   });
 
@@ -183,8 +186,8 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
-    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
-    
+    const snapshot = await getTreasuryAccountSnapshot(group.treasuryAccountPublicKey);
+
     const proposedConfig: ProposedSignerConfig = {
       signers: body.signers,
       thresholds: body.thresholds,
@@ -275,9 +278,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
 
         // Compute the transaction hash so the confirm endpoint can validate
         // the submitted signed XDR is for this exact intent.
-        const intendedTxHash = new Transaction(xdr, config.networkPassphrase)
-          .hash()
-          .toString("hex");
+        const intendedTxHash = hashOfEnvelope(xdr);
 
         const ttx = await tx.treasuryTransaction.create({
           data: {
@@ -396,9 +397,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
 
         // Compute the transaction hash so the confirm endpoint can validate
         // the submitted signed XDR is for this exact intent.
-        const intendedTxHash = new Transaction(xdr, config.networkPassphrase)
-          .hash()
-          .toString("hex");
+        const intendedTxHash = hashOfEnvelope(xdr);
 
         const ttx = await tx.treasuryTransaction.create({
           data: {
@@ -507,17 +506,10 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     // against the threshold on file), not just a single valid signature.
     let multisig: { signers: string[]; threshold: number } | null = null;
     if (ttx.direction === "withdrawal") {
-      const account = await stellar.loadAccount(treasuryAccountPublicKey);
-      if (!account.exists) {
-        throw Errors.badRequest(
-          "treasury_unfunded",
-          "The treasury account is not funded on-chain"
-        );
-      }
-      multisig = {
-        signers: account.signers.map((s) => s.key),
-        threshold: group.treasuryRequiredSigners ?? 1,
-      };
+      multisig = await getTreasuryMultisigRequirement(
+        treasuryAccountPublicKey,
+        group.treasuryRequiredSigners ?? 1
+      );
     }
 
     return runIdempotent({
@@ -537,19 +529,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         // transaction. This prevents a signer from submitting a signature
         // for a modified (attacker-changed) transaction.
         if (fresh.intendedTxHash) {
-          try {
-            const submittedTx = new Transaction(body.signedXdr, config.networkPassphrase);
-            const submittedHash = submittedTx.hash().toString("hex");
-            if (submittedHash !== fresh.intendedTxHash) {
-              throw Errors.badRequest(
-                "xdr_mismatch",
-                "Submitted signed XDR does not match the intended transaction"
-              );
-            }
-          } catch (e) {
-            if (e instanceof AppError) throw e;
-            throw Errors.badRequest("xdr_malformed", "Could not parse signed XDR");
-          }
+          assertSignedXdrMatchesIntent(body.signedXdr, fresh.intendedTxHash);
         }
 
         let hash: string;

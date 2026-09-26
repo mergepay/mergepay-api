@@ -207,6 +207,15 @@ const schema = z.object({
   // identical schedules across instances reconverge into synchronized bursts
   // against an upstream that is already struggling.
   UPSTREAM_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
+  // Whether Horizon *reads* (account load, transaction lookup) also retry an
+  // HTTP 429 within the budget above, backing off exponentially and never
+  // sooner than a Retry-After the upstream sends. Submissions are unaffected.
+  // An explicit "true"/"false" string, because z.coerce.boolean() would turn
+  // the string "false" into true.
+  HORIZON_RETRY_ON_RATE_LIMIT: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
   NODE_ENV: z.string().default("development"),
   RECONCILIATION_INTERVAL: z.coerce.number().int().positive().default(30000),
   CONFIRMATION_THRESHOLD: z.coerce.number().int().positive().default(1),

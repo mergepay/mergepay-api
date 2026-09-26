@@ -160,7 +160,12 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           nextStatus: "processing",
           source: "user",
           ownerUserId: auth.id,
-          extraData: { anchorTxId: result.id } as never,
+          // The JWT is stored atomically with the transition so the worker
+          // can poll the anchor for this withdrawal's status later — the
+          // server cannot mint one itself (the SEP-10 challenge must be
+          // signed by the user's key), and without it a lost webhook would
+          // leave the withdrawal stuck in `processing` forever.
+          extraData: { anchorTxId: result.id, anchorToken: token },
         });
         return {
           ...serializeWithdrawal(updated),

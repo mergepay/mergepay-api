@@ -62,6 +62,10 @@ import {
   type PollResult,
 } from "../services/anchor";
 import { applyAnchorSessionTransition, isTerminalAnchorStatus } from "../services/anchor-status";
+import {
+  applyWithdrawalTransition,
+  mapAnchorStatusToWithdrawalStatus,
+} from "../services/withdrawal-status";
 import { recordStatusTransition } from "../services/status-history";
 import {
   ANCHOR_RETRY_POLICY,
@@ -1070,6 +1074,166 @@ export async function reconcileAnchors(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// withdrawal reconciliation
+// ---------------------------------------------------------------------------
+
+interface WithdrawalJob {
+  id: string;
+  anchorTxId: string | null;
+  anchorToken: string | null;
+  status: string;
+}
+
+/**
+ * Poll one withdrawal and advance it if the anchor reported a new status.
+ *
+ * The fetch/parse layer is the same `anchorService.pollTransaction` the
+ * deposit side uses — timeout, retry, circuit breaker, and malformed-JSON
+ * classification live there, not here.
+ */
+async function reconcileSingleWithdrawal(
+  job: WithdrawalJob,
+  transferServer: string,
+  ctx: CorrelationContext
+): Promise<void> {
+  const jobLog = loggerWithContext(log, ctx);
+
+  if (!job.anchorToken || !job.anchorTxId) return;
+
+  const result: PollResult = await anchorService.pollTransaction({
+    transferServer,
+    token: job.anchorToken,
+    id: job.anchorTxId,
+  });
+
+  // A failed poll (timeout, unreachable anchor, HTTP error, malformed JSON)
+  // leaves the row exactly as it was. A single bad response must never move
+  // a money record: the withdrawal stays `processing`, the next cycle polls
+  // again, and the anchor's own webhook can still complete it meanwhile.
+  if (result.isError) {
+    jobLog.warn(
+      {
+        jobType: "withdrawal",
+        jobId: job.id,
+        outcome: "retry_scheduled",
+        category: result.category,
+        reason: safeFailureMessage(result.message),
+      },
+      "withdrawal poll failed; status left unchanged"
+    );
+    return;
+  }
+
+  // `result.status` is already normalized onto the anchor vocabulary by
+  // pollTransaction; this collapses it onto the coarser Withdrawal state
+  // map. Unrecognized intermediate statuses collapse to `processing`, which
+  // equals the current status, so they persist nothing.
+  const nextStatus = mapAnchorStatusToWithdrawalStatus(result.status);
+  if (nextStatus === job.status) {
+    return;
+  }
+
+  // applyWithdrawalTransition validates the move against the finite
+  // transition map and writes its audit record in the same database
+  // transaction as the status change; a duplicate or out-of-order result is
+  // a no-op rather than a regression.
+  const applied = await applyWithdrawalTransition({
+    withdrawalId: job.id,
+    nextStatus,
+    source: "poll",
+  });
+  if (!applied.changed) return;
+
+  jobLog.info(
+    {
+      jobType: "withdrawal",
+      jobId: job.id,
+      outcome: "advanced",
+      fromStatus: job.status,
+      toStatus: nextStatus,
+      rawStatus: result.rawStatus,
+    },
+    "withdrawal status advanced"
+  );
+}
+
+/**
+ * One cycle of SEP-24 withdrawal reconciliation.
+ *
+ * The deposit side (`reconcileAnchors`) polls every open `AnchorSession`;
+ * this is the missing mirror for the simpler `Withdrawal` record created by
+ * `POST /withdraw`, which previously advanced only when the anchor's webhook
+ * happened to arrive — a lost webhook left it in `processing` forever.
+ *
+ * Rows are selected only while they are non-terminal, carry an anchor
+ * transaction id, and carry the anchor JWT persisted at confirm time, so a
+ * completed/failed/expired/refunded withdrawal is never re-polled. There is
+ * deliberately no claim/lease here: polls are read-only and every write goes
+ * through applyWithdrawalTransition's guarded update, so a second worker
+ * racing this loop can only duplicate anchor *reads*, never a transition.
+ */
+export async function reconcileWithdrawals(): Promise<void> {
+  const withdrawals = await prisma.withdrawal.findMany({
+    where: {
+      status: "processing",
+      anchorTxId: { not: null },
+      anchorToken: { not: null },
+    },
+    orderBy: { updatedAt: "asc" as const },
+    take: config.WORKER_BATCH_SIZE,
+  });
+
+  if (withdrawals.length === 0) return;
+
+  let transferServer: string;
+  try {
+    const toml = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
+    transferServer = toml.transferServerSep24;
+  } catch (error) {
+    // The anchor is unreachable entirely — skip the cycle rather than
+    // burning every row's poll on the same outage. Nothing is mutated.
+    log.warn(
+      {
+        jobType: "withdrawal",
+        jobId: "batch",
+        outcome: "skipped_cycle",
+        reason: safeFailureMessage(error),
+      },
+      "anchor TOML unavailable"
+    );
+    return;
+  }
+
+  for (const withdrawal of withdrawals) {
+    if (isShuttingDown) return;
+
+    const job: WithdrawalJob = {
+      id: withdrawal.id,
+      anchorTxId: withdrawal.anchorTxId,
+      anchorToken: withdrawal.anchorToken,
+      status: withdrawal.status,
+    };
+    const ctx = jobContext("withdrawal", job.id);
+
+    try {
+      await reconcileSingleWithdrawal(job, transferServer, ctx);
+    } catch (error) {
+      // One withdrawal's unexpected failure must never stop the rest of the
+      // batch — the same isolation reconcileAnchors gives its sessions.
+      loggerWithContext(log, ctx).error(
+        {
+          jobType: "withdrawal",
+          jobId: job.id,
+          outcome: "error",
+          reason: safeFailureMessage(error),
+        },
+        "unexpected error reconciling withdrawal"
+      );
+    }
+  }
+}
+
 /** Free anchor leases left behind by a crashed process. */
 export async function recoverStaleAnchorSessions(): Promise<number> {
   const { count } = await prisma.anchorSession.updateMany({
@@ -1149,6 +1313,7 @@ export async function runWorkerCycle(): Promise<void> {
   await Promise.allSettled([
     processSubmittedSettlements(),
     reconcileAnchors(),
+    reconcileWithdrawals(),
     reconcileSettlements(),
     reconcileAllTreasuryBalances(),
     expireInvites(),

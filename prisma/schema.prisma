@@ -298,6 +298,10 @@ model Withdrawal {
   memo           String?
   /// Anchor's external transaction id / SEP-24 `id`, populated on completion.
   anchorTxId     String?  @map("anchor_tx_id")
+  /// Anchor SEP-10 JWT minted when the user completes the confirm step. The
+  /// worker replays it to poll `GET /transaction` for status transitions
+  /// (mirrors AnchorSession.anchor_token — see src/worker/index.ts).
+  anchorToken    String?  @map("anchor_token")
   /// Interactive URL the user opens to complete KYC / off-ramp.
   interactiveUrl String?  @map("interactive_url")
   status         String   @default("pending")

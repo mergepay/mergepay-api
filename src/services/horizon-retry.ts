@@ -42,6 +42,7 @@ export const HORIZON_RETRY_POLICY: HorizonRetryPolicy = {
 
 // ─── Error classification ───────────────────────────────────────────────────
 
+/** Why a Horizon call failed, in terms of whether retrying could help. */
 export type HorizonErrorCategory = "transient" | "indeterminate" | "permanent";
 
 /**
@@ -50,6 +51,16 @@ export type HorizonErrorCategory = "transient" | "indeterminate" | "permanent";
  * This is more specific than `classifyJobFailure` in job-retry.ts: it uses
  * the typed error classes (`TimeoutError`, `TransportError`) from timeout.ts
  * and Horizon-specific result codes rather than message-string matching.
+ *
+ * @param error - The thrown value: a `TimeoutError`, `TransportError`,
+ *   `AppError`, an Horizon SDK error (with `response.data.extras.result_codes`),
+ *   or anything unrecognized.
+ * @returns `"indeterminate"` for timeouts (the call may or may not have been
+ *   applied), `"transient"` for rate limits, 5xx responses and transport
+ *   faults, `"permanent"` for validation 4xx and for Stellar result codes
+ *   (`tx_*`/`op_*`) that describe the envelope itself as invalid. Unrecognized
+ *   errors fall back to `"transient"` — the bounded `maxAttempts` keeps that
+ *   safe.
  */
 export function classifyHorizonError(error: unknown): HorizonErrorCategory {
   // Typed errors from our timeout wrapper.
@@ -62,6 +73,22 @@ export function classifyHorizonError(error: unknown): HorizonErrorCategory {
     if (status === 429) return "transient";
     if (status >= 500) return "transient";
     if (status >= 400) return "permanent";
+  }
+
+  // Raw HTTP status on the error itself, in either shape it arrives:
+  // the Horizon SDK rejects with e.response.status, and fetch-shaped
+  // errors carry e.status. Checked before the response body so a 4xx
+  // that happens to carry a result-codes body is still honoured as
+  // "the upstream refused this request" — retrying a 400 identically
+  // only multiplies load and delays the caller's error (issue #531).
+  if (error && typeof error === "object") {
+    const e = error as { response?: { status?: number }; status?: number };
+    const httpStatus = e.response?.status ?? e.status;
+    if (typeof httpStatus === "number") {
+      if (httpStatus === 429) return "transient";
+      if (httpStatus >= 500) return "transient";
+      if (httpStatus >= 400) return "permanent";
+    }
   }
 
   // Horizon SDK error shapes — the response body may carry result_codes.
@@ -150,6 +177,12 @@ function extractResponse(
  * The delay doubles each attempt (capped at `maxDelayMs`) and a random
  * jitter of ±`jitterRatio` is applied so a fleet of workers does not
  * retry in lockstep.
+ *
+ * @param attempt - 1-based attempt number that just failed. Values below 1
+ *   or non-finite values return `0` (no delay).
+ * @param policy - Bounds for the curve; defaults to {@link HORIZON_RETRY_POLICY}.
+ * @param random - Random source in `[0, 1)`; injected in tests for determinism.
+ * @returns The delay in milliseconds before the next attempt, never negative.
  */
 export function horizonRetryDelayMs(
   attempt: number,
@@ -176,16 +209,22 @@ export interface RetryResult<T> {
   value: T;
 }
 
+/** Failure shape: the last error seen and how many attempts were made. */
 export interface RetryExhausted {
   ok: false;
   lastError: unknown;
   attempts: number;
 }
 
+/** Either a successful value or the exhausted-failure details — never a throw. */
 export type HorizonRetryOutcome<T> = RetryResult<T> | RetryExhausted;
 
 /**
  * Whether the outcome represents a successful result.
+ *
+ * @param outcome - The value returned by {@link withHorizonRetry}.
+ * @returns `true` when `outcome.ok`; narrows the type to `RetryResult<T>` so
+ *   `outcome.value` is safe to read.
  */
 export function isRetrySuccess<T>(
   outcome: HorizonRetryOutcome<T>
@@ -206,11 +245,16 @@ export function isRetrySuccess<T>(
  * perform ledger checks or other reconciliation before the next attempt.
  *
  * @param fn - The operation to run. Called up to `policy.maxAttempts` times.
- * @param classify - Error classifier. Defaults to `classifyHorizonError`.
- * @param policy - Retry policy. Defaults to `HORIZON_RETRY_POLICY`.
- * @param beforeRetry - Optional hook called before each retry with the error
- *   and attempt number. Return `false` to abort without retrying.
- * @param delay - Injectable delay for testing.
+ * @param options - Optional overrides:
+ *   - `classify` — error classifier, defaults to {@link classifyHorizonError}
+ *   - `policy` — retry policy, defaults to {@link HORIZON_RETRY_POLICY}
+ *   - `beforeRetry` — hook called before each retry with the error and attempt
+ *     number; return `false` to abort without retrying
+ *   - `delay` — injectable delay, for tests
+ * @returns A {@link HorizonRetryOutcome} — `{ ok: true, value }` on success,
+ *   `{ ok: false, lastError, attempts }` when a permanent error, an aborted
+ *   `beforeRetry`, or the attempt budget stops the loop. Never throws for a
+ *   classified error; use {@link isRetrySuccess} to narrow the result.
  */
 export async function withHorizonRetry<T>(
   fn: () => Promise<T>,

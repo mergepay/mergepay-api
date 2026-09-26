@@ -195,10 +195,12 @@ export const treasuryProposalsService = {
       await auditTx(tx, {
         userId: params.creatorId,
         groupId: params.groupId,
+        actorPublicKey: params.creatorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_CREATED,
         entityType: "treasury_proposal",
         entityId: created.id,
         metadata: {
+          sourceAccount: treasury.treasuryAccountPublicKey,
           destination: params.destination,
           amount: params.amount,
           assetCode: params.assetCode,
@@ -470,20 +472,14 @@ export const treasuryProposalsService = {
           },
         });
 
-        if (!meetsThreshold) {
-          return {
-            status: STATUS.awaitingSignatures,
-            signatureCount: verified.length,
-            threshold: proposal.threshold,
-            stellarTxHash: null,
-          };
-        }
-
         // Signature persistence, proposal status, and audit records must
         // commit together. A failed audit write must roll back the mutation.
         for (const pk of verified.slice(stored.length).map((s) => s.publicKey)) {
+          const signerUserId = memberUserIds.get(pk) ?? null;
           await auditTx(tx, {
+            userId: signerUserId,
             groupId: proposal.groupId,
+            actorPublicKey: pk,
             action: AuditAction.TREASURY_PROPOSAL_SIGNED,
             entityType: "treasury_proposal",
             entityId: proposal.id,
@@ -495,8 +491,22 @@ export const treasuryProposalsService = {
           });
         }
 
+        if (!meetsThreshold) {
+          return {
+            status: STATUS.awaitingSignatures,
+            signatureCount: verified.length,
+            threshold: proposal.threshold,
+            stellarTxHash: null,
+          };
+        }
+
         // Merge all verified signatures onto the base envelope, then submit.
-        return await this.mergeAndSubmit(tx, proposal.id, verified);
+        return await this.mergeAndSubmit(
+          tx,
+          proposal.id,
+          verified,
+          verified.at(-1)?.publicKey ?? null
+        );
       },
       { timeout: 15_000 }
     );
@@ -518,7 +528,8 @@ export const treasuryProposalsService = {
   async mergeAndSubmit(
     tx: Prisma.TransactionClient,
     proposalId: string,
-    storedSignatures: StoredSignature[]
+    storedSignatures: StoredSignature[],
+    actorPublicKey: string | null
   ): Promise<{
     status: string;
     signatureCount: number;
@@ -552,10 +563,12 @@ export const treasuryProposalsService = {
       });
       await auditTx(tx, {
         groupId: proposal.groupId,
+        actorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_SUBMITTED,
         entityType: "treasury_proposal",
         entityId: proposal.id,
         metadata: {
+          sourceAccount: baseTx.source,
           signatureCount: storedSignatures.length,
           threshold: proposal.threshold,
           stellarTxHash: hash,
@@ -575,6 +588,7 @@ export const treasuryProposalsService = {
       });
       await auditTx(tx, {
         groupId: proposal.groupId,
+        actorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_FAILED,
         entityType: "treasury_proposal",
         entityId: proposal.id,

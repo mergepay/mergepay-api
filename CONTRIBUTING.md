@@ -4,7 +4,8 @@ Thanks for helping build an open-source, Stellar-native public good!
 
 ## Coding standards
 
-- TypeScript `strict`. Validate **every** request with Zod.
+- TypeScript `strict`. The whole of `src/` compiles under the [`strict`](https://www.typescriptlang.org/tsconfig/#strict) flag (see [tsconfig.json](tsconfig.json) and the [TypeScript strict mode](https://github.com/mergepay/mergepay-api#typescript-strict-mode) section in the README for the exact settings and rationale). `npm run build` must pass with zero TS errors — CI runs it on every PR, so strict violations block merge. In practice: narrow `unknown` explicitly, annotate catch variables, prefer real types over `any` casts, and never weaken `tsconfig.json` to make an error go away.
+- Validate **every** request with Zod.
 - The API contract is mirrored in `mergepay-web/src/lib/types.ts` — keep them in sync.
 - Never store or handle user private keys. Build unsigned XDRs; the wallet signs; validate the signed XDR against the intent before submitting.
 - Every group action must check membership; admin-only actions must check the role.
@@ -66,7 +67,7 @@ Expected: a JSON response with `status` and both dependency checks reporting liv
 ## PR checklist
 
 - [ ] Linked to an issue (`Closes #NN`)
-- [ ] `npm run build` passes (zero TS errors)
+- [ ] `npm run build` passes (zero TS errors under `strict` — see [TypeScript strict mode](https://github.com/mergepay/mergepay-api#typescript-strict-mode))
 - [ ] `npm test` passes (no DB/network needed — mock them)
 - [ ] New endpoints validated with Zod + permission checks
 - [ ] Contract changes mirrored in `mergepay-web`

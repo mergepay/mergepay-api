@@ -52,6 +52,7 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
         await treasurySignaturesService.createProposal({
           groupId: body.groupId,
           creatorId: auth.id,
+          creatorPublicKey: auth.stellarPublicKey,
           xdr: body.xdr,
         });
 

@@ -208,6 +208,22 @@ const defaultSleep = (ms: number) =>
  *
  * Never use this for a call that changes upstream state unless that call's own
  * contract makes repeating it harmless — see the module comment.
+ *
+ * @param options - `{ operation, timeoutMs, policy?, isExpected?,
+ *   onAttemptFailed?, sleep?, random? }`. `operation` labels the call in errors
+ *   and logs; `timeoutMs` is the budget for *each* attempt (worst case is
+ *   `maxAttempts × timeoutMs` plus backoff); `isExpected` receives the
+ *   unwrapped upstream error and, when it returns `true`, short-circuits both
+ *   retry and error mapping so the caller gets the upstream's own answer.
+ * @param fn - The read to perform, given an `AbortSignal` and the 1-based
+ *   attempt number. Invoked up to `policy.maxAttempts` times.
+ * @returns The first successful value from `fn`.
+ * @throws {AppError} `upstream` once the retries are exhausted or the failure
+ *   is not retryable — the upstream's own body never escapes, but the original
+ *   error is preserved on the non-enumerable `upstreamCause` for logs.
+ * @throws The original upstream error when `options.isExpected` matches it
+ *   (e.g. a 404 meaning "not funded yet"), unwrapped from any transport
+ *   wrapper so `response.status` and `name` still read as the SDK wrote them.
  */
 export async function withRetry<T>(
   options: RetryOptions,

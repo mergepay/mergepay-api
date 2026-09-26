@@ -26,6 +26,7 @@ import {
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 import { sep24InteractiveRequestSchema } from "../validations/sep24";
+import { sep24CallbackSchema } from "../schemas/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {
@@ -332,6 +333,10 @@ export default async function anchorRoutes(app: FastifyInstance) {
         tags: ["SEP-24"],
         summary: "Anchor status webhook",
         description: "Receives signed webhook status notifications from SEP-24 anchors.",
+        // No `schema.body`: Fastify's JSON-schema validation would run before
+        // this route's handler and therefore before the shared-secret check,
+        // letting an unauthenticated caller probe the payload contract. The
+        // shared Zod schema below validates after the secret is verified.
         response: {
           200: {
             type: "object",
@@ -349,58 +354,51 @@ export default async function anchorRoutes(app: FastifyInstance) {
       if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
         return reply.code(200).send({ ok: true }); // don't reveal verification result
       }
-      const body = z
-        .object({
-          transaction: z
-            .object({ id: z.string(), status: z.string(), message: z.string().optional() })
-            .optional(),
-          id: z.string().optional(),
-          status: z.string().optional(),
-          message: z.string().optional(),
-        })
-        .passthrough()
-        .parse(req.body ?? {});
 
-      const externalId = body.transaction?.id ?? body.id;
-      const status = body.transaction?.status ?? body.status;
-      if (externalId && status) {
-        const mappedStatus = mapAnchorStatus(status);
-        const rawMessage = body.transaction?.message ?? body.message;
-        const sanitizedMessage = typeof rawMessage === "string" ? safeFailureMessage(rawMessage) : null;
+      // Parsed only after the shared-secret check, so an unauthenticated
+      // caller can never reach the schema or the database. The canonical
+      // callback schema (src/schemas/sep24.ts) requires a transaction id and
+      // a status — top level or under `transaction` — and rejects anything
+      // else with the standard structured 400 VALIDATION_ERROR, the same way
+      // the JWT- and HMAC-authenticated callback routes do.
+      const callback = sep24CallbackSchema.parse(req.body ?? {});
 
-        const sessions = await prisma.anchorSession.findMany({
-          where: { externalTransactionId: externalId },
+      const mappedStatus = mapAnchorStatus(callback.rawStatus);
+      const sanitizedMessage =
+        callback.message === null ? null : safeFailureMessage(callback.message);
+
+      const sessions = await prisma.anchorSession.findMany({
+        where: { externalTransactionId: callback.externalTransactionId },
+      });
+      for (const session of sessions) {
+        // applyAnchorSessionTransition atomically validates the transition
+        // against the finite state map and writes its audit record in the
+        // same database transaction as the status change — see
+        // src/services/anchor-status.ts. An out-of-order or duplicate
+        // webhook delivery is a no-op rather than a regression.
+        await applyAnchorSessionTransition({
+          sessionId: session.id,
+          nextStatus: mappedStatus,
+          source: "webhook",
+          extraData: mappedStatus === "error" ? {
+            failureReason: sanitizedMessage,
+          } : undefined,
         });
-        for (const session of sessions) {
-          // applyAnchorSessionTransition atomically validates the transition
-          // against the finite state map and writes its audit record in the
-          // same database transaction as the status change — see
-          // src/services/anchor-status.ts. An out-of-order or duplicate
-          // webhook delivery is a no-op rather than a regression.
-          await applyAnchorSessionTransition({
-            sessionId: session.id,
-            nextStatus: mappedStatus,
-            source: "webhook",
-            extraData: mappedStatus === "error" ? {
-              failureReason: sanitizedMessage,
-            } : undefined,
-          });
-        }
+      }
 
-        // The simpler `Withdrawal` record (POST /withdraw) is a separate
-        // table keyed by the same anchor transaction id — see
-        // src/services/withdrawal-status.ts for why it has its own status
-        // vocabulary and transition map.
-        const withdrawal = await (prisma as any).withdrawal.findUnique({
-          where: { anchorTxId: externalId },
+      // The simpler `Withdrawal` record (POST /withdraw) is a separate
+      // table keyed by the same anchor transaction id — see
+      // src/services/withdrawal-status.ts for why it has its own status
+      // vocabulary and transition map.
+      const withdrawal = await (prisma as any).withdrawal.findUnique({
+        where: { anchorTxId: callback.externalTransactionId },
+      });
+      if (withdrawal) {
+        await applyWithdrawalTransition({
+          withdrawalId: withdrawal.id,
+          nextStatus: mapAnchorStatusToWithdrawalStatus(mappedStatus),
+          source: "webhook",
         });
-        if (withdrawal) {
-          await applyWithdrawalTransition({
-            withdrawalId: withdrawal.id,
-            nextStatus: mapAnchorStatusToWithdrawalStatus(mappedStatus),
-            source: "webhook",
-          });
-        }
       }
       return reply.code(200).send({ ok: true });
     }

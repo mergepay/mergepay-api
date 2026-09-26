@@ -10,11 +10,22 @@ export default fp(async function openAPIPlugin(app: FastifyInstance) {
       openapi: "3.0.0",
       info: {
         title: "Mergepay API",
-        description: "Stellar-native group expense settlement engine",
+        description:
+          "Stellar-native group expense settlement engine. Mergepay lets groups track shared expenses, split them fairly, and settle balances on the Stellar network: SEP-10 wallet authentication, multi-asset expenses with receipt storage, fair split strategies, signature-based settlement with multi-signature treasury accounts, and SEP-24 anchor integration for on/off-ramps.",
         version: "0.1.0",
+        // Kept in sync with package.json (importing the file directly is not
+        // possible under this repo's `rootDir: "src"` build setup).
+        termsOfService: "https://github.com/mergepay/mergepay-api/blob/main/SECURITY.md",
         contact: {
           name: "Mergepay",
           url: "https://mergepay.vercel.app",
+          email: "support@mergepay.com",
+        },
+        license: {
+          name: "MIT",
+          // OpenAPI 3.0 requires an absolute URL; pointing at the repo file
+          // keeps the license text (and its copyright) one click away.
+          url: "https://github.com/mergepay/mergepay-api/blob/main/LICENSE",
         },
       },
       servers: [

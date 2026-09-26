@@ -1376,6 +1376,11 @@ export async function startWorker(): Promise<() => Promise<void>> {
           { jobType: "worker_cycle", outcome: "shutdown_drain_timeout" },
           "in-flight job outran the drain budget, leaving leases to expire"
         );
+        // Leases stay claimed, but the process is on its way out regardless:
+        // the connection pool must still be released so a restart never
+        // inherits dangling database connections.
+        await prisma.$disconnect();
+        log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
         return;
       }
 
@@ -1392,6 +1397,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
         }),
       ]);
       await prisma.$disconnect();
+      log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
 
       log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "worker claims released");
     } catch (error) {

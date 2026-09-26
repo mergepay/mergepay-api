@@ -285,6 +285,110 @@ describe("reconcileSingleSettlement", () => {
 });
 
 // ---------------------------------------------------------------------------
+// needs_review rows
+// ---------------------------------------------------------------------------
+
+// A submission whose on-chain outcome could not be observed is parked in
+// needs_review with its hash recorded. The same read-only reconciliation
+// applies; the difference is what happens when Horizon still has no answer.
+describe("reconcileSingleSettlement — needs_review rows", () => {
+  it("demotes a needs_review row to pending_confirmation when Horizon has no answer", async () => {
+    h.getTransaction.mockResolvedValue(null);
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({ status: "needs_review", retryCount: 0 }),
+      10
+    );
+
+    expect(outcome).toBe("pending");
+    // The demotion rides the same update as the retry increment — one round
+    // trip, and the row never sits in needs_review with a climbing count.
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_1" },
+        data: expect.objectContaining({
+          retryCount: 1,
+          status: "pending_confirmation",
+        }),
+      })
+    );
+  });
+
+  it("keeps a pending_confirmation row's status when Horizon has no answer", async () => {
+    h.getTransaction.mockResolvedValue(null);
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({ status: "pending_confirmation", retryCount: 3 }),
+      10
+    );
+
+    expect(outcome).toBe("pending");
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { retryCount: 4 },
+      })
+    );
+  });
+
+  it("confirms a needs_review row whose transaction landed successfully", async () => {
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1", status: "confirmed", expenseShareId: null,
+    });
+    h.prisma.settlement.findUnique.mockResolvedValue({
+      id: "settle_1",
+      status: "needs_review",
+      fromUserId: "user_1",
+      expenseShareId: null,
+      retryCount: 0,
+    });
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({ status: "needs_review" }),
+      10
+    );
+
+    expect(outcome).toBe("confirmed");
+    // The state machine's conditional guard must list needs_review among the
+    // allowed-from statuses — without it the update matches zero rows and the
+    // confirmation would silently never land.
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: "settle_1",
+          status: { in: expect.arrayContaining(["needs_review", "pending_confirmation"]) },
+        },
+        data: expect.objectContaining({ status: "confirmed" }),
+      })
+    );
+  });
+
+  it("fails a needs_review row whose transaction failed on-chain", async () => {
+    h.getTransaction.mockResolvedValue({ successful: false });
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({ status: "needs_review" }),
+      10
+    );
+
+    expect(outcome).toBe("failed");
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: "settle_1",
+          status: { in: expect.arrayContaining(["needs_review", "pending_confirmation"]) },
+        },
+        data: expect.objectContaining({ status: "failed" }),
+      })
+    );
+    expect(h.audit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "settlement.failed" })
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Verification failure tests
 // ---------------------------------------------------------------------------
 

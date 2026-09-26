@@ -18,6 +18,7 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { mpMemoSchema, stellarAccountIdSchema } from "../lib/stellar-validation";
+import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
 import { rateLimited } from "../lib/rate-limit";
 import { config } from "../config";
 import { Errors } from "../errors";
@@ -42,8 +43,8 @@ import {
 const createBodySchema = z.object({
   destination: stellarAccountIdSchema,
   amount: z.string().min(1),
-  assetCode: z.string().min(1),
-  assetIssuer: stellarAccountIdSchema.nullable().optional(),
+  assetCode: assetCodeSchema,
+  assetIssuer: assetIssuerSchema.nullable().optional(),
   memo: mpMemoSchema.optional(),
 });
 

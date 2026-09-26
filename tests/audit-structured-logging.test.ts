@@ -542,10 +542,10 @@ describe("route integration — POST /groups emits a structured audit event", ()
       event: "audit",
       action: "group.member_remove",
       actor: { type: "user", id: admin.id },
-      target: { type: "group", id: "group_1" },
+      target: { type: "group_member", id: targetUserId },
       groupId: "group_1",
       outcome: "success",
-      metadata: { removedUserId: targetUserId, removedRole: "member" },
+      metadata: { targetUserId, removedRole: "member", outcome: "success" },
     });
     expect(typeof rows[0].timestamp).toBe("string");
   });

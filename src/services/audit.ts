@@ -1,5 +1,6 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
+import { AuditAction } from "./audit-actions";
 import {
   emitAuditEvent,
   sanitizeAuditMetadata,
@@ -122,4 +123,30 @@ export async function auditTx(
   // the source of truth; the telemetry line merely mirrors the write for
   // operators and is best-effort.
   emitTelemetry(data);
+}
+
+export interface GroupMemberAuditParams {
+  userId: string;
+  groupId: string;
+  memberId: string;
+  action:
+    | typeof AuditAction.GROUP_MEMBER_REMOVE
+    | typeof AuditAction.GROUP_MEMBER_ROLE_CHANGE;
+  metadata: Record<string, unknown>;
+}
+
+/** Write a canonical actor/group/member audit record within the mutation transaction. */
+export function auditGroupMemberActionTx(
+  tx: Prisma.TransactionClient,
+  params: GroupMemberAuditParams
+): Promise<void> {
+  return auditTx(tx, {
+    userId: params.userId,
+    groupId: params.groupId,
+    action: params.action,
+    entityType: "group_member",
+    entityId: params.memberId,
+    outcome: "success",
+    metadata: params.metadata,
+  });
 }

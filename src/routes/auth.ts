@@ -2,7 +2,7 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { Errors } from "../errors";
-import { buildChallenge, verifyChallenge } from "../services/sep10";
+import { authenticateChallenge, buildChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
 import { audit } from "../services/audit";
@@ -93,7 +93,9 @@ export default async function authRoutes(app: FastifyInstance) {
     async (req) => {
       sep10QuerySchema.parse(req.query);
       const body = sep10VerifyRequestSchema.parse(req.body);
-      const publicKey = await verifyChallenge(body.transaction);
+      const { account: publicKey, challengeHash } = await authenticateChallenge(
+        body.transaction
+      );
 
       const user = await prisma.user.upsert({
         where: { stellarPublicKey: publicKey },
@@ -104,9 +106,12 @@ export default async function authRoutes(app: FastifyInstance) {
         },
       });
 
-      // The claims contract is unchanged by SEP-10 hardening: verification
-      // still yields a public key, and the session is still minted here.
-      const token = signToken({ id: user.id, stellarPublicKey: publicKey });
+      // Session claims are unchanged; SEP-10 adds only `jti`, the hash of the
+      // challenge this login redeemed.
+      const token = signToken(
+        { id: user.id, stellarPublicKey: publicKey },
+        { jwtid: challengeHash }
+      );
       // A fresh family per login, so revoking one compromised session does
       // not sign the user out of their other devices.
       const refresh = await issueRefreshToken(user.id);

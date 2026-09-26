@@ -303,6 +303,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     "/api/treasury/proposals/:id/signatures",
     "/anchors/deposit",
     "/anchors/withdraw",
+    "/api/sep24/deposit",
+    "/api/sep24/withdraw",
     "/anchors/sessions/:id/complete",
     "/anchors/webhook",
     "/api/webhooks/sep24",

@@ -1,7 +1,14 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
-import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
+import {
+  openApiBody,
+  openApiEnvelope,
+  openApiErrorResponses,
+  openApiIdParams,
+  openApiOkResponse,
+  openApiResponse,
+} from "../lib/openapi";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
@@ -44,7 +51,10 @@ export default async function expenseRoutes(app: FastifyInstance) {
           "Records a group expense and its payment split. The payer's share is settled immediately; every other participant's share is owed.",
         params: openApiIdParams(),
         body: openApiBody(createExpenseSchema),
-        response: openApiEnvelope("expense"),
+        response: {
+          ...openApiEnvelope("expense"),
+          ...openApiErrorResponses(400, 401, 403, 404),
+        },
       },
     },
     async (req) => {
@@ -152,7 +162,22 @@ export default async function expenseRoutes(app: FastifyInstance) {
       schema: {
         tags: ["Expenses"],
         summary: "List a group's expenses",
+        description:
+          "Returns a paginated, filterable list of the group's expenses. Requires membership.",
         params: openApiIdParams(),
+        response: {
+          ...openApiResponse(
+            {
+              expenses: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              meta: { type: "object", additionalProperties: true },
+            },
+            ["expenses", "meta"]
+          ),
+          ...openApiErrorResponses(400, 401, 403),
+        },
       },
     },
     async (req) => {
@@ -169,7 +194,22 @@ export default async function expenseRoutes(app: FastifyInstance) {
   });
 
   // -- get one ----------------------------------------------------------------
-  app.get("/expenses/:id", async (req) => {
+  app.get(
+    "/expenses/:id",
+    {
+      schema: {
+        tags: ["Expenses"],
+        summary: "Get an expense",
+        description:
+          "Returns a single expense with its payer and shares. Requires membership of the expense's group.",
+        params: openApiIdParams(),
+        response: {
+          ...openApiEnvelope("expense"),
+          ...openApiErrorResponses(401, 403, 404),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
     const expense = await prisma.expense.findUnique({
@@ -182,9 +222,25 @@ export default async function expenseRoutes(app: FastifyInstance) {
   });
 
   // -- update (metadata only) -------------------------------------------------
-  app.patch("/expenses/:id", async (req) => {
+  app.patch(
+    "/expenses/:id",
+    {
+      schema: {
+        tags: ["Expenses"],
+        summary: "Update an expense",
+        description:
+          "Updates expense metadata. Only the payer or a group admin may edit it.",
+        params: openApiIdParams(),
+        body: openApiBody(updateExpenseSchema),
+        response: {
+          ...openApiEnvelope("expense"),
+          ...openApiErrorResponses(400, 401, 403, 404),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
     const body = updateExpenseSchema.parse(req.body);
 
     // The membership/role check and the update run in one transaction: a
@@ -223,7 +279,22 @@ export default async function expenseRoutes(app: FastifyInstance) {
   });
 
   // -- delete -----------------------------------------------------------------
-  app.delete("/expenses/:id", async (req) => {
+  app.delete(
+    "/expenses/:id",
+    {
+      schema: {
+        tags: ["Expenses"],
+        summary: "Delete an expense",
+        description:
+          "Deletes an expense. Only the payer or a group admin may delete it, and only while no other participant's share is settled.",
+        params: openApiIdParams(),
+        response: {
+          ...openApiOkResponse(),
+          ...openApiErrorResponses(401, 403, 404, 409),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
 

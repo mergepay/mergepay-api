@@ -10,6 +10,11 @@ vi.mock("../src/config", () => ({
   config: {
     HORIZON_STATUS_TIMEOUT_MS: h.HORIZON_STATUS_TIMEOUT_MS,
     HORIZON_URL: "https://horizon-testnet.stellar.org",
+    // Issue #531: the Horizon query reads retry transient failures; the
+    // budget is configurable via these documented variables.
+    HORIZON_READ_RETRY_MAX_ATTEMPTS: 3,
+    HORIZON_READ_RETRY_INITIAL_DELAY_MS: 0,
+    HORIZON_READ_RETRY_MAX_DELAY_MS: 0,
     isTest: true,
   },
 }));

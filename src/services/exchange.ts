@@ -1,6 +1,7 @@
 import pino from "pino";
 import { config } from "../config";
 import { Errors } from "../errors";
+import { fetchWithRetry } from "./retry";
 
 const log = pino({ name: "exchange" });
 /** The only two assets this module quotes against each other. */
@@ -46,7 +47,15 @@ export async function getExchangeRate(fromAsset: AssetCode, toAsset: AssetCode):
     url.searchParams.set("buying_asset_type", "credit_alphanum4");
     url.searchParams.set("buying_asset_code", config.STABLE_ASSET_CODE);
     url.searchParams.set("buying_asset_issuer", config.STABLE_ASSET_ISSUER);
-    const response = await fetch(url, { signal: AbortSignal.timeout(config.HORIZON_STATUS_TIMEOUT_MS) });
+    // A transient Horizon blip is retried with bounded exponential backoff
+    // (issue #531) rather than immediately degrading to the fallback rate —
+    // the fallback prices settlements, so a recoverable read is worth the
+    // extra attempts. 4xx and 429 responses are returned/raised untouched by
+    // the wrapper and still fall back on the first occurrence.
+    const response = await fetchWithRetry(url.toString(), {
+      operation: "Horizon.orderBook",
+      timeoutMs: config.HORIZON_STATUS_TIMEOUT_MS,
+    });
     if (!response.ok) throw new Error(`Horizon returned ${response.status}`);
     const book = (await response.json()) as { asks?: Array<{ price: string }>; bids?: Array<{ price: string }> };
     const ask = Number(book.asks?.[0]?.price); const bid = Number(book.bids?.[0]?.price);

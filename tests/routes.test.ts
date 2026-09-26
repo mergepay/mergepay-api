@@ -193,20 +193,32 @@ describe("auth routes", () => {
   });
 
   it("POST /auth/verify does not issue a JWT when the challenge fails validation", async () => {
-    // A challenge that fails SEP-10 validation must collapse to the standard
-    // opaque 401 — no token, no user upsert, no audit entry, and no detail
-    // about *why* it failed (wrong network, wrong server, replay, expiry, …).
+    // A well-formed challenge without the client's signature gets the
+    // verifier's actionable 401, but must never issue a token or persist a user.
+    const client = Keypair.random();
+    const { transaction } = buildChallenge(client.publicKey());
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload: { transaction },
+    });
+    expect(res.statusCode).toBe(401);
+    const body = res.json();
+    expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.message).toContain("Challenge signature verification failed");
+    expect(body.requestId).toBeTruthy();
+    expect(body.token).toBeUndefined();
+    expect(prisma.user.upsert).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("POST /auth/verify rejects malformed XDR before challenge verification", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/auth/verify",
       payload: { transaction: "not-a-valid-challenge-xdr" },
     });
-    expect(res.statusCode).toBe(401);
-    const body = res.json();
-    expect(body.code).toBe("UNAUTHORIZED");
-    expect(body.message).toBe("Invalid or expired authentication challenge");
-    expect(body.requestId).toBeTruthy();
-    expect(body.token).toBeUndefined();
+    expect(res.statusCode).toBe(400);
     expect(prisma.user.upsert).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });

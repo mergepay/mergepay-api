@@ -6,29 +6,29 @@ describe("formatAssetIdentifier", () => {
   const testIssuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
   describe("Native asset formatting", () => {
-    it("formats Asset.native() instance as 'native'", () => {
+    it("formats Asset.native() instance as 'XLM'", () => {
       const nativeAsset = Asset.native();
-      expect(formatAssetIdentifier(nativeAsset)).toBe("native");
+      expect(formatAssetIdentifier(nativeAsset)).toBe("XLM");
     });
 
-    it("formats object with code 'native' as 'native'", () => {
-      expect(formatAssetIdentifier({ code: "native" })).toBe("native");
+    it("formats object with code 'native' as 'XLM'", () => {
+      expect(formatAssetIdentifier({ code: "native" })).toBe("XLM");
     });
 
-    it("formats object with code 'XLM' as 'native'", () => {
-      expect(formatAssetIdentifier({ code: "XLM" })).toBe("native");
-      expect(formatAssetIdentifier({ code: "xlm" })).toBe("native");
+    it("formats object with code 'XLM' as 'XLM'", () => {
+      expect(formatAssetIdentifier({ code: "XLM" })).toBe("XLM");
+      expect(formatAssetIdentifier({ code: "xlm" })).toBe("XLM");
     });
 
-    it("formats string 'native' as 'native'", () => {
-      expect(formatAssetIdentifier("native")).toBe("native");
-      expect(formatAssetIdentifier("NATIVE")).toBe("native");
-      expect(formatAssetIdentifier("  native  ")).toBe("native");
+    it("formats string 'native' as 'XLM'", () => {
+      expect(formatAssetIdentifier("native")).toBe("XLM");
+      expect(formatAssetIdentifier("NATIVE")).toBe("XLM");
+      expect(formatAssetIdentifier("  native  ")).toBe("XLM");
     });
 
-    it("formats string 'XLM' as 'native' when no issuer provided", () => {
-      expect(formatAssetIdentifier("XLM")).toBe("native");
-      expect(formatAssetIdentifier("xlm")).toBe("native");
+    it("formats string 'XLM' as 'XLM' when no issuer provided", () => {
+      expect(formatAssetIdentifier("XLM")).toBe("XLM");
+      expect(formatAssetIdentifier("xlm")).toBe("XLM");
     });
   });
 

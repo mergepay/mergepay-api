@@ -49,6 +49,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
+import { buildTreasuryPaymentXdr } from "./treasury-stellar";
 import { audit, auditTx } from "./audit";
 import { AuditAction } from "./audit-actions";
 
@@ -150,7 +151,7 @@ export const treasuryProposalsService = {
       }
 
       const textMemo = params.memo ?? `MP:${shortCodeRunes()}`;
-      xdr = stellar.buildPayment({
+      xdr = buildTreasuryPaymentXdr({
         sourcePublicKey: treasury.treasuryAccountPublicKey,
         sourceSequence: treasuryAcct.sequence,
         destination: params.destination,

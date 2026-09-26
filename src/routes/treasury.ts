@@ -31,11 +31,12 @@ import {
 } from "../lib/pagination";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 import {
-  assertSignedXdrMatchesIntent,
+  buildTreasuryPaymentXdr,
   getTreasuryAccount,
   getTreasuryAccountSnapshot,
   getTreasuryMultisigRequirement,
   hashOfEnvelope,
+  validateTreasurySignedXdr,
 } from "../services/treasury-stellar";
 import {
   validateProposedSignerConfig,
@@ -267,7 +268,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         if (!account.exists) {
           throw Errors.badRequest("account_unfunded", "Your account is not funded yet");
         }
-        const xdr = stellar.buildPayment({
+        const xdr = buildTreasuryPaymentXdr({
           sourcePublicKey: auth.stellarPublicKey,
           sourceSequence: account.sequence,
           destination: treasuryKey,
@@ -385,7 +386,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         if (!account.exists) {
           throw Errors.badRequest("treasury_unfunded", "Treasury account is not funded");
         }
-        const xdr = stellar.buildPayment({
+        const xdr = buildTreasuryPaymentXdr({
           sourcePublicKey: treasuryKey,
           sourceSequence: account.sequence,
           destination: body.destination,
@@ -529,10 +530,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         // Validate the submitted signed XDR is for the exact intended
         // transaction. This prevents a signer from submitting a signature
         // for a modified (attacker-changed) transaction.
-        if (fresh.intendedTxHash) {
-          assertSignedXdrMatchesIntent(body.signedXdr, fresh.intendedTxHash);
-        }
-
         let hash: string;
         try {
           const expected = {
@@ -544,6 +541,18 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             expiresAt: fresh.expiresAt,
             resource: "treasury transaction",
           };
+          if (fresh.intendedTxHash) {
+            const validation = validateTreasurySignedXdr(body.signedXdr, {
+              ...expected,
+              skipSourceSignatureCheck: Boolean(multisig),
+            });
+            if (validation.tx.hash().toString("hex") !== fresh.intendedTxHash) {
+              throw Errors.badRequest(
+                "xdr_mismatch",
+                "Submitted signed XDR does not match the intended transaction"
+              );
+            }
+          }
           hash = multisig
             ? await stellar.submitMultisigPayment(body.signedXdr, expected, multisig)
             : await stellar.submitPayment(body.signedXdr, expected);

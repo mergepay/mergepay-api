@@ -56,6 +56,7 @@ import {
   reconcileSingleSettlement,
   type ReconcilableSettlement,
 } from "../src/services/settlement-reconciliation";
+import { Errors } from "../src/errors";
 
 function pendingConfirmationSettlement(over: Record<string, any> = {}) {
   return {
@@ -112,7 +113,12 @@ beforeEach(() => {
   h.getTransactionPayments.mockResolvedValue([
     { type: "payment", destination: "GTO...", amount: "12.5000000", asset_type: "native" },
   ]);
-  h.verifyTransactionMemo.mockResolvedValue({ verified: true });
+  // verifyTransactionMemo returns the memo read from the ledger (#506).
+  h.verifyTransactionMemo.mockResolvedValue({
+    verified: true,
+    memo: "MP:ABC234",
+    code: "ABC234",
+  });
   h.verifyPaymentOperation.mockImplementation(() => {});
   // Memo → expense validation defaults: no record, so a test that exercises
   // the path must opt in with an explicit mock.
@@ -495,6 +501,91 @@ describe("reconcileSingleSettlement — verification failures", () => {
     );
   });
 
+  // Issue #506: memo failures thrown by the real verifier carry messages such
+  // as "Transaction has no memo" that match none of the legacy message
+  // substrings. They used to be rethrown, which the worker counts as
+  // "pending" — leaving the settlement stuck and re-polled every cycle.
+  it.each([
+    ["missing memo", "Transaction has no memo", "missing_memo"],
+    [
+      "hash memo",
+      'Unexpected memo type: expected "text", got "hash"; a hash memo cannot carry the MP: settlement reference',
+      "hash_memo_mismatch",
+    ],
+    [
+      "invalid hash memo",
+      'Unexpected memo type: expected "text", got "hash"; the hash memo is malformed (expected 32 bytes, base64-encoded)',
+      "invalid_hash_memo",
+    ],
+    ["id memo", 'Unexpected memo type: expected "text", got "id"', "unsupported_memo_type"],
+    [
+      "malformed text memo",
+      "Transaction memo is not a valid Mergepay reference: Mergepay memo must start with 'MP:'.",
+      "malformed_memo",
+    ],
+  ])("fails (never confirms or rethrows) on a %s", async (_label, message, memoFailure) => {
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.verifyTransactionMemo.mockRejectedValue(
+      Errors.badRequest("transaction_verification_failed", message, { memoFailure })
+    );
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1", status: "failed", expenseShareId: null
+    });
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({ stellarTxHash: "hash_bad_memo", expenseId: "exp_1" }),
+      10
+    );
+
+    expect(outcome).toBe("failed");
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "failed", failureReason: message }),
+      })
+    );
+    expect(h.prisma.settlement.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "confirmed" }) })
+    );
+    // No attribution work happens for an unattributable payment.
+    expect(h.prisma.expense.findFirst).not.toHaveBeenCalled();
+    expect(h.getTransactionPayments).not.toHaveBeenCalled();
+    expect(h.audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "settlement.verification_failed",
+        metadata: expect.objectContaining({ stellarTxHash: "hash_bad_memo", memoFailure }),
+      })
+    );
+  });
+
+  it("fails on a non-payment operation verification error (classified by code)", async () => {
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.verifyPaymentOperation.mockImplementation(() => {
+      throw Errors.badRequest(
+        "transaction_verification_failed",
+        'Expected a payment operation, got "create_account"'
+      );
+    });
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1", status: "failed", expenseShareId: null
+    });
+
+    await expect(
+      reconcileSingleSettlement(makeReconcilable({ stellarTxHash: "hash_op" }), 10)
+    ).resolves.toBe("failed");
+  });
+
+  it("still rethrows unexpected errors so the worker can retry them", async () => {
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.verifyTransactionMemo.mockRejectedValue(new Error("database connection lost"));
+
+    await expect(
+      reconcileSingleSettlement(makeReconcilable({ stellarTxHash: "hash_unexpected" }), 10)
+    ).rejects.toThrow("database connection lost");
+    expect(h.prisma.settlement.updateMany).not.toHaveBeenCalled();
+  });
+
   it("fails the settlement when destination verification fails", async () => {
     h.getTransaction.mockResolvedValue({ successful: true });
     h.verifyTransactionMemo.mockResolvedValue({ verified: true });
@@ -642,6 +733,35 @@ describe("reconcileSingleSettlement — memo code vs active expense record", () 
         action: "settlement.verification_failed",
         metadata: expect.objectContaining({
           reason: expect.stringContaining("outstanding shares"),
+        }),
+      })
+    );
+  });
+
+  it("resolves the expense from the memo read on-chain, not a rebuilt one", async () => {
+    verifiedTransaction("failed");
+    // A verifier that (incorrectly) reports success with a different ledger
+    // memo must still not confirm: the expense check parses what was paid.
+    h.verifyTransactionMemo.mockResolvedValue({
+      verified: true,
+      memo: "MP:ZZZ999",
+      code: "ZZZ999",
+    });
+    h.prisma.expense.findFirst.mockResolvedValue({ id: "exp_1", memo: "EXP2345" });
+    h.prisma.expenseShare.count.mockResolvedValue(1);
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({ stellarTxHash: "hash_swapped", expenseId: "exp_1" }),
+      10
+    );
+
+    expect(outcome).toBe("failed");
+    expect(h.prisma.expense.findFirst).not.toHaveBeenCalled();
+    expect(h.audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "settlement.verification_failed",
+        metadata: expect.objectContaining({
+          reason: expect.stringContaining("does not match the expected code"),
         }),
       })
     );

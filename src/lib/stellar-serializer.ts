@@ -33,7 +33,8 @@ export interface StellarSerializedError {
   errorType?: string;
 }
 
-interface StellarErrorLike extends Error {
+/** The structural shape of a Horizon / Stellar SDK error. */
+export interface StellarErrorLike extends Error {
   response?: { status?: number; data?: unknown };
   extras?: Record<string, unknown>;
   problem?: { type?: string; title?: string; detail?: string };
@@ -43,8 +44,11 @@ interface StellarErrorLike extends Error {
  * Detect whether a value is a Stellar SDK error. The SDK throws plain Error
  * subclasses; the distinguishing markers are the `response` or `extras`
  * properties that Horizon attaches.
+ *
+ * Exported so the general error serializer can delegate Stellar-shaped
+ * failures here instead of duplicating the detection rules.
  */
-function isStellarError(value: unknown): value is StellarErrorLike {
+export function isStellarError(value: unknown): value is StellarErrorLike {
   if (!value || typeof value !== "object") return false;
   if (!(value instanceof Error)) return false;
   const err = value as unknown as Record<string, unknown>;

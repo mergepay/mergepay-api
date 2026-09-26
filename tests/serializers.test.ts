@@ -154,6 +154,18 @@ describe("reqSerializer", () => {
     const result: SerializedRequest = reqSerializer(req);
     expect(result.headers.Authorization).toBe("[REDACTED]");
   });
+
+  it("keeps the request id so a logged request stays correlatable", () => {
+    const req = {
+      id: "req-abc123",
+      method: "GET",
+      url: "/health",
+      headers: {},
+    };
+
+    const result: SerializedRequest = reqSerializer(req);
+    expect(result.id).toBe("req-abc123");
+  });
 });
 
 // ─── resSerializer ──────────────────────────────────────────────────────────
@@ -236,5 +248,36 @@ describe("resSerializer", () => {
 
     const result: SerializedResponse = resSerializer(res);
     expect(result.headers["Set-Cookie"]).toBe("[REDACTED]");
+  });
+
+  it("reads headers from a Fastify reply, which exposes them via getHeaders()", () => {
+    // Pino hands the serializer the reply itself, not a Node response: a reply
+    // has no `headers` property, so without this the set-cookie on the wire
+    // would never even be seen, let alone redacted.
+    const res = {
+      statusCode: 201,
+      getHeaders: () => ({
+        "set-cookie": ["session=abc123; HttpOnly"],
+        "content-type": "application/json; charset=utf-8",
+      }),
+    };
+
+    const result: SerializedResponse = resSerializer(res);
+    expect(result.statusCode).toBe(201);
+    expect(result.headers["set-cookie"]).toBe("[REDACTED]");
+    expect(result.headers["content-type"]).toBe("application/json; charset=utf-8");
+  });
+
+  it("survives a getHeaders() that throws", () => {
+    const res = {
+      statusCode: 500,
+      getHeaders: () => {
+        throw new Error("socket is gone");
+      },
+    };
+
+    const result: SerializedResponse = resSerializer(res);
+    expect(result.statusCode).toBe(500);
+    expect(result.headers).toEqual({});
   });
 });

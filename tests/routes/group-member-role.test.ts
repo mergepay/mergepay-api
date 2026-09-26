@@ -297,8 +297,10 @@ describe("DELETE /groups/:id/members/:memberId — atomicity", () => {
     const { data } = prisma.auditLog.create.mock.calls[0][0];
     expect(data.action).toBe("group.member_remove");
     expect(data.groupId).toBe(GROUP_ID);
+    expect(data.entityType).toBe("group_member");
+    expect(data.entityId).toBe(TARGET_ID);
     expect(data.metadata).toMatchObject({
-      removedUserId: TARGET_ID,
+      targetUserId: TARGET_ID,
       removedRole: "member",
     });
   });

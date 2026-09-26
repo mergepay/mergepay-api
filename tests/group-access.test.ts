@@ -119,6 +119,7 @@ beforeEach(() => {
       ? { id: args.where.id, name: "Trip", archived: false, treasuryEnabled: false }
       : null
   );
+  h.prisma.expense.findUnique.mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -135,6 +136,11 @@ async function guardApp() {
     scoped.addHook("preHandler", scoped.authenticate);
     scoped.post("/m/:id", { preHandler: requireGroupRole("member", { param: "id" }) }, handler);
     scoped.post("/a/:groupId", { preHandler: requireGroupRole("admin", { param: "groupId" }) }, handler);
+    scoped.get(
+      "/e/:id",
+      { preHandler: requireGroupRole("member", { param: "id", fromExpense: true }) },
+      handler
+    );
     scoped.get("/unguarded/:id", async (req) => ({ membership: groupMembership(req) }));
   });
   await app.ready();
@@ -266,6 +272,60 @@ describe("requireGroupRole — escalation and bypass attempts", () => {
     const { app } = await guardApp();
     const res = await app.inject({ method: "GET", url: `/unguarded/${GROUP_ID}`, headers: bearer(newUser("admin")) });
     expect(res.statusCode).toBe(500);
+  });
+});
+
+describe("requireGroupRole — fromExpense (routes addressed by an expense id)", () => {
+  const EXPENSE_ID = "expense_1";
+
+  it("resolves the group from the expense row and admits a member", async () => {
+    const { app } = await guardApp();
+    h.prisma.expense.findUnique.mockResolvedValue({ groupId: GROUP_ID });
+    const userId = newUser("member");
+    const res = await app.inject({ method: "GET", url: `/e/${EXPENSE_ID}`, headers: bearer(userId) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().membership).toEqual({ groupId: GROUP_ID, userId, role: "member" });
+    expect(h.prisma.expense.findUnique).toHaveBeenCalledWith({
+      where: { id: EXPENSE_ID },
+      select: { groupId: true },
+    });
+  });
+
+  it("rejects a non-member with 403 and never runs the handler", async () => {
+    const { app, handler } = await guardApp();
+    h.prisma.expense.findUnique.mockResolvedValue({ groupId: GROUP_ID });
+    const res = await app.inject({ method: "GET", url: `/e/${EXPENSE_ID}`, headers: bearer(newUser(null)) });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe("FORBIDDEN");
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for an unknown expense before any membership lookup", async () => {
+    const { app, handler } = await guardApp();
+    h.prisma.expense.findUnique.mockResolvedValue(null);
+    const res = await app.inject({ method: "GET", url: "/e/expense_missing", headers: bearer(newUser("admin")) });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe("NOT_FOUND");
+    expect(h.prisma.groupMember.findUnique).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed (oversized) expense id with 400 before any lookup", async () => {
+    const { app } = await guardApp();
+    const res = await app.inject({
+      method: "GET",
+      url: `/e/${"e".repeat(65)}`,
+      headers: bearer(newUser("member")),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(h.prisma.expense.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unauthenticated request with 401 before any lookup", async () => {
+    const { app } = await guardApp();
+    const res = await app.inject({ method: "GET", url: `/e/${EXPENSE_ID}` });
+    expect(res.statusCode).toBe(401);
+    expect(h.prisma.expense.findUnique).not.toHaveBeenCalled();
   });
 });
 
@@ -480,6 +540,94 @@ describe("group routes on the real app", () => {
     await a.inject({ method: "POST", url, headers: bearer(outsider), payload: {} });
     expect(h.prisma.groupMember.findUnique.mock.calls.length).toBe(lookupsAtLimit);
   });
+});
+
+// ---------------------------------------------------------------------------
+// 2b. Expense routes addressed by a single expense id on the real app
+// ---------------------------------------------------------------------------
+
+/** The three `/expenses/:id` routes guarded via `fromExpense`. */
+const EXPENSE_GUARD_ROUTES = ["GET", "PATCH", "DELETE"] as const;
+
+/** A complete expense row, so admitted requests serialize instead of crashing. */
+function expenseRow() {
+  return {
+    id: "expense_1",
+    groupId: GROUP_ID,
+    payerUserId: "user_payer",
+    payer: {
+      id: "user_payer",
+      stellarPublicKey: PUBLIC_KEY,
+      displayName: "Payer",
+      avatarUrl: null,
+      createdAt: new Date(),
+    },
+    title: "Dinner",
+    description: null,
+    amount: "50.00",
+    assetCode: "USDC",
+    assetIssuer: null,
+    splitType: "equal",
+    memo: null,
+    receiptUrl: null,
+    createdAt: new Date(),
+    shares: [],
+  };
+}
+
+describe("expense routes on the real app", () => {
+  beforeEach(() => {
+    h.prisma.expense.findUnique.mockResolvedValue(expenseRow());
+    h.prisma.expense.update.mockResolvedValue(expenseRow());
+    h.prisma.expense.delete.mockResolvedValue(expenseRow());
+  });
+
+  it.each(EXPENSE_GUARD_ROUTES)(
+    "%s /expenses/:id — non-member gets 403 before the handler",
+    async (method) => {
+      const res = await (await app()).inject({
+        method,
+        url: "/expenses/expense_1",
+        headers: bearer(newUser(null)),
+        payload: method === "GET" ? undefined : {},
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error.code).toBe("FORBIDDEN");
+      expect(writes()).toBe(0);
+    }
+  );
+
+  it.each(EXPENSE_GUARD_ROUTES)(
+    "%s /expenses/:id — unknown expense returns 404 without a membership lookup",
+    async (method) => {
+      h.prisma.expense.findUnique.mockResolvedValue(null);
+      const res = await (await app()).inject({
+        method,
+        url: "/expenses/expense_missing",
+        headers: bearer(newUser(null)),
+        payload: method === "GET" ? undefined : {},
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error.code).toBe("NOT_FOUND");
+      expect(h.prisma.groupMember.findUnique).not.toHaveBeenCalled();
+      expect(writes()).toBe(0);
+    }
+  );
+
+  it.each(EXPENSE_GUARD_ROUTES)(
+    "%s /expenses/:id — the required role passes the guard",
+    async (method) => {
+      // PATCH / DELETE also require payer-or-admin in the handler, so the
+      // admitted caller is an admin there; the guard itself needs member+.
+      const res = await (await app()).inject({
+        method,
+        url: "/expenses/expense_1",
+        headers: bearer(newUser(method === "GET" ? "member" : "admin")),
+        payload: method === "GET" ? undefined : {},
+      });
+      expect(res.statusCode).toBe(200);
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------

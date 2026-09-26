@@ -8,10 +8,18 @@
  * member — or lacks the role — gets 403 before any body is parsed, any
  * upstream (Horizon) call is made, or any business logic runs.
  *
+ * Routes addressed by a single *expense* id (`/expenses/:id`) carry
+ * `requireGroupRole(role, { param, fromExpense: true })`: the group is a
+ * property of the expense row, not of the URL, so the guard resolves that
+ * row first (selecting only its `groupId`) and then applies the same
+ * membership check.
+ *
  * Escalation-safety rules the guard enforces by construction:
  *
- *  - the group id comes only from the named *path* parameter — never from the
- *    query string or body, which the caller could point at a different group;
+ *  - the group id comes only from the named *path* parameter — or, on
+ *    `fromExpense` routes, from the row that parameter addresses — never from
+ *    the query string or body, which the caller could point at a different
+ *    group;
  *  - the role comes only from the database membership row (via
  *    `src/services/access.ts`) — never from the token or request data;
  *  - a membership row with any role other than `admin` never satisfies an
@@ -35,6 +43,8 @@ import type {
 } from "fastify";
 import fp from "fastify-plugin";
 import { z } from "zod";
+import { prisma } from "../db";
+import { Errors } from "../errors";
 import { requireUser } from "./auth";
 import {
   requireAdmin,
@@ -52,10 +62,10 @@ declare module "fastify" {
 /** Roles a group route can require. `admin` implies `member`. */
 export type GroupRole = "member" | "admin";
 
-/** Path parameters that carry a group id on the existing routes. */
+/** Path parameters the guard reads its resource id from. */
 export type GroupIdParam = "id" | "groupId";
 
-/** Group ids are cuids; 64 is the ceiling the routes already validate against. */
+/** Ids are cuids; 64 is the ceiling the routes already validate against. */
 const groupIdSchema = z.string().min(1).max(64);
 
 /** Marks a preHandler produced by `requireGroupRole`, so the plugin can order it. */
@@ -69,27 +79,47 @@ function isGroupGuard(fn: unknown): boolean {
 
 /**
  * Build a `preHandler` that verifies the authenticated caller holds `role` in
- * the group named by the `param` path parameter.
+ * the group named by the `param` path parameter — or, with `fromExpense`, the
+ * group owning the *expense* named by that parameter.
  *
  * - no authenticated user → 401 (defensive; `app.authenticate` runs first)
- * - missing / malformed group id → 400 VALIDATION_ERROR
+ * - missing / malformed id → 400 VALIDATION_ERROR
  * - group does not exist → 404 NOT_FOUND
+ * - expense does not exist (`fromExpense` routes) → 404 NOT_FOUND, before
+ *   any membership lookup
  * - caller not a member, or member without the required role → 403 FORBIDDEN
  */
 export function requireGroupRole(
   role: GroupRole,
-  opts: { param: GroupIdParam }
+  opts: { param: GroupIdParam; fromExpense?: boolean }
 ): preHandlerAsyncHookHandler {
   const paramsSchema = z.object({ [opts.param]: groupIdSchema });
   const check = role === "admin" ? requireAdmin : requireMembership;
 
   const guard: MarkedGuard = async function groupRoleGuard(req: FastifyRequest) {
     const auth = requireUser(req);
-    const groupId = paramsSchema.parse(req.params ?? {})[opts.param] as string;
+    const id = paramsSchema.parse(req.params ?? {})[opts.param] as string;
+    const groupId = opts.fromExpense ? await expenseGroupId(id) : id;
     req.groupMembership = await check(groupId, auth.id);
   };
   guard[GROUP_GUARD] = true;
   return guard;
+}
+
+/**
+ * The group owning an expense — how `fromExpense` routes find theirs.
+ *
+ * Selects only `groupId` (the guard has no business loading payer, shares,
+ * or amounts) and throws the same 404 the route handlers use for an unknown
+ * expense, so callers cannot tell where the lookup happened.
+ */
+async function expenseGroupId(expenseId: string): Promise<string> {
+  const expense = await prisma.expense.findUnique({
+    where: { id: expenseId },
+    select: { groupId: true },
+  });
+  if (!expense) throw Errors.notFound("Expense not found");
+  return expense.groupId;
 }
 
 /**

@@ -563,18 +563,17 @@ describe("group routes", () => {
       expect(prisma.groupMember.delete).toHaveBeenCalledWith({
         where: { groupId_userId: { groupId: "group_1", userId: targetUser.id } },
       });
-      // The record now carries the group it belongs to — it was written with
-      // groupId: null before, so group-scoped audit queries never saw member
-      // removals — along with the role the removed member held.
+      // Group-scoped queries can find the event, and its target identifies the
+      // affected member rather than only the containing group.
       expect(prisma.auditLog.create).toHaveBeenCalledWith({
         data: {
           userId: admin.id,
           groupId: "group_1",
           action: "group.member_remove",
-          entityType: "group",
-          entityId: "group_1",
+          entityType: "group_member",
+          entityId: targetUser.id,
           metadata: {
-            removedUserId: targetUser.id,
+            targetUserId: targetUser.id,
             removedRole: "member",
             outcome: "success",
           },
@@ -727,7 +726,16 @@ describe("expense routes", () => {
         { id: "share_2", expenseId, userId: "user_2", shareAmount: "50.00", status: "pending" },
       ],
     };
+    // The expense row and the admin membership are each read twice: once by
+    // the route's preHandler guard resolving the expense's group, once again
+    // by the handler's own in-transaction check and delete.
     prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
       userId: user.id,

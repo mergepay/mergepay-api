@@ -32,7 +32,7 @@ import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { formatErrorResponse } from "./utils/error-response";
-import { rateLimitPolicies } from "./lib/rate-limit";
+import { isGlobalRateLimitExempt, rateLimitPolicies } from "./lib/rate-limit";
 import { AppError, ErrorCode } from "./lib/errors";
 import { stellarErrorSerializer } from "./lib/stellar-serializer";
 import { reqSerializer, resSerializer } from "./lib/serializers";

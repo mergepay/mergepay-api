@@ -75,6 +75,14 @@ describe("formatAssetIdentifier", () => {
       expect(() => formatAssetIdentifier("USDC")).toThrow(/requires a valid issuer/i);
     });
 
+    it("rejects invalid issuer public keys when formatting or parsing issued assets", () => {
+      expect(() => formatAssetIdentifier({ code: "USDC", issuer: "GINVALID" })).toThrow(
+        /invalid issuer public key/i
+      );
+      expect(() => formatAssetIdentifier("USDC:GINVALID")).toThrow(/invalid issuer public key/i);
+      expect(() => parseAssetIdentifier("USDC:GINVALID")).toThrow(/invalid issuer public key/i);
+    });
+
     it("throws on malformed colon string identifier", () => {
       expect(() => formatAssetIdentifier("USDC:")).toThrow(/invalid asset identifier/i);
       expect(() => formatAssetIdentifier(":GBBD47")).toThrow(/invalid asset identifier/i);

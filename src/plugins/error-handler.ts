@@ -40,6 +40,30 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
   app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
     const requestId = req.id as string;
 
+    // A route may throw something that is not an Error at all — `throw null`,
+    // or a promise rejected with no reason (`Promise.reject()`), which Fastify
+    // hands over as `undefined`. Every branch below reads `.code`,
+    // `.statusCode`, or `.status` off the thrown value, and on nullish that read
+    // throws a TypeError from inside this handler. Fastify then abandons the
+    // pipeline and answers with its own default body:
+    //
+    //   {"statusCode":500,"error":"Internal Server Error",
+    //    "message":"Cannot read properties of null (reading 'code')"}
+    //
+    // which is the one response in the API that does not use the standard
+    // envelope, carries no requestId to correlate on, and echoes an internal
+    // implementation detail back to the caller. Answering here instead keeps a
+    // nullish throw on the same contract as any other unexpected fault: a
+    // logged 500 carrying the fixed, client-safe message. Primitives and plain
+    // objects need no special case — property access on those is already safe,
+    // and they fall through to the generic branch below unchanged.
+    if (err === null || err === undefined) {
+      req.log.error({ requestId }, "Unhandled error");
+      return reply.code(500).send(
+        formatErrorResponse("INTERNAL_ERROR", "Something went wrong.", requestId)
+      );
+    }
+
     if (err instanceof ZodError) {
       const details = err.errors.map((e) => ({
         field: e.path.join("."),

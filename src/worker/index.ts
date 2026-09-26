@@ -706,8 +706,9 @@ export async function recoverStaleSettlements(): Promise<number> {
     where: {
       // pending_confirmation is included: its reconciliation runs under the
       // same lease regime, so a crash mid-check must free the row the same way
-      // a crash mid-submission does.
-      status: { in: [...SUBMITTABLE_STATUSES, "pending_confirmation"] },
+      // a crash mid-submission does. needs_review rows carry a hash under
+      // reconciliation's watch too, so they recover the same way.
+      status: { in: [...SUBMITTABLE_STATUSES, "pending_confirmation", "needs_review"] },
       leaseExpiresAt: { lt: now },
     },
     data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
@@ -727,13 +728,21 @@ export async function recoverStaleSettlements(): Promise<number> {
 // ---------------------------------------------------------------------------
 
 /** The settlement statuses the reconciliation job owes a Horizon check. */
-const RECONCILABLE_STATUSES = ["pending_confirmation"] as const;
+// pending_confirmation: the hash's confirmation is still being verified under
+//   the bounded retry budget in reconcileSingleSettlement.
+// needs_review: a submission whose on-chain outcome could not be observed
+//   (Horizon had no record yet, or stopped answering — see confirmSubmission).
+//   The hash is recorded, so the same read-only Horizon check applies: found
+//   and successful → confirmed, found and failed → failed, still silent →
+//   demoted to pending_confirmation where the retry budget governs.
+const RECONCILABLE_STATUSES = ["pending_confirmation", "needs_review"] as const;
 
 /**
- * Take exclusive ownership of a pending-confirmation reconciliation.
+ * Take exclusive ownership of a pending-confirmation or needs-review
+ * reconciliation.
  *
  * Same conditional-update lease as settlement submission: the row must still
- * be in `pending_confirmation`, still be on the attempt this worker read, and
+ * be in a reconcilable status, still be on the attempt this worker read, and
  * must not carry a live lease. Two workers racing on one row produce exactly
  * one update with `count === 1`.
  */
@@ -764,9 +773,9 @@ async function claimPendingConfirmation(job: {
 }
 
 /**
- * One cycle of pending_confirmation reconciliation: pick up every settled-in
- * question row, claim it, ask Horizon which of the three outcomes it reached,
- * and let the state machine persist it.
+ * One cycle of pending_confirmation / needs_review reconciliation: pick up
+ * every row that owes an on-chain answer, claim it, ask Horizon which of the
+ * three outcomes it reached, and let the state machine persist it.
  *
  * A Horizon lookup that comes back empty is deliberately *not* a resolution:
  * the transaction was submitted but is not on the ledger yet, so the row keeps
@@ -806,6 +815,11 @@ export async function reconcilePendingSettlements(): Promise<void> {
   for (const row of rows) {
     if (isShuttingDown) break;
 
+    // Hashless rows have nothing to check against Horizon. The candidate query
+    // already filters on a recorded hash; this guard keeps the loop safe even
+    // if that filter and this loop ever drift apart.
+    if (!row.stellarTxHash) continue;
+
     if (!(await claimPendingConfirmation(row))) continue;
 
     const ctx = jobContext("reconciliation", row.id);
@@ -823,6 +837,7 @@ export async function reconcilePendingSettlements(): Promise<void> {
           assetCode: row.assetCode,
           assetIssuer: row.assetIssuer,
           destinationPublicKey: row.to.stellarPublicKey,
+          status: row.status,
         },
         RECONCILIATION_MAX_RETRIES,
         ctx
@@ -1376,6 +1391,11 @@ export async function startWorker(): Promise<() => Promise<void>> {
           { jobType: "worker_cycle", outcome: "shutdown_drain_timeout" },
           "in-flight job outran the drain budget, leaving leases to expire"
         );
+        // Leases stay claimed, but the process is on its way out regardless:
+        // the connection pool must still be released so a restart never
+        // inherits dangling database connections.
+        await prisma.$disconnect();
+        log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
         return;
       }
 
@@ -1392,6 +1412,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
         }),
       ]);
       await prisma.$disconnect();
+      log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
 
       log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "worker claims released");
     } catch (error) {

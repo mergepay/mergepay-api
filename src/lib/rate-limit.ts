@@ -26,6 +26,17 @@
 import { config } from "../config";
 import { ipKey, userOrIpKey } from "../services/rate-limit-keys";
 
+/** Keep operational health checks and public API documentation available. */
+export function isGlobalRateLimitExempt(request: { url: string }): boolean {
+  const path = request.url.split("?", 1)[0];
+  return (
+    path === "/health" ||
+    path.startsWith("/health/") ||
+    path === "/docs" ||
+    path.startsWith("/docs/")
+  );
+}
+
 export type RateLimitPolicyName =
   | "global"
   | "authChallenge"

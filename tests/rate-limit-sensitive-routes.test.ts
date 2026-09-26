@@ -97,7 +97,14 @@ vi.mock("@stellar/stellar-sdk", async (importActual) => {
 import { buildApp } from "../src/app";
 import { signToken } from "../src/plugins/auth";
 import { rateLimitPolicies } from "../src/lib/rate-limit";
-import { Keypair } from "@stellar/stellar-sdk";
+import {
+  Account,
+  BASE_FEE,
+  Keypair,
+  Operation,
+  TransactionBuilder,
+} from "@stellar/stellar-sdk";
+import { config } from "../src/config";
 
 type App = Awaited<ReturnType<typeof buildApp>>;
 
@@ -116,6 +123,19 @@ function authHeader() {
     stellarPublicKey: Keypair.random().publicKey(),
   });
   return { authorization: `Bearer ${token}` };
+}
+
+function signedXdr(): string {
+  const signer = Keypair.random();
+  const transaction = new TransactionBuilder(new Account(signer.publicKey(), "0"), {
+    fee: BASE_FEE,
+    networkPassphrase: config.networkPassphrase,
+  })
+    .addOperation(Operation.manageData({ name: "rate-limit-test", value: "signed" }))
+    .setTimeout(60)
+    .build();
+  transaction.sign(signer);
+  return transaction.toXDR();
 }
 
 /** Drive one route until 429, then assert the production 429 contract. */
@@ -220,7 +240,7 @@ describe("rate limiting on the real app wiring (#538)", () => {
       url: "/treasury-transactions/tx_x/confirm",
       max,
       headers: authHeader(),
-      payload: { signedXdr: "x" },
+      payload: { signedXdr: signedXdr() },
       label: "treasury-transactions/:id/confirm",
     });
   });

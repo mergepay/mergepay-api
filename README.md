@@ -111,6 +111,35 @@ npm run dev                   # API on :4000
 npm run worker                # background reconciliation worker (separate shell)
 ```
 
+### Local database setup
+
+For local development, use PostgreSQL 14+ and Node.js 20+. Start PostgreSQL,
+then create the `mergepay` database once:
+
+```bash
+createdb mergepay
+```
+
+Copy `.env.example` to `.env` if you have not already, and set `DATABASE_URL`
+to a connection string for that database, for example:
+
+```env
+DATABASE_URL=postgresql://postgres:your-password@localhost:5432/mergepay
+```
+
+Generate the Prisma client and apply the migrations to initialize the schema:
+
+```bash
+npm run prisma:generate
+npm run prisma:migrate
+```
+
+To add the local development seed data, run:
+
+```bash
+npm run db:seed
+```
+
 New to the codebase? The typing standards enforced across `src/` are documented in [TypeScript strict mode](#typescript-strict-mode).
 
 ## Environment variables

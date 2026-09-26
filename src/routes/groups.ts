@@ -106,11 +106,11 @@ export default async function groupRoutes(app: FastifyInstance) {
         tags: ["Groups"],
         summary: "Create a group",
         description:
-          "Creates a group owned by the caller, who is added to it as its first admin.",
+          "Creates a group owned by the caller, who is added to it as its first admin. 409 if a unique constraint rejects the write (e.g. a duplicate first membership).",
         body: openApiBody(createGroupSchema),
         response: {
           ...openApiEnvelope("group"),
-          ...openApiErrorResponses(400, 401),
+          ...openApiErrorResponses(400, 401, 409),
         },
       },
     },

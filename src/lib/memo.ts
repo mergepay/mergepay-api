@@ -134,6 +134,24 @@ export function parseMemo(raw: string): MemoParseResult {
   return { ok: true, code, memo: raw };
 }
 
+/**
+ * Validate an expense memo strictly as a Stellar `MEMO_TEXT` value of the form
+ * `MP:<code>`. This intentionally mirrors the canonical parser and fails fast
+ * on missing prefixes, malformed code characters, or oversized memos.
+ */
+export function validateExpenseMemo(memo: string): boolean {
+  return typeof memo === "string" && parseMemo(memo).ok;
+}
+
+/**
+ * Parse an expense memo and return the extracted code or `null` when the memo
+ * does not match the strict `MP:<code>` contract.
+ */
+export function parseExpenseCode(memo: string): string | null {
+  const parsed = parseMemo(memo);
+  return parsed.ok ? parsed.code : null;
+}
+
 // ---------------------------------------------------------------------------
 // On-chain payment memo validation
 // ---------------------------------------------------------------------------

@@ -1045,6 +1045,7 @@ describe("reconcilePendingSettlements", () => {
       failed: 1,
       stillPending: 0,
     });
+  });
   it("keeps the batch alive when Horizon blows up for one row", async () => {
     // A bad Horizon response (or any throw) for one row is logged and skipped;
     // the rest of the batch is still reconciled and the cycle completes, so

@@ -710,11 +710,6 @@ export async function recoverStaleSettlements(): Promise<number> {
       status: {
         in: [...SUBMITTABLE_STATUSES, "pending_confirmation", "needs_review"],
       },
-      // pending_confirmation is included: its reconciliation runs under the
-      // same lease regime, so a crash mid-check must free the row the same way
-      // a crash mid-submission does. needs_review rows carry a hash under
-      // reconciliation's watch too, so they recover the same way.
-      status: { in: [...SUBMITTABLE_STATUSES, "pending_confirmation", "needs_review"] },
       leaseExpiresAt: { lt: now },
     },
     data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },

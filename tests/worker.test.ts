@@ -823,6 +823,7 @@ describe("reconcilePendingSettlements", () => {
     return {
       id: "pc_1",
       shortCode: "PC0001",
+      expenseId: "exp_1",
       groupId: "group_1",
       fromUserId: "user_1",
       toUserId: "user_2",
@@ -868,7 +869,7 @@ describe("reconcilePendingSettlements", () => {
       })
     );
     expect(h.reconcileSingleSettlement).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "pc_a", stellarTxHash: "hash_a" }),
+      expect.objectContaining({ id: "pc_a", stellarTxHash: "hash_a", expenseId: "exp_1" }),
       RECONCILIATION_MAX_RETRIES,
       expect.objectContaining({ jobId: "pc_a" })
     );

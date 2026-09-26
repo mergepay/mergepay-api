@@ -1,9 +1,12 @@
 /**
- * Expense listing: query construction, filtering, and pagination.
+ * Expense creation and listing: persistence, query construction, filtering,
+ * and pagination.
  *
  * The route stays thin — it authorizes, parses, and serializes. Everything
  * about *which* rows a page contains lives here so the filter semantics have
- * one home and can be tested without an HTTP server.
+ * one home and can be tested without an HTTP server. The multi-table write
+ * behind expense creation lives here too, so its transaction boundary has a
+ * single home.
  *
  * Pagination follows `src/lib/pagination.ts` unchanged: a `(createdAt, id)`
  * cursor, `limit + 1` rows to detect a further page, and the shared `meta`
@@ -23,6 +26,7 @@ import {
   takeForPage,
   type PageMeta,
 } from "../lib/pagination";
+import { auditTx } from "./audit";
 
 /**
  * Settlement state of an expense, as clients express it.
@@ -200,4 +204,94 @@ export async function listGroupExpenses<T extends { createdAt: Date; id: string 
     where: filters.length === 1 ? { groupId } : { AND: filters },
   });
   return { items, meta: { ...meta, total } };
+}
+
+// -- creation ---------------------------------------------------------------
+
+/** One participant's computed, validated share, ready to be persisted. */
+export interface ExpenseShareDraft {
+  userId: string;
+  shareAmount: string;
+}
+
+/**
+ * Everything the persistence step needs. The caller has already validated
+ * membership, the payer, the split arithmetic, and the asset — this payload
+ * describes rows to write, not a request to interpret.
+ */
+export interface CreateGroupExpenseParams {
+  groupId: string;
+  /** Whose expense it is; their own share is persisted as settled. */
+  payerUserId: string;
+  /** The authenticated caller, recorded as the audit actor. */
+  actorUserId: string;
+  title: string;
+  description?: string | null;
+  amount: string;
+  assetCode: string;
+  assetIssuer?: string | null;
+  splitType: string;
+  memo: string;
+  receiptUrl?: string | null;
+  shares: ExpenseShareDraft[];
+}
+
+/**
+ * Persist a group expense, its participant splits, and its `expense.create`
+ * audit entry in ONE Prisma transaction.
+ *
+ * The three writes span three tables and must land together. Without a shared
+ * transaction, a split that fails after the expense row is inserted leaves an
+ * expense with no shares — invisible to settlement but visible in the history
+ * — and a successful audit write can describe a row that was never committed.
+ * Inside `prisma.$transaction`, any throw (a constraint violation on a split,
+ * a failing audit write, an abrupt connection drop) rolls back every write in
+ * the unit, so the database either holds all three records or none of them.
+ *
+ * Validation and authorization stay with the caller; this function only
+ * persists what has already been proven valid.
+ */
+export async function createGroupExpense<
+  T extends { createdAt: Date; id: string }
+>(params: CreateGroupExpenseParams, include: Prisma.ExpenseInclude): Promise<T> {
+  const created = await prisma.$transaction(async (tx) => {
+    const expense = await tx.expense.create({
+      data: {
+        groupId: params.groupId,
+        payerUserId: params.payerUserId,
+        title: params.title,
+        description: params.description ?? null,
+        amount: params.amount,
+        assetCode: params.assetCode,
+        assetIssuer: params.assetIssuer ?? null,
+        splitType: params.splitType,
+        memo: params.memo,
+        receiptUrl: params.receiptUrl ?? null,
+        shares: {
+          create: params.shares.map((share) => ({
+            userId: share.userId,
+            shareAmount: share.shareAmount,
+            // The payer's own share is settled the moment the expense exists.
+            status: share.userId === params.payerUserId ? "settled" : "pending",
+          })),
+        },
+      },
+      include,
+    });
+
+    // Same transaction: the audit entry exists if and only if the expense it
+    // documents was committed. `auditTx` deliberately does not swallow errors.
+    await auditTx(tx, {
+      userId: params.actorUserId,
+      groupId: params.groupId,
+      action: "expense.create",
+      entityType: "expense",
+      entityId: expense.id,
+      metadata: { amount: params.amount, assetCode: params.assetCode },
+    });
+
+    return expense;
+  });
+
+  return created as unknown as T;
 }

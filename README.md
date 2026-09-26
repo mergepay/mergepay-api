@@ -203,7 +203,7 @@ wallet integration that legitimately retries submissions can raise
 budgets. Windows are milliseconds and capped at one hour; maximums must be
 positive integers, so a typo cannot silently disable limiting. The single
 source of truth for which route gets which policy is the table in
-[src/lib/rate-limit.ts](src/lib/rate-limit.ts); routes name a policy rather
+[src/config/ratelimit.ts](src/config/ratelimit.ts); routes name a policy rather
 than repeating numbers, and each policy has its own key prefix, which is what
 makes the buckets independent.
 

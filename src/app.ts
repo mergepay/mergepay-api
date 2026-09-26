@@ -8,6 +8,7 @@ import path from "node:path";
 import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
+import groupAccessPlugin from "./plugins/group-access";
 import errorHandlerPlugin from "./plugins/error-handler";
 import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
@@ -32,7 +33,7 @@ import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { formatErrorResponse } from "./utils/error-response";
-import { rateLimitPolicies } from "./lib/rate-limit";
+import { isGlobalRateLimitExempt, rateLimitPolicies } from "./lib/rate-limit";
 import { AppError, ErrorCode } from "./lib/errors";
 import { buildLoggerOptions, nullLogDestination } from "./lib/logger";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
@@ -245,6 +246,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     max: config.RATE_LIMIT_GLOBAL_MAX,
     timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: globalRateLimitKey,
+    allowList: isGlobalRateLimitExempt,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: () =>
       // Must be a real Error (AppError), not a bare payload object:
@@ -325,6 +327,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   await app.register(loggingPlugin);
   await app.register(authPlugin);
+  // Must come after the rate-limit registration above: its onRoute hook
+  // moves each group guard behind the limiter in the route's preHandler chain.
+  await app.register(groupAccessPlugin);
   await app.register(errorHandlerPlugin);
   // Registered with fastify-plugin, so `app.idempotent` is visible to every
   // route plugin below rather than only inside this scope.

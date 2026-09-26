@@ -26,6 +26,17 @@
 import { config } from "../config";
 import { ipKey, userOrIpKey } from "../services/rate-limit-keys";
 
+/** Keep operational health checks and public API documentation available. */
+export function isGlobalRateLimitExempt(request: { url: string }): boolean {
+  const path = request.url.split("?", 1)[0];
+  return (
+    path === "/health" ||
+    path.startsWith("/health/") ||
+    path === "/docs" ||
+    path.startsWith("/docs/")
+  );
+}
+
 export type RateLimitPolicyName =
   | "global"
   | "authChallenge"
@@ -179,6 +190,12 @@ export function rateLimited(name: Exclude<RateLimitPolicyName, "global">) {
         timeWindow: policy.timeWindow,
         hook: policy.hook,
         keyGenerator: policyKeyGenerator(policy),
+        onExceeded: (req: any, key: string) => {
+          req.log?.warn?.(
+            { key, policy: name, ip: req.ip, route: req.url },
+            `Rate limit exceeded for policy ${name}`
+          );
+        },
       },
     },
   };

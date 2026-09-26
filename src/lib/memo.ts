@@ -133,3 +133,128 @@ export function parseMemo(raw: string): MemoParseResult {
 
   return { ok: true, code, memo: raw };
 }
+
+// ---------------------------------------------------------------------------
+// On-chain payment memo validation
+// ---------------------------------------------------------------------------
+
+/** Byte length of a Stellar MEMO_HASH / MEMO_RETURN payload. */
+export const MEMO_HASH_BYTES = 32 as const;
+
+/** Why an on-chain payment memo cannot be attributed to the expected reference. */
+export type PaymentMemoFailureReason =
+  /** No memo at all (`memo_type` absent or "none", or an empty text memo). */
+  | "missing_memo"
+  /** A memo type Mergepay never issues (`id`, `return`, or unknown). */
+  | "unsupported_memo_type"
+  /** A `hash` memo whose payload is not 32 bytes of canonical base64. */
+  | "invalid_hash_memo"
+  /** A well-formed `hash` memo — it cannot carry an `MP:` reference. */
+  | "hash_memo_mismatch"
+  /** A text memo that is not a well-formed `MP:<code>` reference. */
+  | "malformed_memo"
+  /** A well-formed `MP:<code>` memo that names a different code. */
+  | "code_mismatch";
+
+export type PaymentMemoValidation =
+  | { ok: true; code: string; memo: string }
+  | { ok: false; reason: PaymentMemoFailureReason; message: string };
+
+/**
+ * The memo fields of a transaction as Horizon reports them. For `text` memos
+ * `memo` is the decoded string; for `hash` / `return` memos it is the 32-byte
+ * payload in base64; for `id` memos it is the decimal id.
+ */
+export interface OnChainMemo {
+  memoType?: string | null;
+  memo?: string | null;
+}
+
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+function isValidHashMemo(value: string): boolean {
+  if (!BASE64_RE.test(value)) return false;
+  const bytes = Buffer.from(value, "base64");
+  // Round-trip check rejects non-canonical padding bits.
+  return bytes.length === MEMO_HASH_BYTES && bytes.toString("base64") === value;
+}
+
+/**
+ * Decide whether an incoming payment's on-chain memo is the Mergepay
+ * reference `MP:<expectedCode>`, and if not, exactly why.
+ *
+ * Mergepay only ever issues `MEMO_TEXT` memos, so attribution is strict:
+ *
+ *  - the memo must be of type `text` — hash, id, and return memos are never
+ *    attributed, even when a hash payload happens to contain `MP:` bytes;
+ *  - the text must parse as `MP:<code>` via {@link parseMemo}, with no case
+ *    folding, trimming, or other normalisation (normalising would let a
+ *    near-miss memo be credited to someone else's settlement);
+ *  - the parsed code must equal `expectedCode` exactly.
+ *
+ * Failure messages never echo the on-chain memo: it is attacker-controlled
+ * input and the message is persisted as a settlement failure reason.
+ *
+ * Pure and synchronous — no Horizon or database I/O.
+ *
+ * @param onChain - The transaction's `memo_type` / `memo` as read from Horizon.
+ * @param expectedCode - The settlement short code the payment must reference.
+ */
+export function validatePaymentMemo(
+  onChain: OnChainMemo,
+  expectedCode: string
+): PaymentMemoValidation {
+  const memoType = onChain.memoType ?? "none";
+  const memo = onChain.memo ?? "";
+
+  if (memoType === "none") {
+    return { ok: false, reason: "missing_memo", message: "Transaction has no memo" };
+  }
+
+  if (memoType === "hash") {
+    const prefix = `Unexpected memo type: expected "text", got "hash"`;
+    if (!isValidHashMemo(memo)) {
+      return {
+        ok: false,
+        reason: "invalid_hash_memo",
+        message: `${prefix}; the hash memo is malformed (expected ${MEMO_HASH_BYTES} bytes, base64-encoded)`,
+      };
+    }
+    return {
+      ok: false,
+      reason: "hash_memo_mismatch",
+      message: `${prefix}; a hash memo cannot carry the MP: settlement reference`,
+    };
+  }
+
+  if (memoType !== "text") {
+    return {
+      ok: false,
+      reason: "unsupported_memo_type",
+      message: `Unexpected memo type: expected "text", got "${memoType.slice(0, 16)}"`,
+    };
+  }
+
+  if (memo.length === 0) {
+    return { ok: false, reason: "missing_memo", message: "Transaction has no memo" };
+  }
+
+  const parsed = parseMemo(memo);
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      reason: "malformed_memo",
+      message: `Transaction memo is not a valid Mergepay reference: ${parsed.message}`,
+    };
+  }
+
+  if (parsed.code !== expectedCode) {
+    return {
+      ok: false,
+      reason: "code_mismatch",
+      message: "Transaction memo does not match the expected settlement reference",
+    };
+  }
+
+  return { ok: true, code: parsed.code, memo: parsed.memo };
+}

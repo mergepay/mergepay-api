@@ -1,7 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
-import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { Errors } from "../errors";
 import { buildChallenge, verifyChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
@@ -15,7 +14,11 @@ import {
   unauthorizedForRefresh,
 } from "../services/refresh-token";
 import { rateLimited } from "../lib/rate-limit";
-import { sep10VerifyRequestSchema } from "../validations/sep10";
+import {
+  sep10ChallengeRequestSchema,
+  sep10QuerySchema,
+  sep10VerifyRequestSchema,
+} from "../validations/sep10";
 import { openApiBody, openApiEnvelope } from "../lib/openapi";
 
 function shortName(pk: string): string {
@@ -43,7 +46,7 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Request SEP-10 challenge",
         description:
           "Builds an unsigned SEP-10 challenge transaction for the specified account, to be signed by the client wallet.",
-        body: openApiBody(z.object({ account: stellarAccountIdSchema })),
+        body: openApiBody(sep10ChallengeRequestSchema),
         response: {
           200: {
             type: "object",
@@ -57,7 +60,8 @@ export default async function authRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-      const body = z.object({ account: stellarAccountIdSchema }).parse(req.body);
+      sep10QuerySchema.parse(req.query);
+      const body = sep10ChallengeRequestSchema.parse(req.body);
       return buildChallenge(body.account);
     }
   );
@@ -87,6 +91,7 @@ export default async function authRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
+      sep10QuerySchema.parse(req.query);
       const body = sep10VerifyRequestSchema.parse(req.body);
       const publicKey = await verifyChallenge(body.transaction);
 

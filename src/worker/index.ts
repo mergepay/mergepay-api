@@ -79,6 +79,7 @@ import {
 import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
 import { cleanupChallenges } from "./tasks/cleanup-challenges";
+import { syncPendingTransactionStatuses } from "./tasks/tx-status-sync";
 import { acquireWorkerLease, releaseWorkerLease } from "../services/worker-lock";
 import {
   type CorrelationContext,
@@ -1325,6 +1326,10 @@ export async function runWorkerCycle(): Promise<void> {
     processSubmittedSettlements(),
     reconcileAnchors(),
     reconcilePendingSettlements(),
+    // Read-only status sync over pending transactions neither sibling claims:
+    // settlements whose confirmation poll was interrupted, and treasury
+    // intents someone may have submitted from their own wallet (issue #355).
+    syncPendingTransactionStatuses(),
     reconcileAllTreasuryBalances(),
     expireInvites(),
     deliverPendingWebhooks(),

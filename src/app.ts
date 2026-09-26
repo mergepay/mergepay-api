@@ -145,8 +145,17 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
 
   app.addHook("onError", async (request, _reply, error) => {
-    const statusCode = (error as any).statusCode ?? (error as any).status ?? 500;
-    const errorCode = (error as any).code ?? "INTERNAL_ERROR";
+    // A handler is not obliged to throw an `Error`: `throw null` and a promise
+    // rejected with no reason (`Promise.reject()`) both surface here as
+    // nullish. Reading `.statusCode` off nullish throws a TypeError *inside this
+    // hook*, which aborts the error pipeline before the central handler can
+    // answer — leaving Fastify's built-in handler to emit a payload that has
+    // neither the standard envelope nor a requestId. Reading through a
+    // nullish-safe view keeps the pipeline alive so the handler can answer on
+    // the normal contract.
+    const thrown = (error ?? {}) as unknown as Record<string, unknown>;
+    const statusCode = (thrown.statusCode as number) ?? (thrown.status as number) ?? 500;
+    const errorCode = (thrown.code as string) ?? "INTERNAL_ERROR";
     const correlationId = getCorrelationId(request.id);
 
     const logData: Record<string, unknown> = {

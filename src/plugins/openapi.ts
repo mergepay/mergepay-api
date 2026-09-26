@@ -46,6 +46,11 @@ export default fp(async function openAPIPlugin(app: FastifyInstance) {
             "SEP-24 interactive deposit, withdrawal, anchor sessions, and callback endpoints",
         },
         {
+          name: "Groups",
+          description:
+            "Group creation, membership, invitations, roles, and archival",
+        },
+        {
           name: "Expenses",
           description: "Group expense creation, splits, receipt uploads, and management",
         },

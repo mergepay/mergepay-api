@@ -311,6 +311,8 @@ describe("Treasury signatures audit records", () => {
       expect(call[0].data.groupId).toBe("group_1");
       expect(call[0].data.userId).toBe(admin.id);
       expect(call[0].data.entityType).toBe("treasury_tx_proposal");
+      // The audit record must bind the entry to the exact transaction intent.
+      expect(call[0].data.metadata?.txHash).toBe("abc123");
     }
   });
 });
@@ -387,6 +389,8 @@ describe("Treasury proposals audit records", () => {
         call[0].data.groupId === "group_1" ||
         call[0].data.metadata?.groupId === "group_1";
       expect(hasGroupId).toBe(true);
+      // The audit record must bind the entry to the exact transaction intent.
+      expect(call[0].data.metadata?.txHash).toBe("hash123");
     }
   });
 });

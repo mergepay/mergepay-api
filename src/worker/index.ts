@@ -975,11 +975,14 @@ async function reconcileSingleAnchor(
     // no retry can change (rejected a request, returned garbage), so move the
     // session to error rather than burning the retry budget on it.
     if (result.errorCategory === "permanent") {
+      // The status_history row is written inside the transition's own
+      // transaction, only if the transition actually lands.
       await applyAnchorSessionTransition({
         sessionId: job.id,
         nextStatus: "error",
         source: "poll",
         expectedCurrentStatus: job.status,
+        reason,
         extraData: {
           lastPolledAt: now,
           failureReason: reason,
@@ -988,13 +991,6 @@ async function reconcileSingleAnchor(
           retryCount: 0,
         } as never,
       });
-      await recordStatusTransition({
-        entityType: "anchor_session",
-        entityId: job.id,
-        newStatus: "error",
-        reason,
-        source: "worker",
-      }).catch(() => undefined);
       jobLog.error(
         {
           jobType: "anchor",
@@ -1038,10 +1034,10 @@ async function reconcileSingleAnchor(
   }
 
   // ── unknown anchor status ────────────────────────────────────────────────
-  // A recognised-but-unknown raw status maps to pending_anchor and stays
-  // retryable. Emit an explicit, operationally useful entry so operators can
-  // spot a future anchor that introduced a status we cannot classify — but
-  // never treat it as a failure or overwrite a terminal state.
+  // A status outside the SEP-24 set is not a failure, but it is not a state
+  // Mergepay can interpret either, so it is never persisted: the session
+  // keeps its last known status and stays eligible for the next poll. The
+  // warning lets operators spot an anchor that introduced a new status.
   if (result.recognized === false) {
     jobLog.warn(
       {
@@ -1049,11 +1045,22 @@ async function reconcileSingleAnchor(
         jobId: job.id,
         attempt,
         outcome: "retry_scheduled",
-        category: result.category ?? "unknown",
-        status: result.status,
+        localStatus: job.status,
+        rawStatus: result.rawStatus,
       },
-      `anchor reported an unrecognized SEP-24 status '${result.rawStatus}' — kept pending and will keep polling`
+      "anchor reported an unrecognized SEP-24 status — kept the current state and will keep polling"
     );
+    await prisma.anchorSession.update({
+      where: { id: job.id },
+      data: {
+        lastPolledAt: now,
+        failureReason: null,
+        errorCategory: null,
+        nextAttemptAt: null,
+        retryCount: 0,
+      },
+    });
+    return;
   }
 
   // ── status unchanged ─────────────────────────────────────────────────────
@@ -1101,6 +1108,8 @@ async function reconcileSingleAnchor(
     nextStatus: result.status,
     source: "poll",
     expectedCurrentStatus: job.status,
+    rawStatus: result.rawStatus ?? undefined,
+    reason: result.status === "error" ? result.message : undefined,
     extraData: {
       lastPolledAt: now,
       failureReason: result.status === "error" ? result.message ?? null : null,
@@ -1127,14 +1136,6 @@ async function reconcileSingleAnchor(
     );
     return;
   }
-
-  await recordStatusTransition({
-    entityType: "anchor_session",
-    entityId: job.id,
-    newStatus: result.status,
-    reason: result.status === "error" ? result.message ?? undefined : undefined,
-    source: "worker",
-  }).catch(() => undefined);
 
   jobLog.info(
     {

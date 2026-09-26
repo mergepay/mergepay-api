@@ -7,8 +7,10 @@ const h = vi.hoisted(() => {
       findMany: vi.fn(),
       findUnique: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     auditLog: { create: vi.fn() },
+    statusHistory: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
     $disconnect: vi.fn(),
   };
@@ -87,6 +89,7 @@ beforeEach(async () => {
 
   prisma.anchorSession.findMany.mockResolvedValue([]);
   prisma.anchorSession.findUnique.mockResolvedValue(null);
+  prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
   prisma.anchorSession.update.mockImplementation(async ({ data }: any) => ({
     ...session(),
     ...data,
@@ -274,9 +277,9 @@ describe("POST /api/webhooks/sep24 — state updates", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ matched: 1, updated: 1 });
 
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "session_1" },
+        where: { id: "session_1", status: "pending_user_transfer_start" },
         data: expect.objectContaining({ status: "completed" }),
       })
     );
@@ -299,7 +302,7 @@ describe("POST /api/webhooks/sep24 — state updates", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ matched: 1, updated: 0 });
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("ignores a transition that would regress a terminal session", async () => {
@@ -315,7 +318,7 @@ describe("POST /api/webhooks/sep24 — state updates", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ updated: 0 });
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("applies the update to every session tracking the transaction", async () => {
@@ -331,7 +334,7 @@ describe("POST /api/webhooks/sep24 — state updates", () => {
     );
 
     expect(response.json()).toMatchObject({ matched: 2, updated: 2 });
-    expect(prisma.anchorSession.update).toHaveBeenCalledTimes(2);
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledTimes(2);
   });
 
   it("returns 200 and audits when no session tracks the transaction", async () => {
@@ -364,7 +367,7 @@ describe("POST /api/webhooks/sep24 — state updates", () => {
       // Not "pending_anchor": an unmapped status would be coerced to a
       // still-in-flight state and hide a dead transfer.
       expect(response.json().status).toBe("error");
-      expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+      expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({ status: "error" }),
         })
@@ -400,7 +403,7 @@ describe("POST /api/webhooks/sep24 — state updates", () => {
       })
     );
 
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           failureReason: "bank rejected the transfer",

@@ -9,7 +9,7 @@ import { requireMembership, requireAdmin } from "../services/access";
 import { groupMembership, requireGroupRole } from "../plugins/group-access";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
-import { ADMIN_AUDIT_ACTIONS, auditTx } from "../services/audit";
+import { auditGroupMemberActionTx, auditTx } from "../services/audit";
 import { AuditAction } from "../services/audit-actions";
 import {
   serializeGroup,
@@ -653,13 +653,16 @@ export default async function groupRoutes(app: FastifyInstance) {
         data: { role: body.role },
         include: { user: true },
       });
-      await auditTx(tx, {
+      await auditGroupMemberActionTx(tx, {
         userId: auth.id,
         groupId: id,
-        action: ADMIN_AUDIT_ACTIONS.MEMBER_ROLE_UPDATED,
-        entityType: "group_member",
-        entityId: memberId,
-        metadata: { previousRole: member.role, role: body.role },
+        memberId,
+        action: AuditAction.GROUP_MEMBER_ROLE_CHANGE,
+        metadata: {
+          targetUserId: memberId,
+          previousRole: member.role,
+          newRole: body.role,
+        },
       });
       return result;
     });
@@ -729,14 +732,12 @@ export default async function groupRoutes(app: FastifyInstance) {
         where: { groupId_userId: { groupId: id, userId: memberId } },
       });
 
-      await auditTx(tx, {
+      await auditGroupMemberActionTx(tx, {
         userId: auth.id,
         groupId: id,
+        memberId,
         action: AuditAction.GROUP_MEMBER_REMOVE,
-        entityType: "group",
-        entityId: id,
-        outcome: "success",
-        metadata: { removedUserId: memberId, removedRole: target.role },
+        metadata: { targetUserId: memberId, removedRole: target.role },
       });
     });
 
@@ -815,13 +816,11 @@ export default async function groupRoutes(app: FastifyInstance) {
         data: { role: body.role },
       });
 
-      await auditTx(tx, {
+      await auditGroupMemberActionTx(tx, {
         userId: auth.id,
         groupId: id,
-        action: "group.member_role_change",
-        entityType: "group_member",
-        entityId: body.userId,
-        outcome: "success",
+        memberId: body.userId,
+        action: AuditAction.GROUP_MEMBER_ROLE_CHANGE,
         metadata: {
           targetUserId: body.userId,
           previousRole: target.role,

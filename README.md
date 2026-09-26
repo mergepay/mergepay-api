@@ -157,6 +157,7 @@ General retry configuration for safe Horizon and anchor reads (see `src/services
 | `UPSTREAM_RETRY_INITIAL_DELAY_MS` | 200 | Initial delay before first retry |
 | `UPSTREAM_RETRY_MAX_DELAY_MS` | 2000 | Maximum delay cap for exponential backoff |
 | `UPSTREAM_RETRY_JITTER_RATIO` | 0.25 | Fraction of delay applied as random jitter |
+| `HORIZON_RETRY_ON_RATE_LIMIT` | true | Horizon reads in `src/services/stellar.ts` also retry HTTP 429 (honouring `Retry-After` up to `UPSTREAM_RETRY_MAX_DELAY_MS`). Submissions are never retried. |
 
 #### Idempotency configuration
 

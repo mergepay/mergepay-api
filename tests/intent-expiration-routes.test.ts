@@ -502,19 +502,20 @@ describe("treasury confirm rejects an expired intent", () => {
     prisma.treasuryTransaction.update.mockResolvedValue(
       fakeTreasuryTx({ status: "confirmed", stellarTxHash: "hash_abc" })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(200);
     // The submission carries the recorded expiry, so the service re-validates
     // the envelope's own time bounds against it.
     expect(h.submitPayment).toHaveBeenCalledWith(
-      "signed-xdr-abc",
+      signedXdr,
       expect.objectContaining({
         expiresAt: expect.any(Date),
         resource: "treasury transaction",
@@ -526,12 +527,13 @@ describe("treasury confirm rejects an expired intent", () => {
     prisma.treasuryTransaction.findUnique.mockResolvedValue(
       fakeTreasuryTx({ expiresAt: longExpired() })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(400);
@@ -548,12 +550,13 @@ describe("treasury confirm rejects an expired intent", () => {
         expiresAt: longExpired(),
       })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(400);

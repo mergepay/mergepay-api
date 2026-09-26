@@ -1,4 +1,4 @@
-import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
+import Fastify, { FastifyInstance, FastifyRequest, FastifyServerOptions } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -32,14 +32,14 @@ import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { formatErrorResponse } from "./utils/error-response";
-import { isGlobalRateLimitExempt, rateLimitPolicies } from "./lib/rate-limit";
+import { rateLimitPolicies } from "./lib/rate-limit";
+import { AppError, ErrorCode } from "./lib/errors";
 import { stellarErrorSerializer } from "./lib/stellar-serializer";
 import { reqSerializer, resSerializer } from "./lib/serializers";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
 import { nanoid } from "nanoid";
-import { AppError, ErrorCode } from "./lib/errors";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -61,7 +61,20 @@ function globalRateLimitKey(request: FastifyRequest): string {
   return `global:ip:${request.ip}`;
 }
 
-export async function buildApp(): Promise<FastifyInstance> {
+/**
+ * Build-time overrides.
+ *
+ * `logger` exists so tests can inject a Pino instance that writes into an
+ * in-memory stream: under test the default logger is disabled (see the
+ * `config.isTest` branch below), so without an injection point there is
+ * nothing for the error-handling tests to assert against. Production callers
+ * pass no options and keep the configured logger.
+ */
+export interface BuildAppOptions {
+  logger?: FastifyServerOptions["logger"];
+}
+
+export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
   validateAssetConfig();
 
   // Contains a @fastify/busboy defect that turns a truncated multipart body
@@ -82,9 +95,11 @@ export async function buildApp(): Promise<FastifyInstance> {
 
       return getCorrelationId(preferred);
     },
-    logger: config.isTest
-      ? false
-      : {
+    logger:
+      options.logger ??
+      (config.isTest
+        ? false
+        : {
           level: config.LOG_LEVEL,
           serializers: {
             err: stellarErrorSerializer as any,
@@ -117,7 +132,7 @@ export async function buildApp(): Promise<FastifyInstance> {
             config.NODE_ENV === "development"
               ? { target: "pino-pretty", options: { colorize: true } }
               : undefined,
-        },
+        }),
     bodyLimit: config.JSON_BODY_LIMIT_BYTES,
   });
 
@@ -153,47 +168,48 @@ export async function buildApp(): Promise<FastifyInstance> {
     const errorCode = (error as any).code ?? "INTERNAL_ERROR";
     const correlationId = getCorrelationId(request.id);
 
-    const level = statusCode >= 500 ? "error" : "warn";
     const logData: Record<string, unknown> = {
       correlationId,
       statusCode,
       errorCode,
     };
-    if (level === "error") {
+    if (statusCode >= 500) {
       // Include the error object (and its stack) for unexpected server faults.
-      logData.err = error;
+      request.log.error({ ...logData, err: error }, "request failed");
+    } else {
+      // Client errors are expected rejections: warn level, no stack.
+      request.log.warn(logData, "request failed");
     }
-    // @ts-ignore - pino child methods accessed dynamically
-    request.log[level](logData, "request failed");
   });
 
-  // Security headers via @fastify/helmet. CSP is left permissive for a JSON API:
-  // there is no rendered HTML, so we only lock down the vectors that matter for
-  // an API backend (frame embedding, MIME sniffing, referrer leakage) and let
-  // the SPA on Vercel own its own CSP for its own documents. `frameguard` denies
-  // embedding entirely — the API is never loaded in an <iframe>. `contentSecurityPolicy`
-  // is enabled with a baseline `default-src 'none'` so any accidental inline
-  // content is inert, without breaking JSON clients that only read headers/body.
-  const cspDirectives: Record<string, string[]> = {
-    defaultSrc: ["'none'"],
-    frameAncestors: ["'none'"],
-  };
+  // Security headers via @fastify/helmet.
+  // Explicit production-ready helmet options configured for API security while
+  // ensuring Swagger UI documentation (/docs) remains fully functional.
   await app.register(helmet, {
     contentSecurityPolicy: {
-      directives: cspDirectives,
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        fontSrc: ["'self'", "https:", "data:"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        imgSrc: ["'self'", "data:", "validator.swagger.io"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrcAttr: ["'none'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        upgradeInsecureRequests: [],
+      },
     },
     frameguard: { action: "deny" },
-    // Disabled on purpose: `require-corp` (helmet's default) would force the
-    // SPA's fetch() clients to negotiate CORP headers and break API calls.
-    crossOriginEmbedderPolicy: false,
-    // API responses are always JSON; never let a browser MIME-sniff them.
     noSniff: true,
-    // Don't leak the full URL in the Referer header to third parties.
     referrerPolicy: { policy: "no-referrer" },
-    // Block the page from being used as a cross-origin opener.
+    crossOriginEmbedderPolicy: false,
     crossOriginOpenerPolicy: { policy: "same-origin" },
     crossOriginResourcePolicy: { policy: "cross-origin" },
-    // Harden the connection by opting into HTTPS upgrades where supported.
+    dnsPrefetchControl: { allow: false },
+    ieNoOpen: true,
+    permittedCrossDomainPolicies: { permittedPolicies: "none" },
     hsts: {
       maxAge: 60 * 60 * 24 * 365,
       includeSubDomains: true,
@@ -238,6 +254,12 @@ export async function buildApp(): Promise<FastifyInstance> {
   // (skipOnError), so a database hiccup degrades to "unlimited" rather than
   // blocking all traffic. The default "memory" store is per-process and
   // needs no failure handling of its own.
+  //
+  // errorResponseBuilder must throw an AppError, not a bare body object:
+  // @fastify/rate-limit re-throws whatever this returns, so a plain object
+  // reaches the central error handler without a statusCode and is answered
+  // 500 instead of 429. AppError carries status 429 and the RATE_LIMITED
+  // code, and the handler renders it in the standard error envelope.
   await app.register(rateLimit, {
     global: true,
     max: config.RATE_LIMIT_GLOBAL_MAX,

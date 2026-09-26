@@ -47,6 +47,27 @@ describe("OpenAPI / Swagger spec", () => {
     expect(res.json().openapi).toBe("3.0.0");
   });
 
+  it("exposes descriptive OpenAPI info metadata (issue #394)", async () => {
+    const app = await buildApp();
+    const res = await app.inject({ method: "GET", url: "/docs/json" });
+    const info = res.json().info;
+
+    // The info object is what consumers and the Swagger UI header render;
+    // every field below must be present and non-stub.
+    expect(info.title).toBe("Mergepay API");
+    expect(info.version).toBe("0.1.0");
+    expect(typeof info.description).toBe("string");
+    expect(info.description.length).toBeGreaterThan(80);
+    expect(info.description).toMatch(/Stellar/i);
+    expect(info.contact?.url).toMatch(/^https:\/\//);
+    expect(info.license?.name).toBe("MIT");
+    expect(info.license?.url).toMatch(/^https:\/\//);
+
+    // At least one server entry so the UI's "Try it out" targets somewhere.
+    expect(Array.isArray(res.json().servers)).toBe(true);
+    expect(res.json().servers.length).toBeGreaterThan(0);
+  });
+
   it("declares top-level documentation tags", async () => {
     const app = await buildApp();
     const res = await app.inject({ method: "GET", url: "/docs/json" });

@@ -18,12 +18,13 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { mpMemoSchema, stellarAccountIdSchema } from "../lib/stellar-validation";
+import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
 import { rateLimited } from "../lib/rate-limit";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
-import { stellar } from "../services/stellar";
+import { getTreasuryAccount } from "../services/treasury-stellar";
 import { isPositive } from "../services/money";
 import {
   serializeGroup,
@@ -42,8 +43,8 @@ import {
 const createBodySchema = z.object({
   destination: stellarAccountIdSchema,
   amount: z.string().min(1),
-  assetCode: z.string().min(1),
-  assetIssuer: stellarAccountIdSchema.nullable().optional(),
+  assetCode: assetCodeSchema,
+  assetIssuer: assetIssuerSchema.nullable().optional(),
   memo: mpMemoSchema.optional(),
 });
 
@@ -187,17 +188,13 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
       );
     }
 
-    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
+    const view = await getTreasuryAccount(group.treasuryAccountPublicKey);
     return {
       group: serializeGroup(group),
-      publicKey: group.treasuryAccountPublicKey,
-      balances: snapshot.balances.map((b) => ({
-        assetCode: b.assetCode,
-        assetIssuer: b.assetIssuer,
-        balance: b.balance,
-      })),
-      signers: snapshot.signers,
-      thresholds: snapshot.thresholds,
+      publicKey: view.publicKey,
+      balances: view.balances,
+      signers: view.signers,
+      thresholds: view.thresholds,
       requiredSigners: group.treasuryRequiredSigners ?? 1,
       networkPassphrase: config.networkPassphrase,
     };

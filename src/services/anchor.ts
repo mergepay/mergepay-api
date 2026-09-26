@@ -42,6 +42,7 @@ import {
 import { fetchWithTimeout, toProviderError } from "./timeout";
 import { anchorCircuit } from "./anchor-circuit";
 import { safeFailureMessage } from "./job-retry";
+import { isSep24TransactionStatus } from "./sep24-types";
 import {
   classifyUpstreamFailure,
   isRetryableFailure,
@@ -667,7 +668,7 @@ export const anchorService = {
 
     // Distinguish a genuinely new anchor status (kept pending, logged loudly)
     // from the statuses we know how to interpret.
-    const recognized = isKnownSep24Status(rawStatus);
+    const recognized = isSep24TransactionStatus(rawStatus);
     const mappedStatus = mapAnchorStatus(rawStatus);
 
     // Sanitise — only carry forward benign fields for debugging
@@ -734,97 +735,41 @@ export const anchorService = {
 
 /**
  * The exhaustive set of SEP-24 transaction statuses (lowercased) that we
- * understand and map explicitly. Any status outside this set is treated as
- * unknown and handled explicitly rather than silently swallowed.
+ * understand and map explicitly. Re-exported from ./sep24-types — the single
+ * source of truth shared with the anchor-session state machine and both
+ * callback handlers — so it can no longer drift from the type union.
  *
  * See: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md#transaction-history
  */
-export const KNOWN_SEP24_STATUSES: ReadonlySet<string> = new Set([
-  // Initial
-  "incomplete",
-  // Intermediate
-  "pending_user_transfer_start",
-  "pending_stellar",
-  "pending_trust",
-  "pending_user",
-  "pending_anchor",
-  "pending_transaction_info_update",
-  "pending_receiver",
-  "pending_sender",
-  // Terminal
-  "completed",
-  "no_market",
-  "too_small",
-  "too_large",
-  "error",
-  "refunded",
-  "expired",
-]);
-
-/** Whether a raw status string is a recognized SEP-24 value (case-insensitive). */
-export function isKnownSep24Status(raw: string): boolean {
-  if (!raw) return false;
-  return KNOWN_SEP24_STATUSES.has(raw.trim().toLowerCase());
-}
+export {
+  KNOWN_SEP24_STATUSES,
+  isSep24TransactionStatus as isKnownSep24Status,
+} from "./sep24-types";
 
 /**
  * Map a raw SEP-24 status string to Mergepay's internal status.
  *
- * The mapping is exhaustive for every known SEP-24 value and funnels
- * terminal failures into the repository's single `error` state. If the
- * upstream returns a status we do not recognise, we map it to
- * "pending_anchor" (a safe intermediate) instead of erroring out, because a
- * future anchor deployment might introduce new intermediate states — but the
- * unknown status is surfaced via `isKnownSep24Status` so callers can log it
- * explicitly rather than mistaking a foreign terminal state for a pending one.
+ * Every status in the canonical union maps to itself. An unrecognised status
+ * (including the deprecated `pending_external` /
+ * `pending_user_transfer_complete`, which `isRecognisedSep24Status` still
+ * accepts) is mapped to "pending_anchor" — a safe intermediate — instead of
+ * erroring out, because a future anchor deployment might introduce new
+ * intermediate states. `isKnownSep24Status` lets callers tell a genuine
+ * pending state from a foreign one.
  *
  * Terminal states (completed, error, refunded, expired, no_market, too_small,
  * too_large) are idempotent — the worker must never overwrite them once set.
  */
 export function mapAnchorStatus(raw: string): string {
   const normalized = raw ? raw.trim().toLowerCase() : "";
-  switch (normalized) {
-    // ── Terminal (success) ──
-    case "completed":
-      return "completed";
 
-    // ── Terminal (failure) ──
-    case "error":
-    case "expired":
-    case "no_market":
-    case "too_small":
-    case "too_large":
-      return normalized;
+  if (isSep24TransactionStatus(normalized)) return normalized;
 
-    case "refunded":
-      return "refunded";
-
-    // ── Intermediate (requires user action) ──
-    case "pending_user_transfer_start":
-      return "pending_user_transfer_start";
-
-    // ── Intermediate (anchor / stellar / user actions) ──
-    case "pending_user":
-    case "pending_transaction_info_update":
-    case "pending_receiver":
-    case "pending_sender":
-    case "pending_stellar":
-    case "pending_trust":
-    case "pending_anchor":
-      return normalized;
-
-    // ── Initial ──
-    case "incomplete":
-      return "incomplete";
-
-    // ── Unknown → safe default ──
-    default:
-      retryLog.warn(
-        { rawStatus: raw, mappedStatus: "pending_anchor" },
-        `Unknown SEP-24 status received: ${raw} — mapping to pending_anchor`
-      );
-      return "pending_anchor";
-  }
+  retryLog.warn(
+    { rawStatus: raw, mappedStatus: "pending_anchor" },
+    `Unknown SEP-24 status received: ${raw} — mapping to pending_anchor`
+  );
+  return "pending_anchor";
 }
 
 /** Whether a normalized status is terminal and no longer needs polling. */

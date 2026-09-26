@@ -4,12 +4,38 @@ import { Errors } from "../errors";
 import { fetchWithRetry } from "./retry";
 
 const log = pino({ name: "exchange" });
+/** The only two assets this module quotes against each other. */
 export type AssetCode = "XLM" | "USDC";
+/**
+ * A quoted rate for one asset pair. `source` says whether the number came
+ * from Horizon's order book or from this module's hard-coded fallback, so a
+ * caller can decide whether a quote is trustworthy; `cached` marks a value
+ * served from the in-memory cache instead of fetched.
+ */
 export interface ExchangeRate { pair: string; rate: number; source: "horizon" | "fallback"; cached: boolean; fetchedAt: string; }
 const cache = new Map<string, { rate: ExchangeRate; expiresAt: number }>();
 const fallbacks: Record<string, number> = { "XLM/USDC": 0.1, "USDC/XLM": 10 };
 function pair(from: AssetCode, to: AssetCode): string { return `${from.toUpperCase()}/${to.toUpperCase()}`; }
 
+/**
+ * Quote `fromAsset` in terms of `toAsset`, reading Horizon's XLM/USDC order
+ * book.
+ *
+ * Horizon is contacted only on a cache miss (or expiry). A failure — timeout,
+ * non-OK status, or an empty book — falls back to this module's fixed rate for
+ * pairs that have one, so a display-only conversion keeps working during a
+ * Horizon outage; pairs without a fallback fail instead of returning a made-up
+ * number. An identity conversion never touches the network at all.
+ *
+ * @param fromAsset - Asset being converted from (`"XLM"` or `"USDC"`).
+ * @param toAsset - Asset being converted to; equal to `fromAsset` yields a
+ *   rate of `1` with `source: "fallback"`.
+ * @returns The quote: `rate` is units of `toAsset` per unit of `fromAsset`,
+ *   `source` is `"horizon"` for a fresh book read and `"fallback"` otherwise,
+ *   and `cached: true` when served from memory.
+ * @throws {AppError} `upstream` when Horizon failed and no fallback rate is
+ *   configured for the pair.
+ */
 export async function getExchangeRate(fromAsset: AssetCode, toAsset: AssetCode): Promise<ExchangeRate> {
   const key = pair(fromAsset, toAsset);
   if (fromAsset === toAsset) return { pair: key, rate: 1, source: "fallback", cached: true, fetchedAt: new Date().toISOString() };
@@ -47,6 +73,20 @@ export async function getExchangeRate(fromAsset: AssetCode, toAsset: AssetCode):
   }
 }
 
+/**
+ * Convert an amount between the two supported assets using
+ * {@link getExchangeRate}.
+ *
+ * @param amount - Non-negative number (or its string form) in `fromAsset`.
+ * @param fromAsset - Asset the amount is denominated in.
+ * @param toAsset - Asset to convert into.
+ * @returns The converted amount as a fixed 7-decimal-place string (Stellar's
+ *   wire precision).
+ * @throws {AppError} `bad_request` (`invalid_amount`) when `amount` is not a
+ *   finite, non-negative number.
+ * @throws {AppError} `upstream` when no rate is available for the pair —
+ *   propagated from {@link getExchangeRate}.
+ */
 export async function convertAmount(amount: string | number, fromAsset: AssetCode, toAsset: AssetCode): Promise<string> {
   const value = Number(amount);
   if (!Number.isFinite(value) || value < 0) throw Errors.badRequest("invalid_amount", "Amount must be a non-negative number");
@@ -54,4 +94,8 @@ export async function convertAmount(amount: string | number, fromAsset: AssetCod
   return (value * quote.rate).toFixed(7);
 }
 
+/**
+ * Drop every cached quote, forcing the next {@link getExchangeRate} call to
+ * re-read Horizon. Primarily for tests and explicit refreshes.
+ */
 export function clearExchangeRateCache(): void { cache.clear(); }

@@ -16,10 +16,12 @@ export {
   sep24AccountSchema,
   sep24AmountSchema,
   sep24AssetCodeSchema,
+  sep24DepositRequestSchema,
   sep24InteractiveRequestSchema,
   sep24MemoSchema,
   sep24MemoTypeSchema,
   sep24WithdrawRequestSchema,
   type Sep24InteractiveRequest,
+  type Sep24DepositRequest,
   type Sep24WithdrawRequest,
 } from "../validations/sep24";

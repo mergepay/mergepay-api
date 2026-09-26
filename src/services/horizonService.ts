@@ -20,6 +20,10 @@ import {
 } from "./horizon-retry";
 
 let _server: Horizon.Server | null = null;
+/**
+ * Lazily constructed Horizon client, shared by every call in this module so
+ * connection reuse is the default and tests only need to mock `HORIZON_URL`.
+ */
 function server(): Horizon.Server {
   if (!_server) _server = new Horizon.Server(config.HORIZON_URL);
   return _server;
@@ -137,6 +141,17 @@ export interface HorizonPaymentOperation {
  * before the error surfaces (issue #531); a 404 is a domain answer and never
  * consumes the retry budget. Throws descriptive AppErrors for network,
  * timeout, or Horizon failures after the budget is exhausted.
+ * Throws descriptive AppErrors for network, timeout, or Horizon failures.
+ *
+ * @param txHash - The hex transaction hash to look up.
+ * @returns The Horizon record when found, or `null` when Horizon reports 404 —
+ *   a transaction that has not yet been ingested is "not visible yet", not an
+ *   error, so the caller decides whether to poll again.
+ * @throws {TimeoutError} when the call exceeds `HORIZON_STATUS_TIMEOUT_MS`;
+ *   re-thrown unmapped so callers can distinguish "unknown outcome".
+ * @throws {TransportError} on DNS/socket/connection failures; re-thrown unmapped.
+ * @throws {AppError} `upstream` for any other Horizon failure (5xx, rate limit,
+ *   malformed response), carrying only the sanitized upstream message.
  */
 export async function getTransactionFromHorizon(
   txHash: string
@@ -170,6 +185,16 @@ export async function getTransactionFromHorizon(
  * bounded exponential backoff before the error surfaces (issue #531).
  * Throws descriptive AppErrors for network failures after the budget is
  * exhausted.
+ * has no payment operations). Throws descriptive AppErrors for network failures.
+ *
+ * @param txHash - The hex transaction hash whose operations are read.
+ * @returns The transaction's payment operations, at most 100 (Horizon's page
+ *   limit for this call). Non-payment operations are filtered out; a
+ *   transaction with no payments yields `[]`, not an error.
+ * @throws {TimeoutError} when the call exceeds `HORIZON_STATUS_TIMEOUT_MS`.
+ * @throws {TransportError} on DNS/socket/connection failures.
+ * @throws {AppError} `upstream` for any other failure Horizon reports (4xx/5xx,
+ *   an unknown or still-ingesting transaction).
  */
 export async function getTransactionPayments(
   txHash: string
@@ -209,6 +234,20 @@ export async function getTransactionPayments(
  *
  * Returns { verified: true } on success.
  * Throws descriptive AppErrors on any verification failure.
+ *
+ * @param txHash - The hex transaction hash to fetch and verify.
+ * @param expectedMemo - The exact memo expected on chain — the `MP:`-prefixed
+ *   text the transaction was built with (see `memoText` in `stellar.ts`),
+ *   e.g. `MP:SETL123`.
+ * @returns `{ verified: true }` when the transaction exists, succeeded, and
+ *   carries a text memo equal to `expectedMemo`.
+ * @throws {AppError} `not_found` when Horizon has no such transaction yet.
+ * @throws {AppError} `bad_request` (`transaction_verification_failed`) when the
+ *   transaction failed on-chain, has no memo, uses a non-text memo type, or
+ *   carries a different memo.
+ * @throws {TimeoutError} when the Horizon read exceeds its deadline.
+ * @throws {TransportError} on a connection failure to Horizon.
+ * @throws {AppError} `upstream` for other Horizon failures.
  */
 export async function verifyTransactionMemo(
   txHash: string,
@@ -258,6 +297,21 @@ export async function verifyTransactionMemo(
  * This is defensive: it inspects what actually landed on-chain, not what
  * was in the signed XDR envelope. Only payment operations are treated as
  * evidence of a settlement payment — other operation types are ignored.
+ *
+ * Pure and synchronous: no Horizon I/O, so it is safe to call on records
+ * already in hand.
+ *
+ * @param op - The operation record read from Horizon (via
+ *   {@link getTransactionPayments}).
+ * @param expected - `{ destination, amount, assetCode, assetIssuer }`; pass
+ *   `assetCode: "XLM"` with `assetIssuer: null` for the native asset.
+ * @returns `void` — resolves when the operation matches on every field.
+ * @throws {AppError} `bad_request` (`transaction_verification_failed`) when
+ *   `op` is not a payment operation.
+ * @throws {AppError} `bad_request` (`settlement_verification_failed`) when the
+ *   destination, amount, asset code, or asset issuer differs. Amounts are
+ *   compared at stroop precision (7 decimal places), so trailing-zero
+ *   formatting differences are not treated as mismatches.
  */
 export function verifyPaymentOperation(
   op: HorizonPaymentOperation,

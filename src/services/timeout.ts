@@ -53,12 +53,19 @@ export class TransportError extends Error {
  * Wraps an async operation with a bounded timeout using AbortController.
  *
  * The `signal` is passed to the operation so it can cancel in-flight I/O.
- * If the timeout fires before the operation completes, the operation is
+ * If the timeout fires before the operation completes, the promise is
  * rejected with a `TimeoutError`.
  *
  * @param operation - A human-readable label for the operation (used in errors and logs).
  * @param timeoutMs - Maximum time in milliseconds before the operation is aborted.
  * @param fn - The actual async work, receiving the AbortSignal.
+ * @returns Whatever `fn` resolves to, provided it beats the deadline.
+ * @throws {TimeoutError} when `timeoutMs` elapses first, or when `fn` rejects
+ *   with an `AbortError` (the abort was ours).
+ * @throws {TransportError} wrapping any unrecognized rejection from `fn`, so
+ *   callers can classify a socket/DNS failure without string-matching.
+ * @throws Re-throws an `AppError` from `fn` unchanged — a deliberate upstream
+ *   answer is not a transport problem.
  */
 export async function withTimeout<T>(
   operation: string,

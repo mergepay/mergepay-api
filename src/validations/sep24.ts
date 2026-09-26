@@ -1,21 +1,9 @@
 /**
  * Shared Zod schemas for SEP-24 (anchor) deposit and withdrawal requests.
  *
- * Centralizes the request-shape validation for the SEP-24 flows so every entry
- * point — the interactive deposit/withdraw start (`POST /anchors/*` in
- * src/routes/anchors.ts) and any future SEP-24 surface — rejects malformed
- * payloads with the same rules, before they reach a service or the database:
- *
- *   - asset code: alphanumeric, 1-12 chars (upper-cased on parse);
- *   - amount: a positive, precision-safe Stellar decimal when supplied;
- *   - account / `to`: a checksum-validated ed25519 Stellar public key;
- *   - memo: a short, alphanumeric anchor memo (no arbitrary bytes);
- *   - memo / memoType: supplied together — an anchor cannot apply a memo it
- *     cannot classify (`memoType` is one of `text`, `id`, `hash`).
- *
- * Supported-asset and network checks intentionally stay in the handler via
- * `validateAsset` (src/services/assets.ts) so they keep their existing error
- * contract — this module only enforces *shape*.
+ * These schemas are used at the route boundary so malformed request data is
+ * rejected before asset lookup, upstream calls, database writes, or business
+ * logic are reached.
  */
 import { z } from "zod";
 import {
@@ -23,7 +11,7 @@ import {
   stellarPublicKeySchema,
 } from "../lib/stellar-validation";
 
-/** A Stellar public key ("G…"), checksum-validated via StrKey. Alias for readability. */
+/** A Stellar public key (G…), checksum-validated via StrKey. */
 export const sep24AccountSchema = stellarPublicKeySchema;
 
 /** SEP-24 asset code: alphanumeric, 1-12 chars, normalised to upper case. */
@@ -44,13 +32,9 @@ export const sep24MemoSchema = z
   .regex(/^[A-Za-z0-9]+$/, "memo may only contain letters and digits")
   .optional();
 
-/** SEP-24 memo type: the Stellar transaction-memo kind accompanying `memo`. */
+/** The Stellar transaction-memo kind accompanying `memo`. */
 export const sep24MemoTypeSchema = z.enum(["text", "id", "hash"]);
 
-/**
- * `memo` and `memoType` travel together (issue #366): an anchor cannot apply
- * a memo it cannot classify, so one without the other is rejected at the door.
- */
 function refineMemoPairing(
   value: { memo?: string; memoType?: "text" | "id" | "hash" },
   ctx: z.RefinementCtx
@@ -71,65 +55,51 @@ function refineMemoPairing(
   }
 }
 
-/**
- * Fields shared by SEP-24 deposit and withdrawal initiation.
- *
- * `amount`, `account`/`to`, and `memo` are optional here because the start
- * request only *begins* a flow; the interactive part carries the final
- * transfer parameters. Supplied values are validated strictly so a malformed
- * amount or a bogus Stellar address is rejected at the door.
- */
-export const sep24InteractiveRequestSchema = z
-  .object({
-    assetCode: sep24AssetCodeSchema,
-    assetIssuer: z.string().nullable().optional(),
-    amount: sep24AmountSchema.optional(),
-    // The Stellar account funding a deposit or receiving a withdrawal.
-    account: sep24AccountSchema.optional(),
-    to: sep24AccountSchema.optional(),
-    memo: sep24MemoSchema,
-    memoType: sep24MemoTypeSchema.optional(),
-    // SEP-24 interactive starts may identify the requesting wallet.
-    walletName: z.string().trim().min(1).max(120).optional(),
-    anchorName: z.string().max(64).optional(),
-  })
-  .refine(
-    (val) => {
-      // A native asset (XLM) must never be given an issuer.
-      return !(val.assetCode === "XLM" && val.assetIssuer);
-    },
+const sharedFields = {
+  assetCode: sep24AssetCodeSchema,
+  assetIssuer: z.string().nullable().optional(),
+  amount: sep24AmountSchema.optional(),
+  account: sep24AccountSchema.optional(),
+  to: sep24AccountSchema.optional(),
+  memo: sep24MemoSchema,
+  memoType: sep24MemoTypeSchema.optional(),
+  walletName: z.string().trim().min(1).max(120).optional(),
+  anchorName: z.string().max(64).optional(),
+};
+
+function validateNativeIssuer<
+  T extends {
+    assetCode: string;
+    assetIssuer?: string | null;
+    memo?: string;
+    memoType?: "text" | "id" | "hash";
+  }
+>(schema: z.ZodType<T>) {
+  return schema.refine(
+    (value) => !(value.assetCode === "XLM" && value.assetIssuer),
     {
       message: "XLM is a native asset and does not take an issuer",
       path: ["assetIssuer"],
     }
-  )
-  .superRefine(refineMemoPairing);
+  ).superRefine(refineMemoPairing);
+}
+
+/** Strict request schema for starting either SEP-24 interactive flow. */
+export const sep24InteractiveRequestSchema = validateNativeIssuer(
+  z.object(sharedFields).strict()
+);
+
+/** Deposit initiation uses the shared interactive request contract. */
+export const sep24DepositRequestSchema = sep24InteractiveRequestSchema;
+
+/**
+ * Strict concrete withdrawal request. Unlike a generic interactive start, a
+ * withdrawal must include the amount that is being settled.
+ */
+export const sep24WithdrawRequestSchema = validateNativeIssuer(
+  z.object({ ...sharedFields, amount: sep24AmountSchema }).strict()
+);
 
 export type Sep24InteractiveRequest = z.infer<typeof sep24InteractiveRequestSchema>;
-
-/**
- * A concrete SEP-24 withdrawal request (as distinct from merely starting an
- * interactive flow): requires the amount to be settled now.
- */
-export const sep24WithdrawRequestSchema = z
-  .object({
-    assetCode: sep24AssetCodeSchema,
-    assetIssuer: z.string().nullable().optional(),
-    amount: sep24AmountSchema,
-    account: sep24AccountSchema.optional(),
-    to: sep24AccountSchema.optional(),
-    memo: sep24MemoSchema,
-    memoType: sep24MemoTypeSchema.optional(),
-    walletName: z.string().trim().min(1).max(120).optional(),
-    anchorName: z.string().max(64).optional(),
-  })
-  .refine(
-    (val) => !(val.assetCode === "XLM" && val.assetIssuer),
-    {
-      message: "XLM is a native asset and does not take an issuer",
-      path: ["assetIssuer"],
-    }
-  )
-  .superRefine(refineMemoPairing);
-
+export type Sep24DepositRequest = z.infer<typeof sep24DepositRequestSchema>;
 export type Sep24WithdrawRequest = z.infer<typeof sep24WithdrawRequestSchema>;

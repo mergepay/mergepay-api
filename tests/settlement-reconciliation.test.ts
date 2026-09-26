@@ -125,6 +125,67 @@ beforeEach(() => {
 // the lease claim — its coverage lives in tests/worker.test.ts.
 
 describe("reconcileSingleSettlement", () => {
+  it("resolves a needs_review settlement to confirmed when the hash landed successfully (issue #541)", async () => {
+    // A needs_review row carries the same fields the reconciliation needs as
+    // a pending_confirmation row: a submitted hash and the stored intent.
+    // The reconciliation is identical — only the status the row arrived in
+    // differs, which is the worker's candidate query's business, not this
+    // function's.
+    h.prisma.settlement.findUnique.mockResolvedValue({
+      id: "settle_1",
+      status: "needs_review",
+      fromUserId: "user_1",
+      expenseShareId: "share_9",
+      retryCount: 0,
+    });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1",
+      status: "confirmed",
+      expenseShareId: "share_9",
+    });
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+
+    const outcome = await reconcileSingleSettlement(makeReconcilable(), 10);
+
+    expect(outcome).toBe("confirmed");
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "settle_1" }),
+        data: expect.objectContaining({ status: "confirmed" }),
+      })
+    );
+    // The expense share is settled as part of the confirmation.
+    expect(h.prisma.expenseShare.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "share_9" },
+        data: { status: "settled" },
+      })
+    );
+  });
+
+  it("resolves a needs_review settlement to failed when the transaction failed on-chain (issue #541)", async () => {
+    h.prisma.settlement.findUnique.mockResolvedValue({
+      id: "settle_1",
+      status: "needs_review",
+      fromUserId: "user_1",
+      expenseShareId: null,
+      retryCount: 0,
+    });
+    h.getTransaction.mockResolvedValue({ successful: false });
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+
+    const outcome = await reconcileSingleSettlement(makeReconcilable(), 10);
+
+    expect(outcome).toBe("failed");
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "settle_1" }),
+        data: expect.objectContaining({ status: "failed" }),
+      })
+    );
+  });
+
   it("moves to completed when transaction is found, successful, and verified", async () => {
     h.getTransaction.mockResolvedValue({ successful: true });
     h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });

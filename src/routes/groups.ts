@@ -128,6 +128,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
+        groupId: created.id,
         action: "group.create",
         entityType: "group",
         entityId: created.id,

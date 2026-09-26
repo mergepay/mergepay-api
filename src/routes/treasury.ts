@@ -43,6 +43,7 @@ import {
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
 import { treasurySignerConfigSchema } from "../validations/treasury";
+import { signedXdrRequestSchema } from "../validations/stellar-transaction";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 const stellarAmountSchema = z.string().min(1);
@@ -460,12 +461,13 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         summary: "Confirm treasury transaction",
         description: "Submits signatures and confirms execution of a treasury transaction.",
         params: openApiIdParams(),
+        body: openApiBody(signedXdrRequestSchema),
       },
     },
     async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+    const body = signedXdrRequestSchema.parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
     const ttx = await prisma.treasuryTransaction.findUnique({ where: { id } });

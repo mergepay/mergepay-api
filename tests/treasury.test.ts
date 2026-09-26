@@ -286,34 +286,22 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
     expect(res.json().error.code).toBe("XDR_MISMATCH");
   });
 
-  it("rejects malformed XDR without updating status to confirmed", async () => {
-    const ttx = fakeTreasuryTx();
-    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
-    prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
-    prisma.groupMember.findUnique.mockResolvedValueOnce({
-      groupId: "group_1",
-      userId: admin.id,
-      role: "admin",
-    });
-    loadAccountMock.mockResolvedValueOnce({
-      exists: true,
-      sequence: "100",
-      balances: [],
-      signers: [{ key: signerA.publicKey(), weight: 1 }],
-      thresholds: { low: 1, med: 1, high: 1 },
-    });
-
+  it.each([
+    { label: "missing", payload: {} },
+    { label: "empty", payload: { signedXdr: "" } },
+    { label: "malformed", payload: { signedXdr: "not-a-real-envelope" } },
+    { label: "invalid XDR bytes", payload: { signedXdr: "AAAA" } },
+  ])("rejects $label XDR before database or Horizon access", async ({ payload }) => {
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "not-a-real-envelope" },
+      payload,
     });
 
     expect(res.statusCode).toBe(400);
-    expect(prisma.treasuryTransaction.update).not.toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ status: "confirmed" }) })
-    );
+    expect(prisma.treasuryTransaction.findUnique).not.toHaveBeenCalled();
+    expect(Horizon.Server.prototype.submitTransaction).not.toHaveBeenCalled();
   });
 
   it("rejects when the treasury account is unfunded", async () => {

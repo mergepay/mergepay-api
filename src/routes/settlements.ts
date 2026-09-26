@@ -55,10 +55,10 @@ import {
   takeForPage,
 } from "../lib/pagination";
 import {
-  loadGroupBalancesWithSuggestions,
+  loadGroupBalancesWithSuggestionsByAsset,
   groupPrimaryAsset,
 } from "../services/group-balances";
-import { calculateSimplifiedDebts } from "../services/settlement";
+import { balanceAssetKey, type Suggestion } from "../services/settlement";
 import { validateAsset, validateAmount } from "../services/assets";
 import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
 import {
@@ -957,6 +957,10 @@ export default async function settlementRoutes(app: FastifyInstance) {
                 type: "array",
                 items: { type: "object", additionalProperties: true },
               },
+              assets: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
             },
           },
           ...openApiErrorResponses(400, 401, 403),
@@ -967,18 +971,42 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
-    const { balances } = await loadGroupBalancesWithSuggestions(groupId);
     const asset = await groupPrimaryAsset(groupId);
-    const suggestions = calculateSimplifiedDebts(
-      balances.map((balance) => ({ userId: balance.userId, net: balance.net }))
+    const byAsset = await loadGroupBalancesWithSuggestionsByAsset(groupId);
+
+    // Top level stays the primary asset's operations for backward
+    // compatibility. `assets` carries every asset the group holds, each with
+    // its own net balances and minimal settle-up transfers — an XLM operation
+    // can never settle a USDC debt.
+    const primary = byAsset.find(
+      (a) =>
+        balanceAssetKey(a.assetCode, a.assetIssuer) ===
+        balanceAssetKey(asset.assetCode, asset.assetIssuer)
     );
+    const withAsset = (
+      assetCode: string,
+      assetIssuer: string | null,
+      suggestions: Suggestion[]
+    ) =>
+      suggestions.map((suggestion) => ({
+        ...suggestion,
+        assetCode,
+        assetIssuer,
+      }));
+
     return {
       assetCode: asset.assetCode,
       assetIssuer: asset.assetIssuer,
-      operations: suggestions.map((suggestion) => ({
-        ...suggestion,
-        assetCode: asset.assetCode,
-        assetIssuer: asset.assetIssuer,
+      operations: withAsset(
+        asset.assetCode,
+        asset.assetIssuer,
+        primary?.suggestions ?? []
+      ),
+      assets: byAsset.map((a) => ({
+        assetCode: a.assetCode,
+        assetIssuer: a.assetIssuer,
+        balances: a.balances,
+        operations: withAsset(a.assetCode, a.assetIssuer, a.suggestions),
       })),
     };
   });
@@ -1004,6 +1032,10 @@ export default async function settlementRoutes(app: FastifyInstance) {
                 type: "array",
                 items: { type: "object", additionalProperties: true },
               },
+              assets: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
             },
           },
           ...openApiErrorResponses(400, 401, 403),
@@ -1015,38 +1047,73 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const { id: groupId } = idParamSchema.parse(req.params);
     await requireMembership(groupId, auth.id);
 
-    const { balances, suggestions } = await loadGroupBalancesWithSuggestions(groupId);
+    const asset = await groupPrimaryAsset(groupId);
+    const byAsset = await loadGroupBalancesWithSuggestionsByAsset(groupId);
 
     const userIds = new Set<string>();
-    balances.forEach((b) => userIds.add(b.userId));
-    suggestions.forEach((s) => {
-      userIds.add(s.fromUserId);
-      userIds.add(s.toUserId);
+    byAsset.forEach((a) => {
+      a.balances.forEach((b) => userIds.add(b.userId));
+      a.suggestions.forEach((s) => {
+        userIds.add(s.fromUserId);
+        userIds.add(s.toUserId);
+      });
     });
     const users = await prisma.user.findMany({
       where: { id: { in: [...userIds] } },
     });
     const userMap = new Map(users.map((u) => [u.id, u]));
 
-    const asset = await groupPrimaryAsset(groupId);
-
-    return {
-      balances: balances
+    const serializeBalances = (
+      assetCode: string,
+      balances: { userId: string; net: string }[]
+    ) =>
+      balances
         .filter((b) => userMap.has(b.userId))
         .map((b) => ({
           userId: b.userId,
           user: serializeUserSafe(userMap.get(b.userId)),
           net: b.net,
-          assetCode: asset.assetCode,
-        })),
-      suggestions: suggestions.map((s) => ({
+          assetCode,
+        }));
+    const serializeSuggestions = (
+      assetCode: string,
+      assetIssuer: string | null,
+      suggestions: Suggestion[]
+    ) =>
+      suggestions.map((s) => ({
         fromUserId: s.fromUserId,
         from: serializeUserSafe(userMap.get(s.fromUserId)),
         toUserId: s.toUserId,
         to: serializeUserSafe(userMap.get(s.toUserId)),
         amount: s.amount,
-        assetCode: asset.assetCode,
-        assetIssuer: asset.assetIssuer,
+        assetCode,
+        assetIssuer,
+      }));
+
+    const primary = byAsset.find(
+      (a) =>
+        balanceAssetKey(a.assetCode, a.assetIssuer) ===
+        balanceAssetKey(asset.assetCode, asset.assetIssuer)
+    );
+
+    return {
+      // Top level is the primary asset for backward compatibility; `assets`
+      // carries the full per-asset picture.
+      balances: serializeBalances(asset.assetCode, primary?.balances ?? []),
+      suggestions: serializeSuggestions(
+        asset.assetCode,
+        asset.assetIssuer,
+        primary?.suggestions ?? []
+      ),
+      assets: byAsset.map((a) => ({
+        assetCode: a.assetCode,
+        assetIssuer: a.assetIssuer,
+        balances: serializeBalances(a.assetCode, a.balances),
+        suggestions: serializeSuggestions(
+          a.assetCode,
+          a.assetIssuer,
+          a.suggestions
+        ),
       })),
     };
   });

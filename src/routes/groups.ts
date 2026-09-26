@@ -97,13 +97,6 @@ const changeMemberRoleSchema = z.object({
 export default async function groupRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-  // Route-level `groupMemberGuard` / `groupAdminGuard` hooks below (issue
-  // #356) run after `authenticate` and reject a non-member or non-admin
-  // before the handler starts. The handlers' own in-transaction checks stay:
-  // a preHandler is outside the handler's transaction, so only the in-tx
-  // check can make a mutation's authorization and its write one atomic step.
-  // See src/plugins/authorization.ts.
-
   // -- create -----------------------------------------------------------------
   app.post(
     "/groups",

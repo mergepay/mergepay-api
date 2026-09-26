@@ -11,9 +11,14 @@
  * deterministic transformation of an envelope, so it is safe to call from
  * request handlers and cheap to fake.
  */
-import { config } from "../config";
 import { AppError, Errors } from "../errors";
-import { stellar, type AccountSnapshot } from "./stellar";
+import {
+  stellar,
+  type AccountSnapshot,
+  type AssetSpec,
+  type PaymentExpectation,
+  validateSignedPaymentXdr,
+} from "./stellar";
 /**
  * The subset of a treasury account the API exposes to members: balances in
  * the order Horizon returned them, the signer list, and signature thresholds.
@@ -23,6 +28,41 @@ export interface TreasuryAccountView {
   balances: { assetCode: string; assetIssuer: string | null; balance: string }[];
   signers: { key: string; weight: number }[];
   thresholds: { low: number; med: number; high: number };
+}
+
+export interface TreasuryPaymentIntent {
+  sourcePublicKey: string;
+  sourceSequence: string;
+  destination: string;
+  asset: AssetSpec;
+  amount: string;
+  memoCode: string;
+  validitySeconds?: number;
+}
+
+/**
+ * Build the unsigned payment envelope used by a treasury intent.
+ *
+ * The returned XDR is deliberately unsigned. Wallets own all private keys and
+ * sign the envelope on the client before sending it back for validation.
+ */
+export function buildTreasuryPaymentXdr(intent: TreasuryPaymentIntent): string {
+  return stellar.buildPayment(intent);
+}
+
+/**
+ * Parse and validate a wallet-produced treasury envelope against its intent.
+ *
+ * Multisig withdrawals set `skipSourceSignatureCheck` because a shared
+ * treasury account is authorized by its co-signers rather than its master
+ * key. The caller still verifies those co-signers and their threshold before
+ * submitting the validated transaction.
+ */
+export function validateTreasurySignedXdr(
+  signedXdr: string,
+  intent: PaymentExpectation
+): { tx: ReturnType<typeof validateSignedPaymentXdr> } {
+  return { tx: validateSignedPaymentXdr(signedXdr, intent) };
 }
 
 /**

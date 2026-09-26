@@ -193,20 +193,32 @@ describe("auth routes", () => {
   });
 
   it("POST /auth/verify does not issue a JWT when the challenge fails validation", async () => {
-    // A challenge that fails SEP-10 validation must collapse to the standard
-    // opaque 401 — no token, no user upsert, no audit entry, and no detail
-    // about *why* it failed (wrong network, wrong server, replay, expiry, …).
+    // A well-formed challenge without the client's signature gets the
+    // verifier's actionable 401, but must never issue a token or persist a user.
+    const client = Keypair.random();
+    const { transaction } = buildChallenge(client.publicKey());
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload: { transaction },
+    });
+    expect(res.statusCode).toBe(401);
+    const body = res.json();
+    expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.message).toContain("Challenge signature verification failed");
+    expect(body.requestId).toBeTruthy();
+    expect(body.token).toBeUndefined();
+    expect(prisma.user.upsert).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("POST /auth/verify rejects malformed XDR before challenge verification", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/auth/verify",
       payload: { transaction: "not-a-valid-challenge-xdr" },
     });
-    expect(res.statusCode).toBe(401);
-    const body = res.json();
-    expect(body.code).toBe("UNAUTHORIZED");
-    expect(body.message).toBe("Invalid or expired authentication challenge");
-    expect(body.requestId).toBeTruthy();
-    expect(body.token).toBeUndefined();
+    expect(res.statusCode).toBe(400);
     expect(prisma.user.upsert).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
@@ -399,13 +411,19 @@ describe("group routes", () => {
     // StrKey (not just a regex) — Keypair.random() guarantees that.
     const validPubKey = Keypair.random().publicKey();
 
+    /**
+     * The caller's admin membership is read twice: once by the route's
+     * `requireGroupRole("admin")` guard, and again inside the transaction
+     * (the re-check that closes the concurrent-demotion window).
+     */
+    function callerIsAdmin(user: { id: string }) {
+      const row = { groupId: "group_1", userId: user.id, role: "admin" };
+      prisma.groupMember.findUnique.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+    }
+
     it("returns 201 and creates an invitation", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(null);
       prisma.invitation.findFirst.mockResolvedValueOnce(null);
       const invitation = {
@@ -456,8 +474,13 @@ describe("group routes", () => {
 
     it("returns 400 for an invalid public key", async () => {
       const user = fakeUser();
-      // No groupMember mock: the public key fails validation before the
-      // route ever opens a transaction or checks membership.
+      // The admin guard passes; the public key then fails validation before
+      // the route opens a transaction, so there is no second (in-tx) lookup.
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: user.id,
+        role: "admin",
+      });
 
       const res = await app.inject({
         method: "POST",
@@ -467,16 +490,13 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(400);
+      expect(prisma.invitation.create).not.toHaveBeenCalled();
     });
 
     it("returns 409 when invitee is already a member", async () => {
       const user = fakeUser();
       const inviteeUser = fakeUser({ id: "user_2", stellarPublicKey: validPubKey });
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(inviteeUser);
       prisma.groupMember.findUnique.mockResolvedValueOnce({
         groupId: "group_1",
@@ -497,11 +517,7 @@ describe("group routes", () => {
 
     it("returns 409 when a pending invitation already exists", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(null);
       prisma.invitation.findFirst.mockResolvedValueOnce({
         id: "existing_inv",
@@ -547,18 +563,17 @@ describe("group routes", () => {
       expect(prisma.groupMember.delete).toHaveBeenCalledWith({
         where: { groupId_userId: { groupId: "group_1", userId: targetUser.id } },
       });
-      // The record now carries the group it belongs to — it was written with
-      // groupId: null before, so group-scoped audit queries never saw member
-      // removals — along with the role the removed member held.
+      // Group-scoped queries can find the event, and its target identifies the
+      // affected member rather than only the containing group.
       expect(prisma.auditLog.create).toHaveBeenCalledWith({
         data: {
           userId: admin.id,
           groupId: "group_1",
           action: "group.member_remove",
-          entityType: "group",
-          entityId: "group_1",
+          entityType: "group_member",
+          entityId: targetUser.id,
           metadata: {
-            removedUserId: targetUser.id,
+            targetUserId: targetUser.id,
             removedRole: "member",
             outcome: "success",
           },
@@ -711,7 +726,16 @@ describe("expense routes", () => {
         { id: "share_2", expenseId, userId: "user_2", shareAmount: "50.00", status: "pending" },
       ],
     };
+    // The expense row and the admin membership are each read twice: once by
+    // the route's preHandler guard resolving the expense's group, once again
+    // by the handler's own in-transaction check and delete.
     prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
       userId: user.id,

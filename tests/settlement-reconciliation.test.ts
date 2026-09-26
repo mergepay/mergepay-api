@@ -9,8 +9,12 @@ const h = vi.hoisted(() => {
       update: vi.fn(),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
+    expense: {
+      findFirst: vi.fn(),
+    },
     expenseShare: {
       update: vi.fn(),
+      count: vi.fn(),
     },
     auditLog: { create: vi.fn() },
     statusHistory: {
@@ -52,11 +56,12 @@ import {
   reconcileSingleSettlement,
   type ReconcilableSettlement,
 } from "../src/services/settlement-reconciliation";
+import { Errors } from "../src/errors";
 
 function pendingConfirmationSettlement(over: Record<string, any> = {}) {
   return {
     id: "settle_1",
-    shortCode: "ABC123",
+    shortCode: "ABC234",
     groupId: "group_1",
     fromUserId: "user_1",
     toUserId: "user_2",
@@ -68,7 +73,7 @@ function pendingConfirmationSettlement(over: Record<string, any> = {}) {
     status: "pending_confirmation",
     retryCount: 0,
     failureReason: null,
-    memo: "MP:ABC123",
+    memo: "MP:ABC234",
     expenseId: null,
     expenseShareId: null,
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
@@ -85,7 +90,7 @@ function makeReconcilable(over: Partial<ReconcilableSettlement> = {}): Reconcila
     id: "settle_1",
     stellarTxHash: "abc123def456",
     retryCount: 0,
-    shortCode: "ABC123",
+    shortCode: "ABC234",
     amount: "12.5000000",
     assetCode: "XLM",
     assetIssuer: null,
@@ -108,8 +113,17 @@ beforeEach(() => {
   h.getTransactionPayments.mockResolvedValue([
     { type: "payment", destination: "GTO...", amount: "12.5000000", asset_type: "native" },
   ]);
-  h.verifyTransactionMemo.mockResolvedValue({ verified: true });
+  // verifyTransactionMemo returns the memo read from the ledger (#506).
+  h.verifyTransactionMemo.mockResolvedValue({
+    verified: true,
+    memo: "MP:ABC234",
+    code: "ABC234",
+  });
   h.verifyPaymentOperation.mockImplementation(() => {});
+  // Memo → expense validation defaults: no record, so a test that exercises
+  // the path must opt in with an explicit mock.
+  h.prisma.expense.findFirst.mockResolvedValue(null);
+  h.prisma.expenseShare.count.mockResolvedValue(0);
 });
 
 // The batch-level reconciliation loop (formerly reconcileSettlements here)
@@ -117,6 +131,67 @@ beforeEach(() => {
 // the lease claim — its coverage lives in tests/worker.test.ts.
 
 describe("reconcileSingleSettlement", () => {
+  it("resolves a needs_review settlement to confirmed when the hash landed successfully (issue #541)", async () => {
+    // A needs_review row carries the same fields the reconciliation needs as
+    // a pending_confirmation row: a submitted hash and the stored intent.
+    // The reconciliation is identical — only the status the row arrived in
+    // differs, which is the worker's candidate query's business, not this
+    // function's.
+    h.prisma.settlement.findUnique.mockResolvedValue({
+      id: "settle_1",
+      status: "needs_review",
+      fromUserId: "user_1",
+      expenseShareId: "share_9",
+      retryCount: 0,
+    });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1",
+      status: "confirmed",
+      expenseShareId: "share_9",
+    });
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+
+    const outcome = await reconcileSingleSettlement(makeReconcilable(), 10);
+
+    expect(outcome).toBe("confirmed");
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "settle_1" }),
+        data: expect.objectContaining({ status: "confirmed" }),
+      })
+    );
+    // The expense share is settled as part of the confirmation.
+    expect(h.prisma.expenseShare.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "share_9" },
+        data: { status: "settled" },
+      })
+    );
+  });
+
+  it("resolves a needs_review settlement to failed when the transaction failed on-chain (issue #541)", async () => {
+    h.prisma.settlement.findUnique.mockResolvedValue({
+      id: "settle_1",
+      status: "needs_review",
+      fromUserId: "user_1",
+      expenseShareId: null,
+      retryCount: 0,
+    });
+    h.getTransaction.mockResolvedValue({ successful: false });
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+
+    const outcome = await reconcileSingleSettlement(makeReconcilable(), 10);
+
+    expect(outcome).toBe("failed");
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "settle_1" }),
+        data: expect.objectContaining({ status: "failed" }),
+      })
+    );
+  });
+
   it("moves to completed when transaction is found, successful, and verified", async () => {
     h.getTransaction.mockResolvedValue({ successful: true });
     h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
@@ -132,7 +207,7 @@ describe("reconcileSingleSettlement", () => {
     });
 
     await reconcileSingleSettlement(
-      { id: "settle_1", stellarTxHash: "hash_abc", retryCount: 0, expenseShareId: null },
+      makeReconcilable({ stellarTxHash: "hash_abc" }),
       10
     );
 
@@ -426,6 +501,91 @@ describe("reconcileSingleSettlement — verification failures", () => {
     );
   });
 
+  // Issue #506: memo failures thrown by the real verifier carry messages such
+  // as "Transaction has no memo" that match none of the legacy message
+  // substrings. They used to be rethrown, which the worker counts as
+  // "pending" — leaving the settlement stuck and re-polled every cycle.
+  it.each([
+    ["missing memo", "Transaction has no memo", "missing_memo"],
+    [
+      "hash memo",
+      'Unexpected memo type: expected "text", got "hash"; a hash memo cannot carry the MP: settlement reference',
+      "hash_memo_mismatch",
+    ],
+    [
+      "invalid hash memo",
+      'Unexpected memo type: expected "text", got "hash"; the hash memo is malformed (expected 32 bytes, base64-encoded)',
+      "invalid_hash_memo",
+    ],
+    ["id memo", 'Unexpected memo type: expected "text", got "id"', "unsupported_memo_type"],
+    [
+      "malformed text memo",
+      "Transaction memo is not a valid Mergepay reference: Mergepay memo must start with 'MP:'.",
+      "malformed_memo",
+    ],
+  ])("fails (never confirms or rethrows) on a %s", async (_label, message, memoFailure) => {
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.verifyTransactionMemo.mockRejectedValue(
+      Errors.badRequest("transaction_verification_failed", message, { memoFailure })
+    );
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1", status: "failed", expenseShareId: null
+    });
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({ stellarTxHash: "hash_bad_memo", expenseId: "exp_1" }),
+      10
+    );
+
+    expect(outcome).toBe("failed");
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "failed", failureReason: message }),
+      })
+    );
+    expect(h.prisma.settlement.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "confirmed" }) })
+    );
+    // No attribution work happens for an unattributable payment.
+    expect(h.prisma.expense.findFirst).not.toHaveBeenCalled();
+    expect(h.getTransactionPayments).not.toHaveBeenCalled();
+    expect(h.audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "settlement.verification_failed",
+        metadata: expect.objectContaining({ stellarTxHash: "hash_bad_memo", memoFailure }),
+      })
+    );
+  });
+
+  it("fails on a non-payment operation verification error (classified by code)", async () => {
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.verifyPaymentOperation.mockImplementation(() => {
+      throw Errors.badRequest(
+        "transaction_verification_failed",
+        'Expected a payment operation, got "create_account"'
+      );
+    });
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1", status: "failed", expenseShareId: null
+    });
+
+    await expect(
+      reconcileSingleSettlement(makeReconcilable({ stellarTxHash: "hash_op" }), 10)
+    ).resolves.toBe("failed");
+  });
+
+  it("still rethrows unexpected errors so the worker can retry them", async () => {
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.verifyTransactionMemo.mockRejectedValue(new Error("database connection lost"));
+
+    await expect(
+      reconcileSingleSettlement(makeReconcilable({ stellarTxHash: "hash_unexpected" }), 10)
+    ).rejects.toThrow("database connection lost");
+    expect(h.prisma.settlement.updateMany).not.toHaveBeenCalled();
+  });
+
   it("fails the settlement when destination verification fails", async () => {
     h.getTransaction.mockResolvedValue({ successful: true });
     h.verifyTransactionMemo.mockResolvedValue({ verified: true });
@@ -475,6 +635,147 @@ describe("reconcileSingleSettlement — verification failures", () => {
           status: "failed",
           failureReason: expect.stringContaining("Horizon"),
         }),
+      })
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Memo code vs active expense record (settlement verification worker runs)
+// ---------------------------------------------------------------------------
+
+describe("reconcileSingleSettlement — memo code vs active expense record", () => {
+  /** Mocks for a transaction that verifies cleanly up to the expense check. */
+  function verifiedTransaction(status: "confirmed" | "failed") {
+    h.getTransaction.mockResolvedValue({ successful: true });
+    h.prisma.settlement.updateMany.mockResolvedValue({ count: 1 });
+    h.prisma.settlement.findUniqueOrThrow.mockResolvedValue({
+      id: "settle_1", status, expenseShareId: null
+    });
+    h.prisma.settlement.findUnique.mockResolvedValue({
+      id: "settle_1",
+      status: "pending_confirmation",
+      fromUserId: "user_1",
+      expenseShareId: null,
+      retryCount: 0,
+    });
+  }
+
+  it("confirms only after the parsed memo code resolves to an active expense", async () => {
+    verifiedTransaction("confirmed");
+    h.prisma.expense.findFirst.mockResolvedValue({ id: "exp_1", memo: "EXP2345" });
+    h.prisma.expenseShare.count.mockResolvedValue(1);
+
+    await reconcileSingleSettlement(
+      makeReconcilable({ stellarTxHash: "hash_ok", expenseId: "exp_1" }),
+      10
+    );
+
+    // The expected memo is generated from the settlement short code…
+    expect(h.verifyTransactionMemo).toHaveBeenCalledWith("hash_ok", "MP:ABC234");
+    // …then parsed and resolved against the linked expense record.
+    expect(h.prisma.expense.findFirst).toHaveBeenCalledWith({
+      where: { id: "exp_1" },
+      select: { id: true, memo: true },
+    });
+    expect(h.prisma.expenseShare.count).toHaveBeenCalledWith({
+      where: { expenseId: "exp_1", status: { not: "settled" } },
+    });
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "confirmed" }),
+      })
+    );
+  });
+
+  it("fails the settlement when the linked expense record no longer exists", async () => {
+    verifiedTransaction("failed");
+    h.prisma.expense.findFirst.mockResolvedValue(null);
+
+    await reconcileSingleSettlement(
+      makeReconcilable({ stellarTxHash: "hash_missing_expense", expenseId: "exp_gone" }),
+      10
+    );
+
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "settle_1" }),
+        data: expect.objectContaining({ status: "failed" }),
+      })
+    );
+    expect(h.audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "settlement.verification_failed",
+        metadata: expect.objectContaining({
+          reason: expect.stringContaining("Memo verification failed"),
+        }),
+      })
+    );
+  });
+
+  it("fails the settlement when the memo's expense has no outstanding shares", async () => {
+    verifiedTransaction("failed");
+    h.prisma.expense.findFirst.mockResolvedValue({ id: "exp_2", memo: "EXP2345" });
+    h.prisma.expenseShare.count.mockResolvedValue(0);
+
+    await reconcileSingleSettlement(
+      makeReconcilable({ stellarTxHash: "hash_settled_expense", expenseId: "exp_2" }),
+      10
+    );
+
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "failed" }),
+      })
+    );
+    expect(h.audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "settlement.verification_failed",
+        metadata: expect.objectContaining({
+          reason: expect.stringContaining("outstanding shares"),
+        }),
+      })
+    );
+  });
+
+  it("resolves the expense from the memo read on-chain, not a rebuilt one", async () => {
+    verifiedTransaction("failed");
+    // A verifier that (incorrectly) reports success with a different ledger
+    // memo must still not confirm: the expense check parses what was paid.
+    h.verifyTransactionMemo.mockResolvedValue({
+      verified: true,
+      memo: "MP:ZZZ999",
+      code: "ZZZ999",
+    });
+    h.prisma.expense.findFirst.mockResolvedValue({ id: "exp_1", memo: "EXP2345" });
+    h.prisma.expenseShare.count.mockResolvedValue(1);
+
+    const outcome = await reconcileSingleSettlement(
+      makeReconcilable({ stellarTxHash: "hash_swapped", expenseId: "exp_1" }),
+      10
+    );
+
+    expect(outcome).toBe("failed");
+    expect(h.prisma.expense.findFirst).not.toHaveBeenCalled();
+    expect(h.audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "settlement.verification_failed",
+        metadata: expect.objectContaining({
+          reason: expect.stringContaining("does not match the expected code"),
+        }),
+      })
+    );
+  });
+
+  it("skips the expense lookup for settlements created before expense linking", async () => {
+    verifiedTransaction("confirmed");
+
+    await reconcileSingleSettlement(makeReconcilable({ stellarTxHash: "hash_legacy" }), 10);
+
+    expect(h.prisma.expense.findFirst).not.toHaveBeenCalled();
+    expect(h.prisma.settlement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "confirmed" }),
       })
     );
   });

@@ -2,7 +2,7 @@ import pino from "pino";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
 import { audit } from "./audit";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { applySettlementTransition } from "./settlement-machine";
 import type { CorrelationContext } from "../lib/correlation";
 import { loggerWithContext } from "../lib/correlation";
@@ -11,6 +11,7 @@ import {
   verifyPaymentOperation,
   getTransactionPayments,
 } from "./horizonService";
+import { buildMemo, validateMemoAgainstActiveExpense } from "./memo";
 import { dispatchEvent } from "./webhook";
 
 const log = pino({ name: "settlement-reconciliation" });
@@ -37,6 +38,12 @@ export interface ReconcilableSettlement {
   retryCount: number;
   /** Settlement short code, used to derive the expected memo (MP:<code>). */
   shortCode: string;
+  /**
+   * Expense this settlement pays off. When present, verification resolves the
+   * parsed memo code against this record and refuses to confirm while the
+   * expense is missing or fully settled (see `validateMemoAgainstActiveExpense`).
+   */
+  expenseId?: string | null;
   /** Expected payment amount. */
   amount: string;
   /** Expected asset code (e.g. "XLM", "USDC"). */
@@ -91,8 +98,41 @@ export async function reconcileSingleSettlement(
 
   if (tx.successful) {
     try {
-      const expectedMemo = `MP:${settlement.shortCode}`;
-      await verifyTransactionMemo(hash, expectedMemo);
+      // Generate the expected memo through the shared helper rather than a
+      // raw template literal: an unusable short code is a verification
+      // failure, not a string that silently never matches on-chain.
+      const expectedMemo = buildMemo(settlement.shortCode);
+      if (!expectedMemo.ok) {
+        throw Errors.badRequest(
+          "transaction_verification_failed",
+          `Memo verification failed: ${expectedMemo.message}`
+        );
+      }
+      // Missing, hash, id, malformed, or mismatched on-chain memos all throw
+      // a TRANSACTION_VERIFICATION_FAILED AppError here, so a payment is only
+      // attributed to this settlement when its memo is exactly MP:<shortCode>.
+      const onChain = await verifyTransactionMemo(hash, expectedMemo.memo);
+
+      // The memo must still resolve to a *live* expense: parse the memo that
+      // actually landed on-chain and check the settlement's expense record
+      // exists with shares still outstanding before this worker is allowed to
+      // confirm. Settlements created before expense linking have no record to
+      // validate against and skip this.
+      if (settlement.expenseId) {
+        const validation = await validateMemoAgainstActiveExpense(
+          onChain.memo,
+          {
+            expectedCode: settlement.shortCode,
+            expenseId: settlement.expenseId,
+          }
+        );
+        if (!validation.ok) {
+          throw Errors.badRequest(
+            "transaction_verification_failed",
+            `Memo verification failed: ${validation.message}`
+          );
+        }
+      }
 
       const payments = await getTransactionPayments(hash);
       const paymentOp = payments.find((op) => op.type === "payment");
@@ -110,11 +150,13 @@ export async function reconcileSingleSettlement(
       });
     } catch (err) {
       if (
-        err instanceof Error &&
-        (err.message.includes("verification_failed") ||
-          err.message.includes("does not match") ||
-          err.message.includes("No payment operation") ||
-          err.message.includes("Horizon request failed"))
+        isVerificationFailure(err) ||
+        (err instanceof Error &&
+          (err.message.includes("verification_failed") ||
+            err.message.includes("Memo verification failed") ||
+            err.message.includes("does not match") ||
+            err.message.includes("No payment operation") ||
+            err.message.includes("Horizon request failed")))
       ) {
         await applySettlementTransition({
           settlementId: settlement.id,
@@ -130,7 +172,11 @@ export async function reconcileSingleSettlement(
           action: "settlement.verification_failed",
           entityType: "settlement",
           entityId: settlement.id,
-          metadata: { stellarTxHash: hash, reason: err.message },
+          metadata: {
+            stellarTxHash: hash,
+            reason: err.message,
+            ...memoFailureMetadata(err),
+          },
         });
         void dispatchEvent("settlement.failed", { settlementId: settlement.id, reason: err.message }, settlement.groupId)
           .catch(() => undefined);
@@ -186,6 +232,32 @@ export async function reconcileSingleSettlement(
     .catch(() => undefined);
   recLog.error({ id: settlement.id, hash }, "settlement transaction failed on Stellar");
   return "failed";
+}
+
+/** AppError codes that mean "this transaction can never verify" — terminal. */
+const VERIFICATION_FAILURE_CODES = new Set([
+  "TRANSACTION_VERIFICATION_FAILED",
+  "SETTLEMENT_VERIFICATION_FAILED",
+]);
+
+/**
+ * True for a verification failure raised by horizonService / this module.
+ *
+ * Classified by the stable error code rather than message text: a memo
+ * failure such as "Transaction has no memo" matches none of the message
+ * substrings above, and used to escape as an unexpected error — leaving the
+ * settlement in pending_confirmation to be re-checked against Horizon on
+ * every worker cycle instead of failing.
+ */
+function isVerificationFailure(err: unknown): err is AppError {
+  return err instanceof AppError && VERIFICATION_FAILURE_CODES.has(err.code);
+}
+
+/** `{ memoFailure }` when a verification error carries a memo failure reason. */
+function memoFailureMetadata(err: unknown): { memoFailure?: string } {
+  if (!(err instanceof AppError)) return {};
+  const reason = (err.details as { memoFailure?: unknown } | undefined)?.memoFailure;
+  return typeof reason === "string" ? { memoFailure: reason } : {};
 }
 
 async function handleTransactionNotFound(

@@ -111,6 +111,35 @@ npm run dev                   # API on :4000
 npm run worker                # background reconciliation worker (separate shell)
 ```
 
+### Local database setup
+
+For local development, use PostgreSQL 14+ and Node.js 20+. Start PostgreSQL,
+then create the `mergepay` database once:
+
+```bash
+createdb mergepay
+```
+
+Copy `.env.example` to `.env` if you have not already, and set `DATABASE_URL`
+to a connection string for that database, for example:
+
+```env
+DATABASE_URL=postgresql://postgres:your-password@localhost:5432/mergepay
+```
+
+Generate the Prisma client and apply the migrations to initialize the schema:
+
+```bash
+npm run prisma:generate
+npm run prisma:migrate
+```
+
+To add the local development seed data, run:
+
+```bash
+npm run db:seed
+```
+
 New to the codebase? The typing standards enforced across `src/` are documented in [TypeScript strict mode](#typescript-strict-mode).
 
 ## Environment variables
@@ -157,6 +186,7 @@ General retry configuration for safe Horizon and anchor reads (see `src/services
 | `UPSTREAM_RETRY_INITIAL_DELAY_MS` | 200 | Initial delay before first retry |
 | `UPSTREAM_RETRY_MAX_DELAY_MS` | 2000 | Maximum delay cap for exponential backoff |
 | `UPSTREAM_RETRY_JITTER_RATIO` | 0.25 | Fraction of delay applied as random jitter |
+| `HORIZON_RETRY_ON_RATE_LIMIT` | true | Horizon reads in `src/services/stellar.ts` also retry HTTP 429 (honouring `Retry-After` up to `UPSTREAM_RETRY_MAX_DELAY_MS`). Submissions are never retried. |
 
 #### Idempotency configuration
 
@@ -347,6 +377,24 @@ treasury account and, when `treasuryRequiredSigners > 1`, returned in
 **from the anchor**. The wallet signs it; `POST /anchors/sessions/:id/complete`
 exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signed
 `POST /anchors/webhook` updates session status; the worker also polls.
+
+Status tracking (`src/services/anchor.ts`, `src/services/anchor-status.ts`):
+
+- `anchorService.getTransaction` reads `GET /transaction` and validates it with
+  the Zod schema in `src/services/anchor-schemas.ts`. `id`, `kind` and `status`
+  are required, unknown fields are stripped, and amounts stay decimal strings
+  (a malformed optional field is dropped and logged, never coerced). Failures
+  raise typed errors from `src/services/anchor-errors.ts`, all 502 over HTTP.
+  Each attempt is bounded by `ANCHOR_POLL_TIMEOUT_MS`, and transient failures
+  are retried per `UPSTREAM_RETRY_*`.
+- Every status change goes through `applyAnchorSessionTransition`: a
+  conditional update on the current status plus a `status_history` row and an
+  audit row, all in one transaction. Re-delivering the same status is a no-op,
+  terminal states (`completed`, `refunded`, `expired`, `no_market`,
+  `too_small`, `too_large`; `error` may still become `refunded`) are never
+  walked back, and concurrent writers record the transition exactly once.
+- A status outside the SEP-24 set is logged and ignored. The session keeps its
+  last known state and the worker keeps polling.
 
 ## Endpoints
 

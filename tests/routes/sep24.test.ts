@@ -9,8 +9,10 @@ const h = vi.hoisted(() => {
       findMany: vi.fn(async () => []),
       findUnique: vi.fn(async () => null),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     auditLog: { create: vi.fn(async () => ({ id: "audit_1" })) },
+    statusHistory: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
   };
   const getToml = vi.fn();
@@ -89,6 +91,7 @@ beforeEach(async () => {
 
   prisma.anchorSession.findMany.mockResolvedValue([]);
   prisma.anchorSession.findUnique.mockResolvedValue(null);
+  prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
   prisma.anchorSession.update.mockImplementation(async ({ data }: any) => ({
     ...session(),
     ...data,
@@ -229,7 +232,7 @@ describe("POST /api/sep24/callback — state updates", () => {
     });
 
     expect(res.json()).toMatchObject({ matched: 1, updated: 1 });
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ status: "completed" }),
       })
@@ -280,7 +283,7 @@ describe("POST /api/sep24/callback — state updates", () => {
     });
 
     expect(res.json()).toMatchObject({ matched: 1, updated: 0 });
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("ignores a transition that would regress a terminal session", async () => {
@@ -293,7 +296,7 @@ describe("POST /api/sep24/callback — state updates", () => {
     });
 
     expect(res.json().updated).toBe(0);
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("returns 200 and audits when no session tracks the transaction", async () => {
@@ -324,7 +327,7 @@ describe("POST /api/sep24/callback — state updates", () => {
       },
     });
 
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           failureReason: "bank rejected the transfer",

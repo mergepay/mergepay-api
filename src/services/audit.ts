@@ -1,59 +1,35 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
-import { createLogger } from "../lib/logger";
-
-const SENSITIVE_KEYS = new Set([
-  "privatekey",
-  "secretkey",
-  "signedxdr",
-  "transactionxdr",
-  "xdr",
-  "token",
-  "jwt",
-  "authorization",
-  "password",
-  "secret",
-]);
-
-function sanitize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sanitize);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .filter(([key]) => !SENSITIVE_KEYS.has(key.toLowerCase()))
-      .map(([key, item]) => [key, sanitize(item)])
-  );
-}
+import { AuditAction } from "./audit-actions";
+import {
+  emitAuditEvent,
+  sanitizeAuditMetadata,
+} from "../lib/audit-logger";
 
 /**
- * Console/file telemetry for the durable audit trail — Issue #367.
+ * Console/file telemetry for the durable audit trail — Issues #367 and #131,
+ * now flowing through the dedicated structured audit-event logger
+ * (src/lib/audit-logger.ts) so every state-changing operation emits one
+ * standardized JSON line with actor, action, target resource, and timestamp.
  *
- * Every audit row is mirrored as a structured Pino line so operators can
- * stream treasury security events in real time, while the Prisma record
- * remains the durable, queryable source of truth. Telemetry is strictly
+ * The Prisma record remains the durable, queryable source of truth; the Pino
+ * line is the streaming mirror for operators. Telemetry is strictly
  * best-effort: a logging failure must never fail — or roll back — the
  * operation the audit record documents.
  */
-const auditLogger = createLogger({ name: "audit", level: "info" });
-
 function emitTelemetry(data: ReturnType<typeof auditData>): void {
-  try {
-    auditLogger.info(
-      {
-        action: data.action,
-        userId: data.userId,
-        groupId: data.groupId,
-        entityType: data.entityType,
-        entityId: data.entityId,
-        metadata: data.metadata,
-      },
-      "audit"
-    );
-  } catch {
-    // Telemetry never breaks the audited operation.
-  }
+  emitAuditEvent({
+    action: data.action,
+    actorType: data.metadata?.actorType,
+    userId: data.userId,
+    actorPublicKey: data.metadata?.actorPublicKey,
+    groupId: data.groupId,
+    entityType: data.entityType ?? "unknown",
+    entityId: data.entityId ?? "unknown",
+    outcome: data.metadata?.outcome,
+    metadata: data.metadata,
+  });
 }
-
 /** Whether the audited action succeeded, for operator-facing filtering. */
 export type AuditOutcome = "success" | "failure";
 
@@ -88,7 +64,7 @@ export function auditData(params: AuditParams) {
     entityType: params.entityType,
     entityId: params.entityId,
     metadata: {
-      ...(sanitize(params.metadata ?? {}) as Record<string, unknown>),
+      ...(sanitizeAuditMetadata(params.metadata ?? {}) as Record<string, unknown>),
       ...(params.outcome ? { outcome: params.outcome } : {}),
       ...(params.actorType ? { actorType: params.actorType } : {}),
       ...(params.actorPublicKey ? { actorPublicKey: params.actorPublicKey } : {}),
@@ -107,10 +83,23 @@ export async function audit(params: AuditParams): Promise<void> {
     // the operation — but surface the loss to telemetry so a silently failing
     // audit store stays visible to operators.
     try {
-      auditLogger.warn(
-        { err, action: params.action, entityId: params.entityId },
-        "audit write failed"
-      );
+      // Reuse the structured schema so a silently failing audit store stays
+      // visible to the same filters operators already use (`event = "audit"`,
+      // `action`), with the failure itself recorded in metadata.
+      emitAuditEvent({
+        action: params.action,
+        actorType: params.actorType,
+        userId: params.userId,
+        actorPublicKey: params.actorPublicKey,
+        groupId: params.groupId,
+        entityType: params.entityType,
+        entityId: params.entityId,
+        outcome: "failure",
+        metadata: {
+          audit_write_failed: true,
+          reason: err instanceof Error ? err.message : "unknown error",
+        },
+      });
     } catch {
       // ignore — never throw into the request path
     }
@@ -134,4 +123,30 @@ export async function auditTx(
   // the source of truth; the telemetry line merely mirrors the write for
   // operators and is best-effort.
   emitTelemetry(data);
+}
+
+export interface GroupMemberAuditParams {
+  userId: string;
+  groupId: string;
+  memberId: string;
+  action:
+    | typeof AuditAction.GROUP_MEMBER_REMOVE
+    | typeof AuditAction.GROUP_MEMBER_ROLE_CHANGE;
+  metadata: Record<string, unknown>;
+}
+
+/** Write a canonical actor/group/member audit record within the mutation transaction. */
+export function auditGroupMemberActionTx(
+  tx: Prisma.TransactionClient,
+  params: GroupMemberAuditParams
+): Promise<void> {
+  return auditTx(tx, {
+    userId: params.userId,
+    groupId: params.groupId,
+    action: params.action,
+    entityType: "group_member",
+    entityId: params.memberId,
+    outcome: "success",
+    metadata: params.metadata,
+  });
 }

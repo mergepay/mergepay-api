@@ -28,7 +28,11 @@ declare module "fastify" {
 
 const JWT_ALGORITHM = "HS256" as const;
 
-export function signToken(user: AuthUser): string {
+/**
+ * Mint a session token. `jwtid` is set for SEP-10 logins to the challenge
+ * transaction hash, which SEP-10 names as the token's `jti`.
+ */
+export function signToken(user: AuthUser, opts: { jwtid?: string } = {}): string {
   return jwt.sign(
     { sub: user.id, pk: user.stellarPublicKey },
     config.JWT_SECRET,
@@ -37,6 +41,7 @@ export function signToken(user: AuthUser): string {
       expiresIn: config.jwtExpiresIn,
       issuer: config.JWT_ISSUER,
       audience: config.JWT_AUDIENCE,
+      ...(opts.jwtid ? { jwtid: opts.jwtid } : {}),
     }
   );
 }

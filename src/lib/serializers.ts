@@ -1,5 +1,5 @@
 /**
- * Custom Pino serializers for Fastify request and response objects.
+ * Custom Pino serializers for Fastify request, response, and error objects.
  *
  * Pino's default `req`/`res` serializers copy every header verbatim, which
  * means Authorization tokens, SEP-10 JWTs, session cookies, and other
@@ -14,9 +14,29 @@
  *  3. Keep the same top-level shape as Pino's built-in serializers (`method`,
  *     `url`, `headers`, `query` for req; `statusCode`, `headers` for res)
  *     so existing log consumers do not break.
+ *
+ * The error serializer follows the same principle for the `err` field: it
+ * flattens an error to the fields that actually help an on-call engineer
+ * (`code`, `statusCode`, `requestId`, a stack) instead of dumping every own
+ * property, and scrubs credential-shaped keys from whatever detail payload the
+ * error carries. Both rules exist to serve the same goal: a log line that is
+ * small enough to read and free of secrets.
+ *
+ * Every serializer here is a total function. Pino calls them from inside its
+ * write path, so a throw (or a circular reference) would corrupt the log line
+ * — and, in the request path, the response.
  */
 
+import { isStellarError, stellarErrorSerializer, type StellarSerializedError } from "./stellar-serializer";
+
 const REDACTED = "[REDACTED]" as const;
+
+/** Value written in place of a structure too deep or too tangled to serialize. */
+const TRUNCATED = "[TRUNCATED]" as const;
+const CIRCULAR = "[CIRCULAR]" as const;
+
+/** How deep the error detail payload is followed before it is cut off. */
+const MAX_DETAIL_DEPTH = 4;
 
 /**
  * Header names that carry authentication credentials or session tokens
@@ -26,6 +46,36 @@ const SENSITIVE_HEADERS = new Set([
   "authorization",
   "cookie",
   "set-cookie",
+]);
+
+/**
+ * Keys that carry credentials anywhere in a serialized structure — not just in
+ * a header map. Applied to the nested detail payloads that errors, workers, and
+ * services attach, where a `token` or a signed envelope can appear under
+ * whatever key the throwing code chose (`err.details.*`, `err.context.*`, …).
+ *
+ * Matching is case-insensitive and by exact key name, so the camelCase and
+ * snake_case spellings in use are both listed.
+ */
+const SENSITIVE_KEYS = new Set([
+  ...SENSITIVE_HEADERS,
+  "token",
+  "accesstoken",
+  "refreshtoken",
+  "sessiontoken",
+  "idtoken",
+  "jwt",
+  "secret",
+  "clientsecret",
+  "password",
+  "privatekey",
+  "secretkey",
+  "seed",
+  "mnemonic",
+  "apikey",
+  "xdr",
+  "signedxdr",
+  "transactionxdr",
 ]);
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -61,6 +111,8 @@ export interface SerializedRequest {
   method: string;
   url: string;
   headers: Record<string, string | string[] | undefined>;
+  /** The request id, when the caller logged a request outside a request scope. */
+  id?: string;
   query?: Record<string, unknown>;
   params?: Record<string, unknown>;
   remoteAddress?: string;
@@ -91,6 +143,13 @@ export function reqSerializer(req: any): SerializedRequest {
   if (req.params && typeof req.params === "object") {
     serialized.params = req.params;
   }
+  // Pino maps an incoming request to a plain object before handing it to this
+  // serializer, and that mapping is where the request id lives. Inside a request
+  // the id also rides on the child logger's bindings, so this is the fallback
+  // that keeps a `{ req }` logged outside that scope correlatable.
+  if (typeof req.id === "string" && req.id) {
+    serialized.id = req.id;
+  }
   if (req.remoteAddress) {
     serialized.remoteAddress = req.remoteAddress;
   }
@@ -113,6 +172,34 @@ export interface SerializedResponse {
 }
 
 /**
+ * The headers of an outgoing response, read from whichever accessor the object
+ * in hand exposes.
+ *
+ * Pino hands this serializer the Fastify reply itself, not a Node response, and
+ * a reply keeps its headers behind `getHeaders()` — so reading `res.headers`
+ * alone would find nothing and `set-cookie` would never be seen, let alone
+ * redacted. `getHeaders()` reads the raw socket, which is unavailable for a
+ * reply whose response was never opened (and throws on a torn-down one), hence
+ * the guard: a log line must not be lost to an error raised while serializing
+ * it.
+ */
+function responseHeaders(
+  res: Record<string, any>
+): Record<string, string | string[] | undefined> {
+  if (res.headers && typeof res.headers === "object") {
+    return redactHeaders(res.headers);
+  }
+  if (typeof res.getHeaders === "function") {
+    try {
+      return redactHeaders(res.getHeaders());
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+/**
  * Pino-compatible serializer for Fastify / Node.js outgoing responses.
  *
  * The `set-cookie` header (which may contain session or SEP-10 tokens) is
@@ -125,6 +212,170 @@ export function resSerializer(res: any): SerializedResponse {
 
   return {
     statusCode: typeof res.statusCode === "number" ? res.statusCode : 0,
-    headers: redactHeaders(res.headers),
+    headers: responseHeaders(res),
   };
+}
+
+// ─── error serializer ───────────────────────────────────────────────────────
+
+/**
+ * Shape returned by the error serializer.
+ *
+ * It extends the Stellar shape so a Horizon failure keeps its problem-detail
+ * fields (`title`, `detail`, result codes) alongside the application fields the
+ * API needs to triage a rejection: the machine-readable `code`, the HTTP
+ * `statusCode`, and the `requestId` that ties the line to a request.
+ */
+export interface SerializedError extends StellarSerializedError {
+  code?: string;
+  requestId?: string;
+  correlationId?: string;
+  /** The upstream operation an error was raised by, when it names one. */
+  operation?: string;
+  details?: unknown;
+}
+
+/**
+ * Recursively copy a value for logging: credential-shaped keys are redacted,
+ * `Date`s become ISO strings, and nesting is bounded by both a depth limit and
+ * a cycle guard.
+ *
+ * The guard matters because Pino hands the serializer's return value straight to
+ * `JSON.stringify`; a self-referencing detail payload would otherwise throw
+ * there and take the surrounding log line — and the request that produced it —
+ * down with it.
+ */
+function sanitizeForLog(
+  value: unknown,
+  depth = 0,
+  seen: WeakSet<object> = new WeakSet<object>()
+): unknown {
+  if (value === null || typeof value !== "object") return value;
+  if (value instanceof Date) return value.toISOString();
+  if (depth >= MAX_DETAIL_DEPTH) return TRUNCATED;
+  if (seen.has(value)) return CIRCULAR;
+  seen.add(value);
+
+  try {
+    if (value instanceof Error) {
+      // A nested error (`cause`, or an error inside a detail payload) is reduced
+      // to its headline. Its own detail payload is walked with this call's depth
+      // and cycle guard, so a chain of errors that points back at itself stops
+      // here instead of exhausting the stack.
+      return { ...errorHeadline(value), ...applicationErrorFields(value, depth + 1, seen) };
+    }
+    if (Array.isArray(value)) {
+      return value.map((item) => sanitizeForLog(item, depth + 1, seen));
+    }
+
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      sanitized[key] = SENSITIVE_KEYS.has(key.toLowerCase())
+        ? REDACTED
+        : sanitizeForLog(item, depth + 1, seen);
+    }
+    return sanitized;
+  } finally {
+    // Released on the way out so a value referenced twice in the same payload
+    // is serialized twice; only a reference back into the current path (a real
+    // cycle) is reported as circular.
+    seen.delete(value);
+  }
+}
+
+/**
+ * The `type` / `name` / `message` / `stack` headline of a thrown value.
+ *
+ * `type` and `stack` are always strings because that is the contract Pino and
+ * Fastify's own error handling expect of a serialized error; a thrown plain
+ * object has neither, so both fall back rather than being left undefined.
+ */
+function errorHeadline(error: object): {
+  type: string;
+  name: string;
+  message: string;
+  stack: string;
+} {
+  const candidate = error as Record<string, unknown>;
+  const name = typeof candidate.name === "string" && candidate.name ? candidate.name : "Error";
+
+  return {
+    type: name,
+    name,
+    message: typeof candidate.message === "string" ? candidate.message : String(error),
+    stack: typeof candidate.stack === "string" ? candidate.stack : "",
+  };
+}
+
+/**
+ * The application-level fields worth keeping on any error, whatever its class.
+ *
+ * Every field is read defensively: these come from thrown values that this
+ * module did not construct (Fastify, `@fastify/*`, the Stellar SDK, upstream
+ * fetch failures), so each one is type-checked before it is trusted.
+ */
+function applicationErrorFields(
+  error: object,
+  depth = 0,
+  seen: WeakSet<object> = new WeakSet<object>()
+): Partial<SerializedError> {
+  const candidate = error as Record<string, unknown>;
+  const fields: Partial<SerializedError> = {};
+
+  if (typeof candidate.code === "string" && candidate.code) {
+    fields.code = candidate.code;
+  }
+  // `status` is AppError's own field; `statusCode` is the mirror Fastify and
+  // the Stellar SDK use. Either may be a string on an upstream error, so only
+  // real numbers are carried over.
+  const statusCode =
+    typeof candidate.statusCode === "number"
+      ? candidate.statusCode
+      : typeof candidate.status === "number"
+        ? candidate.status
+        : undefined;
+  if (statusCode !== undefined) {
+    fields.statusCode = statusCode;
+  }
+  if (typeof candidate.requestId === "string" && candidate.requestId) {
+    fields.requestId = candidate.requestId;
+  }
+  if (typeof candidate.correlationId === "string" && candidate.correlationId) {
+    fields.correlationId = candidate.correlationId;
+  }
+  if (typeof candidate.operation === "string" && candidate.operation) {
+    fields.operation = candidate.operation;
+  }
+  if (candidate.details !== undefined) {
+    fields.details = sanitizeForLog(candidate.details, depth, seen);
+  }
+
+  return fields;
+}
+
+/**
+ * Pino-compatible serializer for errors passed as the `err` field.
+ *
+ * A Horizon failure is delegated to {@link stellarErrorSerializer}, which knows
+ * how to flatten problem details and transaction result codes, and the
+ * application fields are merged on top. Everything else — `AppError`, Fastify
+ * errors, `ZodError`, plain `Error`, a thrown string — is reduced to `type`,
+ * `message`, `stack`, plus whichever of `code` / `statusCode` / `requestId` /
+ * `details` it happens to carry.
+ *
+ * Fields are an allowlist rather than a copy of every own property: an error
+ * from a dependency can hold an entire request or response body, and dumping it
+ * is exactly the log bloat this serializer exists to prevent. Whatever survives
+ * is scrubbed of credential-shaped keys first.
+ */
+export function errorSerializer(error: unknown): SerializedError {
+  if (error === null || error === undefined || typeof error !== "object") {
+    return { message: String(error), type: "Error", stack: "" };
+  }
+
+  if (isStellarError(error)) {
+    return { ...stellarErrorSerializer(error), ...applicationErrorFields(error) };
+  }
+
+  return { ...errorHeadline(error), ...applicationErrorFields(error) };
 }

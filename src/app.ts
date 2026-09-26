@@ -33,13 +33,13 @@ import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { formatErrorResponse } from "./utils/error-response";
 import { rateLimitPolicies } from "./lib/rate-limit";
+import { AppError, ErrorCode } from "./lib/errors";
 import { stellarErrorSerializer } from "./lib/stellar-serializer";
 import { reqSerializer, resSerializer } from "./lib/serializers";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
 import { nanoid } from "nanoid";
-import { AppError, ErrorCode } from "./lib/errors";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -254,6 +254,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // (skipOnError), so a database hiccup degrades to "unlimited" rather than
   // blocking all traffic. The default "memory" store is per-process and
   // needs no failure handling of its own.
+  //
+  // errorResponseBuilder must throw an AppError, not a bare body object:
+  // @fastify/rate-limit re-throws whatever this returns, so a plain object
+  // reaches the central error handler without a statusCode and is answered
+  // 500 instead of 429. AppError carries status 429 and the RATE_LIMITED
+  // code, and the handler renders it in the standard error envelope.
   await app.register(rateLimit, {
     global: true,
     max: config.RATE_LIMIT_GLOBAL_MAX,

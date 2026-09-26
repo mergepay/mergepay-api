@@ -197,6 +197,17 @@ describe("rate limiting on the real app wiring (#538)", () => {
     });
   });
 
+  it("POST /auth/refresh — per-route budget, headers, and 429 envelope", async () => {
+    const max = policies.authVerify.max;
+    await exhaustAndAssert({
+      method: "POST",
+      url: "/auth/refresh",
+      max,
+      payload: { refreshToken: "invalid_refresh_token" },
+      label: "auth/refresh",
+    });
+  });
+
   it("POST /expenses/:id/settle — per-route budget, headers, and 429 envelope", async () => {
     const max = policies.settlementCreate.max;
     await exhaustAndAssert({

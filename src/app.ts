@@ -32,7 +32,7 @@ import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { formatErrorResponse } from "./utils/error-response";
-import { rateLimitPolicies } from "./lib/rate-limit";
+import { isGlobalRateLimitExempt, rateLimitPolicies } from "./lib/rate-limit";
 import { stellarErrorSerializer } from "./lib/stellar-serializer";
 import { reqSerializer, resSerializer } from "./lib/serializers";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
@@ -243,6 +243,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     max: config.RATE_LIMIT_GLOBAL_MAX,
     timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: globalRateLimitKey,
+    allowList: isGlobalRateLimitExempt,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: () =>
       // Must be a real Error (AppError), not a bare payload object:

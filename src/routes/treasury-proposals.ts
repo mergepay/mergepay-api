@@ -146,12 +146,27 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
       });
       const memberPublicKeys = members.map((m) => m.user.stellarPublicKey);
 
-      const result = await treasuryProposalsService.submitSignatures({
-        proposalId,
-        groupId,
-        memberPublicKeys,
-        signedXdr: body.signedXdr,
-      });
+      let result;
+      try {
+        result = await treasuryProposalsService.submitSignatures({
+          proposalId,
+          groupId,
+          memberPublicKeys,
+          signedXdr: body.signedXdr,
+        });
+      } catch (e: any) {
+        if (e.name === "AppError" && e.code === "UPSTREAM_ERROR") {
+          await audit({
+            userId: auth.id,
+            action: "treasury.proposal.failed",
+            entityType: "treasury_proposal",
+            entityId: proposalId,
+            outcome: "failure",
+            metadata: { error: e.message },
+          });
+        }
+        throw e;
+      }
 
       await audit({
         userId: auth.id,

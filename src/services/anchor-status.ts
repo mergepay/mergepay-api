@@ -12,11 +12,19 @@
  *     allowed, are ignored rather than applied or thrown as an error —
  *     anchor callbacks are untrusted input and out-of-order delivery is
  *     expected, not exceptional.
- *   - Every *applied* transition writes its audit record in the same
- *     database transaction as the status change itself, so a caller can
- *     never observe a status change without its audit entry.
- *   - When a caller supplies the `expectedStatus` it read earlier, the status
- *     change is applied with a conditional update, so a stale writer can
+ *   - A status outside the known SEP-24 set is ignored, never coerced into
+ *     a guessed state: garbage from an anchor cannot overwrite a known state.
+ *   - Every *applied* transition writes its `status_history` row and its
+ *     audit record in the same database transaction as the status change
+ *     itself, so a caller can never observe a status change without its
+ *     history, and a rolled-back change leaves no history behind.
+ *   - The status change is always a conditional update (`WHERE id = ? AND
+ *     status = <status read in this transaction>`). Two concurrent writers
+ *     can both pass the in-memory transition check, but only one can match
+ *     that WHERE clause; the loser sees `count: 0` and records nothing. So a
+ *     race produces exactly one history row and one audit row.
+ *   - When a caller supplies the `expectedCurrentStatus` it read earlier, a
+ *     session that has moved on since is left alone, so a stale writer can
  *     never land a write on top of a state it did not actually observe.
  */
 import type { Prisma } from "@prisma/client";
@@ -135,18 +143,16 @@ export interface AnchorSessionUpdateResult<T> {
 
 /**
  * Apply a validated status transition (and optionally other session fields)
- * to a single anchor session, atomically with its audit record.
+ * to a single anchor session, atomically with its history and audit records.
  *
- * `nextStatus` should already be normalized via `mapAnchorStatus` — this
- * function only decides whether the transition is *allowed*, not how to
- * interpret a raw anchor status string.
+ * `nextStatus` should already be normalized via `mapAnchorStatus` or
+ * `resolveSep24Status` — this function only decides whether the transition is
+ * *allowed*, not how to interpret a raw anchor status string.
  *
  * Pass `expectedCurrentStatus` when the caller holds a snapshot of the session
- * (e.g. a poll cycle that read the row earlier). The transition is then
- * applied with a conditional update that requires the row to *still* be in
- * that status; if a concurrent writer already advanced it, the update is a
- * no-op and `changed` is false — a stale writer can never land on top of a
- * terminal state it did not observe.
+ * (e.g. a poll cycle that read the row earlier). If the session has moved on
+ * since, the transition is a no-op and `changed` is false — a stale writer can
+ * never land on top of a terminal state it did not observe.
  */
 export async function applyAnchorSessionTransition(params: {
   sessionId: string;
@@ -158,8 +164,21 @@ export async function applyAnchorSessionTransition(params: {
   ownerUserId?: string;
   /** An optional stale-write guard: the status the caller last observed. */
   expectedCurrentStatus?: string;
+  /** The anchor's own status string, recorded in the audit metadata. */
+  rawStatus?: string;
+  /** Safe, displayable reason stored on the history row (e.g. a failure message). */
+  reason?: string;
 }): Promise<AnchorSessionUpdateResult<{ id: string; status: string }>> {
-  const { sessionId, nextStatus, source, extraData, ownerUserId, expectedCurrentStatus } = params;
+  const {
+    sessionId,
+    nextStatus,
+    source,
+    extraData,
+    ownerUserId,
+    expectedCurrentStatus,
+    rawStatus,
+    reason,
+  } = params;
 
   return prisma.$transaction(async (tx) => {
     const session = await tx.anchorSession.findUnique({ where: { id: sessionId } });
@@ -170,8 +189,14 @@ export async function applyAnchorSessionTransition(params: {
       throw Errors.forbidden("You do not have access to this anchor session");
     }
 
+    // An unknown status is never guessed into a local one: the session keeps
+    // the last state Mergepay understood.
+    if (!isKnownStatus(nextStatus)) {
+      return { session, changed: false };
+    }
+
     const current = session.status as AnchorSessionStatus;
-    const target = isKnownStatus(nextStatus) ? nextStatus : "pending_anchor";
+    const target = nextStatus;
 
     // Idempotent duplicate delivery of the same status: still persist any
     // accompanying extra data (e.g. a retried "complete" call resending the
@@ -195,42 +220,30 @@ export async function applyAnchorSessionTransition(params: {
 
     // A stale-write guard: the caller's snapshot must still be the live
     // status, otherwise a concurrent (e.g. terminal) write already won and
-    // this transition must not land. Guarding before the update makes the
-    // monotonic guarantee explicit at the database layer rather than only in
-    // this process's memory.
+    // this transition must not land.
     if (expectedCurrentStatus !== undefined && expectedCurrentStatus !== current) {
       return { session, changed: false };
     }
-    if (expectedCurrentStatus !== undefined) {
-      const { count } = await tx.anchorSession.updateMany({
-        where: { id: sessionId, status: expectedCurrentStatus },
-        data: { ...extraData, status: target },
-      });
-      if (count === 0) {
-        // The row moved underneath us — a concurrent (e.g. terminal) write won.
-        return { session, changed: false };
-      }
-      await auditTx(tx, {
-        userId: session.userId,
-        action: "anchor_session.status_changed",
-        entityType: "anchor_session",
-        entityId: sessionId,
-        metadata: { from: current, to: target, source },
-      });
-      // updateMany cannot return the updated row; synthesise the minimal shape
-      // the transition contract requires. StatusHistory/audit reflect the new
-      // state; callers needing the full row read the record themselves.
-      const merged = {
-        ...session,
-        ...(extraData as Record<string, unknown> | undefined),
-        status: target,
-      };
-      return { session: merged, changed: true };
+
+    // Conditional update on the status read above. Under concurrency the
+    // database, not this process's memory, decides the single winner.
+    const { count } = await tx.anchorSession.updateMany({
+      where: { id: sessionId, status: current },
+      data: { ...extraData, status: target },
+    });
+    if (count === 0) {
+      // The row moved underneath us — a concurrent write won.
+      return { session, changed: false };
     }
 
-    const updated = await tx.anchorSession.update({
-      where: { id: sessionId },
-      data: { ...extraData, status: target },
+    await tx.statusHistory.create({
+      data: {
+        entityType: "anchor_session",
+        entityId: sessionId,
+        status: target,
+        reason: reason ?? null,
+        source,
+      },
     });
 
     await auditTx(tx, {
@@ -238,9 +251,18 @@ export async function applyAnchorSessionTransition(params: {
       action: "anchor_session.status_changed",
       entityType: "anchor_session",
       entityId: sessionId,
-      metadata: { from: current, to: target, source },
+      metadata: {
+        from: current,
+        to: target,
+        source,
+        ...(rawStatus !== undefined ? { rawStatus } : {}),
+      },
     });
 
-    return { session: updated, changed: true };
+    const updated = await tx.anchorSession.findUnique({ where: { id: sessionId } });
+    return {
+      session: updated ?? { ...session, status: target },
+      changed: true,
+    };
   });
 }

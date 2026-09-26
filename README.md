@@ -378,6 +378,24 @@ treasury account and, when `treasuryRequiredSigners > 1`, returned in
 exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signed
 `POST /anchors/webhook` updates session status; the worker also polls.
 
+Status tracking (`src/services/anchor.ts`, `src/services/anchor-status.ts`):
+
+- `anchorService.getTransaction` reads `GET /transaction` and validates it with
+  the Zod schema in `src/services/anchor-schemas.ts`. `id`, `kind` and `status`
+  are required, unknown fields are stripped, and amounts stay decimal strings
+  (a malformed optional field is dropped and logged, never coerced). Failures
+  raise typed errors from `src/services/anchor-errors.ts`, all 502 over HTTP.
+  Each attempt is bounded by `ANCHOR_POLL_TIMEOUT_MS`, and transient failures
+  are retried per `UPSTREAM_RETRY_*`.
+- Every status change goes through `applyAnchorSessionTransition`: a
+  conditional update on the current status plus a `status_history` row and an
+  audit row, all in one transaction. Re-delivering the same status is a no-op,
+  terminal states (`completed`, `refunded`, `expired`, `no_market`,
+  `too_small`, `too_large`; `error` may still become `refunded`) are never
+  walked back, and concurrent writers record the transition exactly once.
+- A status outside the SEP-24 set is logged and ignored. The session keeps its
+  last known state and the worker keeps polling.
+
 ## Endpoints
 
 | Method | Path | Purpose |

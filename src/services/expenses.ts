@@ -201,3 +201,10 @@ export async function listGroupExpenses<T extends { createdAt: Date; id: string 
   });
   return { items, meta: { ...meta, total } };
 }
+
+export {
+  expensePaymentIntent,
+  validateExpenseXdr,
+  type ExpenseIntentRecord,
+} from "./expense-xdr";
+

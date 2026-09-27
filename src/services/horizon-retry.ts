@@ -85,6 +85,7 @@ export function classifyHorizonError(error: unknown): HorizonErrorCategory {
     const e = error as { response?: { status?: number }; status?: number };
     const httpStatus = e.response?.status ?? e.status;
     if (typeof httpStatus === "number") {
+      if (httpStatus === 408) return "transient";
       if (httpStatus === 429) return "transient";
       if (httpStatus >= 500) return "transient";
       if (httpStatus >= 400) return "permanent";
@@ -250,6 +251,8 @@ export function isRetrySuccess<T>(
  *   - `policy` — retry policy, defaults to {@link HORIZON_RETRY_POLICY}
  *   - `beforeRetry` — hook called before each retry with the error and attempt
  *     number; return `false` to abort without retrying
+ *   - `onRetry` — callback called with the error, failed attempt, and delay
+ *     before each retry
  *   - `delay` — injectable delay, for tests
  * @returns A {@link HorizonRetryOutcome} — `{ ok: true, value }` on success,
  *   `{ ok: false, lastError, attempts }` when a permanent error, an aborted
@@ -262,6 +265,7 @@ export async function withHorizonRetry<T>(
     classify?: (error: unknown) => HorizonErrorCategory;
     policy?: HorizonRetryPolicy;
     beforeRetry?: (error: unknown, attempt: number) => Promise<boolean | void>;
+    onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
     delay?: (ms: number) => Promise<void>;
   } = {}
 ): Promise<HorizonRetryOutcome<T>> {
@@ -269,6 +273,7 @@ export async function withHorizonRetry<T>(
     classify = classifyHorizonError,
     policy = HORIZON_RETRY_POLICY,
     beforeRetry,
+    onRetry,
     delay = defaultDelay,
   } = options;
 
@@ -303,6 +308,7 @@ export async function withHorizonRetry<T>(
 
       // Backoff with jitter.
       const delayMs = horizonRetryDelayMs(attempt, policy);
+      onRetry?.(error, attempt, delayMs);
       await delay(delayMs);
     }
   }

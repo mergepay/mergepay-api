@@ -9,6 +9,7 @@
  * Horizon I/O is kept in this module so tests can mock a single dependency.
  */
 import { Horizon, Memo } from "@stellar/stellar-sdk";
+import pino from "pino";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { withTimeout, TimeoutError, TransportError } from "./timeout";
@@ -25,6 +26,7 @@ import {
 } from "../lib/memo";
 
 let _server: Horizon.Server | null = null;
+const log = pino({ name: "horizon" });
 /**
  * Lazily constructed Horizon client, shared by every call in this module so
  * connection reuse is the default and tests only need to mock `HORIZON_URL`.
@@ -88,6 +90,12 @@ async function withQueryRetry<T>(
     {
       classify: classifyHorizonError,
       policy,
+      onRetry: (_error, attempt, delayMs) => {
+        log.warn(
+          { provider: "horizon", operation, attempt, nextAttempt: attempt + 1, delayMs },
+          "Retrying Horizon request"
+        );
+      },
       // withHorizonRetry computes the backoff itself; this injectable delay
       // applies it, so the schedule is observable in tests.
       delay: (ms) => sleep(ms),

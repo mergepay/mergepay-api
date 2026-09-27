@@ -27,6 +27,10 @@ describe("classifyHorizonError", () => {
     expect(classifyHorizonError({ statusCode: 429 })).toBe("transient");
   });
 
+  it("classifies request timeouts as transient", () => {
+    expect(classifyHorizonError({ response: { status: 408 } })).toBe("transient");
+  });
+
   it("classifies 500+ as transient", () => {
     expect(classifyHorizonError({ statusCode: 502 })).toBe("transient");
     expect(classifyHorizonError({ statusCode: 503 })).toBe("transient");
@@ -220,6 +224,19 @@ describe("withHorizonRetry", () => {
       expect.any(TransportError),
       1
     );
+  });
+
+  it("reports retry attempts with their backoff delay", async () => {
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(new TransportError("query", new Error("ECONNRESET")))
+      .mockResolvedValueOnce("ok");
+    const onRetry = vi.fn();
+
+    await withHorizonRetry(fn, { policy, delay: noopDelay, onRetry });
+
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith(expect.any(TransportError), 1, 100);
   });
 
   it("aborts retry when beforeRetry returns false", async () => {

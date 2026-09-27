@@ -110,6 +110,11 @@ import {
   changeMemberRoleSchema,
   groupMemberParamsSchema,
 } from "../../src/schemas/groups";
+import {
+  validateCreateGroupPayload,
+  validateUpdateGroupPayload,
+} from "../../src/services/groups";
+
 
 const prisma = h.prisma;
 let app: Awaited<ReturnType<typeof buildApp>>;
@@ -208,12 +213,46 @@ describe("schema: createGroupSchema (#707)", () => {
       createGroupSchema.safeParse({ name: "Trip", treasuryEnabled: true }).success
     ).toBe(false);
   });
+
+  it("accepts valid currency types XLM and USDC", () => {
+    expect(createGroupSchema.safeParse({ name: "Trip", currency: "XLM" }).success).toBe(true);
+    expect(createGroupSchema.safeParse({ name: "Trip", currency: "USDC" }).success).toBe(true);
+    expect(createGroupSchema.safeParse({ name: "Trip", currencyType: "USDC" }).success).toBe(true);
+    expect(createGroupSchema.safeParse({ name: "Trip", defaultCurrency: "XLM" }).success).toBe(true);
+  });
+
+  it("rejects invalid currency type", () => {
+    const res = createGroupSchema.safeParse({ name: "Trip", currency: "EUR" });
+    expect(res.success).toBe(false);
+    if (!res.success) {
+      expect(res.error.issues[0].message).toContain("Currency must be XLM or USDC");
+    }
+  });
+
+  it("accepts valid member lists and metadata constraints", () => {
+    const res = createGroupSchema.safeParse({
+      name: "Trip",
+      currency: "USDC",
+      members: ["user_1", { userId: "user_2", role: "member" }],
+      metadata: { category: "Travel", isPrivate: false },
+    });
+    expect(res.success).toBe(true);
+  });
 });
 
 describe("schema: updateGroupSchema (#707)", () => {
   it("accepts a name-only update and a null description", () => {
     expect(updateGroupSchema.safeParse({ name: "Renamed" }).success).toBe(true);
     expect(updateGroupSchema.safeParse({ description: null }).success).toBe(true);
+  });
+
+  it("accepts valid currency update", () => {
+    expect(updateGroupSchema.safeParse({ currency: "USDC" }).success).toBe(true);
+    expect(updateGroupSchema.safeParse({ currencyType: "XLM" }).success).toBe(true);
+  });
+
+  it("rejects invalid currency update", () => {
+    expect(updateGroupSchema.safeParse({ currency: "INVALID" }).success).toBe(false);
   });
 
   it("rejects an empty body — an accepted no-op write is silent data loss", () => {
@@ -233,6 +272,7 @@ describe("schema: updateGroupSchema (#707)", () => {
     ).toBe(false);
   });
 });
+
 
 describe("schema: invitation schemas (#707)", () => {
   it("directInviteSchema rejects a malformed Stellar public key", () => {
@@ -518,3 +558,30 @@ describe("role endpoints — validation (#707)", () => {
     expect(reported).toContain("role");
   });
 });
+
+describe("src/services/groups.ts helper functions", () => {
+  it("validateCreateGroupPayload validates valid creation payload", () => {
+    const data = validateCreateGroupPayload({ name: "  Valid Group  ", currency: "USDC" });
+    expect(data.name).toBe("Valid Group");
+    expect(data.currency).toBe("USDC");
+  });
+
+  it("validateCreateGroupPayload throws 400 Bad Request on invalid payload", () => {
+    expect(() => validateCreateGroupPayload({ name: "" })).toThrow(/name is required/);
+    expect(() => validateCreateGroupPayload({ name: "Test", currency: "INVALID" })).toThrow(/Currency must be XLM or USDC/);
+  });
+
+  it("validateUpdateGroupPayload validates valid update payload", () => {
+    const data = validateUpdateGroupPayload({ name: "New Name", currency: "XLM" });
+    expect(data.name).toBe("New Name");
+    expect(data.currency).toBe("XLM");
+  });
+
+  it("validateUpdateGroupPayload throws 400 Bad Request on invalid update payload", () => {
+    expect(() => validateUpdateGroupPayload({})).toThrow(/At least one/);
+    expect(() => validateUpdateGroupPayload({ currency: "INVALID" })).toThrow(/Currency must be XLM or USDC/);
+  });
+});
+
+
+

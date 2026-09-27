@@ -84,12 +84,40 @@ export const groupMemberParamsSchema = z.object({
 // Group creation
 // ---------------------------------------------------------------------------
 
+/** Currencies supported for shared expense groups. */
+export const GROUP_CURRENCIES = ["XLM", "USDC"] as const;
+export type GroupCurrency = (typeof GROUP_CURRENCIES)[number];
+
+export const groupCurrencySchema = z.enum(GROUP_CURRENCIES, {
+  errorMap: () => ({ message: "Currency must be XLM or USDC" }),
+});
+
+/** Member item payload for group creation/update lists. */
+export const groupMemberInputSchema = z.union([
+  z.string().min(1).max(64),
+  z
+    .object({
+      userId: z.string().min(1).max(64).optional(),
+      publicKey: stellarAccountIdSchema.optional(),
+      role: groupRoleSchema.optional(),
+    })
+    .strict(),
+]);
+
+/** Group metadata constraints schema. */
+export const groupMetadataSchema = z.record(z.unknown());
+
 /** Body of `POST /groups`. */
 export const createGroupSchema = z
   .object({
     /** 1–60 visible characters; whitespace-only names are rejected. */
     name: z.string().trim().min(1, "name is required").max(60),
-    description: z.string().max(280).optional(),
+    description: z.string().max(280).nullable().optional(),
+    currency: groupCurrencySchema.optional(),
+    currencyType: groupCurrencySchema.optional(),
+    defaultCurrency: groupCurrencySchema.optional(),
+    members: z.array(groupMemberInputSchema).optional(),
+    metadata: groupMetadataSchema.optional(),
   })
   .strict();
 
@@ -112,11 +140,27 @@ export const updateGroupSchema = z
   .object({
     name: z.string().trim().min(1, "name is required").max(60).optional(),
     description: z.string().max(280).nullable().optional(),
+    currency: groupCurrencySchema.optional(),
+    currencyType: groupCurrencySchema.optional(),
+    defaultCurrency: groupCurrencySchema.optional(),
+    members: z.array(groupMemberInputSchema).optional(),
+    metadata: groupMetadataSchema.nullable().optional(),
   })
   .strict()
-  .refine((v) => v.name !== undefined || v.description !== undefined, {
-    message: "At least one of name or description is required",
-  });
+  .refine(
+    (v) =>
+      v.name !== undefined ||
+      v.description !== undefined ||
+      v.currency !== undefined ||
+      v.currencyType !== undefined ||
+      v.defaultCurrency !== undefined ||
+      v.members !== undefined ||
+      v.metadata !== undefined,
+    {
+      message: "At least one of name, description, currency, members, or metadata is required",
+    }
+  );
+
 
 // ---------------------------------------------------------------------------
 // Member invitation

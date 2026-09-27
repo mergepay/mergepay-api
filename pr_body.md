@@ -1,24 +1,27 @@
-Feature: Standardize API error responses and structured logging
+## Summary
+This PR implements automated validation for signed XDR transaction payloads against expected group expense intents as well as Zod validation schemas for group creation and update payloads.
 
-This draft PR standardizes API error responses across the application and aligns structured logging with the error contract.
+## Key Changes
+1. **Automated XDR Validation for Group Expense Intents**:
+   - Created `src/services/expense-xdr.ts` containing `validateExpenseXdr`, `expensePaymentIntent`, and `ExpenseIntentRecord`.
+   - Decodes signed XDR payloads using `@stellar/stellar-sdk` (`TransactionBuilder.fromXDR`), inspecting operations, source/destination accounts, asset types/issuers, amounts, memos, time bounds, and signatures against stored expense intent records.
+   - Rejects mismatched parameters, tampered amounts/destinations, fee-bump wrappers, or invalid signatures with a 400 Bad Request error (`XDR_MISMATCH`, `XDR_MALFORMED`, `INTENT_EXPIRED`).
+   - Re-exported expense XDR validation helpers in `src/services/expenses.ts`.
+   - Added comprehensive unit test suite in `tests/expense-xdr-validation.test.ts` covering valid XDRs and tampering scenarios.
 
-Summary of changes:
-- Added `src/utils/error-response.ts` providing a canonical `{ error: { code, message, timestamp, requestId?, details? } }` envelope.
-- Updated `src/plugins/error-handler.ts` and `src/app.ts` to return the canonical envelope for Zod, Fastify validation, `AppError`, provider/upstream, rate-limit, and not-found handlers.
-- Adjusted `onError` hook to log `warn` for expected/operational (4xx) errors and `error` for server (5xx) errors. Include full `err` object only on `error`-level logs.
-- Migrated numerous tests to assert the nested `error.code` and `error.details` shape.
+2. **Group Creation & Update Zod Payload Validation**:
+   - Updated `createGroupSchema` and `updateGroupSchema` in `src/schemas/groups.ts` to validate group name (1-60 non-whitespace chars), description, supported currency types (`XLM`, `USDC`), member lists, and metadata constraints.
+   - Created `src/services/groups.ts` providing `validateCreateGroupPayload` and `validateUpdateGroupPayload` validation helpers.
+   - Applied Zod schemas to Fastify route handlers for `/groups` endpoints.
+   - Added unit tests in `tests/routes/group-schema-validation.test.ts` verifying validation failures for invalid payloads (e.g. invalid currency, empty/whitespace names, oversized descriptions, unknown keys).
 
-Notes:
-- I could not run tests locally in this environment because `vitest` is not installed here; CI should run the full test suite once this PR is opened.
-- This PR branch is `standardize-error-responses` and includes the changes described above.
+## Acceptance Criteria Checklist
+- [x] Implement validation logic that decodes signed XDR payloads and inspects operations.
+- [x] Compare XDR operation details (destination, amount, asset) against expected database records for the given intent.
+- [x] Reject transactions with mismatched parameters with a 400 Bad Request error.
+- [x] Add unit tests covering valid XDRs and various tampering scenarios.
+- [x] Create Zod schemas for group creation and group update request bodies.
+- [x] Apply the schemas to Fastify route handlers for group endpoints.
+- [x] Add unit tests verifying validation failures for invalid group payloads.
 
-Closes: #534
-
-Checklist:
-- [x] Add canonical error envelope
-- [x] Refactor central error handler and app hook
-- [x] Migrate tests to new envelope
-- [ ] CI: run tests and fix remaining failures
-- [ ] (Optional) Remove any temporary compatibility layers after consumers migrate
-
-Please review and let me know if you want me to iterate on CI failures or keep the PR as a draft until test passing is confirmed by CI.
+Closes #

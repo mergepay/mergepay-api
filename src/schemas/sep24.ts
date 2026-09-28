@@ -40,6 +40,7 @@ import {
   sep24DepositRequestSchema,
   sep24WithdrawRequestSchema,
   sep24InitQuerySchema,
+  sep24StellarTransactionHashSchema,
 } from "../validations/sep24";
 
 /**
@@ -85,7 +86,7 @@ export const sep24CallbackTransactionSchema = z
     amount_in: z.string().max(64).nullish(),
     amount_out: z.string().max(64).nullish(),
     amount_fee: z.string().max(64).nullish(),
-    stellar_transaction_id: z.string().max(128).nullish(),
+    stellar_transaction_id: sep24StellarTransactionHashSchema.nullish(),
     external_transaction_id: z.string().max(255).nullish(),
     message: z.string().max(1024).nullish(),
   })

@@ -124,10 +124,10 @@ function expectValidationError(res: { statusCode: number; json: () => any }) {
   expect(res.statusCode).toBe(400);
   const body = res.json();
   expect(body.code).toBe("VALIDATION_ERROR");
-  expect(body.error).toBe("VALIDATION_ERROR");
+  expect(body.error.code).toBe("VALIDATION_ERROR");
   expect(typeof body.message).toBe("string");
-  expect(Array.isArray(body.details)).toBe(true);
-  expect(body.details.length).toBeGreaterThan(0);
+  expect(Array.isArray(body.error.details)).toBe(true);
+  expect(body.error.details.length).toBeGreaterThan(0);
 }
 
 beforeEach(async () => {
@@ -162,7 +162,7 @@ describe("canonical callback schema (src/schemas/sep24.ts)", () => {
         amount_in: "100.0000000",
         amount_out: "99.5000000",
         amount_fee: "0.5000000",
-        stellar_transaction_id: "stellar_hash_1",
+        stellar_transaction_id: "a".repeat(64),
         message: "all good",
       },
     });
@@ -173,7 +173,7 @@ describe("canonical callback schema (src/schemas/sep24.ts)", () => {
       externalTransactionId: "anchor_tx_1",
       rawStatus: "completed",
       message: "all good",
-      stellarTransactionId: "stellar_hash_1",
+      stellarTransactionId: "a".repeat(64),
       amountIn: "100.0000000",
       amountOut: "99.5000000",
       amountFee: "0.5000000",
@@ -354,7 +354,7 @@ describe("POST /anchors/webhook — payload validation", () => {
     });
 
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true });
+    expect(res.json()).toMatchObject({ received: true, status: "completed" });
   });
 
   it("returns a structured 400 when the transaction id is missing", async () => {

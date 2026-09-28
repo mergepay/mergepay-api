@@ -1,7 +1,6 @@
 /** Request validation for signed Stellar transaction submission. */
-import { TransactionBuilder } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import { config } from "../config";
+import { isValidXdr } from "../utils/stellar-xdr";
 
 const signedXdrSchema = z
   .string()
@@ -15,14 +14,12 @@ const signedXdrSchema = z
     (value) => Buffer.from(value, "base64").toString("base64") === value,
     "Signed transaction must use canonical base64 encoding"
   )
-  .refine((value) => {
-    try {
-      TransactionBuilder.fromXDR(value, config.networkPassphrase);
-      return true;
-    } catch {
-      return false;
-    }
-  }, "Signed transaction must be valid Stellar transaction XDR");
+  // Shared parse-level XDR check (issue #419): rejects anything the SDK
+  // cannot decode, before a handler ever touches the envelope.
+  .refine(
+    (value) => isValidXdr(value),
+    "Signed transaction must be valid Stellar transaction XDR"
+  );
 
 export const signedXdrRequestSchema = z.object({ signedXdr: signedXdrSchema });
 

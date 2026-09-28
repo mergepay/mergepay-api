@@ -34,6 +34,7 @@ export {
   type Sep24WithdrawRequest,
 } from "../validations/sep24";
 
+import { z } from "zod";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import {
   sep24DepositRequestSchema,

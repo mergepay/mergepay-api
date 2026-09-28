@@ -13,10 +13,7 @@ import {
 } from "../services/withdrawal-status";
 import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
-import {
-  applySep24Callback,
-  sep24CallbackSchema,
-} from "../services/sep24";
+import { applySep24Callback } from "../services/sep24";
 import {
   paginationQuerySchema,
   buildPage,

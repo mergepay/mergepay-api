@@ -78,7 +78,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
         body: openApiBody(createExpenseSchema),
         response: {
           ...openApiEnvelope("expense"),
-          ...openApiErrorResponses(400, 401, 403, 404),
+          ...openApiErrorResponses(400, 401, 403, 404, 429),
         },
       },
     },

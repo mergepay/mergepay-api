@@ -815,3 +815,222 @@ describe("rate limiting and request throttling on high-frequency API routes (#50
   });
 });
 
+/**
+ * Issue #529 — rate limiting tier configuration for expense settlement submission endpoints.
+ *
+ * Expense settlement submission endpoints interact with Stellar Horizon and trigger
+ * state changes on-chain. To prevent abuse, spamming, or denial-of-service attempts
+ * against settlement submission routes, granular rate limiting rules are applied
+ * using @fastify/rate-limit:
+ *   - POST /expenses/:id/settle (settlementCreate policy, budgeted per user)
+ *   - POST /groups/:id/settlements (settlementCreate policy, budgeted per user)
+ *   - POST /settlements/:id/confirm (settlementConfirm policy, budgeted per user)
+ *   - POST /api/settlements/execute (settlementExecute policy, budgeted per user)
+ *
+ * Acceptance Criteria verified:
+ *   - Configure route-specific rate limits for settlement submission endpoints.
+ *   - Return standard rate limit headers (X-RateLimit-*) and a clean 429 response.
+ *   - Ensure health check and public read endpoints remain unaffected by strict rate limits.
+ *   - Exceeding the rate limit triggers the expected 429 response.
+ */
+describe("expense settlement submission rate limiting (#529)", () => {
+  function tokenFor(userId: string) {
+    const token = signToken({
+      id: userId,
+      stellarPublicKey: Keypair.random().publicKey(),
+    });
+    return { authorization: `Bearer ${token}` };
+  }
+
+  const settleUrl = "/expenses/00000000-0000-0000-0000-000000000000/settle";
+  const groupSettleUrl = "/groups/00000000-0000-0000-0000-000000000000/settlements";
+  const executeUrl = "/api/settlements/execute";
+
+  it("carries route-specific budgets strictly tighter than the global default", () => {
+    const policies = rateLimitPolicies();
+    for (const name of ["settlementCreate", "settlementConfirm", "settlementExecute"] as const) {
+      const policy = policies[name];
+      expect(policy.keyBy).toBe("user-or-ip");
+      expect(policy.hook).toBe("preHandler");
+      expect(policy.max).toBeLessThan(policies.global.max);
+      expect(policy.timeWindow).toBeGreaterThan(0);
+      expect(policy.prefix).toContain("settlement");
+    }
+  });
+
+  it("POST /expenses/:id/settle — per-route budget, headers, and 429 envelope", async () => {
+    const max = policies.settlementCreate.max;
+    const userId = "user_529_settle";
+    const headers = tokenFor(userId);
+
+    const blocked = await exhaustAndAssert({
+      method: "POST",
+      url: settleUrl,
+      max,
+      headers,
+      payload: {},
+      label: "expenses/:id/settle",
+    });
+
+    expect(blocked.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(blocked.headers["x-ratelimit-limit"]).not.toBe(String(policies.global.max));
+  });
+
+  it("POST /api/settlements/execute — per-route budget, headers, and 429 envelope", async () => {
+    const max = policies.settlementExecute.max;
+    const userId = "user_529_execute";
+    const headers = tokenFor(userId);
+
+    let sawUnderLimit = 0;
+    for (let i = 0; i < max; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: executeUrl,
+        headers: { ...headers, "x-idempotency-key": `exec-529-key-${i}` },
+        payload: {
+          settlementId: "00000000-0000-0000-0000-000000000000",
+          signedXdr: "AAAA",
+        },
+      });
+      expect(res.statusCode).not.toBe(429);
+      if (res.statusCode < 500) sawUnderLimit++;
+    }
+    expect(sawUnderLimit).toBe(max);
+
+    const blocked = await app.inject({
+      method: "POST",
+      url: executeUrl,
+      headers: { ...headers, "x-idempotency-key": "exec-529-key-over" },
+      payload: {
+        settlementId: "00000000-0000-0000-0000-000000000000",
+        signedXdr: "AAAA",
+      },
+    });
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(blocked.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(blocked.headers["retry-after"]).toBeDefined();
+    const body = blocked.json();
+    expect(body.code).toBe("RATE_LIMITED");
+    expect(body.requestId).toBeTruthy();
+  });
+
+  it("keys the bucket by SEP-10 identity, maintaining independent budgets per user", async () => {
+    const max = policies.settlementCreate.max;
+    const noisyId = "user_529_noisy";
+    const noisy = tokenFor(noisyId);
+    const neighbour = tokenFor("user_529_neighbour");
+
+    for (let i = 0; i < max; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: settleUrl,
+        headers: noisy,
+        payload: {},
+      });
+      expect(res.statusCode).not.toBe(429);
+    }
+    const blocked = await app.inject({
+      method: "POST",
+      url: settleUrl,
+      headers: noisy,
+      payload: {},
+    });
+    expect(blocked.statusCode).toBe(429);
+
+    // Neighbour user behind same IP is not affected
+    const other = await app.inject({
+      method: "POST",
+      url: settleUrl,
+      headers: neighbour,
+      payload: {},
+    });
+    expect(other.statusCode).not.toBe(429);
+    expect(other.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(other.headers["x-ratelimit-remaining"]).toBe(String(max - 1));
+  });
+
+  it("an unauthenticated caller cannot spend a member's settlement budget", async () => {
+    const max = policies.settlementCreate.max;
+    for (let i = 0; i < max + 5; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: settleUrl,
+        payload: {},
+      });
+      expect(res.statusCode).toBe(401);
+    }
+
+    const victim = tokenFor("user_529_victim");
+    const first = await app.inject({
+      method: "POST",
+      url: settleUrl,
+      headers: victim,
+      payload: {},
+    });
+    expect(first.statusCode).not.toBe(429);
+    expect(first.headers["x-ratelimit-remaining"]).toBe(String(max - 1));
+  });
+
+  it("ensures health check and public read endpoints remain unaffected by strict settlement rate limits", async () => {
+    const max = policies.settlementCreate.max;
+    const userId = "user_529_unaffected";
+    const headers = tokenFor(userId);
+
+    // Exhaust the settlement submission budget
+    for (let i = 0; i < max; i++) {
+      await app.inject({ method: "POST", url: settleUrl, headers, payload: {} });
+    }
+    const blocked = await app.inject({ method: "POST", url: settleUrl, headers, payload: {} });
+    expect(blocked.statusCode).toBe(429);
+
+    // Health checks remain unaffected and return 200
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.statusCode).toBe(200);
+    const healthLive = await app.inject({ method: "GET", url: "/health/live" });
+    expect(healthLive.statusCode).toBe(200);
+
+    // Read routes remain unaffected
+    const history = await app.inject({ method: "GET", url: "/history", headers });
+    expect(history.statusCode).not.toBe(429);
+
+    const expenseList = await app.inject({
+      method: "GET",
+      url: "/groups/00000000-0000-0000-0000-000000000000/expenses",
+      headers,
+    });
+    expect(expenseList.statusCode).not.toBe(429);
+  });
+
+  it("settlement submission and execution keep independent budgets", async () => {
+    const max = policies.settlementCreate.max;
+    const userId = "user_529_independent_sub";
+    const headers = tokenFor(userId);
+
+    // Exhaust settlement creation
+    for (let i = 0; i < max; i++) {
+      await app.inject({ method: "POST", url: settleUrl, headers, payload: {} });
+    }
+    expect((await app.inject({ method: "POST", url: settleUrl, headers, payload: {} })).statusCode).toBe(429);
+
+    // Settlement confirmation still has its full budget
+    const confirmRes = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_x/confirm",
+      headers,
+      payload: { signedXdr: "x" },
+    });
+    expect(confirmRes.statusCode).not.toBe(429);
+    expect(confirmRes.headers["x-ratelimit-limit"]).toBe(String(policies.settlementConfirm.max));
+
+    // Settlement execution also has its full budget
+    const executeRes = await app.inject({
+      method: "POST",
+      url: executeUrl,
+      headers: { ...headers, "x-idempotency-key": "exec-indep-1" },
+      payload: { settlementId: "settle_x", signedXdr: "AAAA" },
+    });
+    expect(executeRes.statusCode).not.toBe(429);
+    expect(executeRes.headers["x-ratelimit-limit"]).toBe(String(policies.settlementExecute.max));
+  });
+});

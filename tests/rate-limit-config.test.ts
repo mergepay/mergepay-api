@@ -18,9 +18,10 @@ describe("rate limit configuration", () => {
     );
   });
 
-  it("gives settlement creation and confirmation their own explicit limits distinct from the global default", () => {
+  it("gives settlement creation, confirmation, and execution their own explicit limits distinct from the global default", () => {
     expect(config.RATE_LIMIT_SETTLEMENT_CREATE_MAX).toBeLessThan(config.RATE_LIMIT_GLOBAL_MAX);
     expect(config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX).toBeLessThan(config.RATE_LIMIT_GLOBAL_MAX);
+    expect(config.RATE_LIMIT_SETTLEMENT_EXECUTE_MAX).toBeLessThan(config.RATE_LIMIT_GLOBAL_MAX);
   });
 
   it("gives the anchor webhook its own explicit limit", () => {
@@ -49,16 +50,33 @@ describe("rate limit window bounds", () => {
     const parsed = envSchema.parse({
       ...process.env,
       RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: String(HOUR_MS),
+      RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS: String(HOUR_MS),
     });
     expect(parsed.RATE_LIMIT_AUTH_VERIFY_WINDOW_MS).toBe(HOUR_MS);
+    expect(parsed.RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS).toBe(HOUR_MS);
   });
 
   it("rejects a window beyond the one-hour bound", () => {
-    const result = envSchema.safeParse({
-      ...process.env,
-      RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: String(HOUR_MS + 1),
-    });
-    expect(result.success).toBe(false);
+    expect(
+      envSchema.safeParse({
+        ...process.env,
+        RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: String(HOUR_MS + 1),
+      }).success
+    ).toBe(false);
+
+    expect(
+      envSchema.safeParse({
+        ...process.env,
+        RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: String(HOUR_MS + 1),
+      }).success
+    ).toBe(false);
+
+    expect(
+      envSchema.safeParse({
+        ...process.env,
+        RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS: String(HOUR_MS + 1),
+      }).success
+    ).toBe(false);
   });
 
   it("rejects a non-positive or fractional window", () => {

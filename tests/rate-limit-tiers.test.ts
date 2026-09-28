@@ -38,6 +38,8 @@ const h = vi.hoisted(() => {
     statusHistory: model(),
     refreshToken: model(),
     auditLog: { create: vi.fn() },
+    $queryRawUnsafe: vi.fn(async () => [{ "?column?": 1 }]),
+    $queryRaw: vi.fn(async () => [{ "?column?": 1 }]),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
@@ -54,10 +56,13 @@ import { rateLimitPolicies } from "../src/lib/rate-limit";
 
 const prisma = h.prisma;
 
-function authHeader() {
+function authHeader(
+  userId = "user_1",
+  publicKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+) {
   const token = signToken({
-    id: "user_1",
-    stellarPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    id: userId,
+    stellarPublicKey: publicKey,
   });
   return { authorization: `Bearer ${token}` };
 }
@@ -228,6 +233,101 @@ describe("settlement confirmation tier (real app)", () => {
     expect(limited.headers["x-ratelimit-remaining"]).toBe("0");
     expect(limited.headers["retry-after"]).toBeTruthy();
     expectStandardRateLimitBody(limited);
+
+    // Health check and public read endpoints remain unaffected after confirmation limit exhaustion (#529)
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.statusCode).toBe(200);
+    const healthLive = await app.inject({ method: "GET", url: "/health/live" });
+    expect(healthLive.statusCode).toBe(200);
+
+    await app.close();
+  });
+});
+
+describe("expense settlement submission tier (real app) (#529)", () => {
+  it("answers the request that crosses the settlement submission limit with 429", async () => {
+    const app = await buildApp();
+    const { max } = rateLimitPolicies().settlementCreate;
+    const headers = authHeader("user_1");
+
+    for (let i = 0; i < max; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/expenses/expense_1/settle",
+        headers,
+        payload: {},
+      });
+      // Expense not found: the route handler ran and was not blocked by rate limiting.
+      expect(res.statusCode).toBe(404);
+    }
+
+    const limited = await app.inject({
+      method: "POST",
+      url: "/expenses/expense_1/settle",
+      headers,
+      payload: {},
+    });
+    expect(limited.statusCode).toBe(429);
+    expect(limited.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(limited.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(limited.headers["retry-after"]).toBeTruthy();
+    expectStandardRateLimitBody(limited);
+
+    // Health check and public read endpoints remain unaffected by strict settlement rate limits (#529)
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.statusCode).toBe(200);
+    const healthLive = await app.inject({ method: "GET", url: "/health/live" });
+    expect(healthLive.statusCode).toBe(200);
+
+    // Another authenticated user maintains their own independent budget
+    const user2Headers = authHeader("user_2", "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+    const user2Res = await app.inject({
+      method: "POST",
+      url: "/expenses/expense_1/settle",
+      headers: user2Headers,
+      payload: {},
+    });
+    expect(user2Res.statusCode).not.toBe(429);
+    expect(user2Res.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(user2Res.headers["x-ratelimit-remaining"]).toBe(String(max - 1));
+
+    await app.close();
+  });
+});
+
+describe("settlement execution submission tier (real app) (#529)", () => {
+  it("answers the request that crosses the settlement execute limit with 429", async () => {
+    const app = await buildApp();
+    const { max } = rateLimitPolicies().settlementExecute;
+    const headers = authHeader("user_1");
+
+    for (let i = 0; i < max; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/settlements/execute",
+        headers: { ...headers, "x-idempotency-key": `exec-key-${i}` },
+        payload: { settlementId: "settle_1", signedXdr: "AAAA" },
+      });
+      // Payer mismatch: the handler ran and rejected with 403, not rate-limited.
+      expect(res.statusCode).toBe(403);
+    }
+
+    const limited = await app.inject({
+      method: "POST",
+      url: "/api/settlements/execute",
+      headers: { ...headers, "x-idempotency-key": "exec-key-over" },
+      payload: { settlementId: "settle_1", signedXdr: "AAAA" },
+    });
+    expect(limited.statusCode).toBe(429);
+    expect(limited.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(limited.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(limited.headers["retry-after"]).toBeTruthy();
+    expectStandardRateLimitBody(limited);
+
+    // Health check remains unaffected
+    const healthLive = await app.inject({ method: "GET", url: "/health/live" });
+    expect(healthLive.statusCode).toBe(200);
+
     await app.close();
   });
 });

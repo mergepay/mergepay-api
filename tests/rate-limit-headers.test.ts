@@ -192,6 +192,44 @@ describe("per-route tiers", () => {
     // because req.user is not populated until the authenticate hook runs.
     expect(rateLimitPolicies().treasuryPropose.hook).toBe("preHandler");
   });
+
+  it("limits settlement creation, confirmation, and execution to their own strict budgets", async () => {
+    const policies = rateLimitPolicies();
+    for (const policyName of ["settlementCreate", "settlementConfirm", "settlementExecute"] as const) {
+      const { max } = policies[policyName];
+      const app = await appWithPolicy(policyName);
+      for (let i = 0; i < max; i++) {
+        expect((await post(app)).statusCode).toBe(200);
+      }
+      expect((await post(app)).statusCode).toBe(429);
+      await app.close();
+    }
+  });
+
+  it("gives settlement submission endpoints distinct buckets separate from each other and the global default", () => {
+    const policies = rateLimitPolicies();
+    expect(policies.settlementCreate.prefix).toBe("settlement.create");
+    expect(policies.settlementConfirm.prefix).toBe("settlement.confirm");
+    expect(policies.settlementExecute.prefix).toBe("settlement.execute");
+    expect(policies.settlementCreate.prefix).not.toBe(policies.settlementConfirm.prefix);
+    expect(policies.settlementConfirm.prefix).not.toBe(policies.settlementExecute.prefix);
+    expect(policies.settlementCreate.prefix).not.toBe(policies.global.prefix);
+  });
+
+  it("budgets settlement submission endpoints strictly below the global default", () => {
+    const policies = rateLimitPolicies();
+    expect(policies.settlementCreate.max).toBeLessThan(policies.global.max);
+    expect(policies.settlementConfirm.max).toBeLessThan(policies.global.max);
+    expect(policies.settlementExecute.max).toBeLessThan(policies.global.max);
+  });
+
+  it("keys settlement submission endpoints by user and runs on preHandler", () => {
+    const policies = rateLimitPolicies();
+    for (const name of ["settlementCreate", "settlementConfirm", "settlementExecute"] as const) {
+      expect(policies[name].keyBy).toBe("user-or-ip");
+      expect(policies[name].hook).toBe("preHandler");
+    }
+  });
 });
 
 describe("global bucket keying", () => {

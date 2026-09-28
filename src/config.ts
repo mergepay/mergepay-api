@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { z } from "zod";
 import { Networks } from "@stellar/stellar-sdk";
+import { rateLimitConfigSchema } from "./config/env";
 
 // URL validation helper
 const urlSchema = z.string().url("Invalid URL format");
@@ -246,6 +247,11 @@ const schema = z.object({
   TX_TIMEOUT: z.coerce.number().int().positive().default(300000),
   MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
 
+  // Generic rate-limit defaults (see issue #408). Declared in src/config/env.ts
+  // so they can be unit-tested in isolation; merged into this schema so a
+  // malformed value aborts startup through this module's fail-fast
+  // process.exit(1) path instead of silently disabling the limiter.
+  ...rateLimitConfigSchema.shape,
   // Security-sensitive endpoint policies.
   RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),

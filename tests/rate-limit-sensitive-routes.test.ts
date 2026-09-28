@@ -65,6 +65,7 @@ const h = vi.hoisted(() => {
     auditLog: model(),
     idempotencyKey: model(),
     refreshToken: model(),
+    withdrawal: model(),
     $queryRawUnsafe: vi.fn(async () => [{ "?column?": 1 }]),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
@@ -305,6 +306,37 @@ describe("rate limiting on the real app wiring", () => {
       max,
       payload: {},
       label: "anchors/webhook",
+    });
+  });
+
+  it("POST /withdraw — per-route budget, headers, and 429 envelope", async () => {
+    // On-chain payment submission (issues #363 / #403): withdrawal
+    // initiation shares the tight anchor-init budget. Malformed bodies fail
+    // body validation before any anchor call, so the suite measures the
+    // limiter itself.
+    const max = policies.anchorInit.max;
+    await exhaustAndAssert({
+      method: "POST",
+      url: "/withdraw",
+      max,
+      headers: authHeader(),
+      payload: {},
+      label: "withdraw",
+    });
+  });
+
+  it("POST /withdraw/:id/confirm — per-route budget, headers, and 429 envelope", async () => {
+    // The signed-XDR submission step of a withdrawal: budgeted with the
+    // other payment confirmations so retrying a submission cannot exhaust a
+    // caller's global allowance.
+    const max = policies.settlementConfirm.max;
+    await exhaustAndAssert({
+      method: "POST",
+      url: "/withdraw/wth_rate_limit/confirm",
+      max,
+      headers: authHeader(),
+      payload: { signedXdr: signedXdr() },
+      label: "withdraw/:id/confirm",
     });
   });
 

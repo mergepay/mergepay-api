@@ -164,6 +164,11 @@ describe("sensitive routes carry the tighter per-route budget", () => {
     ["POST", "/settlements/:id/confirm", "settlementConfirm"],
     ["POST", "/groups/:id/treasury/deposit", "settlementCreate"],
     ["POST", "/groups/:id/treasury/withdraw", "settlementCreate"],
+    // On-chain payment submission (issues #363 / #403): withdrawal initiation
+    // fans out to the anchor like the other anchor-init routes, and the
+    // confirmation submits a signed XDR like the other confirm routes.
+    ["POST", "/withdraw", "anchorInit"],
+    ["POST", "/withdraw/:id/confirm", "settlementConfirm"],
     ["POST", "/treasury-transactions/:id/confirm", "treasurySubmit"],
     // Treasury multisig: creating a proposal is bounded separately from adding
     // a signature to one.

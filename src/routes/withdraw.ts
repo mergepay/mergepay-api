@@ -6,6 +6,7 @@ import { assetCodeSchema } from "../schemas/asset";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
+import { rateLimited } from "../lib/rate-limit";
 import { anchorService } from "../services/anchor";
 import { stellar } from "../services/stellar";
 import { auditTx } from "../services/audit";
@@ -64,7 +65,23 @@ function serializeWithdrawal(withdrawal: any) {
 export default async function withdrawalRoutes(app: FastifyInstance) {
   const withdrawalModel = (prisma as any).withdrawal;
 
-  app.post("/withdraw", { preHandler: [app.authenticate] }, async (req) => {
+  // On-chain payment submission surfaces (issues #363 / #403). Both draw on
+  // dedicated per-route budgets rather than the 100/min global allowance:
+  //
+  //  - `POST /withdraw` initiates a withdrawal that fans out to the anchor's
+  //    SEP-24 transfer server, so it shares the tight `anchorInit` budget
+  //    (RATE_LIMIT_ANCHOR_INIT_MAX, default 10/min) used by the other anchor
+  //    initiation routes — brute-forcing it must not exhaust a caller's
+  //    global traffic.
+  //  - `POST /withdraw/:id/confirm` submits a signed XDR to the network and
+  //    shares the `settlementConfirm` budget
+  //    (RATE_LIMIT_SETTLEMENT_CONFIRM_MAX, default 20/min) with the other
+  //    payment-confirmation routes, absorbing legitimate retries while
+  //    bounding brute-force submission attempts.
+  app.post(
+    "/withdraw",
+    { preHandler: [app.authenticate], ...rateLimited("anchorInit") },
+    async (req) => {
     const auth = requireUser(req);
     const body = withdrawalBody.parse(req.body);
 
@@ -142,7 +159,7 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
 
   app.post(
     "/withdraw/:id/confirm",
-    { preHandler: [app.authenticate] },
+    { preHandler: [app.authenticate], ...rateLimited("settlementConfirm") },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string().min(1) }).parse(req.params);

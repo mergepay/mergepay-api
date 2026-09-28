@@ -290,7 +290,7 @@ describe("POST /withdraw/:id/confirm", () => {
     expect(body.transaction_id).toBe("ANCH-TX-1");
     expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
       where: { id: "wth_1", status: "pending" },
-      data: { anchorTxId: "ANCH-TX-1", status: "processing" },
+      data: { anchorTxId: "ANCH-TX-1", anchorToken: "anchor-jwt", status: "processing" },
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({

@@ -228,7 +228,7 @@ describe("verifyToken — expiration checking", () => {
       () => verifyToken(signWith({ expiresIn: Math.max(1, MARGIN - 5) })),
       "TOKEN_EXPIRED"
     );
-    expect(err.message).toBe("Token is near expiry");
+    expect(err.message).toBe("Token expired");
   });
 
   it("accepts a token whose remaining lifetime is outside the margin", () => {
@@ -257,9 +257,10 @@ describe("verifyToken — expiration checking", () => {
       () => verifyToken(signWith({ expiresIn: -10 })),
       "TOKEN_EXPIRED"
     );
-    const hint = (err.details as { hint?: string })?.hint;
-    expect(hint).toMatch(/SEP-10/);
-    expect(hint).toMatch(/\/auth\/refresh/);
+    const details = err.details as { code?: string; message?: string; endpoints?: Record<string, string> };
+    expect(details?.code).toBe("REAUTHENTICATE");
+    expect(details?.message).toMatch(/SEP-10/);
+    expect(details?.endpoints?.refresh).toMatch(/\/auth\/refresh/);
   });
 
   it("never echoes the underlying jsonwebtoken error text", () => {
@@ -308,12 +309,13 @@ describe("verifyToken — claim validation", () => {
     );
   });
 
-  it("does not carry a hint on INVALID_TOKEN — there is nothing to refresh", () => {
+  it("carries a re-authentication hint on INVALID_TOKEN so clients know how to recover", () => {
     const err = expectAppError(
       () => verifyToken(signWith({ audience: "some-other-audience" })),
       "INVALID_TOKEN"
     );
-    expect(err.details).toBeUndefined();
+    const details = err.details as { code?: string };
+    expect(details?.code).toBe("REAUTHENTICATE");
   });
 });
 

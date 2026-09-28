@@ -183,16 +183,17 @@ export const Errors = {
    * endpoint for clients holding a refresh token — so a wallet integration
    * can react to the code without hard-coding the API's auth flow.
    */
-  tokenExpired: (msg = "Token expired") =>
-    new AppError(401, ErrorCode.TOKEN_EXPIRED, msg, {
-      hint: "Re-authenticate via SEP-10 (POST /auth/challenge, then POST /auth/verify), or exchange a refresh token via POST /auth/refresh.",
-    }),
+  tokenExpired: (msg = "Token expired", details?: unknown) =>
+    new AppError(401, ErrorCode.TOKEN_EXPIRED, msg, details),
 
-  /** The bearer token failed verification — malformed, wrong signature, or
-   * missing claims. There is nothing to refresh; the caller must present a
-   * token this API actually minted. */
-  invalidToken: (msg = "Invalid token") =>
-    new AppError(401, ErrorCode.INVALID_TOKEN, msg),
+  /**
+   * The bearer token failed verification — malformed, wrong signature,
+   * disallowed algorithm, wrong issuer/audience, or a claims shape that does
+   * not identify an account. A refresh token cannot rescue a token like this;
+   * the client must re-authenticate via SEP-10.
+   */
+  invalidToken: (msg = "Invalid token", details?: unknown) =>
+    new AppError(401, ErrorCode.INVALID_TOKEN, msg, details),
 
   /**
    * The SEP-10 challenge the wallet signed has passed its validity window.

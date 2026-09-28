@@ -13,10 +13,7 @@ import {
 } from "../services/withdrawal-status";
 import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
-import {
-  applySep24Callback,
-  sep24CallbackSchema,
-} from "../services/sep24";
+import { applySep24Callback } from "../services/sep24";
 import {
   paginationQuerySchema,
   buildPage,
@@ -32,6 +29,7 @@ import {
   sep24InitQuerySchema,
   sep24WithdrawRequestSchema,
 } from "../validations/sep24";
+import { sep24CallbackSchema } from "../schemas/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {

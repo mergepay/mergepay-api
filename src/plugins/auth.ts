@@ -1,6 +1,6 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
-import jwt, { TokenExpiredError } from "jsonwebtoken";
+import jwt, { JwtPayload, TokenExpiredError } from "jsonwebtoken";
 import { z } from "zod";
 import { config } from "../config";
 import { Errors } from "../errors";
@@ -11,6 +11,18 @@ import { Errors } from "../errors";
  * are rejected as near-expired.
  */
 const TOKEN_EXPIRY_MARGIN_SECONDS = config.TOKEN_EXPIRY_MARGIN_SECONDS ?? 30;
+
+/** Client-facing hint for recovering an expired session. */
+const REAUTH_HINT = {
+  code: "REAUTHENTICATE",
+  message:
+    "Your session has expired. Re-authenticate via SEP-10 to continue, or refresh your session if you hold a valid refresh token.",
+  endpoints: {
+    sep10Challenge: "/auth/challenge",
+    sep10Verify: "/auth/verify",
+    refresh: "/auth/refresh",
+  },
+} as const;
 
 export interface AuthUser {
   id: string;
@@ -64,40 +76,42 @@ export function signToken(user: AuthUser, opts: { jwtid?: string } = {}): string
  * echoed, because it can leak which claim mismatched.
  */
 export function verifyToken(token: string): AuthUser {
-  let decoded: jwt.JwtPayload;
+  let decoded: JwtPayload;
   try {
     decoded = jwt.verify(token, config.JWT_SECRET, {
       algorithms: [JWT_ALGORITHM],
       issuer: config.JWT_ISSUER,
       audience: config.JWT_AUDIENCE,
-    }) as jwt.JwtPayload;
-  } catch (error) {
-    // TokenExpiredError means the signature and claims were fine and only
-    // the lifetime ran out; every other jsonwebtoken error (JsonWebTokenError,
-    // NotBeforeError, …) is a credential that never was or is not yet valid.
-    if (error instanceof TokenExpiredError) {
-      throw Errors.tokenExpired();
+    }) as JwtPayload;
+  } catch (err) {
+    if (err instanceof TokenExpiredError) {
+      throw Errors.tokenExpired(undefined, REAUTH_HINT);
     }
-    throw Errors.invalidToken();
+    // Malformed JWT, wrong signature, disallowed algorithm, wrong
+    // issuer/audience, token not yet valid — none of these can be redeemed
+    // by refreshing, so they share one code and one message.
+    throw Errors.invalidToken(undefined, REAUTH_HINT);
   }
 
-  if (typeof decoded.exp !== "number" || !Number.isFinite(decoded.exp)) {
-    throw Errors.invalidToken("Token is missing required expiry claim");
+  // Tokens this server mints always carry an expiry, so a well-signed
+  // payload without `exp` is not a session we issued. Requiring the claim
+  // also makes the margin check below unconditional.
+  if (typeof decoded.exp !== "number") {
+    throw Errors.invalidToken();
   }
 
   // Reject tokens that are too close to expiry: even though the SDK's own
   // check would still accept them within this margin, a token forged or
-  // replayed moments before expiry should never grant a session. This is
-  // still an expiry outcome for the client — the remedy is to re-authenticate
-  // — so it reports TOKEN_EXPIRED rather than INVALID_TOKEN.
+  // replayed moments before expiry should never grant a session. Reported
+  // as TOKEN_EXPIRED because the client remedy is the same: get a new one.
   const remainingSeconds = decoded.exp - Math.floor(Date.now() / 1000);
   if (remainingSeconds < TOKEN_EXPIRY_MARGIN_SECONDS) {
-    throw Errors.tokenExpired("Token is near expiry");
+    throw Errors.tokenExpired(undefined, REAUTH_HINT);
   }
 
   const { sub, pk } = decoded;
   if (typeof sub !== "string" || !sub || typeof pk !== "string" || !pk) {
-    throw Errors.invalidToken("Token is missing required session claims");
+    throw Errors.invalidToken();
   }
 
   return { id: sub, stellarPublicKey: pk };
@@ -107,9 +121,19 @@ const authorizationHeaderSchema = z
   .string()
   .regex(/^Bearer\s+\S+$/, "Authorization must use the Bearer scheme");
 
+/**
+ * Authenticate a request from its `Authorization` header.
+ *
+ * Missing/undecodable credentials and a rejected token are reported with
+ * different codes (UNAUTHORIZED vs TOKEN_EXPIRED/INVALID_TOKEN) so clients
+ * can branch on the failure without parsing messages. The SDK's own error
+ * text is never echoed back — only the stable codes and the re-auth hint.
+ */
 async function authenticate(req: FastifyRequest, _reply: FastifyReply) {
   const parsedHeader = authorizationHeaderSchema.safeParse(req.headers.authorization);
   if (!parsedHeader.success) {
+    // No usable Authorization header at all: not a token verdict, so this
+    // keeps the original generic code rather than INVALID_TOKEN.
     throw Errors.unauthorized();
   }
 

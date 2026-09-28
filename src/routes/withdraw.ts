@@ -11,14 +11,31 @@ import { stellar } from "../services/stellar";
 import { auditTx } from "../services/audit";
 import { applyWithdrawalTransition } from "../services/withdrawal-status";
 import { isPositive } from "../services/money";
+import {
+  sep24AmountShapeSchema,
+  sep24AssetCodeShapeSchema,
+} from "../validations/sep24";
 
 const SUPPORTED_ASSET_CODES = ["USDC", "XLM"] as const;
 
-const withdrawalBody = z.object({
-  amount: z.string().min(1),
-  assetCode: assetCodeSchema,
-  memo: mpMemoSchema.optional(),
-});
+/**
+ * `POST /withdraw` is a concrete SEP-24 withdrawal request, so its body is
+ * validated with the shared SEP-24 shape rules from src/validations/sep24.ts
+ * — decimal amount with at most 7 fractional digits, alphanumeric asset code —
+ * and the object is strict: an unexpected field is a structured 400 instead
+ * of being silently stripped.
+ *
+ * Positivity and asset *support* stay in the handler below: they carry their
+ * own established error codes (`INVALID_AMOUNT`, `UNSUPPORTED_ASSET`) that a
+ * schema-level failure would otherwise swallow.
+ */
+const withdrawalBody = z
+  .object({
+    amount: sep24AmountShapeSchema,
+    assetCode: sep24AssetCodeShapeSchema,
+    memo: mpMemoSchema.optional(),
+  })
+  .strict();
 
 function units(value: string): bigint {
   const [whole, fraction = ""] = value.split(".");
@@ -161,7 +178,12 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           nextStatus: "processing",
           source: "user",
           ownerUserId: auth.id,
-          extraData: { anchorTxId: result.id } as never,
+          // The JWT is stored atomically with the transition so the worker
+          // can poll the anchor for this withdrawal's status later — the
+          // server cannot mint one itself (the SEP-10 challenge must be
+          // signed by the user's key), and without it a lost webhook would
+          // leave the withdrawal stuck in `processing` forever.
+          extraData: { anchorTxId: result.id, anchorToken: token },
         });
         return {
           ...serializeWithdrawal(updated),

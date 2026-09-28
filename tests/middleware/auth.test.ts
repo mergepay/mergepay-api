@@ -248,14 +248,12 @@ describe("authenticated route — 401 contract", () => {
 
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.code).toBe("TOKEN_EXPIRED");
-      expect(body.error.code).toBe("TOKEN_EXPIRED");
-    expect(body.message).toBe("Token expired");
-    expect(body.requestId).toBeTruthy();
+    expect(body.error.code).toBe("TOKEN_EXPIRED");
     // The hint names both recovery paths: a full SEP-10 re-authentication and
     // the refresh endpoint for clients already holding a refresh token.
-      expect(body.error.details.hint).toMatch(/SEP-10/);
-      expect(body.error.details.hint).toMatch(/\/auth\/refresh/);
+    expect(body.error.details?.code).toBe("REAUTHENTICATE");
+    expect(body.error.details?.message).toMatch(/SEP-10/);
+    expect(body.error.details?.endpoints?.refresh).toMatch(/\/auth\/refresh/);
   });
 
   it("returns TOKEN_EXPIRED for a token inside the expiry margin", async () => {

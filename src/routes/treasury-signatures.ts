@@ -25,12 +25,8 @@ import { requireUser } from "../plugins/auth";
 import { rateLimited } from "../lib/rate-limit";
 import { requireAdmin, requireMembership } from "../services/access";
 import { treasurySignaturesService } from "../services/treasury-signatures";
+import { treasuryTxProposalCreateSchema } from "../validations/treasury";
 import { serializeTreasuryTxProposal } from "../serializers";
-
-const createBodySchema = z.object({
-  groupId: z.string().min(1),
-  xdr: z.string().min(1),
-});
 
 const signatureBodySchema = z.object({
   signedXdr: z.string().min(1),
@@ -40,20 +36,26 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- POST /api/treasury/proposals -------------------------------------
+  //
+  // The body is validated by the shared treasuryTxProposalCreateSchema
+  // (src/validations/treasury.ts, issue #402): a treasury id (`treasuryId`,
+  // or its legacy `groupId` alias), a parseable `xdr`, and an optional
+  // bounded `description`.
   app.post(
     "/api/treasury/proposals",
     rateLimited("treasuryPropose"),
     async (req) => {
       const auth = requireUser(req);
-      const body = createBodySchema.parse(req.body);
-      await requireAdmin(body.groupId, auth.id);
+      const body = treasuryTxProposalCreateSchema.parse(req.body);
+      await requireAdmin(body.treasuryId, auth.id);
 
       const { proposal, networkPassphrase } =
         await treasurySignaturesService.createProposal({
-          groupId: body.groupId,
+          groupId: body.treasuryId,
           creatorId: auth.id,
           creatorPublicKey: auth.stellarPublicKey,
           xdr: body.xdr,
+          description: body.description ?? null,
         });
 
       return {

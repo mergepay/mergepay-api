@@ -159,6 +159,44 @@ describe("treasurySignaturesService.createProposal", () => {
     expect(prisma.auditLog.create).toHaveBeenCalled();
   });
 
+  it("persists the optional description with the proposal", async () => {
+    (prisma.group.findUnique as any).mockResolvedValue({
+      id: GROUP_ID,
+      treasuryEnabled: true,
+      treasuryAccountPublicKey: treasury.publicKey(),
+    });
+
+    const { proposal } = await treasurySignaturesService.createProposal({
+      groupId: GROUP_ID,
+      creatorId: "creator_1",
+      xdr: buildXdr(treasury.publicKey()),
+      description: "Pay the hosting invoice",
+    });
+
+    expect(proposal.description).toBe("Pay the hosting invoice");
+    expect(prisma.treasuryTxProposal.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ description: "Pay the hosting invoice" }),
+      })
+    );
+  });
+
+  it("stores a null description when none is supplied", async () => {
+    (prisma.group.findUnique as any).mockResolvedValue({
+      id: GROUP_ID,
+      treasuryEnabled: true,
+      treasuryAccountPublicKey: treasury.publicKey(),
+    });
+
+    const { proposal } = await treasurySignaturesService.createProposal({
+      groupId: GROUP_ID,
+      creatorId: "creator_1",
+      xdr: buildXdr(treasury.publicKey()),
+    });
+
+    expect(proposal.description).toBeNull();
+  });
+
   it("rejects when the treasury is not enabled", async () => {
     (prisma.group.findUnique as any).mockResolvedValue({
       id: GROUP_ID,

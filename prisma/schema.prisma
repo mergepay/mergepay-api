@@ -401,6 +401,9 @@ model TreasuryTxProposal {
   creatorId String   @map("creator_id")
   /// Unsigned transaction envelope (base64 XDR) exactly as submitted.
   xdr       String   @map("xdr")
+  /// Optional human-readable purpose of the proposal ("pay March rent"),
+  /// stored for display alongside the signature-collection state.
+  description String? @map("description")
   /// Hash of the unsigned envelope. Every signature is verified against it,
   /// and a submitted envelope that hashes differently is rejected outright.
   txHash    String   @map("tx_hash")

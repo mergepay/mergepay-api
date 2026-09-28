@@ -315,6 +315,75 @@ describe("Treasury signatures audit records", () => {
       expect(call[0].data.metadata?.txHash).toBe("abc123");
     }
   });
+
+  it("accepts the treasuryId alias and stores the optional description", async () => {
+    // Issue #402: the create payload is validated by the shared
+    // treasuryTxProposalCreateSchema — treasuryId (or its legacy groupId
+    // alias), a parseable xdr, and an optional bounded description.
+    const unsignedXdr = makeUnsignedXdr({
+      source: treasuryAccount.publicKey(),
+      destination: Keypair.random().publicKey(),
+      amount: "5",
+    });
+
+    prisma.treasuryTxProposal.create.mockResolvedValue({
+      id: "txprop_2",
+      groupId: "group_1",
+      creatorId: admin.id,
+      xdr: unsignedXdr,
+      description: "Pay the vendor invoice",
+      txHash: "def456",
+      sourceAccount: treasuryAccount.publicKey(),
+      requiredWeight: 2,
+      status: "PENDING_SIGNATURES",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    prisma.auditLog.create.mockResolvedValue({});
+
+    const { stellar } = await import("../src/services/stellar");
+    vi.mocked(stellar.loadAccount).mockResolvedValue({
+      exists: true,
+      sequence: "12345",
+      balances: [],
+      signers: [
+        { key: admin.stellarPublicKey, weight: 1 },
+        { key: member.stellarPublicKey, weight: 1 },
+      ],
+      thresholds: { low: 1, med: 1, high: 2 },
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/treasury/proposals",
+      headers: authHeader(),
+      payload: {
+        treasuryId: "group_1",
+        xdr: unsignedXdr,
+        description: "Pay the vendor invoice",
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+
+    const createCall = prisma.treasuryTxProposal.create.mock.calls[0][0];
+    expect(createCall.data.groupId).toBe("group_1");
+    expect(createCall.data.description).toBe("Pay the vendor invoice");
+    expect(res.json().proposal.description).toBe("Pay the vendor invoice");
+  });
+
+  it("rejects a proposal payload with a malformed xdr before touching the service", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/treasury/proposals",
+      headers: authHeader(),
+      payload: { treasuryId: "group_1", xdr: "not-an-xdr!!" },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe("VALIDATION_ERROR");
+    expect(prisma.treasuryTxProposal.create).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------

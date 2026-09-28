@@ -180,6 +180,7 @@ export function serializeTreasuryTxProposal(p: any) {
     groupId: p.groupId,
     creatorId: p.creatorId,
     xdr: p.xdr,
+    description: p.description ?? null,
     sourceAccount: p.sourceAccount,
     requiredWeight: p.requiredWeight,
     signatures: Array.isArray(p.signatures)

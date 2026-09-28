@@ -74,6 +74,8 @@ export interface CreateTxProposalParams {
   creatorPublicKey: string;
   /** Unsigned base64 XDR, built externally, sourced from the treasury account. */
   xdr: string;
+  /** Optional human-readable purpose of the proposal, stored for display. */
+  description?: string | null;
 }
 
 export interface SubmitSignatureParams {
@@ -115,9 +117,10 @@ export const treasurySignaturesService = {
   /**
    * Store a new signature-collection proposal from a caller-supplied unsigned XDR.
    *
-   * @param params - `{ groupId, creatorId, xdr }`. `xdr` is a base64 unsigned
-   *   Stellar transaction envelope, built externally, whose source account must be
-   *   the group's configured treasury account.
+   * @param params - `{ groupId, creatorId, xdr, description? }`. `xdr` is a
+   *   base64 unsigned Stellar transaction envelope, built externally, whose source account must be
+   *   the group's configured treasury account. `description` is optional
+   *   display metadata persisted with the proposal.
    * @returns The created `TreasuryTxProposal` row and the `networkPassphrase` the
    *   envelope was parsed against.
    * @throws {AppError} `treasury_disabled` / `treasury_unfunded` if the group
@@ -164,6 +167,7 @@ export const treasurySignaturesService = {
           groupId: params.groupId,
           creatorId: params.creatorId,
           xdr: params.xdr,
+          description: params.description ?? null,
           txHash,
           sourceAccount: treasuryAccountPublicKey,
           requiredWeight: account.thresholds.high,
@@ -183,6 +187,9 @@ export const treasurySignaturesService = {
           // signature is verified against it.
           txHash: created.txHash,
           requiredWeight: created.requiredWeight,
+          // Optional display metadata (issue #402); only recorded when the
+          // caller supplied it, so existing audit records are unchanged.
+          ...(created.description ? { description: created.description } : {}),
         },
       });
       return created;

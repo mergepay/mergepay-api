@@ -40,6 +40,7 @@ const h = vi.hoisted(() => ({
       findMany: vi.fn(async () => []),
       updateMany: vi.fn(async () => ({ count: 0 })),
     },
+    withdrawal: { findMany: vi.fn(async () => []) },
     invite: { deleteMany: vi.fn(async () => ({ count: 0 })) },
     $disconnect: vi.fn(async () => {}),
   },

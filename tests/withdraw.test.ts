@@ -132,7 +132,7 @@ describe("POST /withdraw", () => {
       payload: { amount: "0", assetCode: "XLM" },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INVALID_AMOUNT");
+    expect(res.json().error.code).toBe("INVALID_AMOUNT");
   });
 
   it("returns 400 for an unsupported asset", async () => {
@@ -143,7 +143,7 @@ describe("POST /withdraw", () => {
       payload: { amount: "1", assetCode: "BTC" },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("UNSUPPORTED_ASSET");
+    expect(res.json().error.code).toBe("UNSUPPORTED_ASSET");
   });
 
   it("returns 400 for insufficient balance", async () => {
@@ -164,7 +164,7 @@ describe("POST /withdraw", () => {
       payload: { amount: "10", assetCode: "XLM" },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INSUFFICIENT_BALANCE");
+    expect(res.json().error.code).toBe("INSUFFICIENT_BALANCE");
   });
 
   it("creates a Withdrawal and returns the interactive_url/transaction_id/status shape", async () => {
@@ -221,7 +221,7 @@ describe("POST /withdraw", () => {
       payload: { amount: "1", assetCode: "USDC" },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("NO_TRUSTLINE");
+    expect(res.json().error.code).toBe("NO_TRUSTLINE");
   });
 
   it("returns 400 for an unfunded account", async () => {
@@ -240,7 +240,7 @@ describe("POST /withdraw", () => {
       payload: { amount: "1", assetCode: "XLM" },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("ACCOUNT_UNFUNDED");
+    expect(res.json().error.code).toBe("ACCOUNT_UNFUNDED");
   });
 });
 
@@ -290,7 +290,7 @@ describe("POST /withdraw/:id/confirm", () => {
     expect(body.transaction_id).toBe("ANCH-TX-1");
     expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
       where: { id: "wth_1", status: "pending" },
-      data: { anchorTxId: "ANCH-TX-1", status: "processing" },
+      data: { anchorTxId: "ANCH-TX-1", anchorToken: "anchor-jwt", status: "processing" },
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -438,6 +438,6 @@ describe("GET /withdraw/:id", () => {
       headers: authHeader(user),
     });
     expect(res.statusCode).toBe(403);
-    expect(res.json().error).toBe("FORBIDDEN");
+    expect(res.json().error.code).toBe("FORBIDDEN");
   });
 });

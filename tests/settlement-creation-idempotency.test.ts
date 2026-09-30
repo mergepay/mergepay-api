@@ -9,6 +9,12 @@ const h = vi.hoisted(() => {
     create: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
+    findMany: vi.fn(async () => [
+      {
+        payerUserId: "payer_1",
+        shares: [{ userId: "user_1", shareAmount: "1000", status: "pending" }],
+      },
+    ]),
   });
   const prisma: any = {
     expense: model(),
@@ -184,7 +190,7 @@ describe("POST /expenses/:id/settle — idempotency", () => {
     });
 
     expect(res.statusCode).toBe(409);
-    expect(res.json().code).toBe("IDEMPOTENCY_CONFLICT");
+    expect(res.json().error.code).toBe("IDEMPOTENCY_CONFLICT");
     expect(prisma.settlement.create).not.toHaveBeenCalled();
   });
 

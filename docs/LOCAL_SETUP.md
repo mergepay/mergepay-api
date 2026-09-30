@@ -76,6 +76,20 @@ npm run prisma:migrate
 npm run db:seed
 ```
 
+The seed script is idempotent — run it as often as you like. It upserts
+sample users, groups, expenses, settlements and treasury rows instead of
+duplicating them, so a second run never trips a unique constraint. What it
+creates (demo accounts, invite code, settlement short codes) is documented in
+[Seed data](../README.md#seed-data).
+
+On a throwaway database you can sync the schema straight from
+`prisma/schema.prisma` instead of replaying migration history:
+
+```bash
+npm run prisma:deploy   # prisma db push — never point this at a database with data you care about
+npm run db:seed
+```
+
 ## 4) Start the API and worker
 
 Open two terminals.

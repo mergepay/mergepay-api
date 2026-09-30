@@ -1,8 +1,8 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
-import { config } from "../config";
 import { requireUser } from "../plugins/auth";
+import { rateLimited } from "../lib/rate-limit";
 import { expenseStatusFilter } from "../services/expenses";
 import { serializeExpense, serializeSettlement } from "../serializers";
 import {
@@ -13,9 +13,10 @@ import {
   encodeCursor,
   type CursorPosition,
 } from "../lib/pagination";
+import { assetCodeSchema } from "../schemas/asset";
 
 const historyQuerySchema = paginationQuerySchema.extend({
-  assetCode: z.string().optional(),
+  assetCode: assetCodeSchema.optional(),
   status: z.string().optional(),
   fromDate: z.string().datetime().optional(),
   toDate: z.string().datetime().optional(),
@@ -24,7 +25,7 @@ const historyQuerySchema = paginationQuerySchema.extend({
 export default async function historyRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
-  app.get("/history", { config: { rateLimit: { max: config.RATE_LIMIT_HISTORY, timeWindow: "1 minute" } } }, async (req) => {
+  app.get("/history", rateLimited("history"), async (req) => {
     const auth = requireUser(req);
     const query = historyQuerySchema.parse(req.query);
     const position = requireCursor(query.cursor);

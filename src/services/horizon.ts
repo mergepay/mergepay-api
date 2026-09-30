@@ -69,6 +69,16 @@ function holdsAsset(
  * A failure from any single lookup fails the whole call: a partial answer here
  * would report "everyone has a trustline" while one account was never actually
  * checked.
+ *
+ * @param params - `{ publicKeys, assetCode, assetIssuer }`. `publicKeys` may
+ *   contain duplicates (they are collapsed before lookup); `assetIssuer` is
+ *   `null` only for native XLM.
+ * @returns One {@link TrustlineStatus} per *unique* input key, in Horizon's
+ *   response order. An unfunded account is reported as
+ *   `{ accountExists: false, hasTrustline: false }`, never as an error.
+ * @throws {AppError} `upstream` when Horizon is unreachable, times out, or any
+ *   single account read fails after retries — the raw Horizon message is not
+ *   forwarded, only the sanitized repository error.
  */
 export async function fetchTrustlines(params: {
   publicKeys: string[];
@@ -120,6 +130,17 @@ export interface MissingTrustline {
  * The error lists every missing participant rather than the first one found.
  * Reporting them one at a time would make a group of five with two gaps take
  * two failed attempts to diagnose.
+ *
+ * @param params - `{ participants, assetCode, assetIssuer }`. Each participant
+ *   is `{ userId, stellarPublicKey }`; `assetIssuer` is `null` only for native
+ *   XLM.
+ * @returns `void` — resolves when every participant can hold the asset. An
+ *   empty participant list short-circuits to success without a Horizon call.
+ * @throws {AppError} `bad_request` (`missing_trustlines`, HTTP 400) listing
+ *   every participant that cannot receive the asset, each with a `reason` of
+ *   `no_trustline` or `account_not_found`.
+ * @throws {AppError} `upstream` when Horizon itself cannot answer — the guard
+ *   fails closed rather than letting an unverifiable expense through.
  */
 export async function assertParticipantsCanHoldAsset(params: {
   participants: { userId: string; stellarPublicKey: string }[];

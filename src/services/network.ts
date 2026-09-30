@@ -1,7 +1,20 @@
+/**
+ * Horizon `/fee_stats` reads, kept behind a short-lived cache.
+ *
+ * Fee percentiles change slowly and the endpoint is only advisory (envelopes
+ * are built with a fixed fee), so every caller shares one cached snapshot and
+ * one in-flight refresh rather than issuing a request each. Horizon I/O stays
+ * here so routes and workers never talk to the network directly.
+ */
 import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { logRetryAttempt, withRetry } from "./retry";
 
+/**
+ * Fee statistics from Horizon's `/fee_stats` endpoint, in stroops.
+ * Percentiles are the 10th–99th of recently accepted fees; values Horizon
+ * reports as missing, non-numeric, or non-positive normalize to `0`.
+ */
 export interface FeeStats {
   minAcceptedFee: number;
   modeAcceptedFee: number;
@@ -81,7 +94,19 @@ async function fetchFeeStats(): Promise<FeeStats> {
   return stats;
 }
 
-/** Return Horizon fee statistics, refreshing the short-lived in-memory cache as needed. */
+/**
+ * Return Horizon fee statistics, refreshing the short-lived in-memory cache as needed.
+ *
+ * Concurrent callers during a refresh share the same in-flight promise, so a
+ * cold cache costs one Horizon round trip however many requests are waiting.
+ *
+ * @returns The current {@link FeeStats} snapshot. Never returns `null`.
+ * @throws {AppError} `upstream` once the bounded per-attempt retries are spent
+ *   (the message names the operation and attempt count; the original failure
+ *   stays reachable via `upstreamCause` for logs). The cache is not updated on
+ *   failure, so the next call starts a fresh refresh instead of serving a
+ *   failed result.
+ */
 export async function getFeeStats(): Promise<FeeStats> {
   if (cached && cached.expiresAt > Date.now()) return cached.stats;
 

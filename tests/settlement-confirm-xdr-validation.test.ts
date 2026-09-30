@@ -170,7 +170,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
@@ -187,7 +187,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
@@ -204,7 +204,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
   });
 
   it("rejects a signed XDR from an unrelated signer (not the settlement's payer share)", async () => {
@@ -221,7 +221,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
   });
 
   it("rejects malformed XDR without touching the database", async () => {
@@ -237,7 +237,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MALFORMED");
+    expect(res.json().error.code).toBe("XDR_MALFORMED");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 });

@@ -112,7 +112,7 @@ describe("error response shape consistency", () => {
     expect(res.statusCode).toBe(400);
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.details)).toBe(true);
+    expect(Array.isArray(body.error.details)).toBe(true);
   });
 
   it("VALIDATION_ERROR with field-level details for invalid body types", async () => {
@@ -123,8 +123,8 @@ describe("error response shape consistency", () => {
     expect(res.statusCode).toBe(400);
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.details)).toBe(true);
-    expect(body.details[0].field).toBe("name");
+    expect(Array.isArray(body.error.details)).toBe(true);
+    expect(body.error.details[0].field).toBe("name");
   });
 
   it("Zod validation errors include standardized 'issues' array", async () => {
@@ -132,10 +132,10 @@ describe("error response shape consistency", () => {
     expect(res.statusCode).toBe(400);
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.issues)).toBe(true);
-    expect(body.issues.length).toBeGreaterThan(0);
+    expect(Array.isArray(body.error.issues)).toBe(true);
+    expect(body.error.issues.length).toBeGreaterThan(0);
     // Each issue has path, message, and code — no stack traces or internal fields
-    for (const issue of body.issues) {
+    for (const issue of body.error.issues) {
       expect(Array.isArray(issue.path)).toBe(true);
       expect(typeof issue.message).toBe("string");
       expect(typeof issue.code).toBe("string");
@@ -147,8 +147,8 @@ describe("error response shape consistency", () => {
     const res = await app.inject({ method: "POST", url: "/auth/challenge", payload: {} });
     const body = res.json();
     expect(body.stack).toBeUndefined();
-    expect(body.issues?.[0]?.stack).toBeUndefined();
-    expect(body.details?.[0]?.stack).toBeUndefined();
+    expect(body.error.issues?.[0]?.stack).toBeUndefined();
+    expect(body.error.details?.[0]?.stack).toBeUndefined();
   });
 
 
@@ -158,21 +158,23 @@ describe("authorization failures", () => {
   it("UNAUTHORIZED when no auth header", async () => {
     const res = await app.inject({ method: "GET", url: "/me" });
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
+    const body = res.json();
+    expect(body.error.code).toBe("UNAUTHORIZED");
   });
 
+  // #16: a credential that cannot be verified at all is INVALID_TOKEN, so a
+  // client does not confuse it with its own expired (but once-valid) token.
   it("INVALID_TOKEN for malformed Bearer token", async () => {
-    // Issue #16: a present-but-unverifiable credential is distinguished from
-    // a missing one — malformed tokens are INVALID_TOKEN, not UNAUTHORIZED.
     const res = await app.inject({ method: "GET", url: "/me", headers: { authorization: "Bearer bad-token" } });
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("INVALID_TOKEN");
+    const body = res.json();
+    expect(body.error.code).toBe("INVALID_TOKEN");
   });
 
   it("UNAUTHORIZED when token is missing Bearer scheme", async () => {
     const res = await app.inject({ method: "GET", url: "/me", headers: { authorization: "Token xxx" } });
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("UNAUTHORIZED");
   });
 });
 
@@ -180,7 +182,8 @@ describe("not found failures", () => {
   it("NOT_FOUND for unknown route", async () => {
     const res = await app.inject({ method: "GET", url: "/nonexistent" });
     expect(res.statusCode).toBe(404);
-    expect(res.json().code).toBe("NOT_FOUND");
-    expect(res.json().message).toBe("Route not found");
+    const body = res.json();
+    expect(body.error.code).toBe("NOT_FOUND");
+    expect(body.error.message).toBe("Route not found");
   });
 });

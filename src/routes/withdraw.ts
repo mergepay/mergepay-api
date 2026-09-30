@@ -2,22 +2,41 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { mpMemoSchema } from "../lib/stellar-validation";
+import { assetCodeSchema } from "../schemas/asset";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
+import { rateLimited } from "../lib/rate-limit";
 import { anchorService } from "../services/anchor";
 import { stellar } from "../services/stellar";
 import { auditTx } from "../services/audit";
 import { applyWithdrawalTransition } from "../services/withdrawal-status";
 import { isPositive } from "../services/money";
+import {
+  sep24AmountShapeSchema,
+  sep24AssetCodeShapeSchema,
+} from "../validations/sep24";
 
 const SUPPORTED_ASSET_CODES = ["USDC", "XLM"] as const;
 
-const withdrawalBody = z.object({
-  amount: z.string().min(1),
-  assetCode: z.string().min(1),
-  memo: mpMemoSchema.optional(),
-});
+/**
+ * `POST /withdraw` is a concrete SEP-24 withdrawal request, so its body is
+ * validated with the shared SEP-24 shape rules from src/validations/sep24.ts
+ * — decimal amount with at most 7 fractional digits, alphanumeric asset code —
+ * and the object is strict: an unexpected field is a structured 400 instead
+ * of being silently stripped.
+ *
+ * Positivity and asset *support* stay in the handler below: they carry their
+ * own established error codes (`INVALID_AMOUNT`, `UNSUPPORTED_ASSET`) that a
+ * schema-level failure would otherwise swallow.
+ */
+const withdrawalBody = z
+  .object({
+    amount: sep24AmountShapeSchema,
+    assetCode: sep24AssetCodeShapeSchema,
+    memo: mpMemoSchema.optional(),
+  })
+  .strict();
 
 function units(value: string): bigint {
   const [whole, fraction = ""] = value.split(".");
@@ -46,7 +65,23 @@ function serializeWithdrawal(withdrawal: any) {
 export default async function withdrawalRoutes(app: FastifyInstance) {
   const withdrawalModel = (prisma as any).withdrawal;
 
-  app.post("/withdraw", { preHandler: [app.authenticate] }, async (req) => {
+  // On-chain payment submission surfaces (issues #363 / #403). Both draw on
+  // dedicated per-route budgets rather than the 100/min global allowance:
+  //
+  //  - `POST /withdraw` initiates a withdrawal that fans out to the anchor's
+  //    SEP-24 transfer server, so it shares the tight `anchorInit` budget
+  //    (RATE_LIMIT_ANCHOR_INIT_MAX, default 10/min) used by the other anchor
+  //    initiation routes — brute-forcing it must not exhaust a caller's
+  //    global traffic.
+  //  - `POST /withdraw/:id/confirm` submits a signed XDR to the network and
+  //    shares the `settlementConfirm` budget
+  //    (RATE_LIMIT_SETTLEMENT_CONFIRM_MAX, default 20/min) with the other
+  //    payment-confirmation routes, absorbing legitimate retries while
+  //    bounding brute-force submission attempts.
+  app.post(
+    "/withdraw",
+    { preHandler: [app.authenticate], ...rateLimited("anchorInit") },
+    async (req) => {
     const auth = requireUser(req);
     const body = withdrawalBody.parse(req.body);
 
@@ -124,7 +159,7 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
 
   app.post(
     "/withdraw/:id/confirm",
-    { preHandler: [app.authenticate] },
+    { preHandler: [app.authenticate], ...rateLimited("settlementConfirm") },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
@@ -160,7 +195,12 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           nextStatus: "processing",
           source: "user",
           ownerUserId: auth.id,
-          extraData: { anchorTxId: result.id } as never,
+          // The JWT is stored atomically with the transition so the worker
+          // can poll the anchor for this withdrawal's status later — the
+          // server cannot mint one itself (the SEP-10 challenge must be
+          // signed by the user's key), and without it a lost webhook would
+          // leave the withdrawal stuck in `processing` forever.
+          extraData: { anchorTxId: result.id, anchorToken: token },
         });
         return {
           ...serializeWithdrawal(updated),

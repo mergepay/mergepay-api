@@ -20,6 +20,7 @@
  */
 import { z } from "zod";
 import { stellarPublicKeySchema } from "../lib/stellar-validation";
+import { isValidXdr } from "../utils/stellar-xdr";
 
 /** A Stellar weight/threshold: integer in [0, 255]. */
 const stellarWeightSchema = z
@@ -93,3 +94,65 @@ export const treasuryThresholdUpdateSchema = z.object({
 });
 
 export type TreasuryThresholdUpdateInput = z.infer<typeof treasuryThresholdUpdateSchema>;
+
+/**
+ * A treasury transaction envelope: a base64 XDR string the SDK can decode
+ * (issue #419's shared `isValidXdr` gate). Shape-only — whether the envelope
+ * is unsigned, sourced from the treasury account, or matches the expected
+ * intent is checked by the service that owns those invariants.
+ */
+export const treasuryXdrSchema = z
+  .string()
+  .min(1, "Transaction XDR is required")
+  .max(50000, "Transaction XDR exceeds maximum size")
+  .refine(
+    (value) => isValidXdr(value),
+    "Transaction must be a valid base64-encoded Stellar XDR"
+  );
+
+/**
+ * A treasury multisig proposal creation payload (issue #402).
+ *
+ * Guards the `POST /api/treasury/proposals` route (src/routes/treasury-signatures.ts)
+ * so a malformed proposal is rejected deterministically before it can reach
+ * the signature-collection workflow:
+ *
+ *   - `treasuryId` — the treasury (group) the proposal spends from. The
+ *     historical field name `groupId` is still accepted so existing clients
+ *     keep working; the schema normalises either to `treasuryId`.
+ *   - `xdr` — the unsigned envelope, validated for parseability up front.
+ *   - `description` — optional human-readable metadata ("pay March rent",
+ *     "vendor invoice #42") stored with the proposal for display; bounded so
+ *     it cannot be used as a free-form data dump.
+ *
+ * Semantic checks (treasury enabled, envelope unsigned, source account
+ * matches) stay in `treasurySignaturesService.createProposal` — this schema
+ * owns the payload *shape* only.
+ */
+export const treasuryTxProposalCreateSchema = z
+  .object({
+    /** Canonical treasury identifier (issue #402). */
+    treasuryId: z.string().min(1).optional(),
+    /** Legacy alias for `treasuryId`, retained for backward compatibility. */
+    groupId: z.string().min(1).optional(),
+    xdr: treasuryXdrSchema,
+    description: z
+      .string()
+      .min(1, "Description cannot be empty")
+      .max(280, "Description must be 280 characters or fewer")
+      .optional(),
+  })
+  .refine((value) => Boolean(value.treasuryId ?? value.groupId), {
+    message: "treasuryId is required",
+    path: ["treasuryId"],
+  })
+  // Guaranteed non-empty by the refinement above: either name resolves to the
+  // same treasury, and `treasuryId` is the canonical one handlers read.
+  .transform((value) => ({
+    ...value,
+    treasuryId: (value.treasuryId ?? value.groupId) as string,
+  }));
+
+export type TreasuryTxProposalCreateInput = z.infer<
+  typeof treasuryTxProposalCreateSchema
+>;

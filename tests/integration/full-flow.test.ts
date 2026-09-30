@@ -4,7 +4,7 @@
  * These tests run against a live Stellar testnet and the local backend API.
  * Ensure the server is running with DATABASE_URL_TEST before executing.
  */
-import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { Keypair } from "@stellar/stellar-sdk";
 import fetch from "node-fetch";
 import {
@@ -18,6 +18,7 @@ import {
   waitForTransaction,
   loadHorizonAccount,
   API_BASE_URL,
+  isLiveServerAvailable,
 } from "./helpers";
 
 const TEST_TIMEOUT = 30000;
@@ -35,9 +36,13 @@ let member2Token: string;
 // Test data
 let groupId: string;
 let expenseId: string;
+let serverAvailable = false;
 
 describe("SEP-10 to Settlement Integration Flow", () => {
   beforeAll(async () => {
+    serverAvailable = await isLiveServerAvailable();
+    if (!serverAvailable) return;
+
     // Create and fund test accounts
     [adminKeypair, member1Keypair, member2Keypair] = await Promise.all([
       createTestAccount(),
@@ -52,6 +57,12 @@ describe("SEP-10 to Settlement Integration Flow", () => {
       authenticateUser(member2Keypair),
     ]);
   }, TEST_TIMEOUT * 2);
+
+  beforeEach((ctx) => {
+    if (!serverAvailable) {
+      ctx.skip();
+    }
+  });
 
   afterAll(async () => {
     // Cleanup: accounts are ephemeral testnet accounts, no action needed

@@ -342,8 +342,8 @@ describe("POST /groups/:id/expenses — trustline validation", () => {
 
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.code).toBe("MISSING_TRUSTLINES");
-    expect(body.details.missing[0].userId).toBe("user_2");
+    expect(body.error.code).toBe("MISSING_TRUSTLINES");
+    expect(body.error.details.missing[0].userId).toBe("user_2");
     // Rejected before anything was written.
     expect(prisma.expense.create).not.toHaveBeenCalled();
   });

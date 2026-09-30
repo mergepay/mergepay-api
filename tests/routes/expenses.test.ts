@@ -128,7 +128,7 @@ describe("GET /groups/:id/expenses — filter validation", () => {
     const res = await list("?asset=DOGE");
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
     expect(prisma.expense.findMany).not.toHaveBeenCalled();
   });
 
@@ -136,14 +136,14 @@ describe("GET /groups/:id/expenses — filter validation", () => {
     const res = await list("?status=REFUNDED");
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
   });
 
   it("rejects a non-ISO date", async () => {
     const res = await list("?startDate=last-tuesday");
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
   });
 
   it("rejects a reversed date range rather than silently returning nothing", async () => {
@@ -153,7 +153,7 @@ describe("GET /groups/:id/expenses — filter validation", () => {
 
     expect(res.statusCode).toBe(400);
     // Matches the audit-log route's convention for the same mistake.
-    expect(res.json().code).toBe("INVALID_RANGE");
+    expect(res.json().error.code).toBe("INVALID_RANGE");
     expect(prisma.expense.findMany).not.toHaveBeenCalled();
   });
 
@@ -161,7 +161,7 @@ describe("GET /groups/:id/expenses — filter validation", () => {
     const res = await list("?limit=9999");
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
   });
 });
 
@@ -288,7 +288,7 @@ describe("GET /groups/:id/expenses — pagination with filters", () => {
     const res = await list("?asset=USDC&cursor=not-a-cursor");
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("INVALID_CURSOR");
+    expect(res.json().error.code).toBe("INVALID_CURSOR");
     expect(prisma.expense.findMany).not.toHaveBeenCalled();
   });
 

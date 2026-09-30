@@ -252,7 +252,7 @@ describe("Anchor reads are retried", () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({}, 503))
-      .mockResolvedValue(jsonResponse({ transaction: { status: "completed" } }));
+      .mockResolvedValue(jsonResponse({ transaction: { id: "tx_1", kind: "deposit", status: "completed" } }));
     vi.stubGlobal("fetch", fetchMock);
 
     const result = await anchorService.pollTransaction({
@@ -286,7 +286,7 @@ describe("Anchor reads are retried", () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({}, 502))
-      .mockResolvedValue(jsonResponse({ transaction: { status: "COMPLETED" } }));
+      .mockResolvedValue(jsonResponse({ transaction: { id: "tx_3", kind: "withdrawal", status: "COMPLETED" } }));
     vi.stubGlobal("fetch", fetchMock);
 
     const status = await anchorService.getTransactionStatus({

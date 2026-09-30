@@ -1,12 +1,24 @@
 import "dotenv/config";
 import { z } from "zod";
 import { Networks } from "@stellar/stellar-sdk";
+import { rateLimitConfigSchema } from "./config/env";
 
 // URL validation helper
 const urlSchema = z.string().url("Invalid URL format");
 
 // Stellar public key validation (G followed by 56 base32 characters)
 const stellarPublicKeySchema = z.string().regex(/^G[A-Z0-9]{55}$/, "Invalid Stellar public key format");
+
+/**
+ * Longest rate-limit window a deployment may configure: one hour.
+ *
+ * A window is the only thing standing between a typo and an endpoint that is
+ * effectively unlimited — `RATE_LIMIT_AUTH_VERIFY_WINDOW_MS=60000000` parses as
+ * a perfectly valid number and would hand an attacker sixteen days of
+ * unlimited login attempts. Rejecting it at boot turns a silent security hole
+ * into a startup error an operator cannot miss.
+ */
+const MAX_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 
 const schema = z.object({
   // Required core configuration
@@ -168,6 +180,19 @@ const schema = z.object({
   WORKER_ANCHOR_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(120_000),
   WORKER_ANCHOR_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
 
+  // Retry budget for the worker *cycle tasks* themselves (issue #708): how
+  // many times a sweep that throws — a transient database or Horizon error —
+  // is retried in-cycle with exponential backoff before it is dead-lettered
+  // for that cycle and logged as critical. The per-job budgets above govern
+  // individual settlement/anchor rows; this one governs the batch sweeps.
+  WORKER_CYCLE_TASK_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  WORKER_CYCLE_TASK_RETRY_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(500),
+  WORKER_CYCLE_TASK_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(10_000),
+  // Consecutive failed cycles before the worker health heartbeat reports
+  // `healthy: false` and emits a critical log line. A count rather than a
+  // boolean because one failure is normal; a run of them is an outage.
+  WORKER_HEALTH_UNHEALTHY_THRESHOLD: z.coerce.number().int().positive().default(3),
+
   // Per-call network timeouts (ms) — every outbound Horizon/anchor request
   // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
   // a slow or hung upstream can't block a worker cycle indefinitely.
@@ -207,46 +232,67 @@ const schema = z.object({
   // identical schedules across instances reconverge into synchronized bursts
   // against an upstream that is already struggling.
   UPSTREAM_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
+  // Whether Horizon *reads* (account load, transaction lookup) also retry an
+  // HTTP 429 within the budget above, backing off exponentially and never
+  // sooner than a Retry-After the upstream sends. Submissions are unaffected.
+  // An explicit "true"/"false" string, because z.coerce.boolean() would turn
+  // the string "false" into true.
+  HORIZON_RETRY_ON_RATE_LIMIT: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
   NODE_ENV: z.string().default("development"),
   RECONCILIATION_INTERVAL: z.coerce.number().int().positive().default(30000),
   CONFIRMATION_THRESHOLD: z.coerce.number().int().positive().default(1),
   TX_TIMEOUT: z.coerce.number().int().positive().default(300000),
   MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
 
+  // Generic rate-limit defaults (see issue #408). Declared in src/config/env.ts
+  // so they can be unit-tested in isolation; merged into this schema so a
+  // malformed value aborts startup through this module's fail-fast
+  // process.exit(1) path instead of silently disabling the limiter.
+  ...rateLimitConfigSchema.shape,
   // Security-sensitive endpoint policies.
   RATE_LIMIT_STORE: z.enum(["memory", "database"]).default("memory"),
-  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().max(100000).default(100),
-  RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_HEALTH: z.coerce.number().int().positive().max(100000).default(60),
   RATE_LIMIT_ANCHOR_WEBHOOK_MAX: z.coerce.number().int().positive().max(100000).default(50),
-  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_ANCHOR_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_ANCHOR_INIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
-  RATE_LIMIT_ANCHOR_INIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_ANCHOR_INIT_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_ANCHOR_POLL_MAX: z.coerce.number().int().positive().max(100000).default(60),
-  RATE_LIMIT_ANCHOR_POLL_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_ANCHOR_POLL_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_TREASURY_SUBMIT_MAX: z.coerce.number().int().positive().max(100000).default(30),
-  RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   // Treasury proposal creation writes a proposal row and starts an approval
   // cycle, so it is bounded like the other state-changing treasury routes.
   RATE_LIMIT_TREASURY_PROPOSE_MAX: z.coerce.number().int().positive().max(100000).default(20),
-  RATE_LIMIT_TREASURY_PROPOSE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_TREASURY_PROPOSE_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_AUTH_CHALLENGE_MAX: z.coerce.number().int().positive().max(100000).default(20),
-  RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_AUTH_CHALLENGE_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_AUTH_VERIFY_MAX: z.coerce.number().int().positive().max(100000).default(10),
-  RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_SETTLEMENT_CREATE_MAX: z.coerce.number().int().positive().max(100000).default(20),
-  RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_SETTLEMENT_CONFIRM_MAX: z.coerce.number().int().positive().max(100000).default(20),
-  RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_SETTLEMENT_EXECUTE_MAX: z.coerce.number().int().positive().max(100000).default(20),
-  RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Expense creation writes an expense plus one share row per participant and
+  // opens a settlement obligation, so it gets its own budget rather than
+  // spending the caller's global allowance. It is looser than the settlement
+  // policies because a legitimately active group creates expenses in bursts,
+  // and it never shares a bucket with them.
+  RATE_LIMIT_EXPENSE_CREATE_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_EXPENSE_CREATE_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   SEP24_RATE_LIMIT_MAX: z.coerce.number().int().positive().max(100000).default(10),
-  SEP24_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  SEP24_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_GROUP: z.coerce.number().int().positive().max(100000).default(10),
-  RATE_LIMIT_GROUP_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_GROUP_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_HISTORY: z.coerce.number().int().positive().max(100000).default(30),
-  RATE_LIMIT_HISTORY_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_HISTORY_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   // trusted proxies: only trust X-Forwarded-For if the direct peer is in this
   // comma-separated list; otherwise Fastify falls back to req.ip = socket remote.
   TRUSTED_PROXY_IPS: z.string().default(""),

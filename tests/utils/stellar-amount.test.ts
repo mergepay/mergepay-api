@@ -8,6 +8,7 @@ import {
   subtractStellarAmounts,
   compareStellarAmounts,
 } from "../../src/utils/stellar-amount";
+import { MAX_STROOPS } from "../../src/lib/money";
 
 describe("formatStellarAmount (wire format - exactly 7dp)", () => {
   it("formats whole numbers with 7 decimal places", () => {
@@ -31,6 +32,10 @@ describe("formatStellarAmount (wire format - exactly 7dp)", () => {
   it("accepts number stroops directly", () => {
     expect(formatStellarAmount(1000000000)).toBe("100.0000000");
     expect(formatStellarAmount(1)).toBe("0.0000001");
+  });
+
+  it("formats the largest representable Stellar amount exactly", () => {
+    expect(formatStellarAmount(MAX_STROOPS)).toBe("922337203685.4775807");
   });
 
   it("throws on invalid decimal string", () => {
@@ -92,6 +97,10 @@ describe("parseStellarAmount", () => {
     expect(parseStellarAmount("10.5")).toBe(105000000n);
     expect(parseStellarAmount("0.0000001")).toBe(1n);
     expect(parseStellarAmount("123.456789")).toBe(1234567890n);
+  });
+
+  it("parses the largest representable Stellar amount without precision loss", () => {
+    expect(parseStellarAmount("922337203685.4775807")).toBe(MAX_STROOPS);
   });
 
   it("throws on invalid inputs", () => {

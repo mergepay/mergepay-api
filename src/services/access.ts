@@ -39,9 +39,10 @@ export async function requireMembership(
   if (!member) {
     const group = await db.group.findUnique({
       where: { id: groupId },
-      select: { id: true },
+      select: { id: true, archived: true },
     });
     if (!group) throw Errors.notFound("Group not found");
+    if (group.archived) throw Errors.forbidden("Group is archived");
     throw Errors.forbidden("You are not a member of this group");
   }
 

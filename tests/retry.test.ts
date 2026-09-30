@@ -11,6 +11,11 @@ import {
   type RetryPolicy,
 } from "../src/services/retry";
 import { TimeoutError, TransportError } from "../src/services/timeout";
+import {
+  calculateBackoffDelay,
+  isTransientHorizonError,
+  retryWithBackoff,
+} from "../src/utils/retry";
 
 /**
  * A policy with no real delay, so tests exercise the retry decisions rather
@@ -443,5 +448,65 @@ describe("defaultReadPolicy", () => {
     expect(policy.maxDelayMs).toBeGreaterThanOrEqual(policy.initialDelayMs);
     expect(policy.jitterRatio).toBeGreaterThanOrEqual(0);
     expect(policy.jitterRatio).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("shared retry utility", () => {
+  it("calculates bounded exponential delays without jitter", () => {
+    const options = {
+      initialDelayMs: 100,
+      maxDelayMs: 250,
+      backoffFactor: 2,
+      jitter: false,
+    };
+
+    expect(calculateBackoffDelay(1, options)).toBe(0);
+    expect(calculateBackoffDelay(2, options)).toBe(100);
+    expect(calculateBackoffDelay(3, options)).toBe(200);
+    expect(calculateBackoffDelay(4, options)).toBe(250);
+  });
+
+  it("classifies transient and permanent Horizon failures", () => {
+    expect(isTransientHorizonError({ response: { status: 429 } })).toBe(true);
+    expect(isTransientHorizonError({ response: { status: 503 } })).toBe(true);
+    expect(isTransientHorizonError({ response: { status: 400 } })).toBe(false);
+    expect(isTransientHorizonError({ response: { status: 501 } })).toBe(false);
+    expect(
+      isTransientHorizonError({
+        response: {
+          data: { extras: { result_codes: { transaction: "tx_bad_seq" } } },
+        },
+      })
+    ).toBe(false);
+  });
+
+  it("retries transient errors and skips sleeping for terminal errors", async () => {
+    const operation = vi
+      .fn<(attempt: number) => Promise<string>>()
+      .mockRejectedValueOnce(new Error("connection reset"))
+      .mockResolvedValueOnce("ok");
+    const sleep = vi.fn(async () => {});
+    const onRetry = vi.fn();
+
+    await expect(
+      retryWithBackoff(operation, {
+        maxAttempts: 3,
+        initialDelayMs: 100,
+        jitter: false,
+        sleep,
+        onRetry,
+      })
+    ).resolves.toBe("ok");
+    expect(operation).toHaveBeenNthCalledWith(1, 1);
+    expect(operation).toHaveBeenNthCalledWith(2, 2);
+    expect(onRetry).toHaveBeenCalledWith(expect.any(Error), 1, 100);
+    expect(sleep).toHaveBeenCalledWith(100);
+
+    const terminal = { response: { status: 400 } };
+    const terminalOperation = vi.fn().mockRejectedValue(terminal);
+    await expect(
+      retryWithBackoff(terminalOperation, { maxAttempts: 3, sleep })
+    ).rejects.toBe(terminal);
+    expect(terminalOperation).toHaveBeenCalledTimes(1);
   });
 });

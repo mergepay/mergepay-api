@@ -220,7 +220,7 @@ describe("list endpoints share one pagination contract", () => {
       });
 
       expect(res.statusCode).toBe(400);
-      expect(res.json().error).toBe("VALIDATION_ERROR");
+      expect(res.json().error.code).toBe("VALIDATION_ERROR");
     });
 
     it(`${route.name}: rejects a malformed cursor`, async () => {
@@ -231,7 +231,7 @@ describe("list endpoints share one pagination contract", () => {
       });
 
       expect(res.statusCode).toBe(400);
-      expect(res.json().error).toBe("INVALID_CURSOR");
+      expect(res.json().error.code).toBe("INVALID_CURSOR");
     });
   }
 });

@@ -24,7 +24,12 @@ const h = vi.hoisted(() => {
     findUnique: vi.fn(),
     findFirst: vi.fn(),
     findUniqueOrThrow: vi.fn(),
-    findMany: vi.fn(async () => []),
+    findMany: vi.fn(async () => [
+      {
+        payerUserId: "user_2",
+        shares: [{ userId: "user_1", shareAmount: "1000", status: "pending" }],
+      },
+    ]),
   });
   const prisma: any = {
     expense: model(),
@@ -306,7 +311,7 @@ describe("creating an intent records a server-controlled expiry", () => {
       });
 
       expect(res.statusCode).toBe(400);
-      expect(res.json().error).toBe("VALIDATION_ERROR");
+      expect(res.json().error.code).toBe("VALIDATION_ERROR");
     }
     expect(h.buildPayment).not.toHaveBeenCalled();
     expect(h.loadAccount).not.toHaveBeenCalled();
@@ -398,9 +403,9 @@ describe("settlement confirm rejects an expired intent", () => {
 
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("INTENT_EXPIRED");
+    expect(body.error.code).toBe("INTENT_EXPIRED");
     expect(body.message).toMatch(/expired/i);
-    expect(body.details.clockSkewToleranceSeconds).toBe(CLOCK_SKEW_TOLERANCE_SECONDS);
+    expect(body.error.details.clockSkewToleranceSeconds).toBe(CLOCK_SKEW_TOLERANCE_SECONDS);
   });
 
   it("never stores the envelope or submits it when the intent has expired", async () => {
@@ -451,7 +456,7 @@ describe("settlement confirm rejects an expired intent", () => {
     });
 
     expect(res.statusCode).toBe(403);
-    expect(res.json().error).toBe("FORBIDDEN");
+    expect(res.json().error.code).toBe("FORBIDDEN");
   });
 
   it("distinguishes a missing settlement from an expired one", async () => {
@@ -465,7 +470,7 @@ describe("settlement confirm rejects an expired intent", () => {
     });
 
     expect(res.statusCode).toBe(404);
-    expect(res.json().error).toBe("NOT_FOUND");
+    expect(res.json().error.code).toBe("NOT_FOUND");
   });
 
   it("treats an intent with no recorded deadline as still valid", async () => {
@@ -502,19 +507,20 @@ describe("treasury confirm rejects an expired intent", () => {
     prisma.treasuryTransaction.update.mockResolvedValue(
       fakeTreasuryTx({ status: "confirmed", stellarTxHash: "hash_abc" })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(200);
     // The submission carries the recorded expiry, so the service re-validates
     // the envelope's own time bounds against it.
     expect(h.submitPayment).toHaveBeenCalledWith(
-      "signed-xdr-abc",
+      signedXdr,
       expect.objectContaining({
         expiresAt: expect.any(Date),
         resource: "treasury transaction",
@@ -526,16 +532,17 @@ describe("treasury confirm rejects an expired intent", () => {
     prisma.treasuryTransaction.findUnique.mockResolvedValue(
       fakeTreasuryTx({ expiresAt: longExpired() })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INTENT_EXPIRED");
+    expect(res.json().error.code).toBe("INTENT_EXPIRED");
     expect(h.submitPayment).not.toHaveBeenCalled();
     expect(prisma.treasuryTransaction.update).not.toHaveBeenCalled();
   });
@@ -548,16 +555,17 @@ describe("treasury confirm rejects an expired intent", () => {
         expiresAt: longExpired(),
       })
     );
+    const signedXdr = signedXdrFor();
 
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "signed-xdr-abc" },
+      payload: { signedXdr },
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("INTENT_EXPIRED");
+    expect(res.json().error.code).toBe("INTENT_EXPIRED");
     expect(h.submitPayment).not.toHaveBeenCalled();
   });
 });

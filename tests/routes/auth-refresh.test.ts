@@ -162,7 +162,7 @@ describe("POST /auth/refresh — rejections are indistinguishable", () => {
       const res = await refresh(token);
 
       expect(res.statusCode).toBe(401);
-      expect(res.json().code).toBe("UNAUTHORIZED");
+      expect(res.json().error.code).toBe("UNAUTHORIZED");
     });
   }
 
@@ -198,7 +198,7 @@ describe("POST /auth/refresh — rejections are indistinguishable", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
   });
 });
 

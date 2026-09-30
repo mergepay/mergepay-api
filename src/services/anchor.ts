@@ -42,11 +42,24 @@ import {
 import { fetchWithTimeout, toProviderError } from "./timeout";
 import { anchorCircuit } from "./anchor-circuit";
 import { safeFailureMessage } from "./job-retry";
+import { isSep24TransactionStatus } from "./sep24-types";
+import {
+  AnchorError,
+  AnchorNetworkError,
+  AnchorTimeoutError,
+  AnchorUnavailableError,
+  AnchorUpstreamError,
+  AnchorValidationError,
+  anchorErrorForStatus,
+} from "./anchor-errors";
+import {
+  parseSep24TransactionResponse,
+  resolveSep24Status,
+  type Sep24AnchorTransaction,
+} from "./anchor-schemas";
 import {
   classifyUpstreamFailure,
-  isRetryableFailure,
   logRetryAttempt,
-  type UpstreamFailureKind,
   upstreamCauseOf,
   withRetry,
 } from "./retry";
@@ -125,9 +138,13 @@ export interface PollResult {
   stellarTransactionHash?: string;
   /**
    * False when the anchor returned a status string outside the known SEP-24
-   * set (mapped to a safe pending state). Undefined on failed polls.
+   * set. `status` is then only a display placeholder ("pending_anchor") and
+   * must not be persisted — see `resolveSep24Status`. Undefined on failed
+   * polls.
    */
   recognized?: boolean;
+  /** The typed error behind a failed poll. Undefined on success. */
+  error?: AnchorError;
 }
 
 // ─── Zod schemas for anchor responses ───────────────────────────────────────
@@ -146,38 +163,7 @@ const interactiveResponseSchema = z.object({
   id: z.string(),
 });
 
-const sep24TransactionResponseSchema = z
-  .object({
-    transaction: z
-      .object({
-        status: z.string().min(1),
-        id: z.string().optional(),
-        kind: z.string().optional(),
-        amount_in: z.union([z.string(), z.number()]).optional(),
-        amount_out: z.union([z.string(), z.number()]).optional(),
-        amount_fee: z.union([z.string(), z.number()]).optional(),
-        started_at: z.string().optional(),
-        completed_at: z.string().optional(),
-        stellar_transaction_hash: z.string().optional(),
-        external_transaction_id: z.string().optional(),
-        message: z.string().optional(),
-        refunds: z.any().optional(),
-      })
-      .strict(),
-  })
-  .strict()
-  .superRefine((data, ctx) => {
-    // A transaction without a usable status is malformed — never accept a
-    // blank/whitespace status that would silently round-trip to pending.
-    const raw = data.transaction.status.trim();
-    if (!raw) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["transaction", "status"],
-        message: "transaction status must be a non-empty string",
-      });
-    }
-  });
+// The SEP-24 `GET /transaction` schema lives in ./anchor-schemas.
 
 // ─── Retry policy for anchor reads ──────────────────────────
 
@@ -259,15 +245,122 @@ function httpFailureCategory(status: number): ProviderFailureCategory {
   return "rejected";
 }
 
-/** Map a retry classification onto the provider category the worker persists. */
-const PROVIDER_CATEGORY_BY_KIND: Record<UpstreamFailureKind, ProviderFailureCategory> = {
-  timeout: "timeout",
-  transport: "transport",
-  server_error: "unavailable",
-  rate_limited: "rate_limited",
-  client_error: "rejected",
-  unknown: "unavailable",
-};
+/**
+ * Convert whatever `fetchReadWithRetry` threw into a typed anchor error. The
+ * retry wrapper maps every failure onto a generic upstream error, so the
+ * originating failure is read back off its preserved cause.
+ */
+function toAnchorError(err: unknown, operation: string): AnchorError {
+  if (err instanceof AnchorError) return err;
+  const cause = upstreamCauseOf(err) ?? err;
+  if (cause instanceof AnchorHttpError) return anchorErrorForStatus(operation, cause.status);
+
+  const kind = classifyUpstreamFailure(cause);
+  if (kind === "timeout") return new AnchorTimeoutError(operation);
+  if (kind === "transport") return new AnchorNetworkError(operation);
+  return new AnchorUpstreamError(operation, null);
+}
+
+/**
+ * Read and validate a `GET /transaction` body. The anchor must answer with the
+ * transaction that was asked for; a different id means the response cannot be
+ * attributed to the session being polled.
+ */
+async function readSep24Transaction(
+  operation: string,
+  requestedId: string,
+  res: Response
+): Promise<Sep24AnchorTransaction> {
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new AnchorValidationError(operation, "invalid_json");
+  }
+
+  const parsed = parseSep24TransactionResponse(body);
+  if (!parsed.success) {
+    throw new AnchorValidationError(operation, "schema", parsed.fields);
+  }
+  if (parsed.droppedFields.length > 0) {
+    retryLog.warn(
+      { operation, transactionId: requestedId, droppedFields: parsed.droppedFields },
+      "SEP-24 transaction had invalid optional fields; they were ignored"
+    );
+  }
+  if (parsed.transaction.id !== requestedId) {
+    throw new AnchorValidationError(operation, "id_mismatch", ["transaction.id"]);
+  }
+  return parsed.transaction;
+}
+
+/**
+ * The one place `GET /transaction` is called. Throws a typed `AnchorError`
+ * for every failure; the public methods decide how to surface it.
+ *
+ * A read, so transient failures (timeout, transport, 5xx except 501/505) are
+ * retried inside `fetchReadWithRetry`, each attempt bounded by `timeoutMs`.
+ * The circuit breaker counts one failure per exhausted attempt budget, or per
+ * unusable response — never one per attempt.
+ */
+async function fetchSep24Transaction(
+  operation: string,
+  params: { transferServer: string; token: string; id: string; timeoutMs?: number }
+): Promise<Sep24AnchorTransaction> {
+  const provider = `tx:${params.transferServer}`;
+  if (anchorCircuit.isOpen(provider)) throw new AnchorUnavailableError(operation);
+
+  const url = `${params.transferServer}/transaction?id=${encodeURIComponent(params.id)}`;
+  let res: Response;
+  try {
+    res = await fetchReadWithRetry(url, operation, params.timeoutMs ?? config.ANCHOR_POLL_TIMEOUT_MS, {
+      headers: { Authorization: `Bearer ${params.token}` },
+    });
+  } catch (err: unknown) {
+    anchorCircuit.recordFailure(provider);
+    throw toAnchorError(err, operation);
+  }
+
+  try {
+    const transaction = await readSep24Transaction(operation, params.id, res);
+    anchorCircuit.recordSuccess(provider);
+    return transaction;
+  } catch (err: unknown) {
+    anchorCircuit.recordFailure(provider);
+    throw err;
+  }
+}
+
+/** The worker-facing message for a failed poll. Never includes anchor body text. */
+function pollFailureMessage(err: AnchorError): string {
+  if (err instanceof AnchorUnavailableError) return "Anchor circuit is open";
+  if (err instanceof AnchorValidationError) {
+    if (err.reason === "invalid_json") return "Anchor returned malformed (non-JSON) response";
+    const detail =
+      err.reason === "id_mismatch"
+        ? "transaction id does not match the request"
+        : err.fields.includes("transaction.status")
+          ? "missing transaction status"
+          : err.fields.some((field) => field === "transaction" || field === "(root)")
+            ? "missing 'transaction'"
+            : `invalid fields (${err.fields.join(", ")})`;
+    return `Anchor returned invalid or malformed response: ${detail}`;
+  }
+  if (err.httpStatus !== null) return `Anchor returned HTTP ${err.httpStatus}`;
+  return `Anchor poll failed: ${err.message}`;
+}
+
+function pollFailure(err: AnchorError): PollResult {
+  return {
+    rawStatus: null,
+    status: "pending_anchor",
+    message: pollFailureMessage(err),
+    isError: true,
+    category: err.category,
+    errorCategory: errorCategoryOf(err.category),
+    error: err,
+  };
+}
 
 /** Whether a provider category is a permanent rejection vs a transient outage. */
 function errorCategoryOf(
@@ -502,69 +595,59 @@ export const anchorService = {
   },
 
   /**
+   * Fetch one SEP-24 transaction (`GET /transaction?id=`) as a validated,
+   * typed object.
+   *
+   * This is the typed entry point for status tracking: it throws an
+   * `AnchorError` subclass for every failure — `AnchorTimeoutError`,
+   * `AnchorNetworkError`, `AnchorAuthError` (401/403, usually an expired
+   * SEP-10 token), `AnchorNotFoundError` (404), `AnchorUpstreamError` (other
+   * non-OK statuses), `AnchorValidationError` (non-JSON body, schema
+   * mismatch, or a different transaction id), and `AnchorUnavailableError`
+   * (circuit open). `status` on the result is the anchor's raw string; pass
+   * it through `resolveSep24Status` before acting on it.
+   */
+  async getTransaction(params: {
+    transferServer: string;
+    token: string;
+    id: string;
+    timeoutMs?: number;
+  }): Promise<Sep24AnchorTransaction> {
+    return fetchSep24Transaction("Anchor.getTransaction", params);
+  },
+
+  /**
    * Poll a single SEP-24 transaction's status.
    *
-   * Returns a raw status string or null if the anchor responded with a
-   * non-OK status or the transaction was not found.
-   *
-   * A read, so transient failures are retried within the call. The circuit
-   * breaker only records a failure once the attempt budget is exhausted —
-   * counting each individual attempt would open the circuit after a single
-   * bad poll rather than after a genuinely unhealthy anchor.
+   * Returns the anchor's normalized (trimmed, lower-cased) status string, or
+   * null for any failure. Callers that need to know *why* a read failed use
+   * `getTransaction` instead.
    */
   async getTransactionStatus(params: {
     transferServer: string;
     token: string;
     id: string;
   }): Promise<string | null> {
-    const provider = `tx:${params.transferServer}`;
-    if (anchorCircuit.isOpen(provider)) {
-      return null;
-    }
-
-    const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
-      params.id
-    )}`;
-    let res: Response;
     try {
-      res = await fetchReadWithRetry(
-        url,
-        "Anchor.getTransactionStatus",
-        config.ANCHOR_POLL_TIMEOUT_MS,
-        { headers: { Authorization: `Bearer ${params.token}` } }
-      );
-      anchorCircuit.recordSuccess(provider);
-    } catch {
-      anchorCircuit.recordFailure(provider);
-      return null;
-    }
-
-    try {
-      const data = parseJson(
-        "Anchor.getTransactionStatus",
-        sep24TransactionResponseSchema,
-        await res.json()
-      );
-      const rawStatus = data.transaction?.status;
-      return rawStatus ? rawStatus.trim().toLowerCase() : null;
-    } catch {
-      anchorCircuit.recordFailure(provider);
-      return null;
+      const transaction = await fetchSep24Transaction("Anchor.getTransactionStatus", params);
+      return transaction.status;
+    } catch (err: unknown) {
+      if (err instanceof AnchorError) return null;
+      throw err;
     }
   },
 
   /**
-   * Full SEP-24 poll with timeout, error normalization, and rich result.
+   * Full SEP-24 poll returning a normalized `PollResult` instead of throwing.
    *
-   * This is the primary method the worker should call. It wraps
-   * getTransactionStatus with a timeout, parses the full transaction
-   * response, and returns a normalised PollResult.
+   * This is the method the worker calls. A failure becomes a result with
+   * `isError`, its provider `category`, whether it is `permanent` or
+   * `transient`, and the typed `error` itself. Transient failures have
+   * already been retried inside the call, so the worker's own retry schedule
+   * governs genuinely unavailable anchors rather than momentary blips.
    *
-   * A read, so transient failures are retried inside the call before a
-   * `PollResult` with `isError` is returned. The worker's own retry schedule
-   * therefore governs genuinely unavailable anchors rather than momentary
-   * blips, and the circuit breaker counts one failure per exhausted budget
-   * rather than one per attempt.
+   * An unrecognized status is not an error: the result carries
+   * `recognized: false` and the worker keeps the session's current state.
    */
   async pollTransaction(params: {
     transferServer: string;
@@ -572,259 +655,98 @@ export const anchorService = {
     id: string;
     timeoutMs?: number;
   }): Promise<PollResult> {
-    const timeoutMs = params.timeoutMs ?? config.ANCHOR_POLL_TIMEOUT_MS;
-    const provider = `tx:${params.transferServer}`;
-    if (anchorCircuit.isOpen(provider)) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor circuit is open",
-        isError: true,
-        category: "unavailable",
-        errorCategory: "transient",
-      };
-    }
-
-    const url = `${params.transferServer}/transaction?id=${encodeURIComponent(params.id)}`;
-
-    let response: Response;
+    let tx: Sep24AnchorTransaction;
     try {
-      response = await fetchReadWithRetry(url, "Anchor.pollTransaction", timeoutMs, {
-        headers: { Authorization: `Bearer ${params.token}` },
-      });
-      anchorCircuit.recordSuccess(provider);
+      tx = await fetchSep24Transaction("Anchor.pollTransaction", params);
     } catch (err: unknown) {
-      anchorCircuit.recordFailure(provider);
-      // The retry wrapper maps every failure to a stable upstream error, so the
-      // anchor's HTTP status is read back off the preserved cause to keep the
-      // previous poll-result message intact.
-      const cause = upstreamCauseOf(err) ?? err;
-      const kind = classifyUpstreamFailure(cause);
-      const message =
-        cause instanceof AnchorHttpError
-          ? `Anchor returned HTTP ${cause.status}`
-          : `Anchor poll failed: ${err instanceof Error ? err.message : String(err)}`;
-      const category = PROVIDER_CATEGORY_BY_KIND[kind];
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message,
-        isError: true,
-        category,
-        errorCategory: errorCategoryOf(category),
-      };
+      if (err instanceof AnchorError) return pollFailure(err);
+      throw err;
     }
 
-    let json: Record<string, unknown>;
-    try {
-      json = (await response.json()) as Record<string, unknown>;
-    } catch {
-      anchorCircuit.recordFailure(provider);
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor returned malformed (non-JSON) response",
-        isError: true,
-        category: "malformed",
-        errorCategory: "permanent",
-      };
-    }
+    const resolved = resolveSep24Status(tx.status);
+    const mappedStatus = resolved.recognized ? resolved.status : "pending_anchor";
+    const anchorMessage = tx.message ? safeFailureMessage(tx.message) : undefined;
 
-    const parseResult = sep24TransactionResponseSchema.safeParse(json);
-    if (!parseResult.success) {
-      anchorCircuit.recordFailure(provider);
-      const issues = parseResult.error.issues;
-      const hasMissingTx = issues.some((i) => i.path.length === 0 || i.path[0] === "transaction");
-      const hasMissingStatus = issues.some((i) => i.path.join(".") === "transaction.status");
-      const detail = hasMissingStatus
-        ? "missing transaction status"
-        : hasMissingTx
-          ? "missing 'transaction'"
-          : "invalid fields";
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: `Anchor returned invalid or malformed response: ${detail}`,
-        isError: true,
-        category: "malformed",
-        errorCategory: "permanent",
-      };
-    }
-
-    const tx = parseResult.data.transaction;
-    const rawStatus =
-      typeof tx.status === "string" ? tx.status : (json.status as string | undefined) ?? null;
-    if (!rawStatus) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor response missing transaction status",
-        isError: true,
-        category: "malformed",
-        errorCategory: "permanent",
-      };
-    }
-
-    // Distinguish a genuinely new anchor status (kept pending, logged loudly)
-    // from the statuses we know how to interpret.
-    const recognized = isKnownSep24Status(rawStatus);
-    const mappedStatus = mapAnchorStatus(rawStatus);
-
-    // Sanitise — only carry forward benign fields for debugging
+    // Sanitise — only carry forward benign fields for debugging.
     const sanitizedTx: Record<string, unknown> = {
       id: tx.id,
-      status: rawStatus,
+      status: tx.status,
       kind: tx.kind,
-      amount_in: tx.amount_in,
-      amount_out: tx.amount_out,
-      amount_fee: tx.amount_fee,
-      started_at: tx.started_at,
-      completed_at: tx.completed_at,
-      stellar_transaction_hash: tx.stellar_transaction_hash,
-      external_transaction_id: tx.external_transaction_id,
-      message: typeof tx.message === "string" ? safeFailureMessage(tx.message) : undefined,
-      refunds: tx.refunds,
+      amount_in: tx.amount_in ?? undefined,
+      amount_out: tx.amount_out ?? undefined,
+      amount_fee: tx.amount_fee ?? undefined,
+      started_at: tx.started_at ?? undefined,
+      completed_at: tx.completed_at ?? undefined,
+      stellar_transaction_id: tx.stellar_transaction_id ?? undefined,
+      external_transaction_id: tx.external_transaction_id ?? undefined,
+      message: anchorMessage,
+      refunds: tx.refunds ?? undefined,
     };
 
-    let displayMessage = `SEP-24 status: ${rawStatus} → ${mappedStatus}`;
-    if (mappedStatus === "error" && typeof tx.message === "string") {
-      displayMessage = safeFailureMessage(tx.message);
-    }
-
-    if (!recognized) {
+    if (!resolved.recognized) {
       retryLog.warn(
-        {
-          rawStatus,
-          mappedStatus,
-          externalTransactionId: params.id,
-        },
-        `SEP-24 transaction reported an unknown status: ${rawStatus} — mapping to ${mappedStatus} and will keep polling`
+        { rawStatus: tx.status, externalTransactionId: params.id, kind: tx.kind },
+        `SEP-24 transaction reported an unknown status: ${tx.status} — keeping the current state and will keep polling`
       );
     }
 
     return {
-      rawStatus,
+      rawStatus: tx.status,
       status: mappedStatus,
-      message: displayMessage,
+      message:
+        mappedStatus === "error" && anchorMessage
+          ? anchorMessage
+          : `SEP-24 status: ${tx.status} → ${mappedStatus}`,
       isError: false,
-      recognized,
+      recognized: resolved.recognized,
       transaction: sanitizedTx,
-      amountIn:
-        typeof tx.amount_in === "string" || typeof tx.amount_in === "number"
-          ? String(tx.amount_in)
-          : undefined,
-      amountOut:
-        typeof tx.amount_out === "string" || typeof tx.amount_out === "number"
-          ? String(tx.amount_out)
-          : undefined,
-      amountFee:
-        typeof tx.amount_fee === "string" || typeof tx.amount_fee === "number"
-          ? String(tx.amount_fee)
-          : undefined,
-      stellarTransactionHash:
-        typeof tx.stellar_transaction_hash === "string"
-          ? tx.stellar_transaction_hash
-          : undefined,
+      amountIn: tx.amount_in ?? undefined,
+      amountOut: tx.amount_out ?? undefined,
+      amountFee: tx.amount_fee ?? undefined,
+      stellarTransactionHash: tx.stellar_transaction_id ?? undefined,
     };
   },
-
 };
 
 // ─── Status mapping ─────────────────────────────────────────────────────────
 
 /**
  * The exhaustive set of SEP-24 transaction statuses (lowercased) that we
- * understand and map explicitly. Any status outside this set is treated as
- * unknown and handled explicitly rather than silently swallowed.
+ * understand and map explicitly. Re-exported from ./sep24-types — the single
+ * source of truth shared with the anchor-session state machine and both
+ * callback handlers — so it can no longer drift from the type union.
  *
  * See: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md#transaction-history
  */
-export const KNOWN_SEP24_STATUSES: ReadonlySet<string> = new Set([
-  // Initial
-  "incomplete",
-  // Intermediate
-  "pending_user_transfer_start",
-  "pending_stellar",
-  "pending_trust",
-  "pending_user",
-  "pending_anchor",
-  "pending_transaction_info_update",
-  "pending_receiver",
-  "pending_sender",
-  // Terminal
-  "completed",
-  "no_market",
-  "too_small",
-  "too_large",
-  "error",
-  "refunded",
-  "expired",
-]);
-
-/** Whether a raw status string is a recognized SEP-24 value (case-insensitive). */
-export function isKnownSep24Status(raw: string): boolean {
-  if (!raw) return false;
-  return KNOWN_SEP24_STATUSES.has(raw.trim().toLowerCase());
-}
+export {
+  KNOWN_SEP24_STATUSES,
+  isSep24TransactionStatus as isKnownSep24Status,
+} from "./sep24-types";
 
 /**
  * Map a raw SEP-24 status string to Mergepay's internal status.
  *
- * The mapping is exhaustive for every known SEP-24 value and funnels
- * terminal failures into the repository's single `error` state. If the
- * upstream returns a status we do not recognise, we map it to
- * "pending_anchor" (a safe intermediate) instead of erroring out, because a
- * future anchor deployment might introduce new intermediate states — but the
- * unknown status is surfaced via `isKnownSep24Status` so callers can log it
- * explicitly rather than mistaking a foreign terminal state for a pending one.
+ * Every status in the canonical union maps to itself. An unrecognised status
+ * (including the deprecated `pending_external` /
+ * `pending_user_transfer_complete`, which `isRecognisedSep24Status` still
+ * accepts) is mapped to "pending_anchor" — a safe intermediate — instead of
+ * erroring out, because a future anchor deployment might introduce new
+ * intermediate states. `isKnownSep24Status` lets callers tell a genuine
+ * pending state from a foreign one.
  *
  * Terminal states (completed, error, refunded, expired, no_market, too_small,
  * too_large) are idempotent — the worker must never overwrite them once set.
  */
 export function mapAnchorStatus(raw: string): string {
   const normalized = raw ? raw.trim().toLowerCase() : "";
-  switch (normalized) {
-    // ── Terminal (success) ──
-    case "completed":
-      return "completed";
 
-    // ── Terminal (failure) ──
-    case "error":
-    case "expired":
-    case "no_market":
-    case "too_small":
-    case "too_large":
-      return normalized;
+  if (isSep24TransactionStatus(normalized)) return normalized;
 
-    case "refunded":
-      return "refunded";
-
-    // ── Intermediate (requires user action) ──
-    case "pending_user_transfer_start":
-      return "pending_user_transfer_start";
-
-    // ── Intermediate (anchor / stellar / user actions) ──
-    case "pending_user":
-    case "pending_transaction_info_update":
-    case "pending_receiver":
-    case "pending_sender":
-    case "pending_stellar":
-    case "pending_trust":
-    case "pending_anchor":
-      return normalized;
-
-    // ── Initial ──
-    case "incomplete":
-      return "incomplete";
-
-    // ── Unknown → safe default ──
-    default:
-      retryLog.warn(
-        { rawStatus: raw, mappedStatus: "pending_anchor" },
-        `Unknown SEP-24 status received: ${raw} — mapping to pending_anchor`
-      );
-      return "pending_anchor";
-  }
+  retryLog.warn(
+    { rawStatus: raw, mappedStatus: "pending_anchor" },
+    `Unknown SEP-24 status received: ${raw} — mapping to pending_anchor`
+  );
+  return "pending_anchor";
 }
 
 /** Whether a normalized status is terminal and no longer needs polling. */

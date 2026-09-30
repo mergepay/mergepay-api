@@ -11,6 +11,10 @@ const h = vi.hoisted(() => {
     webhookDelivery: { createMany: vi.fn(async () => ({ count: 0 })) },
     groupMember: { findUnique: vi.fn() },
     group: { findUnique: vi.fn() },
+    auditLog: { create: vi.fn(async () => ({ id: "audit_1" })) },
+    $transaction: vi.fn(async (arg: any) =>
+      typeof arg === "function" ? arg(prisma) : Promise.all(arg)
+    ),
   };
   return { prisma };
 });
@@ -51,10 +55,12 @@ beforeEach(async () => {
   vi.clearAllMocks();
   if (!app) app = await buildApp();
 
+  // Group registration is an administrative action (#700), so the default
+  // caller is an admin; the non-admin refusal test overrides this to member.
   prisma.groupMember.findUnique.mockResolvedValue({
     groupId: GROUP_ID,
     userId: USER_ID,
-    role: "member",
+    role: "admin",
   });
   prisma.group.findUnique.mockResolvedValue({ id: GROUP_ID });
   prisma.webhook.count.mockResolvedValue(0);
@@ -86,13 +92,29 @@ describe("POST /api/webhooks", () => {
     expect(data).toMatchObject({ groupId: null, userId: USER_ID, enabled: true });
   });
 
-  it("registers a group endpoint for a member", async () => {
+  it("registers a group endpoint for an admin", async () => {
     const res = await register({ groupId: GROUP_ID });
 
     expect(res.statusCode).toBe(201);
     const data = prisma.webhook.create.mock.calls[0][0].data;
     // Owned by the group, so it keeps working after the creator leaves.
     expect(data).toMatchObject({ groupId: GROUP_ID, userId: null });
+    // Registering is an administrative action, so it is audited.
+    expect(prisma.auditLog.create).toHaveBeenCalled();
+  });
+
+  it("refuses a group endpoint for a non-admin member", async () => {
+    prisma.groupMember.findUnique.mockResolvedValue({
+      groupId: GROUP_ID,
+      userId: USER_ID,
+      role: "member",
+    });
+
+    const res = await register({ groupId: GROUP_ID });
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.webhook.create).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 
   it("refuses to register for a group the caller does not belong to", async () => {
@@ -101,6 +123,7 @@ describe("POST /api/webhooks", () => {
 
     const res = await register({ groupId: GROUP_ID });
 
+    // 403, not 404: the group exists, the caller just isn't a member.
     expect(res.statusCode).toBe(403);
     expect(prisma.webhook.create).not.toHaveBeenCalled();
   });
@@ -154,7 +177,7 @@ describe("POST /api/webhooks", () => {
     const res = await register({ groupId: GROUP_ID });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("WEBHOOK_LIMIT_REACHED");
+    expect(res.json().error.code).toBe("WEBHOOK_LIMIT_REACHED");
     expect(prisma.webhook.create).not.toHaveBeenCalled();
   });
 });

@@ -8,7 +8,7 @@
  * tests pin the ordering — drain first, release second — and the bounded
  * fallback when a job outruns the drain budget.
  *
- * The cycle is held open through `reconcileSettlements`, a real dependency of
+ * The cycle is held open through `cleanupChallenges`, a real dependency of
  * `runWorkerCycle`, so the drain is exercised through the worker's own code
  * path rather than a re-implementation of it.
  */
@@ -42,19 +42,10 @@ vi.mock("../src/db", () => ({
   },
 }));
 
-vi.mock("../src/services/settlement-reconciliation", () => ({
-  reconcileSettlements: vi.fn(async () => {
+vi.mock("../src/worker/tasks/cleanup-challenges", () => ({
+  cleanupChallenges: vi.fn(async () => {
     await h.gate.wait();
   }),
-}));
-
-vi.mock("../src/worker/reconciliation", () => ({
-  startReconciliation: () => () => {},
-  reconcileAnchors: vi.fn(async () => {}),
-}));
-
-vi.mock("../src/worker/tasks/cleanup-challenges", () => ({
-  cleanupChallenges: vi.fn(async () => {}),
 }));
 
 const { startWorker } = await import("../src/worker/index");

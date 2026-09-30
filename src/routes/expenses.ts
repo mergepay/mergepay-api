@@ -1,11 +1,23 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
-import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
+import {
+  openApiBody,
+  openApiEnvelope,
+  openApiErrorResponses,
+  openApiIdParams,
+  openApiOkResponse,
+  openApiResponse,
+} from "../lib/openapi";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
-import { computeShares, type SplitType } from "../services/settlement";
+import { requireGroupRole } from "../plugins/group-access";
+import {
+  computeShares,
+  isSettlementEngineError,
+  type SplitType,
+} from "../services/settlement";
 import { shortCode } from "../services/codes";
 import { serializeExpense } from "../serializers";
 import {
@@ -21,6 +33,7 @@ import { validateAsset, validateAmount } from "../services/assets";
 import { assertParticipantsCanHoldAsset } from "../services/horizon";
 import { createExpenseSchema, updateExpenseSchema } from "../validations/expense";
 import { expenseListQuerySchema, listGroupExpenses } from "../services/expenses";
+import { rateLimited } from "../lib/rate-limit";
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });
@@ -33,10 +46,29 @@ const expenseInclude = {
 export default async function expenseRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
+  // Every route below carries a `requireGroupRole` guard (issue #356), which
+  // rejects a non-member before the handler reads or writes anything. Routes
+  // addressed by `/expenses/:id` resolve the group from the expense row via
+  // the guard's `fromExpense` option; the handlers still re-check membership
+  // inside their transaction where the write happens — see
+  // src/plugins/group-access.ts.
+
   // -- create -----------------------------------------------------------------
+  //
+  // Creating an expense is the write that opens a debt for every other
+  // participant, so it carries its own per-user budget rather than spending the
+  // caller's global allowance. The policy is a `preHandler` limit, which runs
+  // after the `app.authenticate` hook above, so the bucket key is the SEP-10
+  // public key from the caller's token and a shared NAT cannot pool one
+  // member's budget against another's. It is its own bucket prefix, so retries
+  // against the settlement routes below never draw down this allowance.
+  const createLimit = rateLimited("expenseCreate");
+
   app.post(
     "/groups/:id/expenses",
     {
+      ...createLimit,
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Expenses"],
         summary: "Create an expense in a group",
@@ -44,20 +76,22 @@ export default async function expenseRoutes(app: FastifyInstance) {
           "Records a group expense and its payment split. The payer's share is settled immediately; every other participant's share is owed.",
         params: openApiIdParams(),
         body: openApiBody(createExpenseSchema),
-        response: openApiEnvelope("expense"),
+        response: {
+          ...openApiEnvelope("expense"),
+          ...openApiErrorResponses(400, 401, 403, 404, 429),
+        },
       },
     },
     async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const body = createExpenseSchema.parse(req.body);
     validateAmount(body.amount);
     const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
-    // When the payer is the caller, the membership check above already proved
+    // When the payer is the caller, the route's membership guard already proved
     // they are an active member — only a *different* payer needs a second
     // lookup.
     if (payerUserId !== auth.id) {
@@ -73,8 +107,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
     let computed;
     try {
       computed = computeShares(body.amount, body.splitType as SplitType, body.shares);
-    } catch (e: any) {
-      throw Errors.badRequest("invalid_split", e?.message ?? "Invalid split");
+    } catch (e) {
+      // The engine's errors are all client mistakes carrying a stable code;
+      // the route forwards code + message so a client can branch without
+      // parsing prose. An unexpected error is not a split problem — rethrow
+      // it rather than disguising it as one.
+      if (!isSettlementEngineError(e)) throw e;
+      throw Errors.badRequest(e.code, e.message);
     }
 
     const participantIds = [...new Set(computed.map((share) => share.userId))];
@@ -149,19 +188,34 @@ export default async function expenseRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/expenses",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Expenses"],
         summary: "List a group's expenses",
+        description:
+          "Returns a paginated, filterable list of the group's expenses. Requires membership.",
         params: openApiIdParams(),
+        response: {
+          ...openApiResponse(
+            {
+              expenses: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
+              meta: { type: "object", additionalProperties: true },
+            },
+            ["expenses", "meta"]
+          ),
+          ...openApiErrorResponses(400, 401, 403),
+        },
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
+    // Membership was checked by the route guard before any row is read, and
+    // the `groupId` filter the service applies is what scopes the page —
+    // never the cursor.
     const query = expenseListQuerySchema.parse(req.query ?? {});
-    // Membership is checked before any row is read, and the `groupId` filter
-    // the service applies is what scopes the page — never the cursor.
-    await requireMembership(groupId, auth.id);
 
     const { items, meta } = await listGroupExpenses(groupId, query, expenseInclude);
 
@@ -169,7 +223,23 @@ export default async function expenseRoutes(app: FastifyInstance) {
   });
 
   // -- get one ----------------------------------------------------------------
-  app.get("/expenses/:id", async (req) => {
+  app.get(
+    "/expenses/:id",
+    {
+      preHandler: requireGroupRole("member", { param: "id", fromExpense: true }),
+      schema: {
+        tags: ["Expenses"],
+        summary: "Get an expense",
+        description:
+          "Returns a single expense with its payer and shares. Requires membership of the expense's group.",
+        params: openApiIdParams(),
+        response: {
+          ...openApiEnvelope("expense"),
+          ...openApiErrorResponses(401, 403, 404),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
     const expense = await prisma.expense.findUnique({
@@ -182,9 +252,26 @@ export default async function expenseRoutes(app: FastifyInstance) {
   });
 
   // -- update (metadata only) -------------------------------------------------
-  app.patch("/expenses/:id", async (req) => {
+  app.patch(
+    "/expenses/:id",
+    {
+      preHandler: requireGroupRole("member", { param: "id", fromExpense: true }),
+      schema: {
+        tags: ["Expenses"],
+        summary: "Update an expense",
+        description:
+          "Updates expense metadata. Only the payer or a group admin may edit it.",
+        params: openApiIdParams(),
+        body: openApiBody(updateExpenseSchema),
+        response: {
+          ...openApiEnvelope("expense"),
+          ...openApiErrorResponses(400, 401, 403, 404),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = idParamSchema.parse(req.params);
     const body = updateExpenseSchema.parse(req.body);
 
     // The membership/role check and the update run in one transaction: a
@@ -223,7 +310,23 @@ export default async function expenseRoutes(app: FastifyInstance) {
   });
 
   // -- delete -----------------------------------------------------------------
-  app.delete("/expenses/:id", async (req) => {
+  app.delete(
+    "/expenses/:id",
+    {
+      preHandler: requireGroupRole("member", { param: "id", fromExpense: true }),
+      schema: {
+        tags: ["Expenses"],
+        summary: "Delete an expense",
+        description:
+          "Deletes an expense. Only the payer or a group admin may delete it, and only while no other participant's share is settled.",
+        params: openApiIdParams(),
+        response: {
+          ...openApiOkResponse(),
+          ...openApiErrorResponses(401, 403, 404, 409),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
 

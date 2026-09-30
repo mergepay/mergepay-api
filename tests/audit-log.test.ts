@@ -109,7 +109,7 @@ describe("GET /groups/:id/audit-log", () => {
     });
 
     expect(res.statusCode).toBe(403);
-    expect(res.json().error).toBe("FORBIDDEN");
+    expect(res.json().error.code).toBe("FORBIDDEN");
   });
 
   it("returns the repository's standard authorization error for a non-member", async () => {
@@ -122,7 +122,7 @@ describe("GET /groups/:id/audit-log", () => {
     });
 
     expect(res.statusCode).toBe(404);
-    expect(res.json().error).toBe("NOT_FOUND");
+    expect(res.json().error.code).toBe("NOT_FOUND");
   });
 
   it("returns events with a redacted metadata payload for an admin", async () => {

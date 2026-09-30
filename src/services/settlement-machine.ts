@@ -33,7 +33,13 @@ const ALLOWED_TRANSITIONS: Record<SettlementStatus, readonly SettlementStatus[]>
   pending_confirmation: ["confirmed", "failed"],
   confirmed: [],
   failed: [],
-  needs_review: ["confirmed", "failed"],
+  // needs_review means a submission's on-chain outcome could not be observed
+  // (Horizon had no record yet, or stopped answering) — never proof of payment
+  // or failure. The worker's reconciliation job keeps checking the recorded
+  // hash; when Horizon still has no answer, the row is demoted back to
+  // pending_confirmation so the bounded reconciliation retry budget — not an
+  // unbounded needs_review wait — decides when enough silence is enough.
+  needs_review: ["confirmed", "failed", "pending_confirmation"],
 };
 
 export function isTerminalSettlementStatus(status: string): boolean {

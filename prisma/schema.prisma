@@ -76,6 +76,7 @@ model GroupMember {
   @@unique([groupId, userId])
   @@index([userId])
   @@index([groupId])
+  @@index([role])
   @@map("group_members")
 }
 model Expense {
@@ -115,6 +116,7 @@ model ExpenseShare {
   @@index([expenseId])
   @@index([userId])
   @@index([expenseId, userId])
+  @@index([status, expenseId])
   @@map("expense_shares")
 }
 
@@ -214,6 +216,7 @@ model TreasuryTransaction {
   @@index([groupId])
   @@index([status])
   @@index([expiresAt])
+  @@index([groupId, status])
   @@map("treasury_transactions")
 }
 
@@ -298,6 +301,10 @@ model Withdrawal {
   memo           String?
   /// Anchor's external transaction id / SEP-24 `id`, populated on completion.
   anchorTxId     String?  @map("anchor_tx_id")
+  /// Anchor SEP-10 JWT minted when the user completes the confirm step. The
+  /// worker replays it to poll `GET /transaction` for status transitions
+  /// (mirrors AnchorSession.anchor_token — see src/worker/index.ts).
+  anchorToken    String?  @map("anchor_token")
   /// Interactive URL the user opens to complete KYC / off-ramp.
   interactiveUrl String?  @map("interactive_url")
   status         String   @default("pending")
@@ -350,6 +357,7 @@ model TreasuryProposal {
   @@index([groupId])
   @@index([status])
   @@index([creatorId])
+  @@index([status, createdAt])
   @@map("treasury_proposals")
 }
 
@@ -393,6 +401,9 @@ model TreasuryTxProposal {
   creatorId String   @map("creator_id")
   /// Unsigned transaction envelope (base64 XDR) exactly as submitted.
   xdr       String   @map("xdr")
+  /// Optional human-readable purpose of the proposal ("pay March rent"),
+  /// stored for display alongside the signature-collection state.
+  description String? @map("description")
   /// Hash of the unsigned envelope. Every signature is verified against it,
   /// and a submitted envelope that hashes differently is rejected outright.
   txHash    String   @map("tx_hash")
@@ -472,6 +483,8 @@ model IdempotencyKey {
   @@map("idempotency_keys")
 }
 
+/// Structured audit log records for state-changing operations including
+/// treasury multisig proposals, signature collections, and submissions.
 model AuditLog {
   id         String   @id @default(cuid())
   userId     String?  @map("user_id")
@@ -488,6 +501,7 @@ model AuditLog {
 
   @@index([userId])
   @@index([groupId])
+  @@index([entityType, entityId])
   @@map("audit_logs")
 }
 

@@ -1,8 +1,15 @@
 import { prisma } from "../db";
 import { config } from "../config";
 import { getFeeStats } from "./network";
+import { withTimeout } from "./timeout";
 
+// Overall deadline for a single readiness probe.
 const CHECK_TIMEOUT_MS = 5_000;
+// Short deadline for the Prisma connectivity probe (`SELECT 1`). Kept well
+// below the readiness deadline so a degraded database — a stalled query, an
+// exhausted connection pool — is reported unhealthy quickly instead of
+// blocking the health check (and its worker thread) for the full 5s.
+const DB_HEALTH_CHECK_TIMEOUT_MS = 2_000;
 const DEEP_CHECK_TIMEOUT_MS = 5_000;
 const READINESS_CACHE_TTL_MS = 5_000;
 
@@ -39,35 +46,50 @@ interface DeepHealthResponse {
 let cached: { response: ReadinessResponse; expiresAt: number } | null = null;
 let inFlight: Promise<ReadinessResponse> | null = null;
 
-function withTimeout<T>(operation: Promise<T>): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("health check timeout")), CHECK_TIMEOUT_MS);
-    operation.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error);
-      }
-    );
-  });
-}
-
+/**
+ * Cheap liveness probe for the database. Never throws — an unreachable or
+ * timed-out database is reported as `false`, not as an error to the caller.
+ *
+ * The `SELECT 1` probe is wrapped in a short timeout so that a stalled
+ * connection fails the readiness check fast rather than hanging it.
+ *
+ * @returns `true` when `SELECT 1` answers within the readiness deadline.
+ */
 export async function checkDatabase(): Promise<boolean> {
   try {
-    await withTimeout(prisma.$queryRawUnsafe("SELECT 1") as Promise<unknown>);
+    const ping =
+      typeof prisma.$queryRawUnsafe === "function"
+        ? () => prisma.$queryRawUnsafe("SELECT 1")
+        : typeof prisma.$queryRaw === "function"
+          ? () => prisma.$queryRaw`SELECT 1`
+          : () => Promise.reject(new Error("No queryRaw method on prisma client"));
+
+    await withTimeout(
+      "database health check",
+      DB_HEALTH_CHECK_TIMEOUT_MS,
+      () => ping()
+    );
     return true;
   } catch {
     return false;
   }
 }
 
+export const checkDatabaseConnection = checkDatabase;
+
+/**
+ * Probe Horizon through the shared fee-stats client (and its short cache) so
+ * a readiness check costs no extra Horizon traffic in the common case. Every
+ * failure mode — timeout, connection refusal, `upstream` error — is reported
+ * as `false` rather than thrown — the health route reports dependency state
+ * instead of failing on it.
+ *
+ * @returns `true` when Horizon answered within the readiness deadline.
+ */
 export async function checkStellar(): Promise<boolean> {
   try {
     // getFeeStats uses the shared Horizon client and its existing short cache.
-    await withTimeout(getFeeStats());
+    await withTimeout("stellar health check", CHECK_TIMEOUT_MS, () => getFeeStats());
     return true;
   } catch {
     return false;
@@ -119,18 +141,16 @@ export function clearReadinessCache(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Race a promise against a timeout. Returns the result on success,
- * or `null` if the operation fails or times out.
+ * Race a dependency probe against its timeout. Returns the result and the
+ * measured latency on success, or `null` if the operation fails or times out.
  */
-async function checkWithTimeout<T>(operation: Promise<T>): Promise<{ result: T; latencyMs: number } | null> {
+async function checkWithTimeout<T>(
+  operation: string,
+  fn: () => Promise<T>
+): Promise<{ result: T; latencyMs: number } | null> {
   const start = Date.now();
   try {
-    const result = await Promise.race([
-      operation,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("timeout")), DEEP_CHECK_TIMEOUT_MS)
-      ),
-    ]);
+    const result = await withTimeout(operation, DEEP_CHECK_TIMEOUT_MS, () => fn());
     return { result, latencyMs: Date.now() - start };
   } catch {
     return null;
@@ -149,8 +169,8 @@ async function checkWithTimeout<T>(operation: Promise<T>): Promise<{ result: T; 
  */
 export async function getDeepHealth(): Promise<DeepHealthResponse> {
   const [dbResult, stellarResult] = await Promise.all([
-    checkWithTimeout(prisma.$queryRaw`SELECT 1`),
-    checkWithTimeout(getFeeStats()),
+    checkWithTimeout("database deep health check", () => prisma.$queryRaw`SELECT 1`),
+    checkWithTimeout("stellar deep health check", () => getFeeStats()),
   ]);
 
   return {

@@ -10,15 +10,26 @@ declare global {
  * Creates a Prisma middleware that enforces a maximum execution time for
  * database queries. This prevents hung queries from blocking Fastify request
  * workers indefinitely during network partitions or heavy load.
+ *
+ * The losing timer in the race is always cleared: leaving one alive per query
+ * would keep the event loop pinned for `timeoutMs` after every result and
+ * hold the process open in tests and short-lived scripts.
  */
-function queryTimeoutMiddleware(timeoutMs: number): Prisma.Middleware {
+export function queryTimeoutMiddleware(timeoutMs: number): Prisma.Middleware {
   return async (params: Prisma.MiddlewareParams, next: (params: Prisma.MiddlewareParams) => Promise<unknown>) => {
-    return Promise.race([
-      next(params),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Query timeout after ${timeoutMs}ms`)), timeoutMs)
-      ),
-    ]);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        next(params),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Query timeout after ${timeoutMs}ms`)), timeoutMs);
+          // Unref so a pending timeout never keeps the process alive on its own.
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   };
 }
 
@@ -47,8 +58,10 @@ function prismaLogLevelsFor(pinoLevel: string): (typeof prismaLogLevels)[number]
  *   - `connect_timeout` bounds socket establishment (a hung DB fails fast).
  *   - `pool_timeout` bounds the wait for a free pooled connection under load.
  * The base `DATABASE_URL` always takes precedence for host/credentials/db.
+ *
+ * Exported for tests; callers in this module pass `env.DATABASE_URL`.
  */
-function buildDatasourceUrl(baseUrl: string): string {
+export function buildDatasourceUrl(baseUrl: string): string {
   const url = new URL(baseUrl);
   const params = url.searchParams;
   params.set("connection_limit", String(env.DATABASE_CONNECTION_LIMIT));
@@ -71,3 +84,39 @@ export const prisma =
 if (env.NODE_ENV !== "production") {
   global.__mergepayPrisma = prisma;
 }
+
+/**
+ * Lightweight database ping helper that executes `SELECT 1` with a timeout
+ * to verify active PostgreSQL connectivity. Returns `true` on success, or
+ * `false` on any failure or timeout instead of throwing uncaught exceptions.
+ */
+export async function checkDatabaseConnection(
+  client: PrismaClient = prisma,
+  timeoutMs: number = env.DATABASE_QUERY_TIMEOUT_MS || 5000
+): Promise<boolean> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    const queryPromise =
+      typeof (client as any).$queryRawUnsafe === "function"
+        ? (client as any).$queryRawUnsafe("SELECT 1")
+        : typeof client.$queryRaw === "function"
+          ? client.$queryRaw`SELECT 1`
+          : Promise.reject(new Error("No queryRaw method on prisma client"));
+
+    await Promise.race([
+      Promise.resolve(queryPromise),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Database health check timed out after ${timeoutMs}ms`)),
+          timeoutMs
+        );
+      }),
+    ]);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+

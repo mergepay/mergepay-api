@@ -4,6 +4,19 @@
  */
 
 import type { Prisma } from "@prisma/client";
+import type {
+  User,
+  Group,
+  GroupMember,
+  Expense,
+  ExpenseShare,
+  Settlement,
+  TreasuryTransaction,
+  TreasuryProposal,
+  AnchorSession,
+  AuditLogEntry,
+  StatusHistory,
+} from "./types/contract";
 
 function dec(v: Prisma.Decimal | string | number): string {
   return v.toString();
@@ -13,7 +26,7 @@ function iso(d: Date): string {
   return d.toISOString();
 }
 
-export function serializeStatusHistory(h: any) {
+export function serializeStatusHistory(h: any): StatusHistory {
   return {
     id: h.id,
     entityType: h.entityType,
@@ -25,7 +38,7 @@ export function serializeStatusHistory(h: any) {
   };
 }
 
-export function serializeUser(u: any) {
+export function serializeUser(u: any): User {
   return {
     id: u.id,
     stellarPublicKey: u.stellarPublicKey,
@@ -35,7 +48,7 @@ export function serializeUser(u: any) {
   };
 }
 
-export function serializeGroup(g: any) {
+export function serializeGroup(g: any): Group {
   return {
     id: g.id,
     name: g.name,
@@ -49,7 +62,7 @@ export function serializeGroup(g: any) {
   };
 }
 
-export function serializeMember(m: any) {
+export function serializeMember(m: any): GroupMember {
   return {
     id: m.id,
     groupId: m.groupId,
@@ -60,23 +73,23 @@ export function serializeMember(m: any) {
   };
 }
 
-export function serializeShare(s: any) {
+export function serializeShare(s: any): ExpenseShare {
   return {
     id: s.id,
     expenseId: s.expenseId,
     userId: s.userId,
-    user: serializeUser(s.user),
+    user: s.user ? serializeUser(s.user) : undefined,
     shareAmount: dec(s.shareAmount),
     status: s.status,
   };
 }
 
-export function serializeExpense(e: any) {
+export function serializeExpense(e: any): Expense {
   return {
     id: e.id,
     groupId: e.groupId,
     payerUserId: e.payerUserId,
-    payer: serializeUser(e.payer),
+    payer: e.payer ? serializeUser(e.payer) : undefined,
     title: e.title,
     description: e.description ?? null,
     amount: dec(e.amount),
@@ -90,14 +103,14 @@ export function serializeExpense(e: any) {
   };
 }
 
-export function serializeSettlement(s: any) {
+export function serializeSettlement(s: any): Settlement {
   return {
     id: s.id,
     groupId: s.groupId,
     fromUserId: s.fromUserId,
-    from: serializeUser(s.from),
+    from: s.from ? serializeUser(s.from) : undefined,
     toUserId: s.toUserId,
-    to: serializeUser(s.to),
+    to: s.to ? serializeUser(s.to) : undefined,
     amount: dec(s.amount),
     assetCode: s.assetCode,
     assetIssuer: s.assetIssuer ?? null,
@@ -116,7 +129,7 @@ export function serializeSettlement(s: any) {
   };
 }
 
-export function serializeTreasuryTx(t: any) {
+export function serializeTreasuryTx(t: any): TreasuryTransaction {
   return {
     id: t.id,
     groupId: t.groupId,
@@ -135,7 +148,7 @@ export function serializeTreasuryTx(t: any) {
   };
 }
 
-export function serializeTreasuryProposal(p: any) {
+export function serializeTreasuryProposal(p: any): TreasuryProposal {
   return {
     id: p.id,
     groupId: p.groupId,
@@ -167,6 +180,7 @@ export function serializeTreasuryTxProposal(p: any) {
     groupId: p.groupId,
     creatorId: p.creatorId,
     xdr: p.xdr,
+    description: p.description ?? null,
     sourceAccount: p.sourceAccount,
     requiredWeight: p.requiredWeight,
     signatures: Array.isArray(p.signatures)
@@ -207,7 +221,7 @@ export function serializeInvite(i: any, webUrl: string) {
   };
 }
 
-export function serializeAnchorSession(s: any) {
+export function serializeAnchorSession(s: any): AnchorSession {
   return {
     id: s.id,
     userId: s.userId,
@@ -251,15 +265,16 @@ function redactAuditMetadata(metadata: unknown): Record<string, unknown> | null 
   return redacted;
 }
 
-export function serializeAuditLogEntry(e: any) {
+export function serializeAuditLogEntry(e: any): AuditLogEntry {
   return {
     id: e.id,
     createdAt: iso(e.createdAt),
     actorUserId: e.userId ?? null,
     actorDisplayName: e.user?.displayName ?? null,
     action: e.action,
-    entityType: e.entityType,
-    entityId: e.entityId,
+    entityType: e.entityType ?? null,
+    entityId: e.entityId ?? null,
     metadata: redactAuditMetadata(e.metadata),
   };
 }
+

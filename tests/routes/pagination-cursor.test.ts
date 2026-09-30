@@ -170,7 +170,7 @@ describe("GET /groups/:groupId/treasury/proposals — cursor pagination", () => 
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("INVALID_CURSOR");
+    expect(res.json().error.code).toBe("INVALID_CURSOR");
     expect(prisma.treasuryProposal.findMany).not.toHaveBeenCalled();
   });
 

@@ -35,16 +35,24 @@
  * Only failures that a later attempt could plausibly survive:
  *
  *   - `TimeoutError` / `TransportError` — the request never got an answer.
- *   - HTTP 5xx — the upstream failed, not the request.
+ *   - HTTP 408 — the upstream timed out waiting; classified as a timeout.
+ *   - HTTP 5xx — the upstream failed, not the request — except 501 (Not
+ *     Implemented) and 505 (HTTP Version Not Supported), which describe the
+ *     request itself and repeat identically.
  *
  * Never retried:
  *
- *   - 4xx other than 429 — a validation or authentication failure repeats
+ *   - 4xx other than 408/429 — a validation or authentication failure repeats
  *     identically, so retrying only multiplies load and delays the error the
  *     caller needs to see.
- *   - 429 — the upstream is explicitly asking for less traffic. Retrying into
- *     a rate limit is what turns a throttle into an outage, so a 429 is
- *     surfaced immediately with its `Retry-After` preserved for the caller.
+ *   - 429, by default — the upstream is explicitly asking for less traffic.
+ *     Retrying into a rate limit is what turns a throttle into an outage, so a
+ *     429 is surfaced immediately. A policy may opt in with
+ *     `retryRateLimited` (Horizon reads do, see src/services/stellar.ts): the
+ *     429 is then retried within the same bounded budget, never sooner than
+ *     the upstream's `Retry-After` when it sends one, and not at all when that
+ *     `Retry-After` exceeds `maxDelayMs` — a long throttle is surfaced rather
+ *     than slept through.
  *
  * ## Backoff
  *
@@ -55,7 +63,9 @@
  */
 import { config } from "../config";
 import { Errors } from "../errors";
+import { ProviderError, retryAfterSeconds } from "../lib/provider-error";
 import { TimeoutError, TransportError, withTimeout } from "./timeout";
+import { calculateBackoffDelay } from "../utils/retry";
 
 export interface RetryPolicy {
   /** Total attempts, including the first. 1 disables retrying. */
@@ -66,6 +76,12 @@ export interface RetryPolicy {
   maxDelayMs: number;
   /** Fraction of each delay that may be removed as jitter (0–1). */
   jitterRatio: number;
+  /**
+   * Retry HTTP 429 as well (default `false`). Only for calls where repeating
+   * is safe *and* the upstream's limit is shared with nothing that must stay
+   * responsive — see the module comment.
+   */
+  retryRateLimited?: boolean;
 }
 
 /** Why an attempt failed, as far as retry policy is concerned. */
@@ -129,10 +145,90 @@ export function classifyUpstreamFailure(error: unknown): UpstreamFailureKind {
 
   const status = statusOf(unwrapped);
   if (status === null) return "unknown";
+  if (status === 408) return "timeout";
   if (status === 429) return "rate_limited";
   if (status >= 500) return "server_error";
   if (status >= 400) return "client_error";
   return "unknown";
+}
+
+/**
+ * 5xx statuses that describe the request, not a transient upstream fault.
+ * They repeat identically, so they are never retried.
+ */
+const NON_RETRYABLE_SERVER_STATUSES = new Set([501, 505]);
+
+/** The HTTP status behind an attempt's failure, unwrapped from any transport wrapper. */
+export function upstreamStatusOf(error: unknown): number | null {
+  return statusOf(unwrapUpstreamError(error));
+}
+
+/**
+ * The upstream's requested wait, in milliseconds, from a `Retry-After`
+ * header (delta-seconds or HTTP-date) or an `X-RateLimit-Reset` header
+ * (seconds), when the error exposes response headers. `null` when absent or
+ * unparseable. The Stellar SDK's own errors do not carry headers, so for
+ * Horizon this is best-effort and backoff alone paces the retry.
+ */
+export function retryAfterMs(error: unknown, now: number = Date.now()): number | null {
+  const seconds = retryAfterSeconds(unwrapUpstreamError(error), now);
+  if (seconds !== undefined) return seconds * 1000;
+
+  const unwrapped = unwrapUpstreamError(error) as {
+    response?: { headers?: Record<string, unknown> };
+    headers?: Record<string, unknown>;
+  } | null;
+  const headers = unwrapped?.response?.headers ?? unwrapped?.headers;
+  const reset = headers && Object.entries(headers).find(([name]) => name.toLowerCase() === "x-ratelimit-reset")?.[1];
+  return (typeof reset === "string" || typeof reset === "number") && /^\d+$/.test(String(reset))
+    ? Number(reset) * 1000
+    : null;
+}
+
+/** Whether one failed attempt should be retried, and after how long. */
+export interface RetryDecision {
+  retry: boolean;
+  delayMs: number;
+}
+
+/**
+ * Decide whether the attempt that just failed should be retried.
+ *
+ * Pure apart from the injected `random` — the whole policy (which failures,
+ * how long to wait, when to stop) lives here so it can be tested without
+ * timers or network.
+ *
+ * @param error - The failed attempt's error.
+ * @param attempt - 1-based number of the attempt that failed.
+ * @param policy - Budget, backoff curve, jitter, and the 429 opt-in.
+ * @param random - Jitter source in `[0, 1)`.
+ */
+export function decideRetry(
+  error: unknown,
+  attempt: number,
+  policy: RetryPolicy,
+  random: () => number = Math.random
+): RetryDecision {
+  const noRetry = { retry: false, delayMs: 0 };
+  if (attempt >= policy.maxAttempts) return noRetry;
+
+  const kind = classifyUpstreamFailure(error);
+  const backoff = backoffDelayMs(attempt + 1, policy, random);
+
+  if (kind === "rate_limited") {
+    if (!policy.retryRateLimited) return noRetry;
+    const requested = retryAfterMs(error);
+    if (requested === null) return { retry: true, delayMs: backoff };
+    // A throttle longer than the policy is willing to wait is surfaced, not
+    // slept through: the caller (or its client) is better placed to wait.
+    if (requested > policy.maxDelayMs) return noRetry;
+    return { retry: true, delayMs: Math.max(backoff, requested) };
+  }
+
+  if (!isRetryableFailure(kind)) return noRetry;
+  const status = upstreamStatusOf(error);
+  if (status !== null && NON_RETRYABLE_SERVER_STATUSES.has(status)) return noRetry;
+  return { retry: true, delayMs: backoff };
 }
 
 /**
@@ -159,12 +255,17 @@ export function backoffDelayMs(
   policy: RetryPolicy,
   random: () => number = Math.random
 ): number {
-  if (attempt <= 1) return 0;
-
-  const exponential = policy.initialDelayMs * 2 ** (attempt - 2);
-  const capped = Math.min(exponential, policy.maxDelayMs);
-  const jitter = capped * policy.jitterRatio * random();
-  return Math.max(0, Math.round(capped - jitter));
+  return calculateBackoffDelay(
+    attempt,
+    {
+      initialDelayMs: policy.initialDelayMs,
+      maxDelayMs: policy.maxDelayMs,
+      backoffFactor: 2,
+      jitter: true,
+      jitterRatio: policy.jitterRatio,
+    },
+    random
+  );
 }
 
 export interface RetryAttemptLog {
@@ -208,6 +309,22 @@ const defaultSleep = (ms: number) =>
  *
  * Never use this for a call that changes upstream state unless that call's own
  * contract makes repeating it harmless — see the module comment.
+ *
+ * @param options - `{ operation, timeoutMs, policy?, isExpected?,
+ *   onAttemptFailed?, sleep?, random? }`. `operation` labels the call in errors
+ *   and logs; `timeoutMs` is the budget for *each* attempt (worst case is
+ *   `maxAttempts × timeoutMs` plus backoff); `isExpected` receives the
+ *   unwrapped upstream error and, when it returns `true`, short-circuits both
+ *   retry and error mapping so the caller gets the upstream's own answer.
+ * @param fn - The read to perform, given an `AbortSignal` and the 1-based
+ *   attempt number. Invoked up to `policy.maxAttempts` times.
+ * @returns The first successful value from `fn`.
+ * @throws {AppError} `upstream` once the retries are exhausted or the failure
+ *   is not retryable — the upstream's own body never escapes, but the original
+ *   error is preserved on the non-enumerable `upstreamCause` for logs.
+ * @throws The original upstream error when `options.isExpected` matches it
+ *   (e.g. a 404 meaning "not funded yet"), unwrapped from any transport
+ *   wrapper so `response.status` and `name` still read as the SDK wrote them.
  */
 export async function withRetry<T>(
   options: RetryOptions,
@@ -242,13 +359,11 @@ export async function withRetry<T>(
 
       lastError = error;
       const kind = classifyUpstreamFailure(error);
-      const isLastAttempt = attempt >= policy.maxAttempts;
-      const retryable = isRetryableFailure(kind) && !isLastAttempt;
-      const delayMs = retryable ? backoffDelayMs(attempt + 1, policy, random) : 0;
+      const { retry, delayMs } = decideRetry(error, attempt, policy, random);
 
       onAttemptFailed?.({ operation, attempt, kind, delayMs });
 
-      if (!retryable) break;
+      if (!retry) break;
       if (delayMs > 0) await sleep(delayMs);
     }
   }
@@ -272,8 +387,16 @@ export function toUpstreamError(
   const kind = classifyUpstreamFailure(error);
 
   const mapped =
-    kind === "rate_limited"
-      ? Errors.upstream(`${operation} is rate limited upstream. Retry shortly.`)
+    kind === "rate_limited" && operation.startsWith("Horizon")
+      ? new ProviderError({
+          provider: "horizon",
+          operation,
+          message: "The upstream service is rate limiting requests. Please retry shortly.",
+          category: "rate_limited",
+          retryAfterSeconds: retryAfterSeconds(unwrapUpstreamError(error)),
+        })
+      : kind === "rate_limited"
+        ? Errors.upstream(`${operation} is rate limited upstream. Retry shortly.`)
       : kind === "timeout"
         ? Errors.upstream(
             `${operation} did not respond within its deadline after ${attempts} attempt(s)`

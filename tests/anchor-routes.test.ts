@@ -7,12 +7,14 @@ const h = vi.hoisted(() => {
       findUnique: vi.fn(),
       findMany: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     withdrawal: {
       findUnique: vi.fn(async () => null),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
     auditLog: { create: vi.fn() },
+    statusHistory: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
     $disconnect: vi.fn(),
   };
@@ -96,19 +98,24 @@ describe("POST /anchors/webhook — status transitions", () => {
     prisma.anchorSession.findUnique.mockResolvedValue(
       fakeSession({ status: "pending_anchor" })
     );
-    prisma.anchorSession.update.mockResolvedValue(fakeSession({ status: "completed" }));
+    prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
 
     const res = await post({ transaction: { id: "ext_1", status: "completed" } });
 
     expect(res.statusCode).toBe(200);
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith({
-      where: { id: "session_1" },
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith({
+      where: { id: "session_1", status: "pending_anchor" },
       data: { status: "completed" },
     });
-    expect(prisma.auditLog.create).toHaveBeenCalledTimes(1);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "sep24.webhook.applied" }),
+    });
   });
 
-  it("ignores a duplicate delivery of the same status without re-auditing", async () => {
+  it("ignores a duplicate delivery without recording a status transition", async () => {
     prisma.anchorSession.findMany.mockResolvedValue([{ id: "session_1" }]);
     prisma.anchorSession.findUnique.mockResolvedValue(
       fakeSession({ status: "completed" })
@@ -117,8 +124,13 @@ describe("POST /anchors/webhook — status transitions", () => {
     const res = await post({ transaction: { id: "ext_1", status: "completed" } });
 
     expect(res.statusCode).toBe(200);
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
-    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "sep24.webhook.applied" }),
+    });
   });
 
   it("ignores an out-of-order regression from a terminal state", async () => {
@@ -132,8 +144,13 @@ describe("POST /anchors/webhook — status transitions", () => {
     const res = await post({ transaction: { id: "ext_1", status: "pending_anchor" } });
 
     expect(res.statusCode).toBe(200);
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
-    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "sep24.webhook.applied" }),
+    });
   });
 
   it("does nothing when no session matches the external transaction id", async () => {
@@ -142,7 +159,7 @@ describe("POST /anchors/webhook — status transitions", () => {
     const res = await post({ transaction: { id: "unknown_ext", status: "completed" } });
 
     expect(res.statusCode).toBe(200);
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("also reconciles a Withdrawal row matched by anchorTxId", async () => {
@@ -198,14 +215,15 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
       id: "ext_new",
     });
 
-    prisma.anchorSession.findUnique.mockResolvedValue(fakeSession({ status: "incomplete" }));
-    prisma.anchorSession.update.mockResolvedValue(
-      fakeSession({
-        status: "pending_user_transfer_start",
-        interactiveUrl: "https://anchor.test/interactive/abc",
-        externalTransactionId: "ext_new",
-      })
-    );
+    // A stateful row: the conditional update only lands when its WHERE
+    // status matches, and the session read back afterwards reflects it.
+    let row: Record<string, any> = fakeSession({ status: "incomplete" });
+    prisma.anchorSession.findUnique.mockImplementation(async () => row);
+    prisma.anchorSession.updateMany.mockImplementation(async ({ where, data }: any) => {
+      if (where.status !== row.status) return { count: 0 };
+      row = { ...row, ...data };
+      return { count: 1 };
+    });
 
     const res = await app.inject({
       method: "POST",
@@ -216,8 +234,9 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json().session.status).toBe("pending_user_transfer_start");
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith({
-      where: { id: "session_1" },
+    expect(res.json().session.interactiveUrl).toBe("https://anchor.test/interactive/abc");
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith({
+      where: { id: "session_1", status: "incomplete" },
       data: {
         interactiveUrl: "https://anchor.test/interactive/abc",
         externalTransactionId: "ext_new",
@@ -253,7 +272,7 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
     });
 
     expect(res.statusCode).toBe(404);
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 });
 

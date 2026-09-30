@@ -87,9 +87,33 @@ describe("toProviderError", () => {
   });
 
   it("maps upstream 429 to rate_limited", () => {
-    const err = toProviderError({ response: { status: 429, data: {} } }, ctx) as ProviderError;
+    const err = toProviderError({
+      response: { status: 429, headers: { "Retry-After": "7" }, data: {} },
+    }, ctx) as ProviderError;
     expect(err.category).toBe("rate_limited");
     expect(err.retryable).toBe(true);
+    expect(err.status).toBe(503);
+    expect(err.code).toBe("SERVICE_UNAVAILABLE");
+    expect(err.retryAfterSeconds).toBe(7);
+    expect(err.details).toMatchObject({ hint: expect.any(String), retryAfterSeconds: 7 });
+  });
+
+  it("parses Retry-After HTTP dates on timeout-wrapped SDK errors", () => {
+    const retryAt = new Date(Date.now() + 5_000);
+    const err = toProviderError(
+      new TransportError("Horizon.loadAccount", {
+        response: {
+          status: 429,
+          headers: { get: () => retryAt.toUTCString() },
+          data: {},
+        },
+      }),
+      ctx,
+    ) as ProviderError;
+
+    expect(err.category).toBe("rate_limited");
+    expect(err.retryAfterSeconds).toBeGreaterThanOrEqual(0);
+    expect(err.retryAfterSeconds).toBeLessThanOrEqual(5);
   });
 
   it("maps upstream 5xx to unavailable", () => {
@@ -306,7 +330,7 @@ describe("route-level provider failure responses", () => {
   it("answers an escaping transport failure with a safe 502 envelope", async () => {
     const res = await app.inject({ method: "GET", url: "/test/provider-transport" });
     expect(res.statusCode).toBe(502);
-    expect(res.json().code).toBe("UPSTREAM_ERROR");
+    expect(res.json().error.code).toBe("UPSTREAM_ERROR");
   });
 
   it("distinguishes a provider rejection by its machine-readable code", async () => {
@@ -315,7 +339,7 @@ describe("route-level provider failure responses", () => {
     const body = res.json();
     expect(body.code).toBe("PROVIDER_REJECTED");
     expect(body.message).toBe("Stellar rejected the transaction: tx_bad_seq");
-    expect(body.error).toBe("PROVIDER_REJECTED");
+    expect(body.error.code).toBe("PROVIDER_REJECTED");
   });
 
   it("keeps unexpected errors on the generic internal-error path", async () => {

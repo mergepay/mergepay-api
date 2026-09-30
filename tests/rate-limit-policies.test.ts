@@ -5,6 +5,7 @@ import {
   policyKeyGenerator,
   rateLimitPolicies,
   rateLimited,
+  type RouteRateLimitOptions,
   type RateLimitPolicyName,
 } from "../src/lib/rate-limit";
 import { config } from "../src/config";
@@ -15,10 +16,15 @@ import { config } from "../src/config";
  *
  * Behaviour is exercised against small, self-contained Fastify instances wired
  * exactly the way `rateLimited()` wires a real route, rather than against
- * `buildApp()`, because buildApp deliberately skips rate limiting under
- * NODE_ENV=test so the rest of the suite does not depend on shared counters or
- * on wall-clock windows. Nothing here reads the real clock or mutates global
- * process state.
+ * `buildApp()`, because the wiring itself (which route names which policy) is
+ * asserted separately in tests/rate-limit-wiring.test.ts. Nothing here reads the
+ * real clock or mutates global process state.
+ *
+ * The table imported below is the one the application uses: there is exactly
+ * one policy table, at src/lib/rate-limit.ts, and both this suite and the routes
+ * import it. An earlier revision of this file imported a second, near-identical
+ * copy from src/config/ratelimit.ts, so the suite passed while the table the
+ * server actually used could drift freely.
  */
 
 const EXPENSIVE_POLICIES: RateLimitPolicyName[] = [
@@ -26,10 +32,16 @@ const EXPENSIVE_POLICIES: RateLimitPolicyName[] = [
   "authVerify",
   "settlementCreate",
   "settlementConfirm",
+  "settlementExecute",
   "treasurySubmit",
+  "treasuryPropose",
   "anchorInit",
   "anchorPoll",
   "anchorWebhook",
+  "sep24Callback",
+  "sep24Webhook",
+  "groupCreate",
+  "history",
 ];
 
 function fakeRequest(over: Record<string, unknown> = {}): any {
@@ -120,7 +132,8 @@ describe("rate-limit policy table", () => {
 
   it("emits route options @fastify/rate-limit understands", () => {
     const options = rateLimited("settlementConfirm");
-    expect(options.config.rateLimit).toMatchObject({
+    const routeRateLimitOptions: RouteRateLimitOptions = options.config.rateLimit;
+    expect(routeRateLimitOptions).toMatchObject({
       max: config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX,
       timeWindow: config.RATE_LIMIT_SETTLEMENT_CONFIRM_WINDOW_MS,
       hook: "preHandler",

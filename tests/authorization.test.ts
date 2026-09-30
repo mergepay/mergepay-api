@@ -147,7 +147,7 @@ describe("GET /groups/:id — membership access", () => {
       headers: authHeader(strangerId),
     });
     expect(res.statusCode).toBe(403);
-    expect(res.json().error).toBe("FORBIDDEN");
+    expect(res.json().error.code).toBe("FORBIDDEN");
   });
 
   it("responds 404 (not 403) when the group does not exist", async () => {
@@ -158,7 +158,7 @@ describe("GET /groups/:id — membership access", () => {
       headers: authHeader(strangerId),
     });
     expect(res.statusCode).toBe(404);
-    expect(res.json().error).toBe("NOT_FOUND");
+    expect(res.json().error.code).toBe("NOT_FOUND");
   });
 
   it("requires authentication", async () => {

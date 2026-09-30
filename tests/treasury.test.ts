@@ -283,37 +283,25 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
   });
 
-  it("rejects malformed XDR without updating status to confirmed", async () => {
-    const ttx = fakeTreasuryTx();
-    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
-    prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
-    prisma.groupMember.findUnique.mockResolvedValueOnce({
-      groupId: "group_1",
-      userId: admin.id,
-      role: "admin",
-    });
-    loadAccountMock.mockResolvedValueOnce({
-      exists: true,
-      sequence: "100",
-      balances: [],
-      signers: [{ key: signerA.publicKey(), weight: 1 }],
-      thresholds: { low: 1, med: 1, high: 1 },
-    });
-
+  it.each([
+    { label: "missing", payload: {} },
+    { label: "empty", payload: { signedXdr: "" } },
+    { label: "malformed", payload: { signedXdr: "not-a-real-envelope" } },
+    { label: "invalid XDR bytes", payload: { signedXdr: "AAAA" } },
+  ])("rejects $label XDR before database or Horizon access", async ({ payload }) => {
     const res = await app.inject({
       method: "POST",
       url: "/treasury-transactions/ttx_1/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "not-a-real-envelope" },
+      payload,
     });
 
     expect(res.statusCode).toBe(400);
-    expect(prisma.treasuryTransaction.update).not.toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ status: "confirmed" }) })
-    );
+    expect(prisma.treasuryTransaction.findUnique).not.toHaveBeenCalled();
+    expect(Horizon.Server.prototype.submitTransaction).not.toHaveBeenCalled();
   });
 
   it("rejects when the treasury account is unfunded", async () => {
@@ -343,7 +331,7 @@ describe("POST /treasury-transactions/:id/confirm — multisig withdrawal", () =
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("TREASURY_UNFUNDED");
+    expect(res.json().error.code).toBe("TREASURY_UNFUNDED");
   });
 
   it("only an admin can confirm a withdrawal", async () => {
@@ -416,10 +404,16 @@ describe("POST /groups/:id/treasury/deposit — audit events", () => {
       console.error("DEPOSIT AUDIT TEST ERROR:", res.statusCode, res.json());
     }
     expect(res.statusCode).toBe(200);
+    // Exactly one audit row, written through the same transaction that
+    // created the deposit — no separate best-effort copy that could
+    // outlive a rollback and orphan an entry (issue #367).
+    expect(prisma.auditLog.create).toHaveBeenCalledTimes(1);
     expect(prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          action: "treasury.deposit.created",
+          userId: admin.id,
+          groupId: "group_1",
+          action: "treasury.deposit.create",
           entityType: "treasury_transaction",
           entityId: "ttx_dep_1",
         }),
@@ -481,14 +475,134 @@ describe("POST /groups/:id/treasury/withdraw — audit events", () => {
       console.error("WITHDRAW AUDIT TEST ERROR:", res.statusCode, res.json());
     }
     expect(res.statusCode).toBe(200);
+    // Exactly one audit row, written through the same transaction that
+    // created the withdrawal — no separate best-effort copy that could
+    // outlive a rollback and orphan an entry (issue #367).
+    expect(prisma.auditLog.create).toHaveBeenCalledTimes(1);
     expect(prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          action: "treasury.withdrawal.created",
+          userId: admin.id,
+          groupId: "group_1",
+          action: "treasury.withdraw.create",
           entityType: "treasury_transaction",
           entityId: "ttx_wd_1",
         }),
       })
+    );
+  });
+});
+
+describe("POST /treasury-transactions/:id/confirm — audit events (issue #367)", () => {
+  it("records an audit entry with actor, group, and tx hash on successful execution", async () => {
+    const ttx = fakeTreasuryTx();
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
+    prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: admin.id,
+      role: "admin",
+    });
+    loadAccountMock.mockResolvedValueOnce({
+      exists: true,
+      sequence: "100",
+      balances: [],
+      signers: [
+        { key: signerA.publicKey(), weight: 1 },
+        { key: signerB.publicKey(), weight: 1 },
+      ],
+      thresholds: { low: 1, med: 2, high: 2 },
+    });
+    vi.spyOn(stellar, "submitMultisigPayment").mockResolvedValueOnce("hash_ok");
+    prisma.treasuryTransaction.update.mockResolvedValueOnce({
+      ...ttx,
+      status: "confirmed",
+      stellarTxHash: "hash_ok",
+      user: admin,
+    });
+
+    const signedXdr = sign(buildWithdrawalXdr(), signerA, signerB);
+    const res = await app.inject({
+      method: "POST",
+      url: "/treasury-transactions/ttx_1/confirm",
+      headers: authHeader(),
+      payload: { signedXdr },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.auditLog.create).toHaveBeenCalledTimes(1);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: admin.id,
+          groupId: "group_1",
+          action: "treasury.confirm",
+          entityType: "treasury_transaction",
+          entityId: "ttx_1",
+          metadata: expect.objectContaining({ hash: "hash_ok" }),
+        }),
+      })
+    );
+  });
+
+  it("leaves no orphaned audit entry when execution fails — audit and state change roll back together", async () => {
+    const ttx = fakeTreasuryTx();
+    prisma.treasuryTransaction.findUnique.mockResolvedValue(ttx);
+    prisma.group.findUnique.mockResolvedValueOnce(fakeGroup());
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: admin.id,
+      role: "admin",
+    });
+    loadAccountMock.mockResolvedValueOnce({
+      exists: true,
+      sequence: "100",
+      balances: [],
+      signers: [
+        { key: signerA.publicKey(), weight: 1 },
+        { key: signerB.publicKey(), weight: 1 },
+      ],
+      thresholds: { low: 1, med: 2, high: 2 },
+    });
+    vi.spyOn(stellar, "submitMultisigPayment").mockRejectedValueOnce(
+      new Error("horizon unavailable")
+    );
+
+    const auditCallsBefore = prisma.auditLog.create.mock.calls.length;
+    const updateCallsBefore = prisma.treasuryTransaction.update.mock.calls.length;
+    let auditCallsDuringTx = 0;
+
+    // Model real transaction semantics: writes recorded by a callback that
+    // throws are discarded, exactly as Prisma's rollback discards them.
+    prisma.$transaction.mockImplementationOnce(async (arg: any) => {
+      if (typeof arg !== "function") return Promise.all(arg);
+      try {
+        return await arg(prisma);
+      } catch (err) {
+        auditCallsDuringTx =
+          prisma.auditLog.create.mock.calls.length - auditCallsBefore;
+        prisma.auditLog.create.mock.calls.splice(auditCallsBefore);
+        prisma.treasuryTransaction.update.mock.calls.splice(updateCallsBefore);
+        throw err;
+      }
+    });
+
+    const signedXdr = sign(buildWithdrawalXdr(), signerA, signerB);
+    const res = await app.inject({
+      method: "POST",
+      url: "/treasury-transactions/ttx_1/confirm",
+      headers: authHeader(),
+      payload: { signedXdr },
+    });
+
+    expect(res.statusCode).toBe(502);
+    // The failed attempt was audited inside the transaction…
+    expect(auditCallsDuringTx).toBeGreaterThan(0);
+    // …but the rollback discards the audit row together with the state
+    // change, so a failed action leaves no orphaned audit entry behind.
+    expect(prisma.auditLog.create.mock.calls.length).toBe(auditCallsBefore);
+    expect(prisma.treasuryTransaction.update.mock.calls.length).toBe(
+      updateCallsBefore
     );
   });
 });

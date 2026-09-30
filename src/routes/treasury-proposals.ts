@@ -18,17 +18,15 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { mpMemoSchema, stellarAccountIdSchema } from "../lib/stellar-validation";
+import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
 import { rateLimited } from "../lib/rate-limit";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { requireMembership, requireAdmin } from "../services/access";
-import { stellar } from "../services/stellar";
+import { requireGroupRole } from "../middleware";
+import { getTreasuryAccount } from "../services/treasury-stellar";
 import { isPositive } from "../services/money";
-import {
-  serializeGroup,
-  serializeTreasuryProposal,
-} from "../serializers";
+import { serializeGroup, serializeTreasuryProposal } from "../serializers";
 import { treasuryProposalsService } from "../services/treasury-proposals";
 import {
   buildPage,
@@ -42,8 +40,8 @@ import {
 const createBodySchema = z.object({
   destination: stellarAccountIdSchema,
   amount: z.string().min(1),
-  assetCode: z.string().min(1),
-  assetIssuer: stellarAccountIdSchema.nullable().optional(),
+  assetCode: assetCodeSchema,
+  assetIssuer: assetIssuerSchema.nullable().optional(),
   memo: mpMemoSchema.optional(),
 });
 
@@ -55,10 +53,15 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- POST /groups/:groupId/treasury/proposals -------------------------------
-  app.post("/groups/:groupId/treasury/proposals", rateLimited("treasuryPropose"), async (req) => {
+  app.post(
+    "/groups/:groupId/treasury/proposals",
+    {
+      ...rateLimited("treasuryPropose"),
+      preHandler: requireGroupRole("admin", { param: "groupId" }),
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
-    await requireAdmin(groupId, auth.id);
     const body = createBodySchema.parse(req.body);
 
     if (!isPositive(body.amount)) {
@@ -108,10 +111,11 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
   // Membership is checked before any row is read, and the `groupId` filter is
   // what scopes the page. The cursor only moves where a page starts inside
   // that already-authorized scope; it never widens it.
-  app.get("/groups/:groupId/treasury/proposals", async (req) => {
-    const auth = requireUser(req);
+  app.get(
+    "/groups/:groupId/treasury/proposals",
+    { preHandler: requireGroupRole("member", { param: "groupId" }) },
+    async (req) => {
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
     const position = requireCursor(cursor);
@@ -129,13 +133,15 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
   // -- POST /groups/:groupId/treasury/proposals/:proposalId/sign --------------
   app.post(
     "/groups/:groupId/treasury/proposals/:proposalId/sign",
-    rateLimited("treasurySubmit"),
+    {
+      ...rateLimited("treasurySubmit"),
+      preHandler: requireGroupRole("member", { param: "groupId" }),
+    },
     async (req) => {
       const auth = requireUser(req);
       const { groupId, proposalId } = z
         .object({ groupId: z.string(), proposalId: z.string() })
         .parse(req.params);
-      await requireMembership(groupId, auth.id);
       // The service enforces the persisted proposal/group relationship. Keep
       // authorization based on the authenticated member and requested group,
       // without performing a second resource lookup that changes legacy error
@@ -174,10 +180,11 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
   );
 
   // -- GET /groups/:groupId/treasury/status -----------------------------------
-  app.get("/groups/:groupId/treasury/status", async (req) => {
-    const auth = requireUser(req);
+  app.get(
+    "/groups/:groupId/treasury/status",
+    { preHandler: requireGroupRole("member", { param: "groupId" }) },
+    async (req) => {
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const group = await prisma.group.findUnique({ where: { id: groupId } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
@@ -187,17 +194,13 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
       );
     }
 
-    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
+    const view = await getTreasuryAccount(group.treasuryAccountPublicKey);
     return {
       group: serializeGroup(group),
-      publicKey: group.treasuryAccountPublicKey,
-      balances: snapshot.balances.map((b) => ({
-        assetCode: b.assetCode,
-        assetIssuer: b.assetIssuer,
-        balance: b.balance,
-      })),
-      signers: snapshot.signers,
-      thresholds: snapshot.thresholds,
+      publicKey: view.publicKey,
+      balances: view.balances,
+      signers: view.signers,
+      thresholds: view.thresholds,
       requiredSigners: group.treasuryRequiredSigners ?? 1,
       networkPassphrase: config.networkPassphrase,
     };

@@ -9,6 +9,7 @@
 import { AppError, Errors } from "../errors";
 import {
   ProviderError,
+  retryAfterSeconds,
   type ProviderFailureCategory,
 } from "../lib/provider-error";
 
@@ -53,12 +54,19 @@ export class TransportError extends Error {
  * Wraps an async operation with a bounded timeout using AbortController.
  *
  * The `signal` is passed to the operation so it can cancel in-flight I/O.
- * If the timeout fires before the operation completes, the operation is
+ * If the timeout fires before the operation completes, the promise is
  * rejected with a `TimeoutError`.
  *
  * @param operation - A human-readable label for the operation (used in errors and logs).
  * @param timeoutMs - Maximum time in milliseconds before the operation is aborted.
  * @param fn - The actual async work, receiving the AbortSignal.
+ * @returns Whatever `fn` resolves to, provided it beats the deadline.
+ * @throws {TimeoutError} when `timeoutMs` elapses first, or when `fn` rejects
+ *   with an `AbortError` (the abort was ours).
+ * @throws {TransportError} wrapping any unrecognized rejection from `fn`, so
+ *   callers can classify a socket/DNS failure without string-matching.
+ * @throws Re-throws an `AppError` from `fn` unchanged — a deliberate upstream
+ *   answer is not a transport problem.
  */
 export async function withTimeout<T>(
   operation: string,
@@ -290,12 +298,17 @@ export function toProviderError(
   if (error instanceof TimeoutError) {
     return new ProviderError({ ...ctx, message: ctx.fallbackMessage, category: "timeout" });
   }
-  if (error instanceof TransportError) {
+  if (error instanceof TransportError && statusOf(error.cause) === null) {
     return new ProviderError({ ...ctx, message: ctx.fallbackMessage, category: "transport" });
   }
 
-  const codes = resultCodesOf(error);
-  const status = statusOf(error);
+  // withTimeout wraps unknown SDK failures as TransportError. Preserve the
+  // underlying HTTP response so rate limits and their headers are not lost.
+  const upstreamError = error instanceof TransportError && statusOf(error.cause) !== null
+    ? error.cause
+    : error;
+  const codes = resultCodesOf(upstreamError);
+  const status = statusOf(upstreamError);
   const category: ProviderFailureCategory = codes
     ? "rejected"
     : status === 429
@@ -312,5 +325,8 @@ export function toProviderError(
     message: ctx.fallbackMessage,
     category,
     detail: codes ?? undefined,
+    retryAfterSeconds: category === "rate_limited" && ctx.provider === "horizon"
+      ? retryAfterSeconds(upstreamError)
+      : undefined,
   });
 }

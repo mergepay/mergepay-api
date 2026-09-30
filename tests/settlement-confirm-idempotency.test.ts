@@ -126,7 +126,7 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("MISSING_IDEMPOTENCY_KEY");
+    expect(res.json().error.code).toBe("MISSING_IDEMPOTENCY_KEY");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 
@@ -210,7 +210,7 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
     });
 
     expect(res.statusCode).toBe(409);
-    expect(res.json().error).toBe("IDEMPOTENCY_CONFLICT");
+    expect(res.json().error.code).toBe("IDEMPOTENCY_CONFLICT");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 

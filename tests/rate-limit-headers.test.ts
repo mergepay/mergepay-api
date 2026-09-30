@@ -3,8 +3,9 @@
  *
  * Like tests/rate-limit-policies.test.ts, behaviour is exercised against small
  * self-contained Fastify instances wired the way `rateLimited()` wires a real
- * route: `buildApp()` skips rate limiting under NODE_ENV=test, so asserting
- * 429s through it would prove nothing. Nothing here reads the real clock.
+ * route, so nothing here depends on the rest of the app booting. Which route
+ * names which policy is asserted in tests/rate-limit-wiring.test.ts. Nothing
+ * here reads the real clock.
  */
 import { describe, it, expect } from "vitest";
 import Fastify from "fastify";
@@ -190,6 +191,44 @@ describe("per-route tiers", () => {
     // A `user-or-ip` policy on onRequest would key every request by IP,
     // because req.user is not populated until the authenticate hook runs.
     expect(rateLimitPolicies().treasuryPropose.hook).toBe("preHandler");
+  });
+
+  it("limits settlement creation, confirmation, and execution to their own strict budgets", async () => {
+    const policies = rateLimitPolicies();
+    for (const policyName of ["settlementCreate", "settlementConfirm", "settlementExecute"] as const) {
+      const { max } = policies[policyName];
+      const app = await appWithPolicy(policyName);
+      for (let i = 0; i < max; i++) {
+        expect((await post(app)).statusCode).toBe(200);
+      }
+      expect((await post(app)).statusCode).toBe(429);
+      await app.close();
+    }
+  });
+
+  it("gives settlement submission endpoints distinct buckets separate from each other and the global default", () => {
+    const policies = rateLimitPolicies();
+    expect(policies.settlementCreate.prefix).toBe("settlement.create");
+    expect(policies.settlementConfirm.prefix).toBe("settlement.confirm");
+    expect(policies.settlementExecute.prefix).toBe("settlement.execute");
+    expect(policies.settlementCreate.prefix).not.toBe(policies.settlementConfirm.prefix);
+    expect(policies.settlementConfirm.prefix).not.toBe(policies.settlementExecute.prefix);
+    expect(policies.settlementCreate.prefix).not.toBe(policies.global.prefix);
+  });
+
+  it("budgets settlement submission endpoints strictly below the global default", () => {
+    const policies = rateLimitPolicies();
+    expect(policies.settlementCreate.max).toBeLessThan(policies.global.max);
+    expect(policies.settlementConfirm.max).toBeLessThan(policies.global.max);
+    expect(policies.settlementExecute.max).toBeLessThan(policies.global.max);
+  });
+
+  it("keys settlement submission endpoints by user and runs on preHandler", () => {
+    const policies = rateLimitPolicies();
+    for (const name of ["settlementCreate", "settlementConfirm", "settlementExecute"] as const) {
+      expect(policies[name].keyBy).toBe("user-or-ip");
+      expect(policies[name].hook).toBe("preHandler");
+    }
   });
 });
 

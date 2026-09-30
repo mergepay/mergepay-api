@@ -1,9 +1,8 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
-import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { Errors } from "../errors";
-import { buildChallenge, verifyChallenge } from "../services/sep10";
+import { authenticateChallenge, buildChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
 import { audit } from "../services/audit";
@@ -15,7 +14,12 @@ import {
   unauthorizedForRefresh,
 } from "../services/refresh-token";
 import { rateLimited } from "../lib/rate-limit";
-import { sep10VerifyRequestSchema } from "../validations/sep10";
+import {
+  sep10ChallengeRequestSchema,
+  sep10QuerySchema,
+  sep10VerifyRequestSchema,
+} from "../validations/sep10";
+import { openApiBody, openApiEnvelope } from "../lib/openapi";
 
 function shortName(pk: string): string {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
@@ -33,21 +37,74 @@ export default async function authRoutes(app: FastifyInstance) {
   const challengeLimit = rateLimited("authChallenge");
   const verifyLimit = rateLimited("authVerify");
 
+  // Every body on this plugin is annotated with `enforce: false`: ajv is left
+  // describing the payload for the OpenAPI spec but not policing it, so a
+  // rejected body always comes back as one VALIDATION_ERROR carrying the
+  // message and `issues` the handler's Zod parse defined, rather than Fastify
+  // pre-empting it with ajv's wording on a subset of rules. The type keywords
+  // are kept — they are what makes the spec describe field types — and ajv's
+  // coercion is off factory-wide (see src/app.ts), so the value Zod judges is
+  // the value the client actually sent.
+
   app.post(
     "/auth/challenge",
-    challengeLimit,
+    {
+      ...challengeLimit,
+      schema: {
+        tags: ["Auth"],
+        summary: "Request SEP-10 challenge",
+        description:
+          "Builds an unsigned SEP-10 challenge transaction for the specified account, to be signed by the client wallet.",
+        body: openApiBody(sep10ChallengeRequestSchema, { enforce: false }),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              transaction: { type: "string" },
+              networkPassphrase: { type: "string" },
+            },
+          },
+        },
+      },
+    },
     async (req) => {
-      const body = z.object({ account: stellarAccountIdSchema }).parse(req.body);
+      sep10QuerySchema.parse(req.query);
+      const body = sep10ChallengeRequestSchema.parse(req.body);
       return buildChallenge(body.account);
     }
   );
 
   app.post(
     "/auth/verify",
-    verifyLimit,
+    {
+      ...verifyLimit,
+      schema: {
+        tags: ["Auth"],
+        summary: "Verify SEP-10 challenge transaction",
+        description:
+          "Verifies the client signature on a SEP-10 challenge transaction and issues JWT access and refresh tokens.",
+        body: openApiBody(sep10VerifyRequestSchema, { enforce: false }),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              token: { type: "string" },
+              refreshToken: { type: "string" },
+              refreshTokenExpiresAt: { type: "string" },
+              user: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
     async (req) => {
+      sep10QuerySchema.parse(req.query);
       const body = sep10VerifyRequestSchema.parse(req.body);
-      const publicKey = await verifyChallenge(body.transaction);
+      const { account: publicKey, challengeHash } = await authenticateChallenge(
+        body.transaction
+      );
 
       const user = await prisma.user.upsert({
         where: { stellarPublicKey: publicKey },
@@ -58,9 +115,12 @@ export default async function authRoutes(app: FastifyInstance) {
         },
       });
 
-      // The claims contract is unchanged by SEP-10 hardening: verification
-      // still yields a public key, and the session is still minted here.
-      const token = signToken({ id: user.id, stellarPublicKey: publicKey });
+      // Session claims are unchanged; SEP-10 adds only `jti`, the hash of the
+      // challenge this login redeemed.
+      const token = signToken(
+        { id: user.id, stellarPublicKey: publicKey },
+        { jwtid: challengeHash }
+      );
       // A fresh family per login, so revoking one compromised session does
       // not sign the user out of their other devices.
       const refresh = await issueRefreshToken(user.id);
@@ -90,54 +150,81 @@ export default async function authRoutes(app: FastifyInstance) {
    * — malformed, unknown, expired, revoked, or reused — returns the same 401,
    * because distinguishing them would let a caller probe the token store.
    */
-  app.post("/auth/refresh", verifyLimit, async (req) => {
-    const body = z
-      .object({ refreshToken: z.string().min(1).max(512) })
-      .parse(req.body);
+  app.post(
+    "/auth/refresh",
+    {
+      ...verifyLimit,
+      schema: {
+        tags: ["Auth"],
+        summary: "Exchange refresh token for access token",
+        description:
+          "Exchanges a valid refresh token for a new access token and rotated refresh token.",
+        body: openApiBody(z.object({ refreshToken: z.string().min(1).max(512) }), {
+          enforce: false,
+        }),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              token: { type: "string" },
+              refreshToken: { type: "string" },
+              refreshTokenExpiresAt: { type: "string" },
+              user: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const body = z
+        .object({ refreshToken: z.string().min(1).max(512) })
+        .parse(req.body);
 
-    let rotated;
-    try {
-      rotated = await rotateRefreshToken(body.refreshToken);
-    } catch (err) {
-      if (err instanceof RefreshTokenError) {
-        // Reuse is the one case worth recording: it means a token was held by
-        // two parties, and the whole family has just been revoked.
-        if (err.reason === "reused") {
-          await audit({
-            action: "auth.refresh.reuse_detected",
-            entityType: "refresh_token",
-            entityId: "redacted",
-            outcome: "failure",
-          });
+      let rotated;
+      try {
+        rotated = await rotateRefreshToken(body.refreshToken);
+      } catch (err) {
+        if (err instanceof RefreshTokenError) {
+          // Reuse is the one case worth recording: it means a token was held by
+          // two parties, and the whole family has just been revoked.
+          if (err.reason === "reused") {
+            await audit({
+              action: "auth.refresh.reuse_detected",
+              entityType: "refresh_token",
+              entityId: "redacted",
+              outcome: "failure",
+            });
+          }
+          throw unauthorizedForRefresh();
         }
-        throw unauthorizedForRefresh();
+        throw err;
       }
-      throw err;
+
+      const user = await prisma.user.findUnique({ where: { id: rotated.userId } });
+      if (!user) throw unauthorizedForRefresh();
+
+      const token = signToken({
+        id: user.id,
+        stellarPublicKey: user.stellarPublicKey,
+      });
+
+      await audit({
+        userId: user.id,
+        action: "auth.refresh",
+        entityType: "user",
+        entityId: user.id,
+        outcome: "success",
+      });
+
+      return {
+        token,
+        refreshToken: rotated.refresh.token,
+        refreshTokenExpiresAt: rotated.refresh.expiresAt.toISOString(),
+        user: serializeUser(user),
+      };
     }
-
-    const user = await prisma.user.findUnique({ where: { id: rotated.userId } });
-    if (!user) throw unauthorizedForRefresh();
-
-    const token = signToken({
-      id: user.id,
-      stellarPublicKey: user.stellarPublicKey,
-    });
-
-    await audit({
-      userId: user.id,
-      action: "auth.refresh",
-      entityType: "user",
-      entityId: user.id,
-      outcome: "success",
-    });
-
-    return {
-      token,
-      refreshToken: rotated.refresh.token,
-      refreshTokenExpiresAt: rotated.refresh.expiresAt.toISOString(),
-      user: serializeUser(user),
-    };
-  });
+  );
 
   /**
    * Log out.
@@ -147,31 +234,59 @@ export default async function authRoutes(app: FastifyInstance) {
    * Unauthenticated callers still get `ok` — logout is not an oracle for
    * whether a token was valid.
    */
-  app.post("/auth/logout", async (req) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) return { ok: true };
+  app.post(
+    "/auth/logout",
+    {
+      schema: {
+        tags: ["Auth"],
+        summary: "Log out user session",
+        description:
+          "Revokes active refresh tokens associated with the authenticated session.",
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              ok: { type: "boolean" },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const authHeader = req.headers.authorization;
+      if (!authHeader) return { ok: true };
 
-    try {
-      await app.authenticate(req, null as never);
-      const auth = requireUser(req);
-      await revokeAllForUser(auth.id);
-      await audit({
-        userId: auth.id,
-        action: "auth.logout",
-        entityType: "user",
-        entityId: auth.id,
-        outcome: "success",
-      });
-    } catch {
-      // An invalid or expired token has nothing to revoke.
+      try {
+        await app.authenticate(req, null as never);
+        const auth = requireUser(req);
+        await revokeAllForUser(auth.id);
+        await audit({
+          userId: auth.id,
+          action: "auth.logout",
+          entityType: "user",
+          entityId: auth.id,
+          outcome: "success",
+        });
+      } catch {
+        // An invalid or expired token has nothing to revoke.
+      }
+
+      return { ok: true };
     }
-
-    return { ok: true };
-  });
+  );
 
   app.get(
     "/me",
-    { preHandler: [app.authenticate] },
+    {
+      preHandler: [app.authenticate],
+      schema: {
+        tags: ["Auth"],
+        summary: "Get current user profile",
+        description: "Returns the profile of the currently authenticated user.",
+        response: openApiEnvelope("user"),
+      },
+    },
     async (req) => {
       const auth = requireUser(req);
       const user = await prisma.user.findUnique({ where: { id: auth.id } });
@@ -182,7 +297,22 @@ export default async function authRoutes(app: FastifyInstance) {
 
   app.patch(
     "/me",
-    { preHandler: [app.authenticate] },
+    {
+      preHandler: [app.authenticate],
+      schema: {
+        tags: ["Auth"],
+        summary: "Update current user profile",
+        description: "Updates user profile fields such as display name and avatar URL.",
+        body: openApiBody(
+          z.object({
+            displayName: z.string().min(1).max(40).optional(),
+            avatarUrl: z.string().url().nullable().optional(),
+          }),
+          { enforce: false }
+        ),
+        response: openApiEnvelope("user"),
+      },
+    },
     async (req) => {
       const auth = requireUser(req);
       const body = z

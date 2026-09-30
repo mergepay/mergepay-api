@@ -2,7 +2,10 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
+import { formatErrorResponse } from "../utils/error-response";
 import { toRequestLimitError } from "../lib/request-limits";
+import { toPrismaError } from "../lib/prisma-error";
+import { ProviderError } from "../lib/provider-error";
 import { TimeoutError, TransportError, toProviderError } from "../services/timeout";
 
 function isHorizonError(error: unknown): error is Error & {
@@ -34,13 +37,50 @@ function isHorizonError(error: unknown): error is Error & {
   );
 }
 
-export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
-  app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
+/**
+ * The field a Zod issue is about, as a dotted path.
+ *
+ * An unrecognized key is the one issue Zod raises with an empty path — the key
+ * is the problem, and it lives in `keys`. Reporting it as `field: ""` tells a
+ * client only that something at the root is wrong, when the whole point of
+ * rejecting unknown keys is that the client learn which one to delete.
+ */
+function zodIssueField(issue: ZodError["errors"][number] | undefined): string {
+  if (!issue) return "";
+  if (issue.code === "unrecognized_keys") return issue.keys?.[0] ?? "";
+  return issue.path.join(".");
+}
+
+export default fp(async function errorHandlerPlugin(app: FastifyInstance) {  app.setErrorHandler((err: Error, req: FastifyRequest, reply: FastifyReply) => {
     const requestId = req.id as string;
+
+    // A route may throw something that is not an Error at all — `throw null`,
+    // or a promise rejected with no reason (`Promise.reject()`), which Fastify
+    // hands over as `undefined`. Every branch below reads `.code`,
+    // `.statusCode`, or `.status` off the thrown value, and on nullish that read
+    // throws a TypeError from inside this handler. Fastify then abandons the
+    // pipeline and answers with its own default body:
+    //
+    //   {"statusCode":500,"error":"Internal Server Error",
+    //    "message":"Cannot read properties of null (reading 'code')"}
+    //
+    // which is the one response in the API that does not use the standard
+    // envelope, carries no requestId to correlate on, and echoes an internal
+    // implementation detail back to the caller. Answering here instead keeps a
+    // nullish throw on the same contract as any other unexpected fault: a
+    // logged 500 carrying the fixed, client-safe message. Primitives and plain
+    // objects need no special case — property access on those is already safe,
+    // and they fall through to the generic branch below unchanged.
+    if (err === null || err === undefined) {
+      req.log.error({ requestId }, "Unhandled error");
+      return reply.code(500).send(
+        formatErrorResponse("INTERNAL_ERROR", "Something went wrong.", requestId)
+      );
+    }
 
     if (err instanceof ZodError) {
       const details = err.errors.map((e) => ({
-        field: e.path.join("."),
+        field: zodIssueField(e),
         message: e.message,
         code: e.code,
       }));
@@ -50,17 +90,12 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         code: e.code,
       }));
       const first = err.errors[0];
-      const field = first?.path.join(".");
+      const field = zodIssueField(first);
       const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
 
-      return reply.code(400).send({
-        code: "VALIDATION_ERROR",
-        error: "VALIDATION_ERROR",
-        message,
-        requestId,
-        details,
-        issues,
-      });
+      return reply.code(400).send(
+        formatErrorResponse("VALIDATION_ERROR", message, requestId, details, issues)
+      );
     }
 
     // A request that failed Fastify's own JSON-schema validation (from a
@@ -69,33 +104,73 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     // the Zod-based handlers use. Failing that — falling into the generic 4xx
     // branch below — would let two identical mistakes on two routes surface
     // with two different codes.
+    //
+    // A route whose body is annotated `openApiBody(schema, { enforce: false })`
+    // reaches this branch for one reason only: the payload is not even the right
+    // primitive for a documented field (`transaction: 12345`). Every rule the
+    // Zod schema owns is stripped from that annotation, so nothing here can
+    // second-guess the handler — ajv's job on such a route is to notice the
+    // shape of the mistake, and Zod's is to explain it.
+    //
+    // So this branch is shaped exactly like the Zod branch above: ajv's
+    // `instancePath` ("/transaction") becomes `field`, its `keyword` becomes
+    // `code`, and the top-level message names the first offending field instead
+    // of a bare "Validation failed". A client should not be able to tell which
+    // of the two validators rejected it, and should not lose `issues` when the
+    // answer happened to come from ajv.
     if ((err as any).code === "FST_ERR_VALIDATION") {
-      const details = Array.isArray((err as any).validation)
-        ? (err as any).validation.map((v: any) => ({
-            field: (v?.instancePath ?? "").replace(/^\//, "") || undefined,
-            message: v?.message ?? "Validation failed",
-          }))
-        : undefined;
-      return reply.code(400).send({
-        code: "VALIDATION_ERROR",
-        error: "VALIDATION_ERROR",
-        message: "Validation failed",
-        requestId,
-        details,
-      });
+      const issues: { path: string[]; field?: string; message: string; code?: string }[] = Array.isArray(
+        (err as any).validation
+      )
+        ? (err as any).validation.map((v: any) => {
+            const field = String(v?.instancePath ?? "").replace(/^\//, "");
+            return {
+              path: field ? field.split(".") : [],
+              field: field || undefined,
+              message: v?.message ?? "Validation failed",
+              code: v?.keyword,
+            };
+          })
+        : [];
+      const details = issues.map((issue) => ({ field: issue.field, message: issue.message }));
+      const first = issues[0];
+      const message = first
+        ? first.field
+          ? `${first.field}: ${first.message}`
+          : first.message
+        : "Validation failed";
+      return reply
+        .code(400)
+        .send(formatErrorResponse("VALIDATION_ERROR", message, requestId, details, issues));
+    }
+
+    // A body Fastify could not parse at all (malformed JSON) or an empty body
+    // sent where JSON was required. Surfaced here so it carries the same
+    // envelope as every other error instead of falling into the generic 4xx
+    // branch, which echoes the parser's own message — text that can quote the
+    // malformed input back to the client. Fixed 400 text, no parse details.
+    //
+    // Malformed JSON arrives as the SyntaxError thrown by JSON.parse with
+    // statusCode 400 set by Fastify's content-type parser — a shape nothing
+    // else in this pipeline produces, and one stable across parser message
+    // formats (which change between V8 releases and are deliberately not
+    // matched here).
+    if (
+      (err as any).code === "FST_ERR_CTP_EMPTY_JSON_BODY" ||
+      (err instanceof SyntaxError && (err as any).statusCode === 400)
+    ) {
+      return reply.code(400).send(
+        formatErrorResponse("VALIDATION_ERROR", "Request body must be valid JSON.", requestId)
+      );
     }
 
     if (err instanceof AppError) {
-      const body: Record<string, unknown> = {
-        code: err.code,
-        error: err.code,
-        message: err.message,
-        requestId,
-      };
-      if (err.details !== undefined) {
-        body.details = err.details;
+      if (err instanceof ProviderError && err.retryAfterSeconds !== undefined) {
+        reply.header("Retry-After", String(err.retryAfterSeconds));
       }
-      return reply.code(err.status).send(body);
+      return reply.code(err.status).send(
+        formatErrorResponse(err.code, err.message, requestId, err.details)
+      );
     }
 
     // A timeout or transport failure that escaped a handler still means the
@@ -108,12 +183,9 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
         operation: "route",
         fallbackMessage: "The upstream service is unavailable",
       });
-      return reply.code(converted.status).send({
-        code: converted.code,
-        error: converted.code,
-        message: converted.message,
-        requestId,
-      });
+      return reply.code(converted.status).send(
+        formatErrorResponse(converted.code, converted.message, requestId)
+      );
     }
 
     // Size and shape limits rejected by Fastify or @fastify/multipart before a
@@ -122,12 +194,40 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     // no stable code to branch on. See src/lib/request-limits.ts.
     const limitError = toRequestLimitError(err);
     if (limitError) {
-      return reply.code(limitError.status).send({
-        code: limitError.code,
-        error: limitError.code,
-        message: limitError.message,
-        requestId,
-      });
+      return reply.code(limitError.status).send(
+        formatErrorResponse(limitError.code, limitError.message, requestId)
+      );
+    }
+
+    // A statement the database rejected: a unique constraint, a dangling
+    // foreign key, a missing required field, or a database this process cannot
+    // reach. These used to reach the generic 500 below, which told the caller
+    // that its own bad request (or a duplicate submission) was a bug in this
+    // process. See src/lib/prisma-error.ts.
+    const prismaError = toPrismaError(err);
+    if (prismaError) {
+      // The response carries the fixed, client-safe message; the log keeps the
+      // original error so an operator still sees the constraint and the driver's
+      // text. A duplicate submission is a client mistake rather than an
+      // incident, so it is logged below warn; an unreachable database, a
+      // deadlock, or a failed statement is not.
+      const level =
+        prismaError.retryable || prismaError.status >= 500 ? "warn" : "debug";
+      req.log[level](
+        {
+          err,
+          requestId,
+          errorCode: prismaError.code,
+          prismaCode: prismaError.prismaCode,
+          // Postgres constraint names are internal, so they are logged rather
+          // than sent in the response body.
+          constraint: prismaError.constraint,
+        },
+        "Database error"
+      );
+      return reply.code(prismaError.status).send(
+        formatErrorResponse(prismaError.code, prismaError.message, requestId, prismaError.details)
+      );
     }
 
     const upstreamStatus =
@@ -137,68 +237,60 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
 
     if (isHorizonError(err) && typeof upstreamStatus === "number") {
       const operation = (err as any).operation ?? "Horizon request";
+      // Log upstream incidents at WARN without including full upstream
+      // error objects to avoid leaking potentially sensitive payloads.
       req.log.warn(
         {
           requestId,
           operation,
           statusCode: upstreamStatus,
           errorCode: (err as any).code ?? "UPSTREAM_ERROR",
-          err,
+          message: (err as any).message,
         },
         "Horizon upstream failure"
       );
 
       if (upstreamStatus === 429) {
-        return reply.code(429).send({
-          code: "RATE_LIMITED",
-          error: "RATE_LIMITED",
-          message: "Horizon is rate limiting requests. Please retry shortly.",
-          requestId,
+        const converted = toProviderError(err, {
+          provider: "horizon",
+          operation,
+          fallbackMessage: "Horizon is rate limiting requests. Please retry shortly.",
         });
+        if (converted instanceof ProviderError && converted.retryAfterSeconds !== undefined) {
+          reply.header("Retry-After", String(converted.retryAfterSeconds));
+        }
+        return reply.code(converted.status).send(
+          formatErrorResponse(converted.code, converted.message, requestId, converted.details)
+        );
       }
 
       if (upstreamStatus >= 500 || upstreamStatus === 408) {
-        return reply.code(502).send({
-          code: "UPSTREAM_ERROR",
-          error: "UPSTREAM_ERROR",
-          message: `${operation} is temporarily unavailable. Please retry shortly.`,
-          requestId,
-        });
+        return reply.code(502).send(
+          formatErrorResponse("UPSTREAM_ERROR", `${operation} is temporarily unavailable. Please retry shortly.`, requestId)
+        );
       }
 
-      return reply.code(502).send({
-        code: "UPSTREAM_ERROR",
-        error: "UPSTREAM_ERROR",
-        message: `${operation} failed while contacting the Stellar network.`,
-        requestId,
-      });
+      return reply.code(502).send(
+        formatErrorResponse("UPSTREAM_ERROR", `${operation} failed while contacting the Stellar network.`, requestId)
+      );
     }
 
     if ((err as any).statusCode === 429) {
-      return reply.code(429).send({
-        code: "RATE_LIMITED",
-        error: "RATE_LIMITED",
-        message: "Too many requests, slow down.",
-        requestId,
-      });
+      return reply.code(429).send(
+        formatErrorResponse("RATE_LIMITED", "Too many requests, slow down.", requestId)
+      );
     }
 
     if ((err as any).statusCode && (err as any).statusCode < 500) {
       const status: number = (err as any).statusCode;
-      return reply.code(status).send({
-        code: "BAD_REQUEST",
-        error: "BAD_REQUEST",
-        message: err.message,
-        requestId,
-      });
+      return reply.code(status).send(
+        formatErrorResponse("BAD_REQUEST", err.message, requestId)
+      );
     }
 
     app.log.error({ err, requestId }, "Unhandled error");
-    return reply.code(500).send({
-      code: "INTERNAL_ERROR",
-      error: "INTERNAL_ERROR",
-      message: "Something went wrong.",
-      requestId,
-    });
+    return reply.code(500).send(
+      formatErrorResponse("INTERNAL_ERROR", "Something went wrong.", requestId)
+    );
   });
 });

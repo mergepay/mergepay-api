@@ -236,13 +236,15 @@ describe("GET /settlements/:id/status — access", () => {
 
     expect(res.statusCode).toBe(403);
     const body = res.json();
-    expect(body.error).toBe("FORBIDDEN");
-    // No amount, party, group, asset, or hash in the refusal. The requestId is
-    // a random correlation id that legitimately appears on every error response
-    // (and is not settlement data), so exclude it — otherwise a short token like
-    // "10" spuriously matches a hex digit run in the id and flakes CI.
-    const { requestId: _requestId, ...rest } = body;
-    const serialized = JSON.stringify(rest);
+    expect(body.error.code).toBe("FORBIDDEN");
+    // No amount, party, group, asset, or hash in the refusal. requestId and
+    // timestamp are per-response metadata on every error envelope (at the top
+    // level and inside `error`) and are not settlement data — strip them
+    // wherever they appear, otherwise a short token like "10" spuriously
+    // matches a digit pair in the clock or a hex run in the id and flakes CI.
+    const serialized = JSON.stringify(body, (key, value) =>
+      key === "requestId" || key === "timestamp" ? undefined : value
+    );
     for (const leak of ["10", KEY_B, "group_1", "XLM", "ABC123"]) {
       expect(serialized).not.toContain(leak);
     }
@@ -273,7 +275,7 @@ describe("GET /settlements/:id/status — access", () => {
 
     expect(res.statusCode).toBe(404);
     const body = res.json();
-    expect(body.error).toBe("NOT_FOUND");
+    expect(body.error.code).toBe("NOT_FOUND");
     expect(body.message).toBe("Settlement not found");
     expect(body.requestId).toBeTruthy();
   });
@@ -285,7 +287,7 @@ describe("GET /settlements/:id/status — access", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("UNAUTHORIZED");
     expect(prisma.settlement.findFirst).not.toHaveBeenCalled();
   });
 
@@ -297,7 +299,7 @@ describe("GET /settlements/:id/status — access", () => {
         headers: authHeader(),
       });
       expect(res.statusCode).toBe(400);
-      expect(res.json().error).toBe("VALIDATION_ERROR");
+      expect(res.json().error.code).toBe("VALIDATION_ERROR");
     }
     expect(prisma.settlement.findFirst).not.toHaveBeenCalled();
   });
@@ -312,7 +314,7 @@ describe("GET /settlements/:id/status — access", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
   });
 });
 

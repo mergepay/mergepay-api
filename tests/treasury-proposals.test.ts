@@ -246,6 +246,49 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
     );
   });
 
+  it("classifies builder failures and persists a safe failure audit", async () => {
+    const user = fakeUser();
+    const treasury = Keypair.random();
+    const destination = Keypair.random().publicKey();
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
+    prisma.group.findUnique.mockResolvedValueOnce({
+      id: "group_1",
+      treasuryEnabled: true,
+      treasuryAccountPublicKey: treasury.publicKey(),
+      treasuryRequiredSigners: 2,
+    });
+    prisma.auditLog.create.mockResolvedValueOnce({});
+    const { stellar } = await import("../src/services/stellar");
+    vi.mocked(stellar.buildPayment).mockImplementationOnce(() => {
+      throw new Error("threshold cannot be satisfied");
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals",
+      headers: authHeader(user),
+      payload: { destination, amount: "5", assetCode: "XLM" },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe("MULTISIG_CONFIGURATION_INVALID");
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "treasury.proposal.failed",
+          metadata: expect.objectContaining({ outcome: "failure" }),
+        }),
+      })
+    );
+    expect(JSON.stringify(prisma.auditLog.create.mock.calls)).not.toContain(
+      "threshold cannot be satisfied"
+    );
+  });
+
   it("rejects a non-Stellar destination", async () => {
     const user = fakeUser();
     prisma.groupMember.findUnique.mockResolvedValueOnce({
@@ -283,7 +326,7 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
       },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
   });
 
   it("returns 400 when treasury is not enabled", async () => {
@@ -311,7 +354,7 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
       },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("TREASURY_DISABLED");
+    expect(res.json().error.code).toBe("TREASURY_DISABLED");
   });
 });
 
@@ -407,7 +450,7 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       payload: { signedXdr: "AAAA" },
     });
     expect(res.statusCode).toBe(409);
-    expect(res.json().error).toBe("ALREADY_SUBMITTED");
+    expect(res.json().error.code).toBe("ALREADY_SUBMITTED");
   });
 
   it("rejects a proposal whose XDR hashes a different transaction", async () => {
@@ -460,7 +503,7 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       payload: { signedXdr: rogue.toXDR() },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
   });
 
   it("returns the proposal when the signer is a member and meets threshold", async () => {
@@ -548,6 +591,19 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
     expect(body.threshold).toBe(1);
     expect(body.stellarTxHash).toBe("hash_xyz");
     expect(body.status).toBe("confirmed");
+
+    // The signature audit record is bound to the proposal's transaction hash
+    // so the entry can be tied back to the exact on-chain intent.
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "treasury.proposal.signed",
+          entityType: "treasury_proposal",
+          entityId: "prop_1",
+          metadata: expect.objectContaining({ txHash: proposalHash }),
+        }),
+      })
+    );
   });
 
   it("writes an audit event when Stellar submission fails", async () => {
@@ -737,7 +793,7 @@ describe("POST /groups/:groupId/treasury/proposals/:proposalId/sign", () => {
       payload: { signedXdr: signed.toXDR() },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error.code).toBe("XDR_MISMATCH");
   });
 });
 
@@ -804,6 +860,6 @@ describe("GET /groups/:groupId/treasury/status", () => {
       headers: authHeader(user),
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("TREASURY_DISABLED");
+    expect(res.json().error.code).toBe("TREASURY_DISABLED");
   });
 });

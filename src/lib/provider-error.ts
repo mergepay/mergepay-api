@@ -36,8 +36,32 @@ export type ProviderFailureCategory =
   | "malformed"
   | "rejected";
 
-/** HTTP status for every provider failure — dependencies fail as 502. */
-const PROVIDER_STATUS = 502;
+/** Parse either Retry-After delta-seconds or an HTTP-date. */
+export function retryAfterSeconds(error: unknown, now = Date.now()): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const candidate = error as { response?: { headers?: unknown }; headers?: unknown };
+  const headers = candidate.response?.headers ?? candidate.headers;
+  if (!headers || typeof headers !== "object") return undefined;
+
+  const headerBag = headers as { get?: (name: string) => unknown } & Record<string, unknown>;
+  let value: unknown;
+  if (typeof headerBag.get === "function") {
+    value = headerBag.get("retry-after");
+  } else {
+    const key = Object.keys(headerBag).find((name) => name.toLowerCase() === "retry-after");
+    if (key) value = headerBag[key];
+  }
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+
+  const retryAfter = String(value).trim();
+  if (/^\d+$/.test(retryAfter)) {
+    const seconds = Number(retryAfter);
+    return Number.isSafeInteger(seconds) ? seconds : undefined;
+  }
+  if (!/[A-Za-z]/.test(retryAfter)) return undefined;
+  const date = Date.parse(retryAfter);
+  return Number.isNaN(date) ? undefined : Math.ceil(Math.max(0, date - now) / 1000);
+}
 
 export interface ProviderErrorParams {
   category: ProviderFailureCategory;
@@ -52,6 +76,8 @@ export interface ProviderErrorParams {
    * Anything that is not a plain opaque token is dropped.
    */
   detail?: unknown;
+  /** Safe client retry guidance from the provider's Retry-After header. */
+  retryAfterSeconds?: number;
 }
 
 /**
@@ -94,15 +120,28 @@ export class ProviderError extends AppError {
   readonly retryable: boolean;
   /** Sanitized safe identifiers (e.g. Horizon result codes), if any. */
   readonly detail: string[] | null;
+  readonly retryAfterSeconds?: number;
 
   constructor(params: ProviderErrorParams) {
     const detail = safeDetailList(params.detail);
+    const horizonRateLimited = params.category === "rate_limited" && params.provider === "horizon";
+    const details = horizonRateLimited
+      ? {
+          hint: "Retry the request after a short delay.",
+          ...(params.retryAfterSeconds === undefined
+            ? {}
+            : { retryAfterSeconds: params.retryAfterSeconds }),
+        }
+      : undefined;
     super(
-      PROVIDER_STATUS,
+      horizonRateLimited ? 503 : 502,
       params.category === "rejected"
         ? ErrorCode.PROVIDER_REJECTED
-        : ErrorCode.UPSTREAM_ERROR,
+        : horizonRateLimited
+          ? ErrorCode.SERVICE_UNAVAILABLE
+          : ErrorCode.UPSTREAM_ERROR,
       detail ? `${params.message}: ${detail}` : params.message,
+      details,
     );
     this.name = "ProviderError";
     this.category = params.category;
@@ -111,5 +150,6 @@ export class ProviderError extends AppError {
     this.retryable =
       params.category !== "rejected" && params.category !== "timeout";
     this.detail = detail ? detail.split(",") : null;
+    this.retryAfterSeconds = horizonRateLimited ? params.retryAfterSeconds : undefined;
   }
 }

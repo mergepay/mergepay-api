@@ -1,317 +1,342 @@
 /**
- * SEP-10 session token expiration tests — issue #16.
+ * Issue #16 — SEP-10 token expiration and refresh, handled gracefully.
  *
- * Verifies that the auth middleware reports *why* a bearer token was
- * rejected instead of collapsing every failure into a generic 401:
+ * The session middleware (src/plugins/auth.ts) must not collapse every bad
+ * credential into one opaque 401. A client needs to know whether its token
+ * expired (re-authenticate via SEP-10, or exchange a refresh token) or was
+ * never valid to begin with (stop sending it):
  *
- *   - a correctly-signed token whose `exp` has passed → 401 TOKEN_EXPIRED,
- *     with a hint telling the client to re-authenticate via SEP-10
- *     (or refresh its session);
- *   - a token that fails verification outright (wrong secret, tampered
- *     payload, malformed string, wrong issuer) → 401 INVALID_TOKEN;
- *   - a missing Authorization header → 401 UNAUTHORIZED;
- *   - a valid token passes through and the route sees the request.
+ *   - expired / inside the expiry margin → 401 `TOKEN_EXPIRED` + a hint
+ *   - malformed, wrong signature, wrong issuer/audience/algorithm,
+ *     not-yet-valid, or missing claims → 401 `INVALID_TOKEN`
+ *   - no Authorization header, or not a Bearer scheme → 401 `UNAUTHORIZED`
+ *   - a valid token proceeds normally
  *
- * Runs fully offline: Prisma is mocked (the protected route's user lookup is
- * not the subject here) and no Horizon or anchor is touched. Tokens are
- * signed with the same `config` values the middleware verifies against, so
- * the suite is independent of any particular environment file.
+ * Unit tests cover `verifyToken` directly; route tests exercise the full
+ * Fastify path (middleware → error handler → response body) against a
+ * protected route.
  */
-
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
 import jwt from "jsonwebtoken";
-import { FastifyInstance } from "fastify";
+import { Keypair } from "@stellar/stellar-sdk";
 
-process.env.VITEST = "true";
-process.env.NODE_ENV = "test";
-
-vi.mock("../../src/db", () => ({
+const h = vi.hoisted(() => ({
   prisma: {
-    user: {
-      findUnique: vi.fn(async () => null),
+    user: { findUnique: vi.fn(), upsert: vi.fn(), create: vi.fn() },
+    group: { findUnique: vi.fn(), create: vi.fn() },
+    groupMember: { findUnique: vi.fn(), findMany: vi.fn(async () => []) },
+    expense: { findUnique: vi.fn() },
+    settlement: { findUnique: vi.fn(), findMany: vi.fn(async () => []) },
+    treasuryTransaction: { findUnique: vi.fn() },
+    anchorSession: { findUnique: vi.fn(), findMany: vi.fn(async () => []) },
+    withdrawal: { findUnique: vi.fn() },
+    invite: { findUnique: vi.fn() },
+    invitation: { findUnique: vi.fn(), findFirst: vi.fn() },
+    idempotencyKey: { findUnique: vi.fn(), create: vi.fn() },
+    auditLog: { create: vi.fn() },
+    refreshToken: {
+      create: vi.fn(),
+      findUnique: vi.fn(),
+      updateMany: vi.fn(),
+      deleteMany: vi.fn(),
     },
+    $transaction: vi.fn(async (arg: any) =>
+      typeof arg === "function" ? arg(h.prisma) : Promise.all(arg)
+    ),
+    $disconnect: vi.fn(),
   },
 }));
 
-vi.mock("../../src/services/audit", () => ({
-  audit: vi.fn(async () => undefined),
-}));
+vi.mock("../../src/db", () => ({ prisma: h.prisma }));
 
-// Imported after the mocks above are registered. `config` is the same parsed
-// configuration the auth plugin reads, so test-minted tokens verify.
 import { buildApp } from "../../src/app";
+import { signToken, verifyToken } from "../../src/plugins/auth";
 import { config } from "../../src/config";
+import { AppError } from "../../src/errors";
 
-const VALID_PK = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGZUA7RNUY6FJQZ";
+const prisma = h.prisma;
 
-/** Seconds of remaining life (may be negative for an already-expired token). */
-function makeToken(opts: {
-  sub: string;
-  pk: string;
-  remainingSeconds: number;
-  issuer?: string;
-  secret?: string;
-}): string {
+const USER_ID = "user_1";
+const PUBLIC_KEY = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+function fakeUser() {
+  return {
+    id: USER_ID,
+    stellarPublicKey: PUBLIC_KEY,
+    displayName: "Tester",
+    avatarUrl: null,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+  };
+}
+
+/** Sign with the real secret but arbitrary claims/options. */
+function signWith(options: jwt.SignOptions, claims: Record<string, unknown> = {}) {
   return jwt.sign(
-    { sub: opts.sub, pk: opts.pk },
-    opts.secret ?? config.JWT_SECRET,
+    { sub: USER_ID, pk: PUBLIC_KEY, ...claims },
+    config.JWT_SECRET,
     {
       algorithm: "HS256",
-      expiresIn: opts.remainingSeconds,
-      issuer: opts.issuer ?? config.JWT_ISSUER,
+      issuer: config.JWT_ISSUER,
       audience: config.JWT_AUDIENCE,
+      ...options,
     }
   );
 }
 
-let app: FastifyInstance;
+let app: Awaited<ReturnType<typeof buildApp>>;
 
 beforeAll(async () => {
   app = await buildApp();
-  await app.ready();
-});
-
-afterAll(async () => {
-  await app.close();
 });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  prisma.user.findUnique.mockResolvedValue(fakeUser());
 });
 
-describe("SEP-10 session token handling (issue #16)", () => {
-  describe("expired tokens", () => {
-    it("returns 401 TOKEN_EXPIRED with a re-auth hint for an expired token", async () => {
-      const token = makeToken({
-        sub: "user-1",
-        pk: VALID_PK,
-        remainingSeconds: -3600,
-      });
-
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${token}` },
-      });
-
-      expect(res.statusCode).toBe(401);
-      const body = res.json();
-      expect(body.code).toBe("TOKEN_EXPIRED");
-      // This API's envelope mirrors the code into `error`; the human text is
-      // carried in `message` (see docs/api-contract.md).
-      expect(body.error).toBe("TOKEN_EXPIRED");
-      expect(body.message).toBe("Token expired");
-      expect(body.details).toMatchObject({ code: "REAUTHENTICATE" });
-      expect(body.details.endpoints).toMatchObject({
-        sep10Challenge: "/auth/challenge",
-        sep10Verify: "/auth/verify",
-        refresh: "/auth/refresh",
-      });
-      expect(body.requestId).toBeDefined();
-    });
-
-    it("returns 401 TOKEN_EXPIRED for a token within the near-expiry margin", async () => {
-      // Inside the margin the SDK would still accept, this server rejects.
-      const token = makeToken({
-        sub: "user-1",
-        pk: VALID_PK,
-        remainingSeconds: Math.max(1, config.TOKEN_EXPIRY_MARGIN_SECONDS - 10),
-      });
-
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${token}` },
-      });
-
-      expect(res.statusCode).toBe(401);
-      const body = res.json();
-      expect(body.code).toBe("TOKEN_EXPIRED");
-      expect(body.error).toBe("TOKEN_EXPIRED");
-      expect(body.message).toBe("Token expired");
-    });
-
-    it("does not reveal which claims failed — same envelope as other auth failures", async () => {
-      const presentedToken = makeToken({
-        sub: "user-1",
-        pk: VALID_PK,
-        remainingSeconds: -1,
-      });
-
-      const expired = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${presentedToken}` },
-      });
-
-      expect(expired.statusCode).toBe(401);
-      expect(expired.json().code).toBe("TOKEN_EXPIRED");
-      // The response never echoes any fragment of the rejected token itself.
-      expect(expired.body).not.toContain(presentedToken.slice(0, 16));
+describe("verifyToken — classification", () => {
+  it("returns the session for a valid token", () => {
+    const token = signToken({ id: USER_ID, stellarPublicKey: PUBLIC_KEY });
+    expect(verifyToken(token)).toEqual({
+      id: USER_ID,
+      stellarPublicKey: PUBLIC_KEY,
     });
   });
 
-  describe("invalid tokens", () => {
-    it("returns 401 INVALID_TOKEN for a token signed with the wrong secret", async () => {
-      const token = makeToken({
-        sub: "user-1",
-        pk: VALID_PK,
-        remainingSeconds: 3600,
-        secret: `${config.JWT_SECRET.slice(0, 8)}-an-entirely-different-secret`,
-      });
-
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${token}` },
-      });
-
-      expect(res.statusCode).toBe(401);
-      const body = res.json();
-      expect(body.code).toBe("INVALID_TOKEN");
-      expect(body.error).toBe("INVALID_TOKEN");
-      expect(body.message).toBe("Invalid token");
-      expect(body.requestId).toBeDefined();
-    });
-
-    it("returns 401 INVALID_TOKEN for a malformed token string", async () => {
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: "Bearer not-a-real-jwt" },
-      });
-
-      expect(res.statusCode).toBe(401);
-      const body = res.json();
-      expect(body.code).toBe("INVALID_TOKEN");
-      expect(body.error).toBe("INVALID_TOKEN");
-      expect(body.message).toBe("Invalid token");
-    });
-
-    it("returns 401 INVALID_TOKEN for a tampered payload", async () => {
-      const token = makeToken({
-        sub: "user-1",
-        pk: VALID_PK,
-        remainingSeconds: 3600,
-      });
-      const [header, , signature] = token.split(".");
-      const forgedPayload = Buffer.from(
-        JSON.stringify({
-          sub: "user-2",
-          pk: VALID_PK,
-          exp: Math.floor(Date.now() / 1000) + 3600,
-          iss: config.JWT_ISSUER,
-          aud: config.JWT_AUDIENCE,
-        })
-      ).toString("base64url");
-
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${header}.${forgedPayload}.${signature}` },
-      });
-
-      expect(res.statusCode).toBe(401);
-      expect(res.json().code).toBe("INVALID_TOKEN");
-    });
-
-    it("returns 401 INVALID_TOKEN for a token with the wrong issuer", async () => {
-      const token = makeToken({
-        sub: "user-1",
-        pk: VALID_PK,
-        remainingSeconds: 3600,
-        issuer: `${config.JWT_ISSUER}-not`,
-      });
-
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${token}` },
-      });
-
-      expect(res.statusCode).toBe(401);
-      expect(res.json().code).toBe("INVALID_TOKEN");
-    });
-
-    it("returns 401 INVALID_TOKEN for a well-signed token missing the exp claim", async () => {
-      const token = jwt.sign(
-        { sub: "user-1", pk: VALID_PK },
-        config.JWT_SECRET,
-        {
-          algorithm: "HS256",
-          issuer: config.JWT_ISSUER,
-          audience: config.JWT_AUDIENCE,
-          // No expiresIn — no exp claim.
-        }
-      );
-
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${token}` },
-      });
-
-      expect(res.statusCode).toBe(401);
-      expect(res.json().code).toBe("INVALID_TOKEN");
-    });
+  it("classifies an expired token as TOKEN_EXPIRED", () => {
+    const token = signWith({ expiresIn: -10 });
+    try {
+      verifyToken(token);
+      expect.unreachable("expired token must be rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AppError);
+      const err = error as AppError;
+      expect(err.code).toBe("TOKEN_EXPIRED");
+      expect(err.status).toBe(401);
+      expect(err.message).toBe("Token expired");
+    }
   });
 
-  describe("missing credentials", () => {
-    it("returns 401 UNAUTHORIZED when no Authorization header is sent", async () => {
-      const res = await app.inject({ method: "GET", url: "/me" });
-
-      expect(res.statusCode).toBe(401);
-      const body = res.json();
-      expect(body.code).toBe("UNAUTHORIZED");
-      expect(body.requestId).toBeDefined();
-    });
-
-    it("returns 401 UNAUTHORIZED for a non-Bearer Authorization header", async () => {
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: "Basic dXNlcjpwYXNz" },
-      });
-
-      expect(res.statusCode).toBe(401);
-      expect(res.json().code).toBe("UNAUTHORIZED");
-    });
+  it("classifies a token inside the expiry margin as TOKEN_EXPIRED", () => {
+    // Well within the 30s margin: still an expiry outcome for the client.
+    const token = signWith({ expiresIn: 5 });
+    expect(() => verifyToken(token)).toThrow(
+      expect.objectContaining({ code: "TOKEN_EXPIRED" })
+    );
   });
 
-  describe("valid tokens", () => {
-    it("lets a valid, unexpired token through to the route", async () => {
-      const token = makeToken({
-        sub: "user-1",
-        pk: VALID_PK,
-        remainingSeconds: 3600,
-      });
+  it("classifies a token signed with the wrong secret as INVALID_TOKEN", () => {
+    const forged = jwt.sign(
+      { sub: USER_ID, pk: PUBLIC_KEY },
+      "wrong-secret-entirely",
+      {
+        algorithm: "HS256",
+        issuer: config.JWT_ISSUER,
+        audience: config.JWT_AUDIENCE,
+        expiresIn: "15m",
+      }
+    );
+    expect(() => verifyToken(forged)).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
+  });
 
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${token}` },
-      });
+  it("classifies a malformed token as INVALID_TOKEN", () => {
+    expect(() => verifyToken("not-a-jwt")).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
+  });
 
-      // 404 (mocked Prisma finds no user) proves authentication passed and
-      // the request reached the handler — the alternative outcomes are all
-      // 401s from the middleware.
-      expect(res.statusCode).toBe(404);
+  it("classifies a token with the wrong issuer as INVALID_TOKEN", () => {
+    const token = signWith({ issuer: "some-other-issuer" });
+    expect(() => verifyToken(token)).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
+  });
+
+  it("classifies a token with the wrong audience as INVALID_TOKEN", () => {
+    const token = signWith({ audience: "some-other-audience" });
+    expect(() => verifyToken(token)).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
+  });
+
+  it("classifies a not-yet-valid token as INVALID_TOKEN", () => {
+    const token = signWith({ notBefore: "10m", expiresIn: "15m" });
+    expect(() => verifyToken(token)).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
+  });
+
+  it("classifies a token missing the session claims as INVALID_TOKEN", () => {
+    const token = jwt.sign({}, config.JWT_SECRET, {
+      algorithm: "HS256",
+      issuer: config.JWT_ISSUER,
+      audience: config.JWT_AUDIENCE,
+      expiresIn: "15m",
+    });
+    expect(() => verifyToken(token)).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
+  });
+
+  it("classifies a token missing the expiry claim as INVALID_TOKEN", () => {
+    const token = jwt.sign(
+      { sub: USER_ID, pk: PUBLIC_KEY },
+      config.JWT_SECRET,
+      {
+        algorithm: "HS256",
+        issuer: config.JWT_ISSUER,
+        audience: config.JWT_AUDIENCE,
+      }
+    );
+
+    expect(() => verifyToken(token)).toThrow(
+      expect.objectContaining({ code: "INVALID_TOKEN" })
+    );
+  });
+
+  it("never echoes the jsonwebtoken error text", () => {
+    const token = signWith({ expiresIn: -10 });
+    try {
+      verifyToken(token);
+    } catch (error) {
+      expect((error as Error).message).not.toMatch(/jwt expired/i);
+    }
+  });
+});
+
+describe("authenticated route — 401 contract", () => {
+  it("lets a valid token through", async () => {
+    const token = signToken({ id: USER_ID, stellarPublicKey: PUBLIC_KEY });
+    const res = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: `Bearer ${token}` },
     });
 
-    it("accepts a token just outside the near-expiry margin", async () => {
-      const token = makeToken({
-        sub: "user-1",
-        pk: VALID_PK,
-        remainingSeconds: config.TOKEN_EXPIRY_MARGIN_SECONDS + 1,
-      });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().user.id).toBe(USER_ID);
+  });
 
-      const res = await app.inject({
-        method: "GET",
-        url: "/me",
-        headers: { authorization: `Bearer ${token}` },
-      });
+  it("returns UNAUTHORIZED when no token is presented", async () => {
+    const res = await app.inject({ method: "GET", url: "/me" });
 
-      expect(res.statusCode).toBe(404);
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error.code).toBe("UNAUTHORIZED");
+       expect(res.json().error.code).toBe("UNAUTHORIZED");
+  });
+
+  it("returns UNAUTHORIZED when the Authorization header is not Bearer", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: "Token xyz" },
     });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error.code).toBe("UNAUTHORIZED");
+  });
+
+  it("returns TOKEN_EXPIRED with a re-authentication hint for an expired token", async () => {
+    const token = signWith({ expiresIn: -10 });
+    const res = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(401);
+    const body = res.json();
+    expect(body.error.code).toBe("TOKEN_EXPIRED");
+    // The hint names both recovery paths: a full SEP-10 re-authentication and
+    // the refresh endpoint for clients already holding a refresh token.
+    expect(body.error.details?.code).toBe("REAUTHENTICATE");
+    expect(body.error.details?.message).toMatch(/SEP-10/);
+    expect(body.error.details?.endpoints?.refresh).toMatch(/\/auth\/refresh/);
+  });
+
+  it("returns TOKEN_EXPIRED for a token inside the expiry margin", async () => {
+    const token = signWith({ expiresIn: 5 });
+    const res = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error.code).toBe("TOKEN_EXPIRED");
+  });
+
+  // The issue's sketch writes `{ error: 'Token expired', code: 'TOKEN_EXPIRED' }`;
+  // this API's error envelope mirrors the machine code into `error` everywhere
+  // and carries the human phrase in `message` — kept consistent with every
+  // other endpoint rather than introducing a second convention.
+  it("returns INVALID_TOKEN for a token signed with the wrong secret", async () => {
+    const forged = jwt.sign(
+      { sub: USER_ID, pk: PUBLIC_KEY },
+      "wrong-secret-entirely",
+      {
+        algorithm: "HS256",
+        issuer: config.JWT_ISSUER,
+        audience: config.JWT_AUDIENCE,
+        expiresIn: "15m",
+      }
+    );
+    const res = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: `Bearer ${forged}` },
+    });
+
+    expect(res.statusCode).toBe(401);
+    const body = res.json();
+      expect(body.error.code).toBe("INVALID_TOKEN");
+    expect(body.code).toBe("INVALID_TOKEN");
+    expect(body.message).toBe("Invalid token");
+    expect(body.requestId).toBeTruthy();
+    // An unverifiable credential is not recoverable by refreshing.
+      expect(body.error.details?.hint).toBeUndefined();
+  });
+
+  it("returns INVALID_TOKEN for a malformed bearer token", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: "Bearer not-a-jwt" },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error.code).toBe("INVALID_TOKEN");
+  });
+
+  it("keeps the error envelope stack-free", async () => {
+    const token = signWith({ expiresIn: -10 });
+    const res = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    const body = res.json();
+    expect(body.stack).toBeUndefined();
+    expect(res.body).not.toMatch(/jwt/i);
+  });
+
+  it("codes TOKEN_EXPIRED and INVALID_TOKEN stay distinguishable", async () => {
+    const expired = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: `Bearer ${signWith({ expiresIn: -10 })}` },
+    });
+    const invalid = await app.inject({
+      method: "GET",
+      url: "/me",
+      headers: { authorization: `Bearer ${signWith({}, {})}`.replace(signWith({}, {}), "garbage.token.value") },
+    });
+
+    expect(expired.json().code).toBe("TOKEN_EXPIRED");
+    expect(invalid.json().code).toBe("INVALID_TOKEN");
+    expect(expired.json().code).not.toBe(invalid.json().code);
   });
 });

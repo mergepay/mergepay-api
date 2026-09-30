@@ -53,9 +53,9 @@ describe("Zod validation error handler", () => {
     const res = await app.inject({ method: "GET", url: "/test-zod/simple" });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.details)).toBe(true);
-    expect(body.details[0]).toMatchObject({
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(Array.isArray(body.error.details)).toBe(true);
+    expect(body.error.details[0]).toMatchObject({
       field: expect.any(String),
       message: expect.any(String),
       code: expect.any(String),
@@ -67,10 +67,10 @@ describe("Zod validation error handler", () => {
     const res = await app.inject({ method: "GET", url: "/test-zod/nested" });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.code).toBe("VALIDATION_ERROR");
-    expect(Array.isArray(body.details)).toBe(true);
-    expect(body.details[0].field).toBe("user.age");
-    expect(body.details[0].message).toContain("18");
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(Array.isArray(body.error.details)).toBe(true);
+    expect(body.error.details[0].field).toBe("user.age");
+    expect(body.error.details[0].message).toContain("18");
     expect(body.requestId).toBeTruthy();
   });
 

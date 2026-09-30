@@ -293,7 +293,7 @@ describe("POST /uploads/receipt", () => {
 
     expect(res.statusCode).toBeGreaterThanOrEqual(400);
     expect(res.statusCode).toBeLessThan(500);
-    expect(res.json().code).toBe("FILE_TOO_LARGE");
+    expect(res.json().error.code).toBe("FILE_TOO_LARGE");
   });
 
   it("leaves nothing on disk when an upload is rejected", async () => {
@@ -344,7 +344,7 @@ describe("POST /uploads/receipt", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("BAD_FILE_TYPE");
+    expect(res.json().error.code).toBe("BAD_FILE_TYPE");
     expect(await appearedSinceSnapshot()).toEqual([]);
   });
 
@@ -409,7 +409,7 @@ describe("POST /uploads/receipt", () => {
     // route checks `valueTruncated` itself — otherwise the upload would be
     // accepted with data the client never sent.
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("FIELD_TOO_LARGE");
+    expect(res.json().error.code).toBe("FIELD_TOO_LARGE");
     expect(await appearedSinceSnapshot()).toEqual([]);
     expect(await stagedOnDisk()).toEqual([]);
   });
@@ -457,7 +457,7 @@ describe("POST /uploads/receipt", () => {
 
     expect(res.statusCode).toBeGreaterThanOrEqual(400);
     expect(res.statusCode).toBeLessThan(500);
-    expect(res.json().code).toBeTruthy();
+    expect(res.json().error.code).toBeTruthy();
   });
 
   it("rejects a request that is not multipart at all", async () => {
@@ -506,7 +506,7 @@ describe("JSON body limits", () => {
 
     expect(res.statusCode).toBeGreaterThanOrEqual(400);
     expect(res.statusCode).toBeLessThan(500);
-    expect(res.json().code).toBeTruthy();
+    expect(res.json().error.code).toBeTruthy();
   });
 
   it("does not constrain an ordinary JSON request", async () => {

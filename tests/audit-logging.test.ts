@@ -365,12 +365,17 @@ describe("AC6: audit logging consistency", () => {
 
   describe("atomicity — audit failure rolls back mutation", () => {
     it("if auditLog.create throws, the group kick mutation is rolled back", async () => {
+      // The caller's admin membership is read twice — once by the
+      // requireGroupRole preHandler and again by the in-transaction admin
+      // re-check (#700) — then the target's row is read by the handler.
+      const callerAdmin = {
+        groupId: "group_1",
+        userId: userA.id,
+        role: "admin",
+      };
       prisma.groupMember.findUnique
-        .mockResolvedValueOnce({
-          groupId: "group_1",
-          userId: userA.id,
-          role: "admin",
-        })
+        .mockResolvedValueOnce(callerAdmin)
+        .mockResolvedValueOnce(callerAdmin)
         .mockResolvedValueOnce({
           groupId: "group_1",
           userId: userB.id,

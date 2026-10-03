@@ -859,6 +859,7 @@ export async function reconcilePendingSettlements(): Promise<void> {
     confirmed: 0,
     failed: 0,
     pending: 0,
+    expired: 0,
   };
 
   for (const row of rows) {
@@ -881,6 +882,7 @@ export async function reconcilePendingSettlements(): Promise<void> {
           groupId: row.groupId,
           stellarTxHash: row.stellarTxHash,
           retryCount: row.retryCount,
+          pendingSince: row.submittedAt ?? row.createdAt,
           shortCode: row.shortCode,
           expenseId: row.expenseId,
           amount: String(row.amount),
@@ -918,6 +920,7 @@ export async function reconcilePendingSettlements(): Promise<void> {
       checked,
       confirmed: outcomes.confirmed,
       failed: outcomes.failed,
+      expired: outcomes.expired,
       stillPending: outcomes.pending,
     },
     "reconciled pending_confirmation and needs_review settlements against Horizon"

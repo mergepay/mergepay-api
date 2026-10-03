@@ -145,41 +145,29 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
-    const expense = await prisma.$transaction(async (tx) => {
-      const created = await tx.expense.create({
-        data: {
-          groupId,
-          payerUserId,
-          title: body.title,
-          description: body.description,
-          amount: body.amount,
-          assetCode: body.assetCode,
-          assetIssuer: body.assetIssuer ?? null,
-          splitType: body.splitType,
-          memo,
-          receiptUrl: body.receiptUrl ?? null,
-          shares: {
-            create: computed.map((c) => ({
-              userId: c.userId,
-              shareAmount: c.shareAmount,
-              status: c.userId === payerUserId ? "settled" : "pending",
-            })),
-          },
-        },
-        include: expenseInclude,
-      });
-
-      await auditTx(tx, {
-        userId: auth.id,
+    // Expense row + participant splits + audit log are written as one unit in
+    // createGroupExpense's `prisma.$transaction` — a failure on any of them
+    // rolls the whole creation back (see src/services/expenses.ts).
+    const expense = await createGroupExpense(
+      {
         groupId,
-        action: "expense.create",
-        entityType: "expense",
-        entityId: created.id,
-        metadata: { amount: body.amount, assetCode: body.assetCode },
-      });
-
-      return created;
-    });
+        payerUserId,
+        actorUserId: auth.id,
+        title: body.title,
+        description: body.description,
+        amount: body.amount,
+        assetCode: body.assetCode,
+        assetIssuer: body.assetIssuer ?? null,
+        splitType: body.splitType,
+        memo,
+        receiptUrl: body.receiptUrl ?? null,
+        shares: computed.map((c) => ({
+          userId: c.userId,
+          shareAmount: c.shareAmount,
+        })),
+      },
+      expenseInclude
+    );
 
     return { expense: serializeExpense(expense) };
   });

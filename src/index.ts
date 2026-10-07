@@ -1,6 +1,7 @@
 import { buildApp } from "./app";
 import { config, env } from "./config";
 import { prisma } from "./db";
+import fastifySwagger from "@fastify/swagger";
 
 async function main() {
   // Config validation already happened at module load time in config.ts
@@ -11,6 +12,38 @@ async function main() {
   }
 
   const app = await buildApp();
+
+  // Register Swagger plugin for API documentation
+  await app.register(fastifySwagger, {
+    openapi: {
+      info: {
+        title: "MergePay API Documentation",
+        description: "OpenAPI schema for MergePay services",
+        version: "1.0.0",
+      },
+      components: {
+        securitySchemes: {
+          bearerAuth: {
+            type: "http",
+            scheme: "bearer",
+            bearerFormat: "JWT",
+          },
+        },
+      },
+      security: [
+        {
+          bearerAuth: [],
+        },
+      ],
+      servers: [
+        {
+          url: `${env.API_PUBLIC_URL}`,
+        },
+      ],
+    },
+    pathPrefix: "/api-docs",
+    exposeRoute: true,
+  });
 
   let shutdownStarted = false;
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {

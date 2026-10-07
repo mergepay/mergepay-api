@@ -720,6 +720,175 @@ export async function recoverStaleSettlements(): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// pending_confirmation + needs_review reconciliation
+// ---------------------------------------------------------------------------
+
+/** The settlement statuses the reconciliation job owes a Horizon check. */
+// pending_confirmation: the hash's confirmation is still being verified under
+//   the bounded retry budget in reconcileSingleSettlement.
+// needs_review: a submission whose on-chain outcome could not be observed
+//   (Horizon had no record yet, or stopped answering — see confirmSubmission).
+//   The hash is recorded, so the same read-only Horizon check applies: found
+//   and successful → confirmed, found and failed → failed, still silent →
+//   demoted to pending_confirmation where the retry budget governs.
+const RECONCILABLE_STATUSES = ["pending_confirmation", "needs_review"] as const;
+
+/**
+ * Take exclusive ownership of a pending-confirmation or needs-review
+ * reconciliation.
+ *
+ * Same conditional-update lease as settlement submission: the row must still
+ * be in a reconcilable status, still be on the attempt this worker read, and
+ * must not carry a live lease. Two workers racing on one row produce exactly
+ * one update with `count === 1`.
+ */
+async function claimPendingConfirmation(job: {
+  id: string;
+  retryCount: number;
+}): Promise<boolean> {
+  if (isShuttingDown) return false;
+  const now = new Date();
+
+  const { count } = await prisma.settlement.updateMany({
+    where: {
+      id: job.id,
+      status: { in: [...RECONCILABLE_STATUSES] },
+      retryCount: job.retryCount,
+      AND: [
+        { OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: now } }] },
+      ],
+    },
+    data: {
+      claimedBy: WORKER_ID,
+      claimedAt: now,
+      leaseExpiresAt: leaseDeadline(),
+    },
+  });
+
+  return count === 1;
+}
+
+/**
+ * One cycle of pending-confirmation/needs-review reconciliation: pick up
+ * every settlement whose on-chain outcome is unresolved — a submitted
+ * transaction not yet confirmed (`pending_confirmation`) or one whose
+ * confirmation response was lost (`needs_review`) — claim it, ask Horizon
+ * which of the three outcomes it reached, and let the state machine persist
+ * it.
+ *
+ * Issue #541: `needs_review` rows were never revisited before this job
+ * covered them. A settlement that reached `needs_review` — submitted, hash
+ * recorded, but Horizon went quiet before pollForConfirmation could report
+ * an outcome — was terminal in practice: the API could not confirm it and
+ * nothing ever asked Horizon again, leaving an actually-settled expense
+ * stuck as unsettled. Both statuses are the same question ("did this hash
+ * land?") with an answer only Horizon holds, so both are reconciled here.
+ * One cycle of pending_confirmation / needs_review reconciliation: pick up
+ * every row that owes an on-chain answer, claim it, ask Horizon which of the
+ * three outcomes it reached, and let the state machine persist it.
+ *
+ * A Horizon lookup that comes back empty is deliberately *not* a resolution:
+ * the transaction was submitted but is not on the ledger yet, so the row keeps
+ * its status, its retry count climbs, and the bounded budget in
+ * reconcileSingleSettlement decides when enough silence is enough.
+ *
+ * Read-only against Horizon — nothing here ever calls submitPayment. Reusing
+ * the claim means a worker that dies mid-check leaves its lease behind, and
+ * the row is picked up again after the lease lapses instead of being checked
+ * by two processes at once.
+ */
+export async function reconcilePendingSettlements(): Promise<void> {
+  const rows = await prisma.settlement.findMany({
+    where: {
+      status: { in: [...RECONCILABLE_STATUSES] },
+      stellarTxHash: { not: null },
+      AND: [
+        { OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: new Date() } }] },
+      ],
+    },
+    include: {
+      to: { select: { stellarPublicKey: true } },
+    },
+    take: config.WORKER_BATCH_SIZE,
+    orderBy: { updatedAt: "asc" as const },
+  });
+
+  if (rows.length === 0) return;
+
+  let checked = 0;
+  const outcomes: Record<SettlementReconciliationOutcome, number> = {
+    confirmed: 0,
+    failed: 0,
+    pending: 0,
+    expired: 0,
+  };
+
+  for (const row of rows) {
+    if (isShuttingDown) break;
+
+    // Hashless rows have nothing to check against Horizon. The candidate query
+    // already filters on a recorded hash; this guard keeps the loop safe even
+    // if that filter and this loop ever drift apart.
+    if (!row.stellarTxHash) continue;
+
+    if (!(await claimPendingConfirmation(row))) continue;
+
+    const ctx = jobContext("reconciliation", row.id);
+    checked += 1;
+
+    try {
+      const outcome = await reconcileSingleSettlement(
+        {
+          id: row.id,
+          groupId: row.groupId,
+          stellarTxHash: row.stellarTxHash,
+          retryCount: row.retryCount,
+          pendingSince: row.submittedAt ?? row.createdAt,
+          shortCode: row.shortCode,
+          expenseId: row.expenseId,
+          amount: String(row.amount),
+          assetCode: row.assetCode,
+          assetIssuer: row.assetIssuer,
+          destinationPublicKey: row.to.stellarPublicKey,
+          status: row.status,
+        },
+        RECONCILIATION_MAX_RETRIES,
+        ctx
+      );
+      outcomes[outcome] += 1;
+    } catch (error) {
+      // One row blowing up must not take the batch — or the worker — down.
+      outcomes.pending += 1;
+      loggerWithContext(log, ctx).error(
+        {
+          jobType: "reconciliation",
+          jobId: row.id,
+          outcome: "error",
+          hash: row.stellarTxHash,
+          reason: safeFailureMessage(error),
+        },
+        "unexpected error reconciling pending settlement"
+      );
+    } finally {
+      await releaseSettlement(row.id);
+    }
+  }
+
+  log.info(
+    {
+      jobType: "reconciliation",
+      outcome: "batch_reconciled",
+      checked,
+      confirmed: outcomes.confirmed,
+      failed: outcomes.failed,
+      expired: outcomes.expired,
+      stillPending: outcomes.pending,
+    },
+    "reconciled pending_confirmation and needs_review settlements against Horizon"
+  );
+}
+
+// ---------------------------------------------------------------------------
 // anchor reconciliation
 // ---------------------------------------------------------------------------
 
@@ -837,6 +1006,9 @@ async function reconcileSingleAnchor(
       return;
     }
 
+    // Transient failures are retried with exponential backoff
+    const delayMs = retryDelayMs(attempt, ANCHOR_RETRY_POLICY);
+    
     await prisma.anchorSession.update({
       where: { id: job.id },
       data: {
@@ -846,20 +1018,52 @@ async function reconcileSingleAnchor(
         errorCategory,
         nextAttemptAt: exhausted
           ? null
-          : new Date(Date.now() + retryDelayMs(attempt, ANCHOR_RETRY_POLICY)),
+          : new Date(Date.now() + delayMs),
       },
     });
 
     if (exhausted) {
+      // Dead-letter handling: mark as permanently failed after exhausting retries
+      await applyAnchorSessionTransition({
+        sessionId: job.id,
+        nextStatus: "error",
+        source: "poll",
+        expectedCurrentStatus: job.status,
+        reason: `${reason} (retries exhausted after ${attempt} attempts)`,
+        extraData: {
+          lastPolledAt: now,
+          failureReason: `${reason} (retries exhausted after ${attempt} attempts)`,
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        } as never,
+      });
       jobLog.error(
         {
           jobType: "anchor",
           jobId: job.id,
           attempt,
-          outcome: "failed",
+          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
+          outcome: "dead_letter",
+          category: "permanent",
           reason,
         },
-        "anchor poll failed with terminal error"
+        "anchor poll retries exhausted - marked as dead letter"
+      );
+    } else {
+      jobLog.warn(
+        {
+          jobType: "anchor",
+          jobId: job.id,
+          attempt,
+          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
+          outcome: "retry_scheduled",
+          category: errorCategory,
+          nextDelayMs: delayMs,
+          nextAttemptAt: new Date(Date.now() + delayMs).toISOString(),
+          reason,
+        },
+        "anchor poll failed - retry scheduled with exponential backoff"
       );
     }
     return;
@@ -1083,6 +1287,7 @@ interface WithdrawalJob {
   anchorTxId: string | null;
   anchorToken: string | null;
   status: string;
+  retryCount: number;
 }
 
 /**
@@ -1101,27 +1306,94 @@ async function reconcileSingleWithdrawal(
 
   if (!job.anchorToken || !job.anchorTxId) return;
 
+  const attempt = job.retryCount + 1;
   const result: PollResult = await anchorService.pollTransaction({
     transferServer,
     token: job.anchorToken,
     id: job.anchorTxId,
   });
 
+  const now = new Date();
+
   // A failed poll (timeout, unreachable anchor, HTTP error, malformed JSON)
-  // leaves the row exactly as it was. A single bad response must never move
-  // a money record: the withdrawal stays `processing`, the next cycle polls
-  // again, and the anchor's own webhook can still complete it meanwhile.
+  // is now handled with retry logic similar to anchor sessions.
   if (result.isError) {
-    jobLog.warn(
-      {
-        jobType: "withdrawal",
-        jobId: job.id,
-        outcome: "retry_scheduled",
-        category: result.category,
-        reason: safeFailureMessage(result.message),
+    const exhausted = attempt >= ANCHOR_RETRY_POLICY.maxAttempts;
+    const reason = safeFailureMessage(result.message);
+    const errorCategory: JobFailureCategory =
+      exhausted || result.errorCategory === "permanent" ? "permanent" : "transient";
+
+    // Permanent failures stop the withdrawal immediately
+    if (result.errorCategory === "permanent") {
+      jobLog.error(
+        {
+          jobType: "withdrawal",
+          jobId: job.id,
+          attempt,
+          outcome: "failed",
+          category: "permanent",
+          reason,
+        },
+        "withdrawal poll failed with a permanent error"
+      );
+      return;
+    }
+
+    // Transient failures are retried with exponential backoff
+    const delayMs = retryDelayMs(attempt, ANCHOR_RETRY_POLICY);
+    
+    await prisma.withdrawal.update({
+      where: { id: job.id },
+      data: {
+        retryCount: attempt,
+        failureReason: reason,
+        errorCategory,
+        nextAttemptAt: exhausted
+          ? null
+          : new Date(Date.now() + delayMs),
       },
-      "withdrawal poll failed; status left unchanged"
-    );
+    });
+
+    if (exhausted) {
+      // Dead-letter handling: mark as permanently failed after exhausting retries
+      await prisma.withdrawal.update({
+        where: { id: job.id },
+        data: {
+          status: "failed",
+          failureReason: `${reason} (retries exhausted after ${attempt} attempts)`,
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        },
+      });
+      jobLog.error(
+        {
+          jobType: "withdrawal",
+          jobId: job.id,
+          attempt,
+          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
+          outcome: "dead_letter",
+          category: "permanent",
+          reason,
+        },
+        "withdrawal poll retries exhausted - marked as dead letter"
+      );
+    } else {
+      jobLog.warn(
+        {
+          jobType: "withdrawal",
+          jobId: job.id,
+          attempt,
+          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
+          outcome: "retry_scheduled",
+          category: errorCategory,
+          nextDelayMs: delayMs,
+          nextAttemptAt: new Date(Date.now() + delayMs).toISOString(),
+          reason,
+        },
+        "withdrawal poll failed - retry scheduled with exponential backoff"
+      );
+    }
     return;
   }
 
@@ -1174,11 +1446,17 @@ async function reconcileSingleWithdrawal(
  * racing this loop can only duplicate anchor *reads*, never a transition.
  */
 export async function reconcileWithdrawals(): Promise<void> {
+  const now = new Date();
   const withdrawals = await prisma.withdrawal.findMany({
     where: {
       status: "processing",
       anchorTxId: { not: null },
       anchorToken: { not: null },
+      retryCount: { lt: ANCHOR_RETRY_POLICY.maxAttempts },
+      AND: [
+        { OR: [{ errorCategory: null }, { errorCategory: { not: "permanent" } }] },
+        { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
+      ],
     },
     orderBy: { updatedAt: "asc" as const },
     take: config.WORKER_BATCH_SIZE,
@@ -1213,6 +1491,7 @@ export async function reconcileWithdrawals(): Promise<void> {
       anchorTxId: withdrawal.anchorTxId,
       anchorToken: withdrawal.anchorToken,
       status: withdrawal.status,
+      retryCount: withdrawal.retryCount ?? 0,
     };
     const ctx = jobContext("withdrawal", job.id);
 

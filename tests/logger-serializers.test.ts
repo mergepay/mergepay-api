@@ -160,6 +160,64 @@ describe("shared logger options", () => {
   });
 });
 
+describe("Pino header serializer output", () => {
+  it("redacts sensitive request and response headers in emitted log payloads", () => {
+    const serializedLines: Record<string, any>[] = [];
+    const logger = pino(
+      { ...buildLoggerOptions({ level: "trace" }) },
+      {
+        write(chunk: string) {
+          serializedLines.push(JSON.parse(chunk));
+        },
+      }
+    );
+
+    logger.info(
+      {
+        req: {
+          method: "GET",
+          url: "/health/live",
+          headers: {
+            authorization: "Bearer request-secret",
+            cookie: "session=request-cookie",
+            "x-api-key": "request-api-key",
+            "user-agent": "mergepay-tests/1.0",
+          },
+        },
+        res: {
+          statusCode: 200,
+          headers: {
+            authorization: "Bearer response-secret",
+            cookie: "session=response-cookie",
+            "set-cookie": "session=response-set-cookie",
+            "x-api-key": "response-api-key",
+            "content-type": "application/json",
+          },
+        },
+      },
+      "header serializer test"
+    );
+
+    const [line] = serializedLines;
+    expect(line.req.headers).toMatchObject({
+      authorization: "[REDACTED]",
+      cookie: "[REDACTED]",
+      "x-api-key": "[REDACTED]",
+      "user-agent": "mergepay-tests/1.0",
+    });
+    expect(line.res.headers).toMatchObject({
+      authorization: "[REDACTED]",
+      cookie: "[REDACTED]",
+      "set-cookie": "[REDACTED]",
+      "x-api-key": "[REDACTED]",
+      "content-type": "application/json",
+    });
+    expect(JSON.stringify(line)).not.toMatch(
+      /request-secret|request-cookie|request-api-key|response-secret|response-cookie|response-set-cookie|response-api-key/
+    );
+  });
+});
+
 describe("request logging through the Fastify instance", () => {
   it("redacts credentials while keeping the request id and telemetry headers", async () => {
     const res = await app.inject({

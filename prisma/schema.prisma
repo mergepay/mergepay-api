@@ -309,6 +309,12 @@ model Withdrawal {
   interactiveUrl String?  @map("interactive_url")
   status         String   @default("pending")
   failureReason  String?  @map("failure_reason")
+  // Durable job state for the withdrawal worker (see src/worker/index.ts).
+  // Same contract as Settlement and AnchorSession: retry count, backoff
+  // scheduling, and failure classification for robust polling.
+  retryCount     Int      @default(0) @map("retry_count")
+  errorCategory  String?  @map("error_category")
+  nextAttemptAt  DateTime? @map("next_attempt_at")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
 
@@ -316,6 +322,7 @@ model Withdrawal {
 
   @@index([userId])
   @@index([status])
+  @@index([status, nextAttemptAt]) // For picking up eligible worker jobs
   // Unique (not just indexed): the anchor's transaction id is the
   // idempotency key for webhook/poll reconciliation — two Withdrawal rows
   // must never be able to claim the same anchor transaction. Postgres

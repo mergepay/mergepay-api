@@ -150,6 +150,7 @@ describe("syncPendingTransactionStatuses", () => {
       confirmed: 0,
       failed: 0,
       pending: 0,
+      expired: 0,
       unavailable: 0,
       skipped: 0,
     });
@@ -177,6 +178,7 @@ describe("syncPendingTransactionStatuses", () => {
       confirmed: 2,
       failed: 0,
       pending: 0,
+      expired: 0,
       unavailable: 0,
       skipped: 0,
     });
@@ -188,6 +190,7 @@ describe("syncPendingTransactionStatuses", () => {
         confirmed: 2,
         failed: 0,
         pending: 0,
+        expired: 0,
         unavailable: 0,
         skipped: 0,
       }),
@@ -263,6 +266,7 @@ describe("settlement status sync", () => {
       confirmed: 1,
       failed: 0,
       pending: 0,
+      expired: 0,
       unavailable: 0,
       skipped: 0,
     });
@@ -288,6 +292,7 @@ describe("settlement status sync", () => {
       confirmed: 0,
       failed: 0,
       pending: 0,
+      expired: 0,
       unavailable: 0,
       skipped: 1,
     });
@@ -311,6 +316,7 @@ describe("settlement status sync", () => {
       confirmed: 1,
       failed: 0,
       pending: 0,
+      expired: 0,
       unavailable: 1,
       skipped: 0,
     });
@@ -421,6 +427,7 @@ describe("treasury transaction status sync", () => {
       confirmed: 1,
       failed: 0,
       pending: 0,
+      expired: 0,
       unavailable: 0,
       skipped: 0,
     });
@@ -462,6 +469,7 @@ describe("treasury transaction status sync", () => {
       confirmed: 0,
       failed: 0,
       pending: 1,
+      expired: 0,
       unavailable: 0,
       skipped: 0,
     });
@@ -515,6 +523,7 @@ describe("treasury transaction status sync", () => {
       confirmed: 0,
       failed: 0,
       pending: 0,
+      expired: 0,
       unavailable: 1,
       skipped: 0,
     });
@@ -571,6 +580,7 @@ describe("treasury transaction status sync", () => {
       confirmed: 1,
       failed: 0,
       pending: 0,
+      expired: 0,
       unavailable: 1,
       skipped: 0,
     });

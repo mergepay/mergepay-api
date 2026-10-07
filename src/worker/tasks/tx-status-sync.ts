@@ -143,6 +143,7 @@ export type TxStatusSyncOutcome =
   | "confirmed"
   | "failed"
   | "pending"
+  | "expired"
   | "unavailable"
   | "skipped";
 
@@ -152,6 +153,7 @@ export interface TxStatusSyncSummary {
   confirmed: number;
   failed: number;
   pending: number;
+  expired: number;
   unavailable: number;
   skipped: number;
 }
@@ -202,6 +204,7 @@ function emptySummary(): TxStatusSyncSummary {
     confirmed: 0,
     failed: 0,
     pending: 0,
+    expired: 0,
     unavailable: 0,
     skipped: 0,
   };
@@ -780,6 +783,7 @@ export async function syncPendingTransactionStatuses(
       confirmed: summary.confirmed,
       failed: summary.failed,
       pending: summary.pending,
+      expired: summary.expired,
       unavailable: summary.unavailable,
       skipped: summary.skipped,
     },

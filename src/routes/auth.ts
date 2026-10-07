@@ -1,4 +1,4 @@
-import { FastifyInstance } from "fastify";
+import { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
 import { Errors } from "../errors";
@@ -33,9 +33,14 @@ export default async function authRoutes(app: FastifyInstance) {
   // Both buckets are keyed strictly by client IP — there is no authenticated
   // user yet, and the wallet's public key must never become a bucket key,
   // because differing 429 behaviour would then reveal whether an account is
-  // known to the API.
   const challengeLimit = rateLimited("authChallenge");
+  (challengeLimit.config.rateLimit as any).onExceeded = (req: FastifyRequest) => {
+    req.log.warn({ ip: req.ip }, "Rate limit exceeded for auth challenge");
+  };
   const verifyLimit = rateLimited("authVerify");
+  (verifyLimit.config.rateLimit as any).onExceeded = (req: FastifyRequest) => {
+    req.log.warn({ ip: req.ip }, "Rate limit exceeded for auth verify");
+  };
 
   // Every body on this plugin is annotated with `enforce: false`: ajv is left
   // describing the payload for the OpenAPI spec but not policing it, so a

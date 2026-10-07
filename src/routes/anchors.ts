@@ -13,7 +13,8 @@ import {
 } from "../services/withdrawal-status";
 import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
-import { applySep24Callback } from "../services/sep24";
+import { ipKey } from "../services/rate-limit-keys";
+import { safeFailureMessage } from "../services/job-retry";
 import {
   paginationQuerySchema,
   buildPage,
@@ -24,11 +25,7 @@ import {
 } from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
-import {
-  sep24DepositRequestSchema,
-  sep24InitQuerySchema,
-  sep24WithdrawRequestSchema,
-} from "../validations/sep24";
+import { sep24InteractiveRequestSchema } from "../validations/sep24";
 import { sep24CallbackSchema } from "../schemas/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
@@ -97,26 +94,12 @@ export default async function anchorRoutes(app: FastifyInstance) {
   );
 
   // -- start deposit / withdraw -----------------------------------------------
-  async function start(
-    kind: "deposit" | "withdrawal",
-    req: any,
-    requestSchema = kind === "deposit"
-      ? sep24DepositRequestSchema
-      : sep24WithdrawRequestSchema
-  ) {
+  async function start(kind: "deposit" | "withdrawal", req: any) {
     const auth = requireUser(req);
-    // Query first, then body: both are Zod-owned, and both run before the
-    // anchor is contacted, so a malformed request never reaches an upstream
-    // call, the database, or the audit log.
-    sep24InitQuerySchema.parse(req.query ?? {});
-    const body = requestSchema.parse(req.body);
+    const body = sep24InteractiveRequestSchema.parse(req.body);
 
-    // Validate that the requested asset is supported. The issuer is part of
-    // the request contract, so it is validated *with* the code rather than
-    // dropped: a caller naming an issuer Mergepay does not issue that asset
-    // under would otherwise get a session created against a different asset
-    // than the one it asked for.
-    validateAsset(body.assetCode, body.assetIssuer);
+    // Validate that the requested asset is supported.
+    validateAsset(body.assetCode);
 
     const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
     const challenge = await anchorService.getChallenge(
@@ -160,11 +143,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         summary: "Initiate SEP-24 interactive deposit",
         description:
           "Initiates a SEP-24 interactive deposit session and returns an anchor auth challenge.",
-        // Documented from the same Zod schema the handler parses with, but with
-        // the rules stripped: the handler is the only validator, so a rejection
-        // arrives in the documented VALIDATION_ERROR envelope with `issues`.
-        querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
-        body: openApiBody(sep24DepositRequestSchema, { enforce: false }),
+        body: openApiBody(sep24InteractiveRequestSchema),
         response: {
           200: {
             type: "object",
@@ -190,8 +169,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         summary: "Initiate SEP-24 interactive withdrawal",
         description:
           "Initiates a SEP-24 interactive withdrawal session and returns an anchor auth challenge.",
-        querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
-        body: openApiBody(sep24WithdrawRequestSchema, { enforce: false }),
+        body: openApiBody(sep24InteractiveRequestSchema),
         response: {
           200: {
             type: "object",
@@ -225,7 +203,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
       const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
 
       const session = await prisma.anchorSession.findUnique({
@@ -268,7 +246,6 @@ export default async function anchorRoutes(app: FastifyInstance) {
     "/anchors/sessions",
     {
       preHandler: [app.authenticate],
-      ...pollLimit,
       schema: {
         tags: ["SEP-24"],
         summary: "List user anchor sessions",
@@ -325,7 +302,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+      const { id } = z.object({ id: z.string() }).parse(req.params);
 
       const session = await prisma.anchorSession.findUnique({
         where: { id },
@@ -345,21 +322,27 @@ export default async function anchorRoutes(app: FastifyInstance) {
   app.post(
     "/anchors/webhook",
     {
-      ...rateLimited("anchorWebhook"),
+      config: {
+        rateLimit: {
+          max: config.SEP24_RATE_LIMIT_MAX,
+          timeWindow: config.RATE_LIMIT_WINDOW_MS,
+          keyGenerator: ipKey("anchor.webhook"),
+        },
+      },
       schema: {
         tags: ["SEP-24"],
         summary: "Anchor status webhook",
         description: "Receives signed webhook status notifications from SEP-24 anchors.",
-        body: openApiBody(sep24CallbackSchema),
+        // No `schema.body`: Fastify's JSON-schema validation would run before
+        // this route's handler and therefore before the shared-secret check,
+        // letting an unauthenticated caller probe the payload contract. The
+        // shared Zod schema below validates after the secret is verified.
         response: {
           200: {
             type: "object",
             additionalProperties: true,
             properties: {
-              received: { type: "boolean" },
-              status: { type: "string" },
-              matched: { type: "integer" },
-              updated: { type: "integer" },
+              ok: { type: "boolean" },
             },
           },
         },
@@ -372,31 +355,52 @@ export default async function anchorRoutes(app: FastifyInstance) {
         return reply.code(200).send({ ok: true }); // don't reveal verification result
       }
 
+      // Parsed only after the shared-secret check, so an unauthenticated
+      // caller can never reach the schema or the database. The canonical
+      // callback schema (src/schemas/sep24.ts) requires a transaction id and
+      // a status — top level or under `transaction` — and rejects anything
+      // else with the standard structured 400 VALIDATION_ERROR, the same way
+      // the JWT- and HMAC-authenticated callback routes do.
       const callback = sep24CallbackSchema.parse(req.body ?? {});
-      const result = await applySep24Callback(callback);
 
-      const withdrawal = await prisma.withdrawal.findUnique({
+      const mappedStatus = mapAnchorStatus(callback.rawStatus);
+      const sanitizedMessage =
+        callback.message === null ? null : safeFailureMessage(callback.message);
+
+      const sessions = await prisma.anchorSession.findMany({
+        where: { externalTransactionId: callback.externalTransactionId },
+      });
+      for (const session of sessions) {
+        // applyAnchorSessionTransition atomically validates the transition
+        // against the finite state map and writes its audit record in the
+        // same database transaction as the status change — see
+        // src/services/anchor-status.ts. An out-of-order or duplicate
+        // webhook delivery is a no-op rather than a regression.
+        await applyAnchorSessionTransition({
+          sessionId: session.id,
+          nextStatus: mappedStatus,
+          source: "webhook",
+          extraData: mappedStatus === "error" ? {
+            failureReason: sanitizedMessage,
+          } : undefined,
+        });
+      }
+
+      // The simpler `Withdrawal` record (POST /withdraw) is a separate
+      // table keyed by the same anchor transaction id — see
+      // src/services/withdrawal-status.ts for why it has its own status
+      // vocabulary and transition map.
+      const withdrawal = await (prisma as any).withdrawal.findUnique({
         where: { anchorTxId: callback.externalTransactionId },
       });
       if (withdrawal) {
         await applyWithdrawalTransition({
           withdrawalId: withdrawal.id,
-          nextStatus: mapAnchorStatusToWithdrawalStatus(
-            mapAnchorStatus(callback.rawStatus)
-          ),
+          nextStatus: mapAnchorStatusToWithdrawalStatus(mappedStatus),
           source: "webhook",
         });
       }
-
-      // 200 regardless of whether a session matched or the transition applied:
-      // anchors retry non-2xx responses, and re-delivering a callback that was
-      // correctly processed as a no-op only amplifies load.
-      return reply.code(200).send({
-        received: true,
-        status: result.status,
-        matched: result.matched,
-        updated: result.updated,
-      });
+      return reply.code(200).send({ ok: true });
     }
   );
 }

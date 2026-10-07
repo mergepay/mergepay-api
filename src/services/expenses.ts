@@ -1,12 +1,9 @@
 /**
- * Expense creation and listing: persistence, query construction, filtering,
- * and pagination.
+ * Expense listing: query construction, filtering, and pagination.
  *
  * The route stays thin — it authorizes, parses, and serializes. Everything
  * about *which* rows a page contains lives here so the filter semantics have
- * one home and can be tested without an HTTP server. The multi-table write
- * behind expense creation lives here too, so its transaction boundary has a
- * single home.
+ * one home and can be tested without an HTTP server.
  *
  * Pagination follows `src/lib/pagination.ts` unchanged: a `(createdAt, id)`
  * cursor, `limit + 1` rows to detect a further page, and the shared `meta`
@@ -26,7 +23,6 @@ import {
   takeForPage,
   type PageMeta,
 } from "../lib/pagination";
-import { auditTx } from "./audit";
 
 /**
  * Settlement state of an expense, as clients express it.

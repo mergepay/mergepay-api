@@ -52,6 +52,7 @@ import {
 import { pollForConfirmation } from "../services/horizon-confirm";
 import { settlementPaymentIntent } from "../services/settlement-xdr";
 import { checkSettlementPreflight } from "../services/settlement-preflight";
+import { recordStatusTransitionInTransaction } from "../services/status-history";
 import {
   classifySettlementFailure,
   type SettlementFailureCategory,
@@ -75,10 +76,15 @@ import {
   SETTLEMENT_RETRY_POLICY,
   type JobFailureCategory,
 } from "../services/job-retry";
-import { reconcileSettlements } from "../services/settlement-reconciliation";
+import {
+  RECONCILIATION_MAX_RETRIES,
+  reconcileSingleSettlement,
+  type SettlementReconciliationOutcome,
+} from "../services/settlement-reconciliation";
 import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
 import { cleanupChallenges } from "./tasks/cleanup-challenges";
+import { syncPendingTransactionStatuses } from "./tasks/tx-status-sync";
 import { acquireWorkerLease, releaseWorkerLease } from "../services/worker-lock";
 import {
   type CorrelationContext,
@@ -86,11 +92,27 @@ import {
   loggerWithContext,
 } from "../lib/correlation";
 import { jobLogger, type JobLogger } from "../lib/worker-logger";
+import {
+  CYCLE_TASK_RETRY_POLICY,
+  getWorkerHealth,
+  initWorkerHealth,
+  logHealthCritical,
+  logHealthHeartbeat,
+  recordCycleFailure,
+  recordCycleStart,
+  recordCycleSuccess,
+  recordTaskDeadLetter,
+  recordTaskFailure,
+  withRetry,
+} from "./health";
 
 const log = pino({ name: "worker" });
 
 /** Identifies this process in job leases, so it can release its own claims. */
 const WORKER_ID = randomUUID();
+
+// Bind the health registry to this process once, at module load.
+initWorkerHealth(WORKER_ID);
 
 /** Total submission attempts per settlement, including the first. */
 export const SETTLEMENT_MAX_RETRIES = SETTLEMENT_RETRY_POLICY.maxAttempts;
@@ -202,24 +224,32 @@ async function scheduleRetry(params: {
   const nextAttemptAt = new Date(Date.now() + delayMs);
   const leaseExpiresAt = new Date(nextAttemptAt.getTime() + config.WORKER_LEASE_TIMEOUT_MS);
 
-  await prisma.settlement.update({
-    where: { id: job.id },
-    data: {
-      retryCount: attempt,
-      nextAttemptAt,
-      errorCategory: category,
-      failureReason: reason,
-      leaseExpiresAt,
-    },
-  });
+  // The retry bookkeeping, the status-history entry, and the backoff decision
+  // describe one retry event; persist them in a single interactive transaction
+  // so a crash (or a database hiccup) between the writes can never leave a row
+  // whose retryCount, failure reason, and history disagree. A failure anywhere
+  // rolls both writes back and propagates: the worker's batch loop releases
+  // the lease and the next cycle re-claims the job from a consistent state.
+  await prisma.$transaction(async (tx) => {
+    await tx.settlement.update({
+      where: { id: job.id },
+      data: {
+        retryCount: attempt,
+        nextAttemptAt,
+        errorCategory: category,
+        failureReason: reason,
+        leaseExpiresAt,
+      },
+    });
 
-  await recordStatusTransition({
-    entityType: "settlement",
-    entityId: job.id,
-    newStatus: job.status,
-    reason,
-    source: "worker",
-  }).catch(() => undefined);
+    await recordStatusTransitionInTransaction(tx as never, {
+      entityType: "settlement",
+      entityId: job.id,
+      newStatus: job.status,
+      reason,
+      source: "worker",
+    });
+  });
 
   loggerWithContext(log, ctx).warn(
     {
@@ -362,6 +392,10 @@ async function confirmSubmission(params: {
     nextAttemptAt: null,
   });
 
+  // Best-effort, like `audit` everywhere outside a caller-owned transaction:
+  // the transition above already committed with its own atomic audit record,
+  // so this informational line must never turn a *completed* submission into
+  // a failed job.
   await audit({
     userId: null,
     groupId: job.groupId,
@@ -704,7 +738,12 @@ export async function recoverStaleSettlements(): Promise<number> {
   const now = new Date();
   const { count } = await prisma.settlement.updateMany({
     where: {
-      status: { in: [...SUBMITTABLE_STATUSES] },
+      // pending_confirmation and needs_review are included: their
+      // reconciliation runs under the same lease regime, so a crash mid-check
+      // must free the row the same way a crash mid-submission does.
+      status: {
+        in: [...SUBMITTABLE_STATUSES, "pending_confirmation", "needs_review"],
+      },
       leaseExpiresAt: { lt: now },
     },
     data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
@@ -972,11 +1011,14 @@ async function reconcileSingleAnchor(
     // no retry can change (rejected a request, returned garbage), so move the
     // session to error rather than burning the retry budget on it.
     if (result.errorCategory === "permanent") {
+      // The status_history row is written inside the transition's own
+      // transaction, only if the transition actually lands.
       await applyAnchorSessionTransition({
         sessionId: job.id,
         nextStatus: "error",
         source: "poll",
         expectedCurrentStatus: job.status,
+        reason,
         extraData: {
           lastPolledAt: now,
           failureReason: reason,
@@ -985,13 +1027,6 @@ async function reconcileSingleAnchor(
           retryCount: 0,
         } as never,
       });
-      await recordStatusTransition({
-        entityType: "anchor_session",
-        entityId: job.id,
-        newStatus: "error",
-        reason,
-        source: "worker",
-      }).catch(() => undefined);
       jobLog.error(
         {
           jobType: "anchor",
@@ -1070,10 +1105,10 @@ async function reconcileSingleAnchor(
   }
 
   // ── unknown anchor status ────────────────────────────────────────────────
-  // A recognised-but-unknown raw status maps to pending_anchor and stays
-  // retryable. Emit an explicit, operationally useful entry so operators can
-  // spot a future anchor that introduced a status we cannot classify — but
-  // never treat it as a failure or overwrite a terminal state.
+  // A status outside the SEP-24 set is not a failure, but it is not a state
+  // Mergepay can interpret either, so it is never persisted: the session
+  // keeps its last known status and stays eligible for the next poll. The
+  // warning lets operators spot an anchor that introduced a new status.
   if (result.recognized === false) {
     jobLog.warn(
       {
@@ -1081,11 +1116,22 @@ async function reconcileSingleAnchor(
         jobId: job.id,
         attempt,
         outcome: "retry_scheduled",
-        category: result.category ?? "unknown",
-        status: result.status,
+        localStatus: job.status,
+        rawStatus: result.rawStatus,
       },
-      `anchor reported an unrecognized SEP-24 status '${result.rawStatus}' — kept pending and will keep polling`
+      "anchor reported an unrecognized SEP-24 status — kept the current state and will keep polling"
     );
+    await prisma.anchorSession.update({
+      where: { id: job.id },
+      data: {
+        lastPolledAt: now,
+        failureReason: null,
+        errorCategory: null,
+        nextAttemptAt: null,
+        retryCount: 0,
+      },
+    });
+    return;
   }
 
   // ── status unchanged ─────────────────────────────────────────────────────
@@ -1133,6 +1179,8 @@ async function reconcileSingleAnchor(
     nextStatus: result.status,
     source: "poll",
     expectedCurrentStatus: job.status,
+    rawStatus: result.rawStatus ?? undefined,
+    reason: result.status === "error" ? result.message : undefined,
     extraData: {
       lastPolledAt: now,
       failureReason: result.status === "error" ? result.message ?? null : null,
@@ -1159,14 +1207,6 @@ async function reconcileSingleAnchor(
     );
     return;
   }
-
-  await recordStatusTransition({
-    entityType: "anchor_session",
-    entityId: job.id,
-    newStatus: result.status,
-    reason: result.status === "error" ? result.message ?? undefined : undefined,
-    source: "worker",
-  }).catch(() => undefined);
 
   jobLog.info(
     {
@@ -1573,6 +1613,61 @@ export async function expireStaleTreasuryProposals(): Promise<void> {
   }
 }
 
+/**
+ * Run one cycle task under the issue-#708 retry wrapper.
+ *
+ * A transient database or Horizon error is retried in-cycle with bounded,
+ * jittered exponential backoff. When the budget is exhausted the failure is
+ * *recorded* (health counters) and *logged as critical* — the dead-letter
+ * signal for a sweep task, which keeps no row of its own — and the cycle
+ * continues: one failing task must not starve the other eight.
+ */
+async function runCycleTask<T>(
+  taskName: string,
+  task: () => Promise<T>
+): Promise<void> {
+  try {
+    await withRetry(task, {
+      taskName,
+      policy: CYCLE_TASK_RETRY_POLICY,
+      // The worker's injectable delay, so tests drive the backoff schedule
+      // without real time passing (same pattern as the settlement loop).
+      sleep: delayFn,
+      onRetry: ({ attempt, delayMs, reason }) => {
+        recordTaskFailure(taskName);
+        log.warn(
+          {
+            jobType: "worker_cycle",
+            task: taskName,
+            attempt,
+            maxAttempts: CYCLE_TASK_RETRY_POLICY.maxAttempts,
+            outcome: "retry_scheduled",
+            nextDelayMs: delayMs,
+            reason,
+          },
+          "worker cycle task retry scheduled"
+       );
+      },
+    });
+  } catch (error) {
+    // Budget exhausted (or a permanent/indeterminate failure): log critical,
+    // count it, and let the cycle go on. The `error` field carries the
+    // sanitized failure so log-based alerting sees the real cause.
+    recordTaskFailure(taskName);
+    recordTaskDeadLetter(taskName);
+    log.error(
+      {
+        jobType: "worker_cycle",
+        task: taskName,
+        outcome: "dead_letter",
+        reason: safeFailureMessage(error),
+      },
+      "worker cycle task exhausted its retry budget"
+    );
+    throw error;
+  }
+}
+
 export async function runWorkerCycle(): Promise<void> {
   const lease = await acquireWorkerLease(
     "mergepay:worker-cycle",
@@ -1584,23 +1679,58 @@ export async function runWorkerCycle(): Promise<void> {
     return;
   }
 
-  try {
-  // Recover first: a restart should adopt the previous process's work before
-  // looking for new jobs.
-  await Promise.allSettled([recoverStaleSettlements(), recoverStaleAnchorSessions()]);
+  // Health tracking (issue #708): the cycle is timed, its outcome recorded,
+  // and a structured heartbeat emitted on every run so log-based alerting can
+  // see the loop is alive (or that consecutive cycles keep failing).
+  recordCycleStart();
+  let failed = false;
 
-  await Promise.allSettled([
-    processSubmittedSettlements(),
-    reconcileAnchors(),
-    reconcileWithdrawals(),
-    reconcileSettlements(),
-    reconcileAllTreasuryBalances(),
-    expireInvites(),
-    deliverPendingWebhooks(),
-    expireStaleTreasuryProposals(),
-    cleanupChallenges(),
-  ]);
+  try {
+    // Recover first: a restart should adopt the previous process's work before
+    // looking for new jobs. The recovery sweeps are cycle tasks like any other,
+    // so a transient database error during recovery is retried too.
+    await Promise.allSettled([
+      runCycleTask("recoverStaleSettlements", recoverStaleSettlements),
+      runCycleTask("recoverStaleAnchorSessions", recoverStaleAnchorSessions),
+    ]);
+
+    const taskResults = await Promise.allSettled([
+      runCycleTask("processSubmittedSettlements", processSubmittedSettlements),
+      runCycleTask("reconcileAnchors", reconcileAnchors),
+      runCycleTask("reconcileWithdrawals", reconcileWithdrawals),
+      runCycleTask("reconcilePendingSettlements", reconcilePendingSettlements),
+      // Read-only status sync over pending transactions neither sibling claims:
+      // settlements whose confirmation poll was interrupted, and treasury
+      // intents someone may have submitted from their own wallet (issue #355).
+      runCycleTask("syncPendingTransactionStatuses", syncPendingTransactionStatuses),
+      runCycleTask("reconcileAllTreasuryBalances", reconcileAllTreasuryBalances),
+      runCycleTask("expireInvites", expireInvites),
+      runCycleTask("deliverPendingWebhooks", deliverPendingWebhooks),
+      runCycleTask("expireStaleTreasuryProposals", expireStaleTreasuryProposals),
+      runCycleTask("cleanupChallenges", cleanupChallenges),
+    ]);
+
+    // A cycle is "failed" when any task exhausted its retry budget — exactly
+    // the tasks that were previously swallowed by allSettled with no trace.
+    failed = taskResults.some((r) => r.status === "rejected");
   } finally {
+    if (failed) {
+      recordCycleFailure("one or more cycle tasks exhausted their retry budget");
+    } else {
+      recordCycleSuccess();
+    }
+    logHealthHeartbeat(log);
+    if (
+      failed &&
+      getWorkerHealth().consecutiveFailures >=
+        config.WORKER_HEALTH_UNHEALTHY_THRESHOLD
+    )
+    {
+      logHealthCritical(
+        log,
+        "consecutive failed worker cycles reached the unhealthy threshold"
+      );
+    }
     await releaseWorkerLease(lease);
   }
 }
@@ -1676,6 +1806,11 @@ export async function startWorker(): Promise<() => Promise<void>> {
           { jobType: "worker_cycle", outcome: "shutdown_drain_timeout" },
           "in-flight job outran the drain budget, leaving leases to expire"
         );
+        // Leases stay claimed, but the process is on its way out regardless:
+        // the connection pool must still be released so a restart never
+        // inherits dangling database connections.
+        await prisma.$disconnect();
+        log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
         return;
       }
 
@@ -1692,6 +1827,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
         }),
       ]);
       await prisma.$disconnect();
+      log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
 
       log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "worker claims released");
     } catch (error) {

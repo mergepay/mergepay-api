@@ -646,6 +646,112 @@ path end-to-end:
 Subsequent requests use `{{token}}` automatically. Response variables
 (`@name` / `{{…}}`) chain group and expense IDs for you.
 
+## Architecture notes
+
+### Error handling standardization (#654)
+
+All errors flow through a single Fastify plugin (`src/plugins/error-handler.ts`)
+that maps framework, validation, database, and upstream failures to a canonical
+envelope while keeping operator-visible details server-side only. The mapping is
+deterministic and tested end-to-end:
+
+| Source | HTTP status | Error code | Details |
+| --- | --- | --- | --- |
+| Zod validation failure | 400 | `VALIDATION_ERROR` | Field-level issues with message and code |
+| Prisma P2002 (unique constraint) | 409 | `DUPLICATE_RECORD` | Conflicting fields, model name |
+| Prisma P2025/P2001 (record not found) | 404 | `NOT_FOUND` | — |
+| Prisma P2003 (foreign key) | 400 | `VALIDATION_ERROR` | Referenced field name |
+| Prisma lifecycle codes (P1000-P1017) | 503 | `SERVICE_UNAVAILABLE` | Retryable, driver text logged only |
+| Horizon upstream failure | 502 | `UPSTREAM_ERROR` | Provider error category |
+| Timeout / transport error | 502 | `UPSTREAM_ERROR` | Transient network issue |
+| Rate limit exceeded | 429 | `RATE_LIMIT_EXCEEDED` | Retry-After header |
+| Generic unhandled error | 500 | `INTERNAL_ERROR` | Sanitized message only |
+
+Tests: [`tests/prisma-error.test.ts`](tests/prisma-error.test.ts),
+[`tests/plugins/error-handler.test.ts`](tests/plugins/error-handler.test.ts).
+
+### Background worker retry and idempotency (#652)
+
+The settlement and SEP-24 anchor workers run as a separate process
+(`npm run worker:start`) and follow strict rules for resilience:
+
+**Claim before work.** Each job is claimed with a conditional update that writes
+a lease (`claimedBy`, `leaseExpiresAt`). Only one worker can win; two processes
+can never drive the same transition. A crashed worker's lease lapses and the job
+becomes eligible again.
+
+**Classify before retrying.** Every failure is categorised
+([`src/services/job-retry.ts`](src/services/job-retry.ts)):
+
+| Category | Meaning | Action |
+| --- | --- | --- |
+| `transient` | Call demonstrably did not take effect (rate limit, timeout, connection refused) | Retry with bounded exponential backoff + jitter |
+| `indeterminate` | Outcome unknown (dropped socket, timeout after submission) | Check Horizon by transaction hash **before** resubmitting |
+| `permanent` | Request itself is wrong (validation, authorization, rejected transaction) | Stop immediately, persist reason, visible to operators |
+
+**Idempotency guards.** Before any indeterminate failure is retried, the worker
+calls `alreadyApplied()` which queries Horizon by the envelope's deterministic
+hash. If the transaction already succeeded on-chain, the settlement advances to
+`confirmed` without resubmitting — preventing double payments when the response
+was lost but the payment went through.
+
+**Bounded backoff.** Exponential backoff with jitter prevents thundering herds:
+`delay = min(maxDelay, initialDelay × 2^(attempt-1)) ± jitter`. Policies are
+configurable via environment variables (see table below).
+
+**Permanent failure marking.** Terminal failures record three columns in the
+`Settlement` row:
+
+- `errorCategory`: retry decision (`transient` / `indeterminate` / `permanent`)
+- `failureReason`: sanitized, length-capped explanation (no secrets, no XDR)
+- `failureCategory`: why it failed (`validation` / `insufficient_funds` /
+  `expired` / `upstream` / `ledger_rejected` / `internal`)
+
+Tests: [`tests/worker.test.ts`](tests/worker.test.ts),
+[`tests/settlement-execute-idempotency.test.ts`](tests/settlement-execute-idempotency.test.ts).
+
+#### Worker retry configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WORKER_SETTLEMENT_MAX_ATTEMPTS` | 5 | Total submission attempts per settlement |
+| `WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS` | 1000 | Initial backoff delay |
+| `WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS` | 30000 | Maximum backoff cap |
+| `WORKER_SETTLEMENT_RETRY_JITTER_RATIO` | 0.25 | Jitter fraction (0–1) |
+| `WORKER_ANCHOR_MAX_ATTEMPTS` | 5 | Total poll attempts per anchor session |
+| `WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS` | 2000 | Anchor poll backoff start |
+| `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` | 60000 | Anchor poll backoff cap |
+| `WORKER_ANCHOR_RETRY_JITTER_RATIO` | 0.25 | Anchor jitter fraction |
+
+### Horizon SDK isolation (#650)
+
+Routes never call the Stellar SDK directly. The only import of
+`@stellar/stellar-sdk` in `src/routes/` is in
+[`src/routes/treasury.ts`](src/routes/treasury.ts:3) for `StrKey` (key format
+validation, not Horizon calls). All Horizon interaction goes through service
+modules (`src/services/stellar.ts`, `src/services/horizonService.ts`), ensuring
+a clean separation between request handling and blockchain interaction.
+
+### SEP-10 Zod validation (#647)
+
+Both SEP-10 endpoints parse their body against strict Zod schemas that reject
+unknown keys rather than silently ignoring them:
+
+- **`POST /auth/challenge`**: validates `account` as a 56-character Stellar
+  public key with checksum refinement
+  ([`src/validations/sep10.ts`](src/validations/sep10.ts:28-39))
+- **`POST /auth/verify`**: validates `transaction` as canonical base64 XDR
+  (whole number of 4-byte words, max 50KB), optional `home_domain` and
+  `client_domain` as valid domains
+  ([`src/validations/sep10.ts`](src/validations/sep10.ts:108-125))
+
+Unknown query parameters are also rejected, so a client mistakenly sending
+`GET /auth?account=...` gets a 400 VALIDATION_ERROR instead of being silently
+ignored.
+
+Tests: [`tests/validations/sep10.test.ts`](tests/validations/sep10.test.ts),
+[`tests/sep10-request-validation.test.ts`](tests/sep10-request-validation.test.ts).
+
 ## Deployment
 
 Deploys to **Render / Fly.io / Railway**. Provision Postgres (Neon/Supabase/RDS),

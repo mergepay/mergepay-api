@@ -64,9 +64,16 @@ vi.mock("../../src/services/stellar", async (importActual) => {
     stellar: {
       ...actual.stellar,
       loadAccount: vi.fn(async () => ({
-        exists: false,
+        exists: true,
         sequence: "0",
-        balances: [],
+        balances: [
+          {
+            balance: "1000.0000000",
+            asset_type: "credit_alphanum4",
+            asset_code: "XLM",
+            limit: "922337203685.4775807",
+          },
+        ],
         signers: [],
         thresholds: { low: 0, med: 0, high: 0 },
       })),
@@ -144,6 +151,12 @@ beforeEach(async () => {
     title: "New Expense",
     amount: "50.00",
     assetCode: "XLM",
+    assetIssuer: null,
+    splitType: "equal",
+    memo: null,
+    receiptUrl: null,
+    description: null,
+    createdAt: new Date("2026-01-01T00:00:00.000Z"),
     shares: [],
   });
   prisma.expense.update.mockResolvedValue({
@@ -151,6 +164,15 @@ beforeEach(async () => {
     groupId: GROUP_ID,
     payerUserId: MEMBER_USER,
     title: "Updated Expense",
+    description: null,
+    amount: "100.00",
+    assetCode: "XLM",
+    assetIssuer: null,
+    splitType: "equal",
+    memo: null,
+    receiptUrl: null,
+    createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    shares: [],
   });
   prisma.expense.delete.mockResolvedValue({});
 

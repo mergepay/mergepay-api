@@ -55,7 +55,7 @@ export const createExpenseSchema = z
     shares: z.array(shareInput).min(1),
     payerUserId: z.string().optional(),
     memo: z.string().max(24).optional(),
-    receiptUrl: z.string().nullable().optional(),
+    receiptUrl: z.string().url("Receipt URL must be a valid URL").nullable().optional(),
   })
   .superRefine((val, ctx) => {
     refineValidatedAsset(ctx, val.assetCode, val.assetIssuer);

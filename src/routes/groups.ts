@@ -420,6 +420,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/invite",
     {
+      ...rateLimited("groupInvite"),
       preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Groups"],
@@ -554,6 +555,7 @@ export default async function groupRoutes(app: FastifyInstance) {
   app.post(
     "/groups/join",
     {
+      ...rateLimited("groupJoin"),
       schema: {
         tags: ["Groups"],
         summary: "Join a group with an invite code",

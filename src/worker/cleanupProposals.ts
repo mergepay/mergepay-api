@@ -124,6 +124,9 @@ async function expireOne(
     await auditTx(tx, {
       userId: proposal.creatorId,
       groupId: proposal.groupId,
+      // The sweep decided this, not the creator — `userId` above is the owner
+      // the row belongs to, and without this the audit stream infers "user".
+      actorType: "worker",
       action: "treasury_proposal.expired",
       entityType: "treasury_proposal",
       entityId: proposal.id,

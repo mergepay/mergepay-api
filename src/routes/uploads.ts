@@ -24,6 +24,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { config } from "../config";
 import { Errors } from "../errors";
+import { rateLimited } from "../lib/rate-limit";
 import { requireUser } from "../plugins/auth";
 
 const ALLOWED: Record<string, string> = {
@@ -66,7 +67,7 @@ function assertNoTruncatedField(fields: unknown): void {
 export default async function uploadRoutes(app: FastifyInstance) {
   app.post(
     "/uploads/receipt",
-    { preHandler: [app.authenticate] },
+    { ...rateLimited("uploadReceipt"), preHandler: [app.authenticate] },
     async (req) => {
       requireUser(req);
 

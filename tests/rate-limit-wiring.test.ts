@@ -197,6 +197,15 @@ describe("sensitive routes carry the tighter per-route budget", () => {
     // Group creation and history.
     ["POST", "/groups", "groupCreate"],
     ["GET", "/history", "history"],
+    // Issue #668 — the categories the table did not model: the one public
+    // unauthenticated read, the membership writes, outbound-webhook
+    // registration, and the only multipart upload route.
+    ["GET", "/api/exchange-rates", "exchangeRates"],
+    ["POST", "/groups/:id/invite", "groupInvite"],
+    ["POST", "/groups/join", "groupJoin"],
+    ["POST", "/api/webhooks", "webhookCreate"],
+    ["POST", "/groups/:groupId/webhooks", "webhookCreate"],
+    ["POST", "/uploads/receipt", "uploadReceipt"],
   ];
 
   it("covers every route the application declares a limit on", () => {

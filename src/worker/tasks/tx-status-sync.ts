@@ -494,6 +494,8 @@ async function markTreasuryTransaction(
   await audit({
     userId: row.userId,
     groupId: row.groupId,
+    // Horizon told the worker, not the user. `userId` is the row's owner.
+    actorType: "worker",
     action:
       status === "failed"
         ? AuditAction.TREASURY_TRANSACTION_FAILED

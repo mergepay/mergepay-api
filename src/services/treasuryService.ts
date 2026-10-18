@@ -195,6 +195,7 @@ async function compareAndUpdate(
 
   await audit({
     groupId: treasuryId,
+    actorType: "worker",
     action: "treasury.balance_variance",
     entityType: "AccountBalance",
     entityId: `${publicKey}:${assetCode}`,

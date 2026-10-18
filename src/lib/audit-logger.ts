@@ -98,7 +98,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 export interface AuditActor {
   /** "user" for authenticated callers; "worker" | "system" for automation. */
   type: "user" | "worker" | "system";
-  /** Authenticated user id when `type` is "user", otherwise omitted. */
+  /**
+   * The authenticated user who acted. Emitted only when `type` is "user":
+   * an automated transition still carries the user it *concerned* (in the
+   * durable row's `userId` and in metadata), but that user is not the actor,
+   * and writing their id here would make a worker's change attributable to
+   * them.
+   */
   id?: string | null;
 }
 
@@ -156,7 +162,7 @@ export function emitAuditEvent(input: AuditEventInput): void {
     const actorType = input.actorType ?? (input.userId ? "user" : "system");
     const actor: AuditActor = {
       type: actorType,
-      ...(input.userId ? { id: input.userId } : {}),
+      ...(actorType === "user" && input.userId ? { id: input.userId } : {}),
     };
 
     // The durable writer records outcome only when the caller supplies one, so

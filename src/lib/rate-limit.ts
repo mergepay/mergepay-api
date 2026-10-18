@@ -8,9 +8,14 @@
  *
  *   app.post("/settlements/:id/confirm", rateLimited("settlementConfirm"), handler)
  *
- * Every policy gets its own key *prefix*, which is what makes the buckets
- * independent: two routes with the same identity still consume separate
- * budgets, and a read route with no policy only ever touches the global one.
+ * Every policy gets its own key *prefix*, so a tier's counter can never land
+ * in the global bucket or in another tier's: a read route with no policy only
+ * ever touches the global one. Two routes that name the same policy produce the
+ * same key, and whether they then share a budget depends on the counter store —
+ * with `RATE_LIMIT_STORE=database` they do (one row per key), while the default
+ * in-memory store gives every route its own child store, so they do not. The
+ * `webhookCreate` and `anchorPoll` policies are each applied to two routes and
+ * are affected by that difference.
  *
  * Keying rules (see src/services/rate-limit-keys.ts):
  *  - `user-or-ip` — the authenticated Mergepay user id when the request has
@@ -60,7 +65,12 @@ export type RateLimitPolicyName =
   | "sep24Callback"
   | "sep24Webhook"
   | "groupCreate"
-  | "history";
+  | "groupInvite"
+  | "groupJoin"
+  | "history"
+  | "exchangeRates"
+  | "webhookCreate"
+  | "uploadReceipt";
 
 export interface RateLimitPolicy {
   /** Requests permitted per window. */
@@ -208,6 +218,61 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       timeWindow: config.RATE_LIMIT_HISTORY_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "history.read",
+      hook: "preHandler",
+    },
+    // The only public unauthenticated read in the API. Without its own bucket
+    // it consumed the caller's global allowance — and there is no caller, so
+    // every anonymous scan spent the per-IP global budget that the same IP
+    // would later need for a real request. It also prices two asset pairs
+    // upstream per call, so it is the cheapest route to make someone else's
+    // infrastructure bill with.
+    exchangeRates: {
+      max: config.RATE_LIMIT_EXCHANGE_RATES_MAX,
+      timeWindow: config.RATE_LIMIT_EXCHANGE_RATES_WINDOW_MS,
+      keyBy: "ip",
+      prefix: "rates.read",
+      hook: "onRequest",
+    },
+    // Membership writes. `groupCreate` budgets group *creation*; nothing here
+    // bounded adding people to a group that already exists, which is the write
+    // a compromised admin session actually uses. Its own bucket keeps invite
+    // spam from also burning the caller's creation allowance.
+    groupInvite: {
+      max: config.RATE_LIMIT_GROUP_INVITE_MAX,
+      timeWindow: config.RATE_LIMIT_GROUP_INVITE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "group.invite",
+      hook: "preHandler",
+    },
+    // Redeeming an invite code is guessed at, not spent: the threat is walking
+    // codes that belong to other groups, which is a per-source property. Keyed
+    // by IP on `onRequest` so rotating sessions cannot widen the search.
+    groupJoin: {
+      max: config.RATE_LIMIT_GROUP_JOIN_MAX,
+      timeWindow: config.RATE_LIMIT_GROUP_JOIN_WINDOW_MS,
+      keyBy: "ip",
+      prefix: "group.join",
+      hook: "onRequest",
+    },
+    // Registering a webhook hands the server a URL to call — on a retry
+    // schedule, so one accepted request becomes many outbound attempts. Budgeted
+    // per account, separate from group writes, because the cost lands on egress
+    // rather than on the caller's own rows.
+    webhookCreate: {
+      max: config.RATE_LIMIT_WEBHOOK_CREATE_MAX,
+      timeWindow: config.RATE_LIMIT_WEBHOOK_CREATE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "webhook.create",
+      hook: "preHandler",
+    },
+    // Multipart uploads write to disk. Sharing the global bucket with reads
+    // meant a client retrying a lost upload response could also starve its own
+    // dashboard polling, and vice versa.
+    uploadReceipt: {
+      max: config.RATE_LIMIT_UPLOAD_RECEIPT_MAX,
+      timeWindow: config.RATE_LIMIT_UPLOAD_RECEIPT_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "upload.receipt",
       hook: "preHandler",
     },
   };

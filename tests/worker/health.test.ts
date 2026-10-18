@@ -42,6 +42,8 @@ const h = vi.hoisted(() => ({
     },
     withdrawal: { findMany: vi.fn(async () => []) },
     invite: { deleteMany: vi.fn(async () => ({ count: 0 })) },
+    // The durable dead-letter record (#667): `audit()` writes here.
+    auditLog: { create: vi.fn(async () => ({ id: "audit_1" })) },
     $disconnect: vi.fn(async () => {}),
   },
   cleanupChallenges: vi.fn(async () => {}),
@@ -377,5 +379,88 @@ describe("runWorkerCycle — task retries, dead-lettering, and heartbeat (#708)"
     expect(health.cyclesFailed).toBe(1);
     expect(health.lastCycleOutcome).toBe("failed");
     expect(health.deadLetteredTasks).toContain("cleanupChallenges");
+  });
+});
+
+describe("runCycleTask — durable dead-letter record (#667)", () => {
+  /** The audit row written for `taskName`, or undefined when there is none. */
+  function deadLetterRow(entityId: string) {
+    return h.prisma.auditLog.create.mock.calls
+      .map(([arg]) => arg.data)
+      .find((data) => data?.action === "worker.task.dead_letter" && data?.entityId === entityId);
+  }
+
+  it("persists a dead-letter audit row when a task exhausts its budget", async () => {
+    h.cleanupChallenges.mockRejectedValue(
+      Object.assign(new Error("service unavailable"), { status: 503 })
+    );
+
+    await runWorkerCycle();
+
+    const row = deadLetterRow("cleanupChallenges");
+    expect(row).toBeDefined();
+    // No user owns a sweep task, so the record must not pretend one does.
+    expect(row.userId).toBeNull();
+    expect(row.groupId).toBeNull();
+    expect(row.entityType).toBe("worker_task");
+    expect(row.metadata.outcome).toBe("failure");
+    expect(row.metadata.actorType).toBe("worker");
+    // Enough detail to answer "what stopped, why, and how many times" from the
+    // database alone — the point of the row is that it outlives this process.
+    expect(row.metadata.reason).toBe("service unavailable");
+    expect(row.metadata.category).toBe("transient");
+    expect(row.metadata.maxAttempts).toBe(CYCLE_TASK_RETRY_POLICY.maxAttempts);
+    expect(typeof row.metadata.workerId).toBe("string");
+  });
+
+  it("mirrors the dead letter as a structured audit line attributed to the worker", async () => {
+    h.cleanupChallenges.mockRejectedValue(
+      Object.assign(new Error("service unavailable"), { status: 503 })
+    );
+
+    await runWorkerCycle();
+
+    const line = h.logger.info.mock.calls
+      .map(([fields]) => fields)
+      .find((fields) => fields?.event === "audit" && fields?.action === "worker.task.dead_letter");
+    expect(line).toBeDefined();
+    // `actor.type` is the field alerting filters on; "worker" is what separates
+    // this from a user's failed request.
+    expect(line.actor).toEqual({ type: "worker" });
+    expect(line.target).toEqual({ type: "worker_task", id: "cleanupChallenges" });
+    expect(line.outcome).toBe("failure");
+  });
+
+  it("writes no dead-letter row for a task that succeeds after retrying", async () => {
+    h.cleanupChallenges
+      .mockRejectedValueOnce(Object.assign(new Error("db connection refused"), { status: 503 }))
+      .mockResolvedValueOnce(undefined);
+
+    await runWorkerCycle();
+
+    expect(h.cleanupChallenges).toHaveBeenCalledTimes(2);
+    expect(h.prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(getWorkerHealth().deadLetteredTasks).toEqual([]);
+  });
+
+  it("writes a row per dead-lettered task, not just the first", async () => {
+    h.cleanupChallenges.mockRejectedValue(
+      Object.assign(new Error("service unavailable"), { status: 503 })
+    );
+    h.reconcileAllTreasuryBalances.mockRejectedValue(
+      Object.assign(new Error("gateway timeout"), { status: 504 })
+    );
+
+    await runWorkerCycle();
+
+    expect(deadLetterRow("cleanupChallenges")).toBeDefined();
+    const treasury = deadLetterRow("reconcileAllTreasuryBalances");
+    expect(treasury).toBeDefined();
+    expect(treasury.metadata.reason).toBe("gateway timeout");
+    expect(treasury.metadata.category).toBe("transient");
+
+    const health = getWorkerHealth();
+    expect(health.deadLetteredTasks).toContain("cleanupChallenges");
+    expect(health.deadLetteredTasks).toContain("reconcileAllTreasuryBalances");
   });
 });

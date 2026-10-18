@@ -248,6 +248,10 @@ export async function applyAnchorSessionTransition(params: {
 
     await auditTx(tx, {
       userId: session.userId,
+      // Only "user" means the owner performed it. A `poll` is the background
+      // worker asking the anchor, and a `webhook` is the anchor reporting back;
+      // in both cases the owner is who the session belongs to, not the actor.
+      actorType: source === "user" ? "user" : source === "poll" ? "worker" : "system",
       action: "anchor_session.status_changed",
       entityType: "anchor_session",
       entityId: sessionId,

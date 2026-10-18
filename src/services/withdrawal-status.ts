@@ -209,6 +209,9 @@ export async function applyWithdrawalTransition(params: {
 
     await auditTx(tx, {
       userId: withdrawal.userId,
+      // Same rule as anchor sessions: only "user" was performed by the owner —
+      // "poll" is the worker, "webhook" is the anchor reporting back.
+      actorType: source === "user" ? "user" : source === "poll" ? "worker" : "system",
       action: "withdrawal.status_changed",
       entityType: "withdrawal",
       entityId: withdrawalId,

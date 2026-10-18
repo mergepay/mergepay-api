@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 const h = vi.hoisted(() => {
   const prisma: any = {
@@ -53,7 +53,10 @@ function register(body: Record<string, unknown>, headers = authHeader()) {
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  if (!app) app = await buildApp();
+  // A fresh app per case: the limiter's counter lives in the app instance, and
+  // these cases exercise registration validation, not throttling — #668 gave
+  // this route a per-user tier, so they must not inherit each other's bucket.
+  app = await buildApp();
 
   // Group registration is an administrative action (#700), so the default
   // caller is an admin; the non-admin refusal test overrides this to member.
@@ -70,6 +73,10 @@ beforeEach(async () => {
     updatedAt: new Date("2026-01-01T00:00:00.000Z"),
     ...data,
   }));
+});
+
+afterEach(async () => {
+  await app.close();
 });
 
 describe("POST /api/webhooks", () => {

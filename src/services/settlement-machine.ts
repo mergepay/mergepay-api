@@ -163,6 +163,10 @@ export async function applySettlementTransition(params: ApplySettlementTransitio
 
     await auditTx(client, {
       userId: settlement.fromUserId,
+      // `source` is the transition's own provenance and its values are exactly
+      // the actor vocabulary, so a worker's confirmation is recorded as the
+      // worker's act even though the row belongs to the payer.
+      actorType: source,
       action: "settlement.status_changed",
       entityType: "settlement",
       entityId: settlementId,

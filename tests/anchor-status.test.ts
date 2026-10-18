@@ -96,7 +96,15 @@ describe("applyAnchorSessionTransition", () => {
         action: "anchor_session.status_changed",
         entityType: "anchor_session",
         entityId: "session_1",
-        metadata: { from: "pending_anchor", to: "completed", source: "webhook" },
+        // `source: "webhook"` is the anchor reporting back, so the actor is
+        // automation even though the session belongs to `user_1`.
+        userId: "user_1",
+        metadata: {
+          from: "pending_anchor",
+          to: "completed",
+          source: "webhook",
+          actorType: "system",
+        },
       }),
     });
   });

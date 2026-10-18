@@ -175,7 +175,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
   // never included in any subsequent read: a caller who loses it registers a
   // new endpoint rather than recovering the old one, which keeps a leaked
   // response body from being enough to forge signed payloads later.
-  app.post("/api/webhooks", async (req, reply) => {
+  app.post("/api/webhooks", rateLimited("webhookCreate"), async (req, reply) => {
     const auth = requireUser(req);
     const body = registerSchema.parse(req.body);
 
@@ -245,7 +245,10 @@ async function webhookManagementRoutes(app: FastifyInstance) {
   const asMember = { preHandler: requireGroupRole("member", { param: "groupId" }) };
   const asAdmin = { preHandler: requireGroupRole("admin", { param: "groupId" }) };
 
-  app.post("/groups/:groupId/webhooks", asAdmin, async (req) => {
+  app.post(
+    "/groups/:groupId/webhooks",
+    { ...asAdmin, ...rateLimited("webhookCreate") },
+    async (req) => {
     const auth = requireUser(req);
     const { groupId } = paramsSchema.parse(req.params);
     const body = createSchema.parse(req.body);

@@ -173,6 +173,7 @@ export async function reconcileSingleSettlement(
         });
         await audit({
           userId: null,
+          actorType: "worker",
           action: "settlement.verification_failed",
           entityType: "settlement",
           entityId: settlement.id,
@@ -205,6 +206,7 @@ export async function reconcileSingleSettlement(
     });
     await audit({
       userId: null,
+      actorType: "worker",
       action: "settlement.completed",
       entityType: "settlement",
       entityId: settlement.id,
@@ -227,6 +229,7 @@ export async function reconcileSingleSettlement(
   });
   await audit({
     userId: null,
+    actorType: "worker",
     action: "settlement.failed",
     entityType: "settlement",
     entityId: settlement.id,
@@ -304,6 +307,7 @@ async function handleTransactionNotFound(
     });
     await audit({
       userId: null,
+      actorType: "worker",
       action: "settlement.reconciliation.exhausted",
       entityType: "settlement",
       entityId: settlement.id,

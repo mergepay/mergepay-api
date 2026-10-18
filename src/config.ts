@@ -295,6 +295,38 @@ const schema = z.object({
   RATE_LIMIT_GROUP_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   RATE_LIMIT_HISTORY: z.coerce.number().int().positive().max(100000).default(30),
   RATE_LIMIT_HISTORY_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Issue #668 — the routes that were left on the global bucket. Each is a
+  // category the table did not model: a public unauthenticated read, the
+  // membership writes, outbound-webhook registration, and multipart upload.
+  //
+  // GET /api/exchange-rates answers without a session, and every call prices
+  // two asset pairs through the anchor services, so it is the one route an
+  // anonymous scanner can spend real upstream budget on. Keyed by IP, because
+  // there is no identity to key by.
+  RATE_LIMIT_EXCHANGE_RATES_MAX: z.coerce.number().int().positive().max(100000).default(30),
+  RATE_LIMIT_EXCHANGE_RATES_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Invitations are writes with side effects beyond the caller's own data: each
+  // one targets a third-party account. The budget is deliberately tighter than
+  // group creation because a compromised admin session spams members, not
+  // groups.
+  RATE_LIMIT_GROUP_INVITE_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_GROUP_INVITE_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Joining redeems an invite code, so the abuse shape is guessing codes that
+  // belong to other groups. That threat is per-source, not per-account — an
+  // attacker rotates accounts as easily as codes — so this bucket is keyed by
+  // IP and runs on `onRequest`, before the session is even read.
+  RATE_LIMIT_GROUP_JOIN_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_GROUP_JOIN_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Registering a webhook makes the server issue outbound HTTP to a
+  // caller-supplied URL on a retry schedule, so a single account can multiply
+  // one request into many egress attempts.
+  RATE_LIMIT_WEBHOOK_CREATE_MAX: z.coerce.number().int().positive().max(100000).default(10),
+  RATE_LIMIT_WEBHOOK_CREATE_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
+  // Receipt uploads write to disk and are retried by clients that lost the
+  // response, so they need a budget of their own rather than the global one
+  // they share with every read the same client makes.
+  RATE_LIMIT_UPLOAD_RECEIPT_MAX: z.coerce.number().int().positive().max(100000).default(20),
+  RATE_LIMIT_UPLOAD_RECEIPT_WINDOW_MS: z.coerce.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS).default(60000),
   // trusted proxies: only trust X-Forwarded-For if the direct peer is in this
   // comma-separated list; otherwise Fastify falls back to req.ip = socket remote.
   TRUSTED_PROXY_IPS: z.string().default(""),

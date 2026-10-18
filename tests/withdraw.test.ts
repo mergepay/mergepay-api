@@ -297,7 +297,12 @@ describe("POST /withdraw/:id/confirm", () => {
         action: "withdrawal.status_changed",
         entityType: "withdrawal",
         entityId: "wth_1",
-        metadata: { from: "pending", to: "processing", source: "user" },
+        metadata: {
+          from: "pending",
+          to: "processing",
+          source: "user",
+          actorType: "user",
+        },
       }),
     });
   });

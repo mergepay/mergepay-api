@@ -484,7 +484,14 @@ describe("Conditional stale-write guard (expectedCurrentStatus)", () => {
     expect(prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          metadata: { from: "pending_anchor", to: "completed", source: "poll" },
+          // A poll is the worker asking the anchor, so the worker is the actor
+          // even though the session belongs to `user_1`.
+          metadata: {
+            from: "pending_anchor",
+            to: "completed",
+            source: "poll",
+            actorType: "worker",
+          },
         }),
       })
     );

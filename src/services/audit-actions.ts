@@ -58,6 +58,12 @@ export const AuditAction = {
   SETTLEMENT_CONFIRMED: "settlement.confirmed",
   SETTLEMENT_FAILED: "settlement.failed",
   SETTLEMENT_RETRIED: "settlement.retried",
+
+  // ── Worker (background jobs) ────────────────────────────────────────
+  // A cycle task that exhausted its in-cycle retry budget. Sweep tasks keep no
+  // row of their own to fail, so this record is the durable trace that a job
+  // stopped running — see src/worker/index.ts `runCycleTask`.
+  WORKER_TASK_DEAD_LETTER: "worker.task.dead_letter",
 } as const;
 
 export type AuditActionValue = (typeof AuditAction)[keyof typeof AuditAction];

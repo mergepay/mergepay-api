@@ -51,9 +51,9 @@ const REAUTH_HINT = {
   message:
     "Your session has expired. Re-authenticate via SEP-10 to continue, or refresh your session if you hold a valid refresh token.",
   endpoints: {
-    sep10Challenge: "/auth/challenge",
-    sep10Verify: "/auth/verify",
-    refresh: "/auth/refresh",
+    sep10Challenge: "/api/v1/auth/challenge",
+    sep10Verify: "/api/v1/auth/verify",
+    refresh: "/api/v1/auth/refresh",
   },
 } as const;
 

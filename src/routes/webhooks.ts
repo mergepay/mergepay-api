@@ -78,7 +78,7 @@ async function sep24CallbackRoute(app: FastifyInstance) {
   );
 
   app.post(
-    "/api/webhooks/sep24",
+    "/webhooks/sep24",
     {
       ...rateLimited("sep24Webhook"),
       schema: {
@@ -115,7 +115,7 @@ async function sep24CallbackRoute(app: FastifyInstance) {
         // signature was malformed, stale, or simply wrong hands an attacker a
         // free oracle for probing the secret.
         req.log.warn(
-          { reason: verification.reason, route: "/api/webhooks/sep24" },
+          { reason: verification.reason, route: "/webhooks/sep24" },
           "rejected SEP-24 callback"
         );
         throw Errors.unauthorized("Invalid webhook signature");
@@ -175,7 +175,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
   // never included in any subsequent read: a caller who loses it registers a
   // new endpoint rather than recovering the old one, which keeps a leaked
   // response body from being enough to forge signed payloads later.
-  app.post("/api/webhooks", rateLimited("webhookCreate"), async (req, reply) => {
+  app.post("/webhooks", rateLimited("webhookCreate"), async (req, reply) => {
     const auth = requireUser(req);
     const body = registerSchema.parse(req.body);
 

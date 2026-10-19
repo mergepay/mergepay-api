@@ -44,7 +44,7 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
   // or its legacy `groupId` alias), a parseable `xdr`, and an optional
   // bounded `description`.
   app.post(
-    "/api/treasury/proposals",
+    "/treasury/proposals",
     rateLimited("treasuryPropose"),
     async (req) => {
       const auth = requireUser(req);
@@ -79,7 +79,7 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
   );
 
   // -- GET /api/treasury/proposals/:id -------------------------------------
-  app.get("/api/treasury/proposals/:id", async (req) => {
+  app.get("/treasury/proposals/:id", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
 
@@ -95,7 +95,7 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
 
   // -- POST /api/treasury/proposals/:id/signatures --------------------------
   app.post(
-    "/api/treasury/proposals/:id/signatures",
+    "/treasury/proposals/:id/signatures",
     rateLimited("treasurySubmit"),
     async (req) => {
       const auth = requireUser(req);

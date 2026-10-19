@@ -195,6 +195,7 @@ See [.env.example](.env.example). Key ones:
 | `ANCHOR_HOME_DOMAIN` | SEP-24 anchor home domain (default SDF test anchor) |
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
+| `REQUEST_TIMEOUT_MS` | Per-request wall-clock budget in milliseconds (default 10000, must be positive) |
 
 #### Database connection & query timeouts
 
@@ -268,7 +269,7 @@ General retry configuration for safe Horizon and anchor reads (see `src/services
 
 #### Idempotency configuration
 
-Idempotency for `POST /api/settlements/execute` prevents duplicate submissions:
+Idempotency for `POST /api/v1/settlements/execute` prevents duplicate submissions:
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -277,12 +278,35 @@ Idempotency for `POST /api/settlements/execute` prevents duplicate submissions:
 
 #### SEP-24 webhook configuration
 
-Configuration for SEP-24 anchor callbacks (`POST /api/webhooks/sep24`):
+Configuration for SEP-24 anchor callbacks (`POST /api/v1/webhooks/sep24`):
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `SEP24_WEBHOOK_SECRETS` | "" | Per-anchor HMAC secrets as "anchorName:secret,anchorName:secret" |
 | `SEP24_WEBHOOK_TOLERANCE_MS` | 300000 (5m) | Maximum timestamp deviation allowed for anchor callbacks |
+
+#### Request timeout
+
+Every request gets a wall-clock budget (`REQUEST_TIMEOUT_MS`, default 10s) so a
+hung handler cannot hold its connection or a worker forever.
+[src/plugins/request-timeout.ts](src/plugins/request-timeout.ts) arms the timer
+on `onRequest` — covering auth, validation, database work, and upstream calls,
+not just the handler body — and answers a request that overruns it with the
+standard error envelope:
+
+```json
+{
+  "error": { "code": "REQUEST_TIMEOUT", "message": "Request timed out", "timestamp": "…" },
+  "code": "REQUEST_TIMEOUT",
+  "message": "Request timed out"
+}
+```
+
+The timer is disarmed on the response's `finish`/`close`, so promises or
+streams the handler leaves behind cannot fire a 408 onto a response that was
+already sent. There are no per-route exemptions — health probes are subject to
+the same bound — so an operator can reason about one budget rather than a
+matrix of them.
 
 ### Rate limiting
 
@@ -299,13 +323,13 @@ traffic pattern or trust boundary replace that default with their own bucket:
 | `POST /groups/:id/expenses` | `RATE_LIMIT_EXPENSE_CREATE_MAX` / `_WINDOW_MS` | 30 / 1 min |
 | `POST /expenses/:id/settle`, `POST /groups/:id/settlements`, `POST /groups/:id/treasury/deposit`, `POST /groups/:id/treasury/withdraw` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
 | `POST /settlements/:id/confirm`, `POST /withdraw/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 20 / 1 min |
-| `POST /api/settlements/execute` | `RATE_LIMIT_SETTLEMENT_EXECUTE_MAX` / `_WINDOW_MS` | 20 / 1 min |
-| `POST /treasury-transactions/:id/confirm`, `POST /groups/:groupId/treasury/proposals/:proposalId/sign`, `POST /api/treasury/proposals/:id/signatures` | `RATE_LIMIT_TREASURY_SUBMIT_MAX` / `_WINDOW_MS` | 30 / 1 min |
-| `POST /groups/:groupId/treasury/proposals`, `POST /api/treasury/proposals` | `RATE_LIMIT_TREASURY_PROPOSE_MAX` / `_WINDOW_MS` | 20 / 1 min |
-| `POST /anchors/deposit`, `POST /anchors/withdraw`, `POST /anchors/sessions/:id/complete`, `POST /api/sep24/deposit`, `POST /api/sep24/withdraw`, `POST /withdraw` | `RATE_LIMIT_ANCHOR_INIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /api/v1/settlements/execute` | `RATE_LIMIT_SETTLEMENT_EXECUTE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /treasury-transactions/:id/confirm`, `POST /groups/:groupId/treasury/proposals/:proposalId/sign`, `POST /api/v1/treasury/proposals/:id/signatures` | `RATE_LIMIT_TREASURY_SUBMIT_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /groups/:groupId/treasury/proposals`, `POST /api/v1/treasury/proposals` | `RATE_LIMIT_TREASURY_PROPOSE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /anchors/deposit`, `POST /anchors/withdraw`, `POST /anchors/sessions/:id/complete`, `POST /api/v1/sep24/deposit`, `POST /api/v1/sep24/withdraw`, `POST /withdraw` | `RATE_LIMIT_ANCHOR_INIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
 | `GET /anchors`, `GET /anchors/sessions`, `GET /anchors/sessions/:id` | `RATE_LIMIT_ANCHOR_POLL_MAX` / `_WINDOW_MS` | 60 / 1 min |
 | `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 50 / 1 min |
-| `POST /api/sep24/callback`, `POST /api/webhooks/sep24` | `SEP24_RATE_LIMIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /api/v1/sep24/callback`, `POST /api/v1/webhooks/sep24` | `SEP24_RATE_LIMIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
 | `POST /groups` | `RATE_LIMIT_GROUP` / `_WINDOW_MS` | 10 / 1 min |
 | `GET /history` | `RATE_LIMIT_HISTORY` / `_WINDOW_MS` | 30 / 1 min |
 
@@ -489,7 +513,7 @@ treasury account and, when `treasuryRequiredSigners > 1`, returned in
 exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signed
 `POST /anchors/webhook` updates session status; the worker also polls.
 
-`/api/sep24/deposit|withdraw` are aliases of the same two routes and share the
+`/api/v1/sep24/deposit|withdraw` are aliases of the same two routes and share the
 same request contract. Both are validated by the Zod schemas in
 [src/validations/sep24.ts](src/validations/sep24.ts) before the anchor is
 contacted, so a malformed request never reaches an upstream call, the database,
@@ -534,7 +558,29 @@ Status tracking (`src/services/anchor.ts`, `src/services/anchor-status.ts`):
 - A status outside the SEP-24 set is logged and ignored. The session keeps its
   last known state and the worker keeps polling.
 
+## API versioning
+
+Domain routes are served under the **`/api/v1`** prefix: `/api/v1/auth/challenge`,
+`/api/v1/groups`, `/api/v1/anchors/deposit`, and so on. The prefix is a single
+constant (`API_V1_PREFIX` in [src/app.ts](src/app.ts)) passed to every route
+plugin's registration, so the fastify route table, the OpenAPI document, and
+the rate-limit wiring all describe the same versioned surfaces.
+
+Clients written against the pre-version paths keep working: a `rewriteUrl` hook
+maps the legacy root spellings (`/auth/challenge`, `/groups/…`) and the old
+`/api/…` aliases (`/api/sep24/deposit`, `/api/treasury/proposals`, …) onto the
+canonical versioned routes before routing, preserving the query string. The
+rewrite is a compatibility layer, not a second surface — both spellings reach
+the same handler, validators, and audit entries — and new integrations should
+use `/api/v1`. The operational endpoints (`/health`, `/health/live`,
+`/health/ready`, `/docs`, and the static `/uploads/…` receipt files) stay at
+the root: they are outside the versioned API contract and probes must not have
+to track an API version.
+
 ## Endpoints
+
+All paths below are relative to `/api/v1` (see
+[API versioning](#api-versioning)).
 
 | Method | Path | Purpose |
 | --- | --- | --- |

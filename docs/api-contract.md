@@ -1,5 +1,10 @@
 # Mergepay API contract reference
 
+Routes are served under the `/api/v1` prefix; path references below are written
+without it for brevity unless the full spelling is the point. The legacy root
+and `/api/…` spellings still route to the same handlers (see the API versioning
+section in [../README.md](../README.md#api-versioning)).
+
 The canonical client contract lives in `mergepay-web/src/lib/types.ts`. This file
 is the local reference for the parts of the contract that are defined by this
 repository, so a change here can be mirrored there in one step.
@@ -78,7 +83,7 @@ name go to the log instead.
 ## Pagination
 
 Applies to `GET /groups`, `/groups/:id/expenses`, `/groups/:id/settlements`, `/groups/:id/ledger`,
-`/groups/:id/treasury/history`, `/anchors/sessions`, `/api/sep24/transactions`, and `/history`.
+`/groups/:id/treasury/history`, `/anchors/sessions`, `/api/v1/sep24/transactions`, and `/history`.
 Defined in [../src/lib/pagination.ts](../src/lib/pagination.ts).
 
 ### Query parameters

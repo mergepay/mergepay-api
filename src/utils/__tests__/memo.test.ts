@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
 import {
   parseMemo,
   isValidMemoCode,
@@ -7,6 +8,7 @@ import {
   MAX_MEMO_BYTES,
   validateExpenseMemo,
   parseExpenseCode,
+  mergepayMemoSchema,
 } from "../memo";
 
 describe("Stellar Memo Validation Utility (src/utils/memo)", () => {
@@ -174,6 +176,46 @@ describe("Stellar Memo Validation Utility (src/utils/memo)", () => {
       expect(parseExpenseCode("mp:AB234")).toBeNull();
       expect(parseExpenseCode("MP:AB!234")).toBeNull();
       expect(parseExpenseCode("MP:" + "A".repeat(26))).toBeNull();
+    });
+  });
+
+  describe("mergepayMemoSchema (Zod integration)", () => {
+    it("accepts the same memos the parser accepts", () => {
+      for (const memo of ["MP:A", "MP:AB234", "MP:XYZ234789"]) {
+        expect(mergepayMemoSchema.safeParse(memo).success).toBe(true);
+      }
+    });
+
+    it("rejects a missing or wrong prefix with the parser's message", () => {
+      const result = mergepayMemoSchema.safeParse("AB234");
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].message).toMatch(/must start with 'MP:'/i);
+      }
+    });
+
+    it("rejects a memo that exceeds the 28-byte Stellar MEMO_TEXT bound", () => {
+      const oversize = `${MP_PREFIX}${"A".repeat(26)}`; // 29 bytes
+      expect(Buffer.byteLength(oversize, "utf8")).toBeGreaterThan(MAX_MEMO_BYTES);
+      const result = mergepayMemoSchema.safeParse(oversize);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].message).toMatch(/28 UTF-8 bytes/i);
+      }
+    });
+
+    it("rejects non-string input at the Zod boundary", () => {
+      expect(mergepayMemoSchema.safeParse(undefined).success).toBe(false);
+      expect(mergepayMemoSchema.safeParse(12345).success).toBe(false);
+    });
+
+    it("composes into an object schema and reports the field path", () => {
+      const body = z.object({ memo: mergepayMemoSchema });
+      const result = body.safeParse({ memo: "not-a-memo" });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].path).toEqual(["memo"]);
+      }
     });
   });
 });

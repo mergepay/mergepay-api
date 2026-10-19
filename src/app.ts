@@ -12,6 +12,7 @@ import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
 import openAPIPlugin from "./plugins/openapi";
 import rateLimitPlugin, { type RateLimitRegistration } from "./plugins/rate-limit";
+import requestTimeoutPlugin from "./plugins/request-timeout";
 import { validateAssetConfig } from "./services/assets";
 import authRoutes from "./routes/auth";
 import groupRoutes from "./routes/groups";
@@ -76,6 +77,98 @@ export interface BuildAppOptions {
    * production caller, keep the default. See src/plugins/rate-limit.ts.
    */
   rateLimit?: RateLimitRegistration;
+  /**
+   * Request timeout for this instance, in milliseconds; defaults to
+   * `config.REQUEST_TIMEOUT_MS`.
+   *
+   * Exists so a suite can prove the timeout without waiting the production
+   * budget out. A test that injects a deliberately slow route passes a few
+   * milliseconds and asserts the 408; production callers pass nothing and keep
+   * the configured value. See src/plugins/request-timeout.ts.
+   */
+  requestTimeoutMs?: number;
+}
+
+/**
+ * Versioned base path every domain route is mounted under (issue #386).
+ *
+ * The version lives in the registration, not in each route file, so the
+ * version bump is one edit here rather than one per `app.get(...)` call.
+ * Operational endpoints — health probes, the OpenAPI docs, and the static
+ * `/uploads/` file server — deliberately stay at the root; a client's
+ * liveness probe should not have to track the API version.
+ */
+export const API_V1_PREFIX = "/api/v1";
+
+/**
+ * Legacy API path prefixes that keep resolving while clients migrate onto
+ * {@link API_V1_PREFIX}.
+ *
+ * Before versioning, domain routes lived at these root paths (and a handful of
+ * newer ones under `/api/...`). Fastify's `rewriteUrl` maps those requests onto
+ * the versioned route table, so an existing client keeps working after this
+ * change while a new one targets `/api/v1` explicitly. Every entry is a real
+ * past route prefix: a request outside this set — a test route, a typo, a
+ * probe — is never rewritten and still answers 404 from wherever it pointed.
+ */
+const LEGACY_API_PATH_PREFIXES = [
+  "/auth",
+  "/me",
+  "/groups",
+  "/expenses",
+  "/settlements",
+  "/treasury",
+  "/treasury-transactions",
+  "/anchors",
+  "/withdraw",
+  "/history",
+  "/users",
+  // The upload endpoint moved under the version prefix while its served files
+  // stayed at /uploads/<file>; only the endpoint path is rewritten.
+  "/uploads/receipt",
+] as const;
+
+/**
+ * Map a legacy request path onto its versioned equivalent, preserving the
+ * query string. Anything already versioned, operational, or unknown is
+ * returned untouched.
+ */
+export function toVersionedUrl(rawUrl: string): string {
+  const queryAt = rawUrl.indexOf("?");
+  const pathname = queryAt === -1 ? rawUrl : rawUrl.slice(0, queryAt);
+  const search = queryAt === -1 ? "" : rawUrl.slice(queryAt);
+
+  if (pathname === API_V1_PREFIX || pathname.startsWith(`${API_V1_PREFIX}/`)) {
+    return rawUrl;
+  }
+
+  // Paths that were already namespaced, just without a version: /api/sep24/x
+  // becomes /api/v1/sep24/x. Checked before the root-prefix list below so an
+  // entry like /api/exchange-rates never becomes /api/v1/api/exchange-rates.
+  if (pathname.startsWith("/api/")) {
+    return `${API_V1_PREFIX}${pathname.slice("/api".length)}${search}`;
+  }
+
+  const isLegacyDomainPath = LEGACY_API_PATH_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)
+  );
+
+  return isLegacyDomainPath ? `${API_V1_PREFIX}${pathname}${search}` : rawUrl;
+}
+
+/**
+ * Strip the version prefix from a registered route URL, if present.
+ *
+ * `onRoute` sees the URL after the registration prefix has been applied, while
+ * the tables in this file are written against route-relative paths. Normalising
+ * here keeps `BODY_LIMITED_ROUTES` readable and correct no matter which prefix
+ * a route plugin was registered under.
+ */
+function stripApiVersion(url: string): string {
+  if (url === API_V1_PREFIX) return "/";
+  return url.startsWith(`${API_V1_PREFIX}/`)
+    ? url.slice(API_V1_PREFIX.length)
+    : url;
 }
 
 export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
@@ -102,6 +195,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   const app = Fastify({
     requestIdHeader: "x-request-id",
+    // Legacy path compatibility for the /api/v1 migration (issue #386). Runs
+    // before routing, so the route table itself contains only versioned paths
+    // while old clients keep reaching them.
+    rewriteUrl: (request) => toVersionedUrl(request.url ?? "/"),
     genReqId: (request) => {
       const incomingRequestId = request.headers["x-request-id"];
       const incomingCorrelationId = request.headers["x-correlation-id"];
@@ -141,6 +238,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   if (options.onRoute) {
     app.addHook("onRoute", options.onRoute);
   }
+
+  // Bounds the whole pipeline — auth, validation, handler, upstream and
+  // database work — and answers an overrun with 408. Registered before the
+  // route plugins so its `onRequest` hook is inherited by every route they
+  // declare, including any test route added afterwards.
+  await app.register(requestTimeoutPlugin, {
+    timeoutMs: options.requestTimeoutMs ?? config.REQUEST_TIMEOUT_MS,
+  });
 
   app.addHook("onRequest", async (request, reply) => {
     const requestId = request.id;
@@ -302,7 +407,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   ]);
 
   app.addHook("onRoute", (routeOptions) => {
-    const url = routeOptions.url;
+    // Registered routes carry the /api/v1 prefix; the tables above are written
+    // against route-relative paths.
+    const url = stripApiVersion(routeOptions.url);
 
     if (url === "/uploads/receipt") {
       routeOptions.bodyLimit = config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024;
@@ -350,23 +457,26 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     return reply.code(statusCode).send(deepHealth);
   });
 
-  await app.register(authRoutes);
-  await app.register(groupRoutes);
-  await app.register(expenseRoutes);
-  await app.register(settlementRoutes);
-  await app.register(treasuryRoutes);
-  await app.register(treasuryProposalRoutes);
-  await app.register(treasurySignatureRoutes);
-  await app.register(treasuryMultisigRoutes);
-  await app.register(anchorRoutes);
-  await app.register(withdrawalRoutes);
-  await app.register(historyRoutes);
-  await app.register(uploadRoutes);
-  await app.register(userGroupsRoutes);
-  await app.register(auditLogRoutes);
-  await app.register(sep24Routes);
-  await app.register(webhookRoutes);
-  await app.register(exchangeRateRoutes);
+  // Every domain route plugin is mounted under /api/v1 (issue #386), so no
+  // route file spells the version itself. Health, docs, and the static
+  // /uploads/ server above stay at the root on purpose.
+  await app.register(authRoutes, { prefix: API_V1_PREFIX });
+  await app.register(groupRoutes, { prefix: API_V1_PREFIX });
+  await app.register(expenseRoutes, { prefix: API_V1_PREFIX });
+  await app.register(settlementRoutes, { prefix: API_V1_PREFIX });
+  await app.register(treasuryRoutes, { prefix: API_V1_PREFIX });
+  await app.register(treasuryProposalRoutes, { prefix: API_V1_PREFIX });
+  await app.register(treasurySignatureRoutes, { prefix: API_V1_PREFIX });
+  await app.register(treasuryMultisigRoutes, { prefix: API_V1_PREFIX });
+  await app.register(anchorRoutes, { prefix: API_V1_PREFIX });
+  await app.register(withdrawalRoutes, { prefix: API_V1_PREFIX });
+  await app.register(historyRoutes, { prefix: API_V1_PREFIX });
+  await app.register(uploadRoutes, { prefix: API_V1_PREFIX });
+  await app.register(userGroupsRoutes, { prefix: API_V1_PREFIX });
+  await app.register(auditLogRoutes, { prefix: API_V1_PREFIX });
+  await app.register(sep24Routes, { prefix: API_V1_PREFIX });
+  await app.register(webhookRoutes, { prefix: API_V1_PREFIX });
+  await app.register(exchangeRateRoutes, { prefix: API_V1_PREFIX });
 
   return app;
 }

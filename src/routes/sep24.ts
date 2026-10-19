@@ -184,7 +184,7 @@ export default async function sep24Routes(app: FastifyInstance) {
   }
 
   app.post(
-    "/api/sep24/deposit",
+    "/sep24/deposit",
     {
       preHandler: [app.authenticate, validateSep24Deposit],
       ...initLimit,
@@ -214,7 +214,7 @@ export default async function sep24Routes(app: FastifyInstance) {
   );
 
   app.post(
-    "/api/sep24/withdraw",
+    "/sep24/withdraw",
     {
       preHandler: [app.authenticate, validateSep24Withdraw],
       ...initLimit,
@@ -255,7 +255,7 @@ export default async function sep24Routes(app: FastifyInstance) {
   // (`status_eta`, `amount_in`, `fee_details`, …) are omitted rather than
   // invented; `session_id` and `status_history` are Mergepay's own additions.
   app.get(
-    "/api/sep24/transaction",
+    "/sep24/transaction",
     {
       preHandler: [app.authenticate],
       ...pollLimit,
@@ -309,7 +309,7 @@ export default async function sep24Routes(app: FastifyInstance) {
   // above: a client paging through a loop must not be able to amplify its own
   // polling into anchor traffic.
   app.get(
-    "/api/sep24/transactions",
+    "/sep24/transactions",
     {
       preHandler: [app.authenticate],
       ...pollLimit,
@@ -391,7 +391,7 @@ export default async function sep24Routes(app: FastifyInstance) {
   // check, which remains the authorization gate. Keyed by IP because there is
   // no authenticated user to key by.
   app.post(
-    "/api/sep24/callback",
+    "/sep24/callback",
     {
       ...rateLimited("sep24Callback"),
       schema: {

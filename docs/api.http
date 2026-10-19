@@ -17,7 +17,7 @@ GET {{baseUrl}}/health
 
 ### 2. SEP-10 Challenge
 # @name challenge
-POST {{baseUrl}}/auth/challenge
+POST {{baseUrl}}/api/v1/auth/challenge
 Content-Type: application/json
 
 {
@@ -41,7 +41,7 @@ Content-Type: application/json
 #     " '<challenge-xdr>' '<your-secret>'
 #
 # @name verify
-POST {{baseUrl}}/auth/verify
+POST {{baseUrl}}/api/v1/auth/verify
 Content-Type: application/json
 
 {
@@ -53,12 +53,12 @@ Content-Type: application/json
 ### ───────────────────────────────────────────────────────────────────────
 
 ### 4. Get current user
-GET {{baseUrl}}/me
+GET {{baseUrl}}/api/v1/me
 Authorization: Bearer {{token}}
 
 ### 5. Create a group
 # @name createGroup
-POST {{baseUrl}}/groups
+POST {{baseUrl}}/api/v1/groups
 Authorization: Bearer {{token}}
 Content-Type: application/json
 
@@ -70,7 +70,7 @@ Content-Type: application/json
 ### 6. Add an expense
 @groupId = {{createGroup.response.body.group.id}}
 # @name createExpense
-POST {{baseUrl}}/groups/{{groupId}}/expenses
+POST {{baseUrl}}/api/v1/groups/{{groupId}}/expenses
 Authorization: Bearer {{token}}
 Content-Type: application/json
 
@@ -91,7 +91,7 @@ Content-Type: application/json
 # The payer's share is auto-settled on creation.  For this to succeed you
 # need at least one other group member who is the payer.
 @expenseId = {{createExpense.response.body.expense.id}}
-POST {{baseUrl}}/expenses/{{expenseId}}/settle
+POST {{baseUrl}}/api/v1/expenses/{{expenseId}}/settle
 Authorization: Bearer {{token}}
 Content-Type: application/json
 
@@ -100,5 +100,5 @@ Content-Type: application/json
 }
 
 ### 8. Get personal history
-GET {{baseUrl}}/history
+GET {{baseUrl}}/api/v1/history
 Authorization: Bearer {{token}}

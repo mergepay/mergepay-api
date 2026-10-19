@@ -694,10 +694,10 @@ describe("OpenAPI graph", () => {
 
     expect(res.statusCode).toBe(200);
     const paths = res.json().paths;
-    expect(paths["/treasury/propose"].post).toBeTruthy();
-    expect(paths["/treasury/{id}/sign"].post).toBeTruthy();
-    expect(paths["/treasury/propose"].post.tags).toContain("Treasury");
-    expect(paths["/treasury/{id}/sign"].post.responses).toEqual(
+    expect(paths["/api/v1/treasury/propose"].post).toBeTruthy();
+    expect(paths["/api/v1/treasury/{id}/sign"].post).toBeTruthy();
+    expect(paths["/api/v1/treasury/propose"].post.tags).toContain("Treasury");
+    expect(paths["/api/v1/treasury/{id}/sign"].post.responses).toEqual(
       expect.objectContaining({ "401": expect.anything(), "409": expect.anything() })
     );
   });

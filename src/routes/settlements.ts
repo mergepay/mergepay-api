@@ -668,7 +668,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // and network latency between a client and this API is exactly the condition
   // that produces an unacknowledged retry.
   app.post(
-    "/api/settlements/execute",
+    "/settlements/execute",
     {
       ...executeLimit,
       preHandler: app.idempotent({

@@ -39,6 +39,12 @@ const schema = z.object({
   DATABASE_CONNECTION_LIMIT: z.coerce.number().int().positive().default(5),
   PORT: z.coerce.number().int().positive().default(4000),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  // How long (ms) a request may occupy a connection before the server answers
+  // it with 408 Request Timeout. Bounds stalled handlers — a slow-loris client,
+  // a runaway Horizon call, or a database query the pool never resolves — so a
+  // request cannot pin a worker thread indefinitely. See
+  // src/plugins/request-timeout.ts for the enforcement mechanism.
+  REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   API_PUBLIC_URL: urlSchema,
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])

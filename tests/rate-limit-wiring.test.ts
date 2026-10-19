@@ -77,8 +77,8 @@ beforeAll(async () => {
 describe("rate-limit registration options", () => {
   it("registers every route, so the audit below is looking at the real route table", () => {
     expect(routes.length).toBeGreaterThan(30);
-    expect(routes.some((r) => r.url === "/auth/challenge")).toBe(true);
-    expect(routes.some((r) => r.url === "/settlements/:id/confirm")).toBe(true);
+    expect(routes.some((r) => r.url === "/api/v1/auth/challenge")).toBe(true);
+    expect(routes.some((r) => r.url === "/api/v1/settlements/:id/confirm")).toBe(true);
   });
 });
 
@@ -151,64 +151,64 @@ describe("sensitive routes carry the tighter per-route budget", () => {
   const expected: Array<[string, string, RateLimitPolicyName]> = [
     // SEP-10. Keyed by IP: there is no session yet, and a public-key bucket
     // would make 429s an oracle for whether an account is known.
-    ["POST", "/auth/challenge", "authChallenge"],
-    ["POST", "/auth/verify", "authVerify"],
-    ["POST", "/auth/refresh", "authVerify"],
+    ["POST", "/api/v1/auth/challenge", "authChallenge"],
+    ["POST", "/api/v1/auth/verify", "authVerify"],
+    ["POST", "/api/v1/auth/refresh", "authVerify"],
     // Expense creation writes a row and starts a payment split, so it is
     // budgeted on its own rather than drawing on the settlement budget.
-    ["POST", "/groups/:id/expenses", "expenseCreate"],
+    ["POST", "/api/v1/groups/:id/expenses", "expenseCreate"],
     // Settlement submission and confirmation.
-    ["POST", "/expenses/:id/settle", "settlementCreate"],
-    ["POST", "/groups/:id/settlements", "settlementCreate"],
-    ["POST", "/api/settlements/execute", "settlementExecute"],
-    ["POST", "/settlements/:id/confirm", "settlementConfirm"],
-    ["POST", "/groups/:id/treasury/deposit", "settlementCreate"],
-    ["POST", "/groups/:id/treasury/withdraw", "settlementCreate"],
+    ["POST", "/api/v1/expenses/:id/settle", "settlementCreate"],
+    ["POST", "/api/v1/groups/:id/settlements", "settlementCreate"],
+    ["POST", "/api/v1/settlements/execute", "settlementExecute"],
+    ["POST", "/api/v1/settlements/:id/confirm", "settlementConfirm"],
+    ["POST", "/api/v1/groups/:id/treasury/deposit", "settlementCreate"],
+    ["POST", "/api/v1/groups/:id/treasury/withdraw", "settlementCreate"],
     // On-chain payment submission (issues #363 / #403): withdrawal initiation
     // fans out to the anchor like the other anchor-init routes, and the
     // confirmation submits a signed XDR like the other confirm routes.
-    ["POST", "/withdraw", "anchorInit"],
-    ["POST", "/withdraw/:id/confirm", "settlementConfirm"],
-    ["POST", "/treasury-transactions/:id/confirm", "treasurySubmit"],
+    ["POST", "/api/v1/withdraw", "anchorInit"],
+    ["POST", "/api/v1/withdraw/:id/confirm", "settlementConfirm"],
+    ["POST", "/api/v1/treasury-transactions/:id/confirm", "treasurySubmit"],
     // Treasury multisig: creating a proposal is bounded separately from adding
     // a signature to one.
-    ["POST", "/api/treasury/proposals", "treasuryPropose"],
-    ["POST", "/groups/:groupId/treasury/proposals", "treasuryPropose"],
-    ["POST", "/api/treasury/proposals/:id/signatures", "treasurySubmit"],
-    ["POST", "/groups/:groupId/treasury/proposals/:proposalId/sign", "treasurySubmit"],
+    ["POST", "/api/v1/treasury/proposals", "treasuryPropose"],
+    ["POST", "/api/v1/groups/:groupId/treasury/proposals", "treasuryPropose"],
+    ["POST", "/api/v1/treasury/proposals/:id/signatures", "treasurySubmit"],
+    ["POST", "/api/v1/groups/:groupId/treasury/proposals/:proposalId/sign", "treasurySubmit"],
     // Issue #657's collection-style aliases of the same two operations.
-    ["POST", "/treasury/propose", "treasuryPropose"],
-    ["POST", "/treasury/:id/sign", "treasurySubmit"],
+    ["POST", "/api/v1/treasury/propose", "treasuryPropose"],
+    ["POST", "/api/v1/treasury/:id/sign", "treasurySubmit"],
     // Anchor / SEP-24. Initiation fans out upstream, so it is the tightest.
-    ["POST", "/anchors/deposit", "anchorInit"],
-    ["POST", "/anchors/withdraw", "anchorInit"],
-    ["POST", "/anchors/sessions/:id/complete", "anchorInit"],
-    ["POST", "/api/sep24/deposit", "anchorInit"],
-    ["POST", "/api/sep24/withdraw", "anchorInit"],
-    ["GET", "/anchors", "anchorPoll"],
-    ["GET", "/anchors/sessions", "anchorPoll"],
-    ["GET", "/anchors/sessions/:id", "anchorPoll"],
+    ["POST", "/api/v1/anchors/deposit", "anchorInit"],
+    ["POST", "/api/v1/anchors/withdraw", "anchorInit"],
+    ["POST", "/api/v1/anchors/sessions/:id/complete", "anchorInit"],
+    ["POST", "/api/v1/sep24/deposit", "anchorInit"],
+    ["POST", "/api/v1/sep24/withdraw", "anchorInit"],
+    ["GET", "/api/v1/anchors", "anchorPoll"],
+    ["GET", "/api/v1/anchors/sessions", "anchorPoll"],
+    ["GET", "/api/v1/anchors/sessions/:id", "anchorPoll"],
     // SEP-24 status polling (#651) — same budget as the session reads, because
     // it is the same DB-only status read under a spec-shaped response.
-    ["GET", "/api/sep24/transaction", "anchorPoll"],
+    ["GET", "/api/v1/sep24/transaction", "anchorPoll"],
     // The list form of the same poll (#655): one page of the same DB-only
     // status reads, so it takes the same budget rather than a new one.
-    ["GET", "/api/sep24/transactions", "anchorPoll"],
-    ["POST", "/anchors/webhook", "anchorWebhook"],
-    ["POST", "/api/sep24/callback", "sep24Callback"],
-    ["POST", "/api/webhooks/sep24", "sep24Webhook"],
+    ["GET", "/api/v1/sep24/transactions", "anchorPoll"],
+    ["POST", "/api/v1/anchors/webhook", "anchorWebhook"],
+    ["POST", "/api/v1/sep24/callback", "sep24Callback"],
+    ["POST", "/api/v1/webhooks/sep24", "sep24Webhook"],
     // Group creation and history.
-    ["POST", "/groups", "groupCreate"],
-    ["GET", "/history", "history"],
+    ["POST", "/api/v1/groups", "groupCreate"],
+    ["GET", "/api/v1/history", "history"],
     // Issue #668 — the categories the table did not model: the one public
     // unauthenticated read, the membership writes, outbound-webhook
     // registration, and the only multipart upload route.
-    ["GET", "/api/exchange-rates", "exchangeRates"],
-    ["POST", "/groups/:id/invite", "groupInvite"],
-    ["POST", "/groups/join", "groupJoin"],
-    ["POST", "/api/webhooks", "webhookCreate"],
-    ["POST", "/groups/:groupId/webhooks", "webhookCreate"],
-    ["POST", "/uploads/receipt", "uploadReceipt"],
+    ["GET", "/api/v1/exchange-rates", "exchangeRates"],
+    ["POST", "/api/v1/groups/:id/invite", "groupInvite"],
+    ["POST", "/api/v1/groups/join", "groupJoin"],
+    ["POST", "/api/v1/webhooks", "webhookCreate"],
+    ["POST", "/api/v1/groups/:groupId/webhooks", "webhookCreate"],
+    ["POST", "/api/v1/uploads/receipt", "uploadReceipt"],
   ];
 
   it("covers every route the application declares a limit on", () => {

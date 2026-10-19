@@ -151,8 +151,8 @@ function post(path: string, payload: unknown, query = "") {
 }
 
 /** The four initiation routes: two aliases for deposit, two for withdrawal. */
-const DEPOSIT_ROUTES = ["/anchors/deposit", "/api/sep24/deposit"] as const;
-const WITHDRAW_ROUTES = ["/anchors/withdraw", "/api/sep24/withdraw"] as const;
+const DEPOSIT_ROUTES = ["/api/v1/anchors/deposit", "/api/v1/sep24/deposit"] as const;
+const WITHDRAW_ROUTES = ["/api/v1/anchors/withdraw", "/api/v1/sep24/withdraw"] as const;
 
 /**
  * Assert the standardized validation envelope: a 400 whose body carries the
@@ -552,7 +552,7 @@ describe("SEP-24 initiation — OpenAPI annotations", () => {
     const res = await app.inject({ method: "GET", url: "/docs/json" });
     const paths = res.json().paths ?? {};
 
-    for (const route of ["/anchors/deposit", "/anchors/withdraw", "/api/sep24/deposit", "/api/sep24/withdraw"]) {
+    for (const route of ["/api/v1/anchors/deposit", "/api/v1/anchors/withdraw", "/api/v1/sep24/deposit", "/api/v1/sep24/withdraw"]) {
       const body = paths[route]?.post?.requestBody?.content?.["application/json"]?.schema;
       expect(body, `missing documented body for ${route}`).toBeTruthy();
       // Unknown keys stay the handler's business, so ajv must not strip or
@@ -569,7 +569,7 @@ describe("SEP-24 initiation — OpenAPI annotations", () => {
   it("still documents the SEP-24 fields and the query parameters", async () => {
     const res = await app.inject({ method: "GET", url: "/docs/json" });
     const paths = res.json().paths ?? {};
-    const deposit = paths["/api/sep24/deposit"]?.post;
+    const deposit = paths["/api/v1/sep24/deposit"]?.post;
 
     const properties = Object.keys(
       deposit.requestBody.content["application/json"].schema.properties

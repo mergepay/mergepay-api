@@ -14,6 +14,7 @@
  * imported anywhere without pulling in side effects.
  */
 
+import { z } from "zod";
 import { ALPHABET } from "../services/codes";
 
 /** Prefix that marks a memo as a Mergepay payment intent reference. */
@@ -133,6 +134,28 @@ export function parseMemo(raw: string): MemoParseResult {
 
   return { ok: true, code, memo: raw };
 }
+
+/**
+ * Zod schema for a well-formed Mergepay `MP:<code>` memo.
+ *
+ * Route and body schemas that accept a Mergepay memo can compose this in
+ * rather than re-deriving the prefix/length/alphabet rules: a rejection carries
+ * the parser's own message under the field that failed, and a handler that
+ * also needs the extracted code can call {@link parseMemo} on the validated
+ * string.
+ *
+ * ```ts
+ * const bodySchema = z.object({ memo: mergepayMemoSchema });
+ * ```
+ */
+export const mergepayMemoSchema = z.string().superRefine((memo, ctx) => {
+  const parsed = parseMemo(memo);
+  if (!parsed.ok) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: parsed.message });
+  }
+});
+
+export type MergepayMemo = z.infer<typeof mergepayMemoSchema>;
 
 /**
  * Validate an expense memo strictly as a Stellar `MEMO_TEXT` value of the form

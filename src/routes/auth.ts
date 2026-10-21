@@ -35,6 +35,8 @@ export default async function authRoutes(app: FastifyInstance) {
   // user yet, and the wallet's public key must never become a bucket key,
   // because differing 429 behaviour would then reveal whether an account is
   // known to the API.
+  // Their separate policy prefixes keep challenge traffic from spending the
+  // tighter verification budget.
   const challengeLimit = rateLimited("authChallenge");
   const verifyLimit = rateLimited("authVerify");
 

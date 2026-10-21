@@ -246,6 +246,30 @@ describe("treasurySignaturesService.createProposal", () => {
       })
     ).rejects.toMatchObject({ status: 400, code: "XDR_NOT_UNSIGNED" });
   });
+
+  it("does not persist a proposal when the treasury is unfunded", async () => {
+    (prisma.group.findUnique as any).mockResolvedValue({
+      id: GROUP_ID,
+      treasuryEnabled: true,
+      treasuryAccountPublicKey: treasury.publicKey(),
+    });
+    vi.mocked(stellar.loadAccount).mockResolvedValueOnce({
+      exists: false,
+      sequence: "0",
+      balances: [],
+      signers: [],
+      thresholds: { low: 0, med: 0, high: 0 },
+    });
+
+    await expect(
+      treasurySignaturesService.createProposal({
+        groupId: GROUP_ID,
+        creatorId: "creator_1",
+        xdr: buildXdr(treasury.publicKey()),
+      })
+    ).rejects.toMatchObject({ status: 400, code: "TREASURY_UNFUNDED" });
+    expect(prisma.treasuryTxProposal.create).not.toHaveBeenCalled();
+  });
 });
 
 describe("treasurySignaturesService.submitSignature", () => {
@@ -268,6 +292,108 @@ describe("treasurySignaturesService.submitSignature", () => {
     });
     expect(stellar.submitSigned).not.toHaveBeenCalled();
     expect(storedSignatures).toHaveLength(1);
+  });
+
+  it("submits when signer weight exactly meets the live threshold", async () => {
+    setupProposal();
+    vi.mocked(stellar.loadAccount).mockResolvedValueOnce({
+      exists: true,
+      sequence: "1",
+      balances: [],
+      signers: [
+        { key: admin1.publicKey(), weight: 5 },
+        { key: admin2.publicKey(), weight: 6 },
+        { key: nonAdminSigner.publicKey(), weight: 4 },
+      ],
+      thresholds: { low: 1, med: 5, high: 5 },
+    });
+
+    const result = await treasurySignaturesService.submitSignature({
+      proposalId: PROPOSAL_ID,
+      groupId: GROUP_ID,
+      userId: "admin1",
+      signedXdr: sign(storedProposal.xdr, admin1),
+    });
+
+    expect(result).toMatchObject({
+      status: STATUS.submitted,
+      totalWeight: 5,
+      requiredWeight: 5,
+      stellarTxHash: "stellar_hash_1",
+    });
+    expect(stellar.submitSigned).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays pending when signer weight is one below the live threshold", async () => {
+    setupProposal();
+    vi.mocked(stellar.loadAccount).mockResolvedValueOnce({
+      exists: true,
+      sequence: "1",
+      balances: [],
+      signers: [
+        { key: admin1.publicKey(), weight: 5 },
+        { key: admin2.publicKey(), weight: 6 },
+        { key: nonAdminSigner.publicKey(), weight: 4 },
+      ],
+      thresholds: { low: 1, med: 5, high: 6 },
+    });
+
+    const result = await treasurySignaturesService.submitSignature({
+      proposalId: PROPOSAL_ID,
+      groupId: GROUP_ID,
+      userId: "admin1",
+      signedXdr: sign(storedProposal.xdr, admin1),
+    });
+
+    expect(result).toMatchObject({
+      status: STATUS.pendingSignatures,
+      totalWeight: 5,
+      requiredWeight: 6,
+      stellarTxHash: null,
+    });
+    expect(stellar.submitSigned).not.toHaveBeenCalled();
+  });
+
+  it("counts a signer's repeated signature in one envelope only once", async () => {
+    setupProposal();
+
+    const result = await treasurySignaturesService.submitSignature({
+      proposalId: PROPOSAL_ID,
+      groupId: GROUP_ID,
+      userId: "admin1",
+      signedXdr: sign(storedProposal.xdr, admin1, admin1),
+    });
+
+    expect(result.totalWeight).toBe(5);
+    expect(storedSignatures).toHaveLength(1);
+    expect(prisma.treasurySignature.create).toHaveBeenCalledTimes(1);
+    expect(stellar.submitSigned).not.toHaveBeenCalled();
+  });
+
+  it("rejects an admin signer with no current on-chain weight", async () => {
+    setupProposal();
+    vi.mocked(stellar.loadAccount).mockResolvedValueOnce({
+      exists: true,
+      sequence: "1",
+      balances: [],
+      signers: [
+        { key: admin1.publicKey(), weight: 0 },
+        { key: admin2.publicKey(), weight: 6 },
+        { key: nonAdminSigner.publicKey(), weight: 4 },
+      ],
+      thresholds: { low: 1, med: 5, high: 10 },
+    });
+
+    await expect(
+      treasurySignaturesService.submitSignature({
+        proposalId: PROPOSAL_ID,
+        groupId: GROUP_ID,
+        userId: "admin1",
+        signedXdr: sign(storedProposal.xdr, admin1),
+      })
+    ).rejects.toMatchObject({ status: 400, code: "UNAUTHORIZED_SIGNER" });
+    expect(storedSignatures).toHaveLength(0);
+    expect(prisma.treasurySignature.create).not.toHaveBeenCalled();
   });
 
   it("merges signatures and submits once the weight threshold is met", async () => {

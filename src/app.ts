@@ -233,6 +233,15 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     },
   });
 
+  // Responses are private by default; routes may opt into a public cache only
+  // when their payload is independent of the caller and safe to share.
+  app.addHook("onSend", async (_request, reply, payload) => {
+    if (!reply.hasHeader("cache-control")) {
+      reply.header("Cache-Control", "no-store");
+    }
+    return payload;
+  });
+
   // Declared before any plugin below registers a route, so it observes the
   // whole table. See BuildAppOptions.onRoute.
   if (options.onRoute) {

@@ -119,6 +119,7 @@ describe("GET /groups/:id/expenses — filter validation", () => {
     const res = await list("");
 
     expect(res.statusCode).toBe(200);
+    expect(res.headers["cache-control"]).toBe("no-store");
     // No filters means no AND wrapper: the query is what it always was.
     expect(lastWhere().groupId).toBe(GROUP_ID);
     expect(lastWhere().AND).toBeUndefined();

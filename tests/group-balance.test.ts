@@ -53,6 +53,7 @@ describe("GET /groups/:id/balance", () => {
   it("returns XLM and configured USDC balances for a member", async () => {
     const response = await app.inject({ method: "GET", url: "/groups/group_1/balance", headers: headers() });
     expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("no-store");
     expect(response.json()).toEqual({ balances: [
       { asset: "XLM", balance: "100.5000000" },
       { asset: "USDC", balance: "250.0000000" },

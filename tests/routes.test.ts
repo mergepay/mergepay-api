@@ -154,6 +154,7 @@ describe("auth routes", () => {
       payload: { account: client.publicKey() },
     });
     expect(res.statusCode).toBe(200);
+    expect(res.headers["cache-control"]).toBe("no-store");
     const body = res.json();
     expect(body.transaction).toBeTruthy();
     expect(body.networkPassphrase).toBeTruthy();
@@ -408,6 +409,7 @@ describe("group routes", () => {
       headers: authHeader(user),
     });
     expect(res.statusCode).toBe(200);
+    expect(res.headers["cache-control"]).toBe("no-store");
     const body = res.json();
     expect(body.yourRole).toBe("admin");
     expect(body.members).toHaveLength(1);

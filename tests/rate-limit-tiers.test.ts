@@ -417,6 +417,7 @@ describe("exchange rate read tier (real app) (#668)", () => {
       remoteAddress,
     });
     expect(first.statusCode).toBe(200);
+    expect(first.headers["cache-control"]).toBe("public, max-age=30");
     // The advertised limit is this policy's, not the global default.
     expect(first.headers["x-ratelimit-limit"]).toBe(String(max));
     expect(first.headers["x-ratelimit-remaining"]).toBe(String(max - 1));

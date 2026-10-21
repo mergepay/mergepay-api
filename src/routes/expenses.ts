@@ -177,6 +177,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
         include: expenseInclude,
       });
 
+req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense.create" }, "Audit: expense created");
       await logActionTx(tx, {
         actorId: auth.id,
         groupId,

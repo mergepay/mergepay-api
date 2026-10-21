@@ -119,6 +119,7 @@ export default async function groupRoutes(app: FastifyInstance) {
           members: { create: { userId: auth.id, role: "admin" } },
         },
       });
+req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "Audit: group created");
       await logActionTx(tx, {
         actorId: auth.id,
         groupId: created.id,
@@ -710,6 +711,7 @@ export default async function groupRoutes(app: FastifyInstance) {
         data: { role: body.role },
         include: { user: true },
       });
+      req.log.info({ userId: auth.id, groupId: id, memberId, action: "group.member.update" }, "Audit: group member updated");
       await auditGroupMemberActionTx(tx, {
         userId: auth.id,
         groupId: id,

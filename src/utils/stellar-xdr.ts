@@ -5,6 +5,12 @@
  * malformed input *before* it reaches the SDK-backed business logic, so
  * untrusted payloads fail fast with a validation error instead of surfacing
  * as an opaque parse failure deep inside a handler.
+ *
+ * This module stays deliberately dependency-free: it is a pure parse check
+ * imported by request schemas, and importing `src/services/stellar` from here
+ * would drag the database, config, and every test double of that service into
+ * schema validation. Horizon I/O and transaction construction still live in
+ * `src/services/`; nothing here contacts the network or builds an envelope.
  */
 import { TransactionBuilder } from "@stellar/stellar-sdk";
 import { config } from "../config";

@@ -144,12 +144,16 @@ describe("getTransactionPayments retry behaviour (issue #531)", () => {
         })
       )
       .mockResolvedValueOnce({
-        records: [{ type: "payment", destination: "GTO", amount: "1" }],
+        records: [{ type: "payment", to: "GTO", amount: "1" }],
       });
 
     const ops = await getTransactionPayments("hash_5");
 
-    expect(ops).toEqual([{ type: "payment", destination: "GTO", amount: "1" }]);
+    // Horizon's raw payment record names the recipient `to`; the service maps
+    // it onto the app's `destination` field.
+    expect(ops).toEqual([
+      expect.objectContaining({ type: "payment", destination: "GTO", amount: "1" }),
+    ]);
     expect(h.paymentsCall).toHaveBeenCalledTimes(2);
   });
 

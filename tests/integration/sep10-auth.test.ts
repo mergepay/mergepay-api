@@ -1,5 +1,15 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { Keypair, MemoNone, Transaction, WebAuth } from "@stellar/stellar-sdk";
+import { randomBytes } from "node:crypto";
+import {
+  Account,
+  BASE_FEE,
+  Keypair,
+  MemoNone,
+  Operation,
+  Transaction,
+  TransactionBuilder,
+  WebAuth,
+} from "@stellar/stellar-sdk";
 
 const mocks = vi.hoisted(() => ({
   prisma: {
@@ -42,6 +52,7 @@ import { buildApp } from "../../src/app";
 import { config } from "../../src/config";
 import { verifyToken } from "../../src/plugins/auth";
 import { serverKeypair } from "../../src/services/sep10";
+import { stellar } from "../../src/services/stellar";
 
 const user = {
   id: "sep10_integration_user",
@@ -80,6 +91,39 @@ function signChallenge(transaction: string, signer: Keypair): string {
   const signed = new Transaction(transaction, config.networkPassphrase);
   signed.sign(signer);
   return signed.toXDR();
+}
+
+/**
+ * A server-signed challenge with explicit time bounds. `WebAuth.buildChallengeTx`
+ * only computes `[now, now + validity]`, so the not-yet-valid and over-long
+ * window cases are assembled here exactly as the SDK builds them, then signed
+ * by the real server and the client.
+ */
+function challengeWithBounds(client: Keypair, minTime: number, maxTime: number): string {
+  const server = serverKeypair();
+  const tx = new TransactionBuilder(new Account(server.publicKey(), "-1"), {
+    fee: BASE_FEE,
+    networkPassphrase: config.networkPassphrase,
+    timebounds: { minTime, maxTime },
+  })
+    .addOperation(
+      Operation.manageData({
+        name: `${config.SEP10_HOME_DOMAIN} auth`,
+        value: randomBytes(48).toString("base64"),
+        source: client.publicKey(),
+      })
+    )
+    .addOperation(
+      Operation.manageData({
+        name: "web_auth_domain",
+        value: config.WEB_AUTH_DOMAIN,
+        source: server.publicKey(),
+      })
+    )
+    .build();
+  tx.sign(server);
+  tx.sign(client);
+  return tx.toXDR();
 }
 
 beforeAll(async () => {
@@ -212,6 +256,91 @@ describe("SEP-10 authentication integration", () => {
     expect(response.statusCode).toBe(401);
     expect(response.json().code).toBe("CHALLENGE_EXPIRED");
     expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a challenge that is not valid yet with CHALLENGE_NOT_YET_VALID", async () => {
+    const client = Keypair.random();
+    const now = Math.floor(Date.now() / 1000);
+    // Starts two minutes in the future: inside the SDK's own 300s grace, but
+    // outside this server's 30s clock-skew tolerance, so the envelope reaches
+    // our time-bound check and is reported as not-yet-valid rather than being
+    // collapsed into the SDK's generic parse failure.
+    const signedXdr = challengeWithBounds(client, now + 120, now + 420);
+
+    const response = await verifyEnvelope(signedXdr);
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().code).toBe("CHALLENGE_NOT_YET_VALID");
+    expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a challenge whose validity window is longer than this server issues", async () => {
+    const client = Keypair.random();
+    const now = Math.floor(Date.now() / 1000);
+    const signedXdr = challengeWithBounds(client, now, now + 3600);
+
+    const response = await verifyEnvelope(signedXdr);
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().code).toBe("CHALLENGE_WINDOW_TOO_LONG");
+    expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a funded multisig account signed below its medium threshold", async () => {
+    const account = Keypair.random();
+    const signerA = Keypair.random();
+    const signerB = Keypair.random();
+    // The account itself never signs: authorization is two of its configured
+    // signers. One signature is not enough, and the API must not fall back to
+    // treating the account key as authoritative once it exists on Horizon.
+    vi.mocked(stellar.loadAccount).mockResolvedValueOnce({
+      exists: true,
+      sequence: "1",
+      balances: [],
+      signers: [
+        { key: signerA.publicKey(), weight: 1 },
+        { key: signerB.publicKey(), weight: 1 },
+      ],
+      thresholds: { low: 0, med: 2, high: 2 },
+    });
+
+    const challenge = await requestChallenge(account.publicKey());
+    const signedXdr = signChallenge(challenge.json().transaction, signerA);
+
+    const response = await verifyEnvelope(signedXdr);
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().code).toBe("UNAUTHORIZED");
+    expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it("accepts a funded multisig account signed at its medium threshold", async () => {
+    const account = Keypair.random();
+    const signerA = Keypair.random();
+    const signerB = Keypair.random();
+    vi.mocked(stellar.loadAccount).mockResolvedValueOnce({
+      exists: true,
+      sequence: "1",
+      balances: [],
+      signers: [
+        { key: signerA.publicKey(), weight: 1 },
+        { key: signerB.publicKey(), weight: 1 },
+      ],
+      thresholds: { low: 0, med: 2, high: 2 },
+    });
+
+    const challenge = await requestChallenge(account.publicKey());
+    const tx = new Transaction(challenge.json().transaction, config.networkPassphrase);
+    tx.sign(signerA);
+    tx.sign(signerB);
+
+    const response = await verifyEnvelope(tx.toXDR());
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().user.stellarPublicKey).toBe(account.publicKey());
+    expect(mocks.prisma.user.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { stellarPublicKey: account.publicKey() } })
+    );
   });
 
   it("rejects a challenge with a tampered or invalid signature with UNAUTHORIZED", async () => {

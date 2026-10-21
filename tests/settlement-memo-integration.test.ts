@@ -100,7 +100,9 @@ beforeEach(() => {
   h.getTransaction.mockResolvedValue({ successful: true });
   h.horizonOperations.mockResolvedValue({
     records: [
-      { type: "payment", destination: DESTINATION, amount: "12.5000000", asset_type: "native" },
+      // Horizon returns the recipient as `to`; getTransactionPayments maps it
+      // onto the app's `destination`.
+      { type: "payment", to: DESTINATION, amount: "12.5000000", asset_type: "native" },
     ],
   });
   h.prisma.settlement.findUnique.mockResolvedValue({

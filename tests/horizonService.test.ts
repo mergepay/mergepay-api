@@ -181,13 +181,34 @@ describe("getTransactionPayments", () => {
     vi.clearAllMocks();
   });
 
-  it("returns payment operations", async () => {
-    const op = makePaymentOp();
-    h.mockPaymentsCall.mockResolvedValue({ records: [op, { type: "manage_data" }] });
+  it("returns payment operations, mapping Horizon's `to` onto the app's `destination`", async () => {
+    // Horizon's payment operation carries `from`/`to`, not `destination`.
+    // The raw record is shaped exactly as Horizon returns it so the mapping is
+    // what this assertion pins down; a record already using `destination`
+    // would pass even if the translation were dropped.
+    const horizonOp = {
+      type: "payment",
+      from: "GFROM...",
+      to: "GTO...",
+      amount: "10.0000000",
+      asset_type: "native",
+      source_account: "GFROM...",
+    };
+    h.mockPaymentsCall.mockResolvedValue({ records: [horizonOp, { type: "manage_data" }] });
 
     const result = await getTransactionPayments("tx_hash_1");
 
-    expect(result).toEqual([op]);
+    expect(result).toEqual([
+      {
+        type: "payment",
+        destination: "GTO...",
+        amount: "10.0000000",
+        asset_type: "native",
+        asset_code: undefined,
+        asset_issuer: undefined,
+        source_account: "GFROM...",
+      },
+    ]);
   });
 
   it("returns empty array when no payment ops", async () => {

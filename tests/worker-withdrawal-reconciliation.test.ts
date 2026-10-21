@@ -143,15 +143,29 @@ describe("reconcileWithdrawals", () => {
       );
     });
 
-    it("marks permanent failures without retrying", async () => {
+    it("dead-letters a permanent failure through the transition, without retrying", async () => {
       const withdrawal = fakeWithdrawal({ retryCount: 0 });
       prisma.withdrawal.findMany.mockResolvedValue([withdrawal]);
       h.pollTransaction.mockResolvedValue(errorPollResult("malformed response", "permanent"));
-      prisma.withdrawal.update.mockResolvedValue(withdrawal);
+      h.applyWithdrawalTransition.mockResolvedValue({ changed: true });
 
       await reconcileWithdrawals();
 
-      // Permanent failures should not update the withdrawal - they just log and return
+      // A permanent failure must actually be recorded: leaving the row in
+      // `processing` with no error category means the next cycle polls the
+      // anchor again, forever, on a request it already rejected.
+      expect(h.applyWithdrawalTransition).toHaveBeenCalledWith({
+        withdrawalId: "withdrawal_1",
+        nextStatus: "failed",
+        source: "poll",
+        extraData: expect.objectContaining({
+          failureReason: "malformed response",
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        }),
+      });
+      // And it must not spend the retry budget on a failure no retry can fix.
       expect(prisma.withdrawal.update).not.toHaveBeenCalled();
     });
 

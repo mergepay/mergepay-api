@@ -1,6 +1,5 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { config } from "../config";
@@ -8,7 +7,7 @@ import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { requireGroupRole } from "../middleware";
-import { stellar, memoText } from "../services/stellar";
+import { isValidPublicKey, stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
 import { AuditAction } from "../services/audit-actions";
@@ -87,7 +86,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       })
       .parse(req.body);
 
-    if (!StrKey.isValidEd25519PublicKey(body.publicKey)) {
+    if (!isValidPublicKey(body.publicKey)) {
       throw Errors.badRequest("invalid_public_key", "Not a valid Stellar public key");
     }
 
@@ -367,7 +366,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     validateAmount(body.amount);
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
-    if (!StrKey.isValidEd25519PublicKey(body.destination)) {
+    if (!isValidPublicKey(body.destination)) {
       throw Errors.badRequest("invalid_destination", "Not a valid Stellar public key");
     }
 

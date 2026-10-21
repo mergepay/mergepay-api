@@ -1370,14 +1370,32 @@ async function reconcileSingleWithdrawal(
     const errorCategory: JobFailureCategory =
       exhausted || result.errorCategory === "permanent" ? "permanent" : "transient";
 
-    // Permanent failures stop the withdrawal immediately
+    // Permanent failures stop the withdrawal immediately.
+    //
+    // The failure has to be *persisted*, not just logged: the row is otherwise
+    // left in `processing` with no error category, so the next cycle selects
+    // it again and the anchor is polled forever on a request it already
+    // rejected. Funnelling the dead-letter through applyWithdrawalTransition
+    // records it with the same guarded update and audit row as every other
+    // withdrawal status change.
     if (result.errorCategory === "permanent") {
+      await applyWithdrawalTransition({
+        withdrawalId: job.id,
+        nextStatus: "failed",
+        source: "poll",
+        extraData: {
+          failureReason: reason,
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        },
+      });
       jobLog.error(
         {
           jobType: "withdrawal",
           jobId: job.id,
           attempt,
-          outcome: "failed",
+          outcome: "dead_letter",
           category: "permanent",
           reason,
         },

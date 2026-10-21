@@ -197,7 +197,10 @@ export async function getTransactionFromHorizon(
     const tx = await withQueryRetry("Horizon.getTransactionDetails", async () => {
       return server().transactions().transaction(txHash).call();
     });
-    return tx as unknown as HorizonTransactionRecord;
+    // Horizon's TransactionRecord carries every field the interface above
+    // names; the return annotation is what keeps this assignment honest.
+    const record: HorizonTransactionRecord = tx;
+    return record;
   } catch (error: unknown) {
     const status = error && typeof error === "object" && "response" in error
       ? (error as { response?: { status?: unknown } }).response?.status
@@ -238,9 +241,24 @@ export async function getTransactionPayments(
         .forTransaction(txHash)
         .limit(100);
       const records = await payments.call();
-      return records.records.filter(
-        (op: any) => op.type === "payment"
-      ) as unknown as HorizonPaymentOperation[];
+      return records.records
+        .filter(
+          (op): op is Horizon.ServerApi.PaymentOperationRecord =>
+            op.type === "payment"
+        )
+        .map((op) => ({
+          type: op.type,
+          // Horizon names a payment's recipient `to`; the app's record shape
+          // (and every verification below) calls it `destination`. Mapping it
+          // here keeps that translation in the one module that owns Horizon
+          // I/O, instead of leaking Horizon's vocabulary to callers.
+          destination: op.to,
+          amount: op.amount,
+          asset_type: op.asset_type,
+          asset_code: op.asset_code,
+          asset_issuer: op.asset_issuer,
+          source_account: op.source_account,
+        }));
     });
     return result;
   } catch (error: unknown) {

@@ -17,6 +17,7 @@ import {
   Keypair,
   Memo,
   Operation,
+  StrKey,
   Transaction,
   TransactionBuilder,
 } from "@stellar/stellar-sdk";
@@ -48,8 +49,31 @@ function server(): Horizon.Server {
   activeServer = available.find((i) => i === activeServer) ?? available[0] ?? activeServer;
   return servers()[activeServer];
 }
-function isRetryableHorizonError(error: any): boolean {
-  const status = error?.response?.status;
+/**
+ * The slice of a Horizon/axios failure this module reads. Declared explicitly
+ * so error handling never depends on an `any` cast: provider errors are
+ * untrusted values, and every field access below goes through this shape.
+ */
+interface HorizonFailureShape {
+  name?: string;
+  message?: string;
+  response?: {
+    status?: number;
+    data?: {
+      extras?: { result_codes?: unknown };
+      result_codes?: unknown;
+    };
+  };
+}
+
+function asHorizonFailure(error: unknown): HorizonFailureShape {
+  return error !== null && typeof error === "object"
+    ? (error as HorizonFailureShape)
+    : {};
+}
+
+function isRetryableHorizonError(error: unknown): boolean {
+  const status = asHorizonFailure(error).response?.status;
   return status === undefined || status === 408 || status === 429 || status >= 500;
 }
 /**
@@ -143,10 +167,19 @@ function horizonReadPolicy(): RetryPolicy {
  * the attempt budget.
  */
 function isNotFound(error: unknown): boolean {
-  const candidate = error as
-    | { response?: { status?: number }; name?: string }
-    | null;
-  return candidate?.response?.status === 404 || candidate?.name === "NotFoundError";
+  const candidate = asHorizonFailure(error);
+  return candidate.response?.status === 404 || candidate.name === "NotFoundError";
+}
+
+/**
+ * Whether a value is a well-formed ed25519 Stellar account address (G...).
+ *
+ * Exported so route handlers validate account-shaped input through this
+ * service instead of importing the SDK themselves, which keeps every Stellar
+ * concern mockable behind one module (issue #845).
+ */
+export function isValidPublicKey(value: string): boolean {
+  return StrKey.isValidEd25519PublicKey(value);
 }
 
 /**
@@ -258,20 +291,30 @@ export const stellar = {
       return {
         exists: true,
         sequence: acct.sequenceNumber(),
-        balances: acct.balances.map((b: any) => ({
-          assetCode: b.asset_type === "native" ? "XLM" : b.asset_code,
-          assetIssuer: b.asset_type === "native" ? null : b.asset_issuer ?? null,
-          balance: b.balance,
-        })),
-        signers: acct.signers.map((s: any) => ({ key: s.key, weight: s.weight })),
+        balances: acct.balances.map((balance) => {
+          if (balance.asset_type === "native") {
+            return { assetCode: "XLM", assetIssuer: null, balance: balance.balance };
+          }
+          if ("asset_code" in balance) {
+            return {
+              assetCode: balance.asset_code,
+              assetIssuer: balance.asset_issuer,
+              balance: balance.balance,
+            };
+          }
+          // Liquidity-pool shares carry no asset code; the asset type is the
+          // only stable identifier the snapshot can report for them.
+          return { assetCode: balance.asset_type, assetIssuer: null, balance: balance.balance };
+        }),
+        signers: acct.signers.map((signer) => ({ key: signer.key, weight: signer.weight })),
         thresholds: {
           low: acct.thresholds.low_threshold,
           med: acct.thresholds.med_threshold,
           high: acct.thresholds.high_threshold,
         },
       };
-    } catch (e: any) {
-      if (e?.response?.status === 404 || e?.name === "NotFoundError") {
+    } catch (error: unknown) {
+      if (isNotFound(error)) {
         return {
           exists: false,
           sequence: "0",
@@ -280,7 +323,7 @@ export const stellar = {
           thresholds: { low: 0, med: 0, high: 0 },
         };
       }
-      const converted = toProviderError(e, {
+      const converted = toProviderError(error, {
         provider: "horizon",
         operation: "Horizon.loadAccount",
         fallbackMessage: "Stellar account lookup failed",
@@ -500,10 +543,10 @@ export const stellar = {
           );
         }
       );
-      return { successful: (tx as any).successful };
-    } catch (e: any) {
-      if (e?.response?.status === 404) return null;
-      throw e;
+      return { successful: tx.successful };
+    } catch (error: unknown) {
+      if (asHorizonFailure(error).response?.status === 404) return null;
+      throw error;
     }
   },
 
@@ -561,11 +604,12 @@ async function submitToHorizon(tx: Transaction): Promise<string> {
   try {
     const res = await withHorizonFailover((horizon) => horizon.submitTransaction(tx));
     return res.hash;
-  } catch (e: any) {
+  } catch (error: unknown) {
+    const failure = asHorizonFailure(error);
     const codes =
-      e?.response?.data?.extras?.result_codes ??
-      e?.response?.data?.result_codes;
-    const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
+      failure.response?.data?.extras?.result_codes ??
+      failure.response?.data?.result_codes;
+    const detail = codes ? JSON.stringify(codes) : failure.message ?? "submit failed";
     throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
   }
 }
@@ -863,8 +907,8 @@ export function matchPaymentIntent(
     return { field: "fee", message: "Transaction fee is outside the accepted range" };
   }
 
-  const op = tx.operations[0] as any;
-  if (op.type !== "payment") {
+  const op = tx.operations[0];
+  if (!op || op.type !== "payment") {
     return { field: "operationType", message: "Expected a payment operation" };
   }
   if (op.source && op.source !== expected.sourcePublicKey) {
@@ -894,7 +938,9 @@ export function matchPaymentIntent(
 
   const wantMemo = memoText(expected.memoCode);
   const gotMemo =
-    tx.memo && (tx.memo as any).value ? (tx.memo as any).value.toString() : "";
+    tx.memo.value === null || tx.memo.value === undefined
+      ? ""
+      : tx.memo.value.toString();
   if (gotMemo !== wantMemo) {
     return { field: "memo", message: "Memo does not match the expense reference" };
   }

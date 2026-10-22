@@ -621,6 +621,13 @@ describe("expense routes", () => {
       { userId: user.id },
       { userId: "user_2" },
     ]);
+    // Twice: the route's membership guard, then the handler's in-transaction
+    // re-check.
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId,
+      userId: user.id,
+      role: "member",
+    });
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId,
       userId: user.id,
@@ -687,6 +694,13 @@ describe("expense routes", () => {
       { userId: user.id },
       { userId: "user_2" },
     ]);
+    // Twice: the route's membership guard, then the handler's in-transaction
+    // re-check.
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId,
+      userId: user.id,
+      role: "member",
+    });
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId,
       userId: user.id,

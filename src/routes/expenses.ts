@@ -154,6 +154,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
     const expense = await prisma.$transaction(async (tx) => {
+      // Re-verify the caller's membership inside the atomic unit. The
+      // preHandler guard authorised the request before this handler ran, so a
+      // concurrent removal or archival could have landed since; re-running the
+      // same check here (as the update and delete routes already do) means the
+      // check and the insert either both see the membership or neither runs.
+      await requireActiveMembership(groupId, auth.id, tx);
+
       const created = await tx.expense.create({
         data: {
           groupId,

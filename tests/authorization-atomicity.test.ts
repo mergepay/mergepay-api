@@ -175,6 +175,91 @@ describe("POST /groups/:id/expenses authorization", () => {
     expect(res.statusCode).toBe(400);
     expect(prisma.expense.create).not.toHaveBeenCalled();
   });
+
+  it("re-verifies the caller's membership inside the creation transaction", async () => {
+    // Simulate the race the guard cannot close on its own: the caller is a
+    // member when the preHandler runs, then is removed before the handler's
+    // transaction reaches the write. The in-transaction check must catch it.
+    let lookups = 0;
+    prisma.groupMember.findUnique.mockImplementation(async () => {
+      lookups += 1;
+      return lookups === 1
+        ? { groupId: "group_1", userId: "user_1", role: "member" }
+        : null;
+    });
+    // Two lookups: the guard's active-group probe and the transaction's own
+    // 403-vs-404 probe after the membership row has vanished.
+    prisma.group.findUnique.mockResolvedValueOnce({ id: "group_1", archived: false });
+    prisma.group.findUnique.mockResolvedValueOnce({ id: "group_1", archived: false });
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: "user_1", user: { stellarPublicKey: fakeUser().stellarPublicKey } },
+    ]);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/expenses",
+      headers: authHeader(),
+      payload: {
+        title: "Hotel",
+        amount: "120.00",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [{ userId: "user_1" }],
+      },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.expense.create).not.toHaveBeenCalled();
+  });
+
+  it("checks membership twice — once in the guard, once atomically with the write", async () => {
+    membershipDb({ "group_1:user_1": { role: "member" } });
+    // Guard active-group probe + the transaction's active-membership probe.
+    prisma.group.findUnique.mockResolvedValueOnce({ id: "group_1", archived: false });
+    prisma.group.findUnique.mockResolvedValueOnce({ id: "group_1", archived: false });
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: "user_1", user: { stellarPublicKey: fakeUser().stellarPublicKey } },
+    ]);
+    prisma.expense.create.mockResolvedValueOnce({
+      id: "exp_1",
+      groupId: "group_1",
+      payerUserId: "user_1",
+      title: "Hotel",
+      description: null,
+      amount: "120.00",
+      assetCode: "XLM",
+      assetIssuer: null,
+      splitType: "equal",
+      memo: "HOTEL001",
+      receiptUrl: null,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      shares: [],
+    });
+    prisma.auditLog.create.mockResolvedValueOnce({});
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/expenses",
+      headers: authHeader(),
+      payload: {
+        title: "Hotel",
+        amount: "120.00",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [{ userId: "user_1" }],
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.expense.create).toHaveBeenCalled();
+
+    const callerChecks = prisma.groupMember.findUnique.mock.calls.filter(
+      (call: any) => call[0]?.where?.groupId_userId?.userId === "user_1"
+    );
+    // One lookup from the preHandler guard, one from the transaction that
+    // performs the insert — the check is not merely a request-time formality.
+    expect(callerChecks).toHaveLength(2);
+  });
 });
 
 describe("DELETE /expenses/:id authorization", () => {

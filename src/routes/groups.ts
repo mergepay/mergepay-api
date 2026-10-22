@@ -7,6 +7,7 @@ import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
 import { inviteCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import {
   serializeGroup,
   serializeInvitation,
@@ -50,11 +51,16 @@ export default async function groupRoutes(app: FastifyInstance) {
           members: { create: { userId: auth.id, role: "admin" } },
         },
       });
+      // groupId is set so the creation shows up in the group's own audit
+      // log alongside every later action on it.
       await auditTx(tx, {
         userId: auth.id,
-        action: "group.create",
+        groupId: created.id,
+        action: AuditAction.GROUP_CREATE,
         entityType: "group",
         entityId: created.id,
+        actorType: "user",
+        outcome: "success",
         metadata: { name: body.name },
       });
       return created;

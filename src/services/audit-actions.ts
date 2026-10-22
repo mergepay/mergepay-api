@@ -21,6 +21,11 @@ export const AuditAction = {
   GROUP_LEAVE: "group.leave",
   GROUP_MEMBER_REMOVE: "group.member_remove",
 
+  // ── Expenses ────────────────────────────────────────────────────────
+  EXPENSE_CREATE: "expense.create",
+  EXPENSE_UPDATE: "expense.update",
+  EXPENSE_DELETE: "expense.delete",
+
   // ── Treasury ────────────────────────────────────────────────────────
   TREASURY_ENABLE: "treasury.enable",
   TREASURY_DEPOSIT_CREATE: "treasury.deposit.create",

@@ -8,6 +8,7 @@ import { computeShares, type SplitType } from "../services/settlement";
 import { normalizeAmount } from "../services/money";
 import { shortCode } from "../services/codes";
 import { auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import { validateAsset, validateAmount } from "../services/assets";
 import { serializeExpense } from "../serializers";
 import {
@@ -101,13 +102,24 @@ export default async function expenseRoutes(app: FastifyInstance) {
         include: expenseInclude,
       });
 
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.create",
-          entityType: "expense",
-          entityId: created.id,
-          metadata: { groupId, amount: body.amount, assetCode: body.assetCode },
+      // The actor is always the authenticated user; a client-supplied
+      // payerUserId is recorded as metadata, never as the actor.
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId,
+        action: AuditAction.EXPENSE_CREATE,
+        entityType: "expense",
+        entityId: created.id,
+        actorType: "user",
+        outcome: "success",
+        metadata: {
+          groupId,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          payerUserId,
+          splitType: body.splitType,
+          shareCount: computed.length,
         },
       });
 
@@ -180,13 +192,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
         include: expenseInclude,
       });
 
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.update",
-          entityType: "expense",
-          entityId: id,
-        },
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: expense.groupId,
+        action: AuditAction.EXPENSE_UPDATE,
+        entityType: "expense",
+        entityId: id,
+        metadata: { fields: Object.keys(body) },
       });
 
       return result;
@@ -222,13 +234,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
       }
 
       await tx.expense.delete({ where: { id } });
-      await tx.auditLog.create({
-        data: {
-          userId: auth.id,
-          action: "expense.delete",
-          entityType: "expense",
-          entityId: id,
-        },
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: found.groupId,
+        action: AuditAction.EXPENSE_DELETE,
+        entityType: "expense",
+        entityId: id,
+        metadata: { amount: String(found.amount), assetCode: found.assetCode },
       });
     });
     return { ok: true };

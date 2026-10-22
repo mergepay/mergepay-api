@@ -28,6 +28,7 @@ import { stellar, memoText } from "../services/stellar";
 import { validateSettlementXdr } from "../services/settlement-xdr";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import { rateLimited } from "../lib/rate-limit";
 import {
   readIdempotencyKey,
@@ -194,6 +195,27 @@ export default async function settlementRoutes(app: FastifyInstance) {
           data: { status: "settling" },
         });
 
+        // Same transaction as the settlement row: if anything below (e.g.
+        // building the XDR for an unfunded account) fails, neither persists.
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: expense.groupId,
+          action: AuditAction.SETTLEMENT_CREATED,
+          entityType: "settlement",
+          entityId: settlement.id,
+          actorType: "user",
+          outcome: "success",
+          metadata: {
+            kind: "expense_share",
+            expenseId: expense.id,
+            expenseShareId: myShare.id,
+            toUserId: expense.payerUserId,
+            amount: String(myShare.shareAmount),
+            assetCode,
+            assetIssuer,
+          },
+        });
+
         const xdr = await buildSettlementXdr({
           fromPublicKey: auth.stellarPublicKey,
           toPublicKey: expense.payer.stellarPublicKey,
@@ -274,6 +296,23 @@ export default async function settlementRoutes(app: FastifyInstance) {
           entityId: settlement.id,
           newStatus: "pending",
           source: "api",
+        });
+
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId,
+          action: AuditAction.SETTLEMENT_CREATED,
+          entityType: "settlement",
+          entityId: settlement.id,
+          actorType: "user",
+          outcome: "success",
+          metadata: {
+            kind: "net_balance",
+            toUserId: body.toUserId,
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+          },
         });
 
         const xdr = await buildSettlementXdr({
@@ -373,7 +412,8 @@ export default async function settlementRoutes(app: FastifyInstance) {
           // retry bookkeeping is reset below so the worker picks it up fresh.
           await auditTx(tx, {
             userId: auth.id,
-            action: "settlement.confirm.retry",
+            groupId: settlement.groupId,
+            action: AuditAction.SETTLEMENT_CONFIRM_RETRY,
             entityType: "settlement",
             entityId: id,
             metadata: { previousFailure: settlement.failureReason },
@@ -405,6 +445,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           });
           await auditTx(tx, {
             userId: auth.id,
+            groupId: settlement.groupId,
             action: "settlement.confirm",
             entityType: "settlement",
             entityId: id,

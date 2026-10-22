@@ -35,6 +35,7 @@ import { randomUUID } from "node:crypto";
 import pino from "pino";
 import { config } from "../config";
 import { prisma } from "../db";
+import { connectWithRetry } from "../lib/db-connect";
 import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
@@ -984,5 +985,7 @@ if (process.env.NODE_ENV !== "test") {
     console.error("❌ Critical configuration missing for worker. Exiting.");
     process.exit(1);
   }
-  void startWorker();
+  connectWithRetry(prisma, { logger: log })
+    .then(() => startWorker())
+    .catch(() => process.exit(1));
 }

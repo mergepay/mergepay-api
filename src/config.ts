@@ -53,6 +53,12 @@ const schema = z.object({
   MULTIPART_MAX_FILES: z.coerce.number().int().positive().default(1),
   MULTIPART_MAX_FIELDS: z.coerce.number().int().positive().default(20),
 
+  // Startup database connection retry (src/lib/db-connect.ts). Exponential
+  // backoff between attempts, capped at the max delay.
+  DB_CONNECT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
+  DB_CONNECT_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(500),
+  DB_CONNECT_MAX_DELAY_MS: z.coerce.number().int().positive().default(10000),
+
   // Worker configuration
   WORKER_INTERVAL_MS: z.coerce.number().positive().default(30000),
   // How long a worker's claim on a job survives without renewal. A process that

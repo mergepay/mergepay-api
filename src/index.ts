@@ -1,6 +1,7 @@
 import { buildApp } from "./app";
 import { config } from "./config";
 import { prisma } from "./db";
+import { connectWithRetry } from "./lib/db-connect";
 
 async function main() {
   // Config validation already happened at module load time in config.ts
@@ -11,6 +12,15 @@ async function main() {
   }
 
   const app = await buildApp();
+
+  // Wait for the database before accepting traffic, so a container that
+  // starts ahead of PostgreSQL doesn't serve failing requests or crash-loop.
+  try {
+    await connectWithRetry(prisma, { logger: app.log });
+  } catch {
+    await app.close();
+    process.exit(1);
+  }
 
 
   const shutdown = async (signal: string) => {

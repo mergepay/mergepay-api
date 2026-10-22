@@ -39,7 +39,7 @@ export {
 } from "../validations/sep24";
 
 import { z } from "zod";
-import type { FastifyRequest, FastifyReply } from "fastify";
+import { validateRequest } from "../middleware/validate-request";
 import {
   sep24DepositRequestSchema,
   sep24WithdrawRequestSchema,
@@ -48,28 +48,33 @@ import {
 } from "../validations/sep24";
 
 /**
- * Request validation middleware for SEP-24 deposit initiation endpoint.
- * Validates query parameters and request body using Zod schemas.
+ * Request validation middleware for the SEP-24 deposit initiation endpoints.
+ *
+ * Applied as a `preHandler` to both aliases — `POST /anchors/deposit` and
+ * `POST /api/sep24/deposit` — so the two cannot drift: they share one schema
+ * pair and one hook. Query first, then body, and both run before the anchor is
+ * contacted, so a malformed request never reaches an upstream call, the
+ * database, or the audit log.
+ *
+ * The hook throws the raw `ZodError`; src/plugins/error-handler.ts renders it
+ * as the standard `400 VALIDATION_ERROR` envelope with `details` and `issues`.
  */
-export async function validateSep24Deposit(
-  req: FastifyRequest,
-  _reply: FastifyReply
-): Promise<void> {
-  req.query = sep24InitQuerySchema.parse(req.query ?? {});
-  req.body = sep24DepositRequestSchema.parse(req.body);
-}
+export const validateSep24Deposit = validateRequest({
+  query: sep24InitQuerySchema,
+  body: sep24DepositRequestSchema,
+});
 
 /**
- * Request validation middleware for SEP-24 withdrawal initiation endpoint.
- * Validates query parameters and request body using Zod schemas.
+ * Request validation middleware for the SEP-24 withdrawal initiation
+ * endpoints (`POST /anchors/withdraw`, `POST /api/sep24/withdraw`).
+ *
+ * Identical to {@link validateSep24Deposit} except for the body schema, which
+ * additionally requires the amount being settled.
  */
-export async function validateSep24Withdraw(
-  req: FastifyRequest,
-  _reply: FastifyReply
-): Promise<void> {
-  req.query = sep24InitQuerySchema.parse(req.query ?? {});
-  req.body = sep24WithdrawRequestSchema.parse(req.body);
-}
+export const validateSep24Withdraw = validateRequest({
+  query: sep24InitQuerySchema,
+  body: sep24WithdrawRequestSchema,
+});
 
 // -- deposit / withdrawal status callbacks ----------------------------------
 

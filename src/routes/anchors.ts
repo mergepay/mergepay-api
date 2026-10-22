@@ -29,8 +29,14 @@ import {
   sep24DepositRequestSchema,
   sep24InitQuerySchema,
   sep24WithdrawRequestSchema,
+  type Sep24DepositRequest,
+  type Sep24WithdrawRequest,
 } from "../validations/sep24";
-import { sep24CallbackSchema } from "../schemas/sep24";
+import {
+  sep24CallbackSchema,
+  validateSep24Deposit,
+  validateSep24Withdraw,
+} from "../schemas/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {
@@ -98,19 +104,19 @@ export default async function anchorRoutes(app: FastifyInstance) {
   );
 
   // -- start deposit / withdraw -----------------------------------------------
+  //
+  // The request shape is enforced by the `validateSep24Deposit` /
+  // `validateSep24Withdraw` preHandler hooks on the routes below, not here: the
+  // handler receives a request whose query and body have already been parsed
+  // (and normalised — asset codes are upper-cased on parse) against the SEP-24
+  // schemas. Re-parsing them in the handler would be a second, silent source of
+  // truth for the same contract.
   async function start(
     kind: "deposit" | "withdrawal",
     req: FastifyRequest,
-    requestSchema = kind === "deposit"
-      ? sep24DepositRequestSchema
-      : sep24WithdrawRequestSchema
+    body: Sep24DepositRequest | Sep24WithdrawRequest
   ) {
     const auth = requireUser(req);
-    // Query first, then body: both are Zod-owned, and both run before the
-    // anchor is contacted, so a malformed request never reaches an upstream
-    // call, the database, or the audit log.
-    sep24InitQuerySchema.parse(req.query ?? {});
-    const body = requestSchema.parse(req.body);
 
     // Validate that the requested asset is supported. The issuer is part of
     // the request contract, so it is validated *with* the code rather than
@@ -154,16 +160,17 @@ export default async function anchorRoutes(app: FastifyInstance) {
   app.post(
     "/anchors/deposit",
     {
-      preHandler: [app.authenticate],
+      preHandler: [app.authenticate, validateSep24Deposit],
       ...initLimit,
       schema: {
         tags: ["SEP-24"],
         summary: "Initiate SEP-24 interactive deposit",
         description:
           "Initiates a SEP-24 interactive deposit session and returns an anchor auth challenge.",
-        // Documented from the same Zod schema the handler parses with, but with
-        // the rules stripped: the handler is the only validator, so a rejection
-        // arrives in the documented VALIDATION_ERROR envelope with `issues`.
+        // Documented from the same Zod schema the preHandler parses with, but
+        // with the rules stripped: the middleware is the only validator, so a
+        // rejection arrives in the documented VALIDATION_ERROR envelope with
+        // `issues`.
         querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
         body: openApiBody(sep24DepositRequestSchema, { enforce: false }),
         response: {
@@ -178,13 +185,13 @@ export default async function anchorRoutes(app: FastifyInstance) {
         },
       },
     },
-    (req) => start("deposit", req)
+    (req) => start("deposit", req, req.body as Sep24DepositRequest)
   );
 
   app.post(
     "/anchors/withdraw",
     {
-      preHandler: [app.authenticate],
+      preHandler: [app.authenticate, validateSep24Withdraw],
       ...initLimit,
       schema: {
         tags: ["SEP-24"],
@@ -205,7 +212,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         },
       },
     },
-    (req) => start("withdrawal", req)
+    (req) => start("withdrawal", req, req.body as Sep24WithdrawRequest)
   );
 
   // -- complete (exchange signed challenge for interactive url) ---------------

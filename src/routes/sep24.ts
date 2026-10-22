@@ -44,6 +44,8 @@ import {
   sep24TransactionQuerySchema,
   sep24TransactionsQuerySchema,
   sep24WithdrawRequestSchema,
+  type Sep24DepositRequest,
+  type Sep24WithdrawRequest,
 } from "../validations/sep24";
 import {
   validateSep24Deposit,
@@ -134,21 +136,15 @@ export default async function sep24Routes(app: FastifyInstance) {
   async function handleStartInteractive(
     kind: "deposit" | "withdrawal",
     req: FastifyRequest,
-    requestSchema = kind === "deposit"
-      ? sep24DepositRequestSchema
-      : sep24WithdrawRequestSchema
+    body: Sep24DepositRequest | Sep24WithdrawRequest
   ) {
     const auth = requireUser(req);
-    // Query first, then body: both are Zod-owned, and both run before the
-    // anchor is contacted, so a malformed request never reaches an upstream
-    // call, the database, or the audit log.
-    sep24InitQuerySchema.parse(req.query ?? {});
-    const body = requestSchema.parse(req.body);
 
-    // The issuer is part of the request contract, so it is validated *with*
-    // the code rather than dropped: a caller naming an issuer Mergepay does not
-    // issue that asset under would otherwise get a session created against a
-    // different asset than the one it asked for.
+    // The query string and body were parsed by the `validateSep24Deposit` /
+    // `validateSep24Withdraw` preHandler on the route below, before any anchor
+    // is contacted, so a malformed request never reaches an upstream call, the
+    // database, or the audit log. Parsing them again here would be a second
+    // copy of the same contract.
     validateAsset(body.assetCode, body.assetIssuer);
 
     const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
@@ -210,7 +206,8 @@ export default async function sep24Routes(app: FastifyInstance) {
         },
       },
     },
-    (req) => handleStartInteractive("deposit", req)
+    (req) =>
+      handleStartInteractive("deposit", req, req.body as Sep24DepositRequest)
   );
 
   app.post(
@@ -237,7 +234,8 @@ export default async function sep24Routes(app: FastifyInstance) {
         },
       },
     },
-    (req) => handleStartInteractive("withdrawal", req)
+    (req) =>
+      handleStartInteractive("withdrawal", req, req.body as Sep24WithdrawRequest)
   );
 
   // SEP-24 status polling (#651).

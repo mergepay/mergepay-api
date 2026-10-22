@@ -436,6 +436,9 @@ export const anchorService = {
 
 };
 
+/** Typed interface for the SEP-1/10/24 anchor operations callers depend on (and tests mock). */
+export type AnchorService = typeof anchorService;
+
 // ─── Status mapping ─────────────────────────────────────────────────────────
 
 /**

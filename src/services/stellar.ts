@@ -13,7 +13,6 @@ import {
   Asset,
   BASE_FEE,
   FeeBumpTransaction,
-  Horizon,
   Keypair,
   Memo,
   Operation,
@@ -25,16 +24,18 @@ import { Errors } from "../errors";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
 import { withTimeout, TimeoutError, TransportError } from "./timeout";
 import {
+  horizonResultCodes,
+  horizonServer,
+  isHorizonNotFound,
+  unwrapHorizonError,
+} from "./horizon";
+import {
   INTENT_VALIDITY_SECONDS,
   assertTimeBoundsMatchIntent,
   readTimeBounds,
 } from "../lib/time-bounds";
 
-let _server: Horizon.Server | null = null;
-function server(): Horizon.Server {
-  if (!_server) _server = new Horizon.Server(config.HORIZON_URL);
-  return _server;
-}
+const server = horizonServer;
 
 function logUpstreamError(e: unknown, codes: unknown): void {
   console.error("[stellar] Upstream error:", e instanceof Error ? e.message : String(e), codes ? JSON.stringify(codes) : "");
@@ -112,7 +113,9 @@ export const stellar = {
         },
       };
     } catch (e: any) {
-      if (e?.response?.status === 404 || e?.name === "NotFoundError") {
+      // withTimeout wraps the SDK's NotFoundError in a TransportError, so the
+      // 404 check has to look through it.
+      if (isHorizonNotFound(e)) {
         return {
           exists: false,
           sequence: "0",
@@ -219,14 +222,15 @@ export const stellar = {
       );
       return res.hash;
     } catch (e: any) {
+      // Horizon answering with a rejection is an upstream error, not a
+      // transport failure, even though withTimeout wraps it as one.
+      const err = unwrapHorizonError(e);
       // Re-throw TimeoutError and TransportError as-is for retry classification
-      if (e instanceof TimeoutError || e instanceof TransportError) {
-        throw e;
+      if (err instanceof TimeoutError || err instanceof TransportError) {
+        throw err;
       }
-      const codes =
-        e?.response?.data?.extras?.result_codes ??
-        e?.response?.data?.result_codes;
-      logUpstreamError(e, codes);
+      const codes = horizonResultCodes(err);
+      logUpstreamError(err, codes);
       throw Errors.upstream("Stellar rejected the transaction");
     }
   },
@@ -238,16 +242,7 @@ export const stellar = {
    */
   async submitSigned(signedXdr: string): Promise<string> {
     const tx = new Transaction(signedXdr, config.networkPassphrase);
-    try {
-      const res = await server().submitTransaction(tx);
-      return res.hash;
-    } catch (e: any) {
-      const codes =
-        e?.response?.data?.extras?.result_codes ??
-        e?.response?.data?.result_codes;
-      const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
-      throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
-    }
+    return submitToHorizon(tx);
   },
 
   /** Look up a transaction by hash. Returns null if not yet visible. */
@@ -264,7 +259,7 @@ export const stellar = {
       );
       return { successful: (tx as any).successful };
     } catch (e: any) {
-      if (e?.response?.status === 404) return null;
+      if (isHorizonNotFound(e)) return null;
       throw e;
     }
   },
@@ -280,6 +275,9 @@ export const stellar = {
     return new Transaction(signedXdr, config.networkPassphrase).hash().toString("hex");
   },
 };
+
+/** Typed interface for the Horizon operations callers depend on (and tests mock). */
+export type StellarService = typeof stellar;
 
 /**
  * Parse an envelope against **our** network passphrase, rejecting malformed
@@ -312,13 +310,16 @@ export function parseSignedPaymentXdr(
 
 async function submitToHorizon(tx: Transaction): Promise<string> {
   try {
-    const res = await server().submitTransaction(tx);
+    const res = await withTimeout(
+      "Horizon.submitTransaction",
+      config.HORIZON_SUBMIT_TIMEOUT_MS,
+      async () => server().submitTransaction(tx)
+    );
     return res.hash;
   } catch (e: any) {
-    const codes =
-      e?.response?.data?.extras?.result_codes ??
-      e?.response?.data?.result_codes;
-    const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
+    const err = unwrapHorizonError(e) as any;
+    const codes = horizonResultCodes(err);
+    const detail = codes ? JSON.stringify(codes) : err?.message ?? "submit failed";
     throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
   }
 }

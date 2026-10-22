@@ -1,5 +1,5 @@
-import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "../config";
+import { horizonServer } from "./horizon";
 import { withTimeout } from "./timeout";
 
 export interface FeeStats {
@@ -17,14 +17,8 @@ export interface FeeStats {
   p99: number;
 }
 
-let server: Horizon.Server | null = null;
 let cached: { stats: FeeStats; expiresAt: number } | null = null;
 let refresh: Promise<FeeStats> | null = null;
-
-function horizon(): Horizon.Server {
-  if (!server) server = new Horizon.Server(config.HORIZON_URL);
-  return server;
-}
 
 function fee(value: unknown): number {
   const parsed = Number(value);
@@ -55,7 +49,7 @@ async function fetchFeeStats(): Promise<FeeStats> {
     async (_signal) => {
       // Horizon.Server.feeStats doesn't accept AbortSignal directly,
       // but we wrap it so timeout still fires and rejects the promise.
-      return horizon().feeStats();
+      return horizonServer().feeStats();
     }
   );
   const stats = normalize(response as unknown as Record<string, unknown>);

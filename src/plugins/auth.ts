@@ -1,14 +1,18 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
-import jwt from "jsonwebtoken";
 import { z } from "zod";
-import { config } from "../config";
 import { Errors } from "../errors";
+import { verifyToken } from "../services/jwt";
+import type { AuthUser } from "../services/jwt";
 
-export interface AuthUser {
-  id: string;
-  stellarPublicKey: string;
-}
+/*
+ * The JWT utilities live in src/services/jwt.ts (issue #421). They are
+ * re-exported here so this plugin stays the single import point the routes
+ * and tests have always used, while the crypto itself remains unit-testable
+ * without building a Fastify instance.
+ */
+export { signToken, verifyToken } from "../services/jwt";
+export type { AuthUser } from "../services/jwt";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -19,66 +23,31 @@ declare module "fastify" {
   }
 }
 
-const JWT_ALGORITHM = "HS256" as const;
-
-export function signToken(user: AuthUser): string {
-  return jwt.sign(
-    { sub: user.id, pk: user.stellarPublicKey },
-    config.JWT_SECRET,
-    {
-      algorithm: JWT_ALGORITHM,
-      expiresIn: config.jwtExpiresIn,
-      issuer: config.JWT_ISSUER,
-      audience: config.JWT_AUDIENCE,
-    }
-  );
-}
-
-/**
- * Verify a bearer token and return the account it was issued for.
- *
- * Enforces algorithm, issuer, audience, and expiration in addition to the
- * signature so a token minted for a different environment/audience (or
- * signed with a different algorithm) is rejected outright, and validates the
- * claim shape so a malformed/tampered payload can't be coerced into
- * authenticating as an arbitrary account.
- */
-export function verifyToken(token: string): AuthUser {
-  let decoded: jwt.JwtPayload;
-  try {
-    decoded = jwt.verify(token, config.JWT_SECRET, {
-      algorithms: [JWT_ALGORITHM],
-      issuer: config.JWT_ISSUER,
-      audience: config.JWT_AUDIENCE,
-    }) as jwt.JwtPayload;
-  } catch {
-    throw Errors.unauthorized();
-  }
-
-  const { sub, pk } = decoded;
-  if (typeof sub !== "string" || !sub || typeof pk !== "string" || !pk) {
-    throw Errors.unauthorized();
-  }
-
-  return { id: sub, stellarPublicKey: pk };
-}
-
 const authorizationHeaderSchema = z
   .string()
   .regex(/^Bearer\s+\S+$/, "Authorization must use the Bearer scheme");
 
+/**
+ * Authenticate a request from its `Authorization` header.
+ *
+ * Missing/undecodable credentials and a rejected token are reported with
+ * different codes (UNAUTHORIZED vs TOKEN_EXPIRED/INVALID_TOKEN) so clients
+ * can branch on the failure without parsing messages. The SDK's own error
+ * text is never echoed back — only the stable codes and the re-auth hint.
+ */
 async function authenticate(req: FastifyRequest, _reply: FastifyReply) {
   const parsedHeader = authorizationHeaderSchema.safeParse(req.headers.authorization);
   if (!parsedHeader.success) {
+    // No usable Authorization header at all: not a token verdict, so this
+    // keeps the original generic code rather than INVALID_TOKEN.
     throw Errors.unauthorized();
   }
 
+  // verifyToken raises the specific 401 the caller should act on —
+  // TOKEN_EXPIRED with a re-authentication hint, INVALID_TOKEN for anything
+  // unverifiable — so those AppErrors must reach the error handler unmodified.
   const token = parsedHeader.data.slice("Bearer ".length).trim();
-  try {
-    req.user = verifyToken(token);
-  } catch {
-    throw Errors.unauthorized("Invalid or expired session");
-  }
+  req.user = verifyToken(token);
 }
 
 export default fp(async function authPlugin(app: FastifyInstance) {

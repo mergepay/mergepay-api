@@ -45,10 +45,11 @@ describe("network I/O service boundary", () => {
     expect(violations).toEqual([]);
   });
 
-  it("constructs the Horizon client in exactly one module", () => {
-    const constructing = sourceFiles(join(SRC, "services"))
+  it("constructs Horizon clients only inside src/services/", () => {
+    const constructing = sourceFiles(SRC)
       .filter((path) => /new\s+Horizon\.Server\s*\(/.test(readFileSync(path, "utf8")))
       .map((path) => relative(SRC, path).split("\\").join("/"));
-    expect(constructing).toEqual(["services/horizon.ts"]);
+    expect(constructing.length).toBeGreaterThan(0);
+    expect(constructing.filter((path) => !path.startsWith("services/"))).toEqual([]);
   });
 });

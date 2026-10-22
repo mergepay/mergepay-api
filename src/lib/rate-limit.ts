@@ -8,9 +8,14 @@
  *
  *   app.post("/settlements/:id/confirm", rateLimited("settlementConfirm"), handler)
  *
- * Every policy gets its own key *prefix*, which is what makes the buckets
- * independent: two routes with the same identity still consume separate
- * budgets, and a read route with no policy only ever touches the global one.
+ * Every policy gets its own key *prefix*, so a tier's counter can never land
+ * in the global bucket or in another tier's: a read route with no policy only
+ * ever touches the global one. Two routes that name the same policy produce the
+ * same key, and whether they then share a budget depends on the counter store —
+ * with `RATE_LIMIT_STORE=database` they do (one row per key), while the default
+ * in-memory store gives every route its own child store, so they do not. The
+ * `webhookCreate` and `anchorPoll` policies are each applied to two routes and
+ * are affected by that difference.
  *
  * Keying rules (see src/services/rate-limit-keys.ts):
  *  - `user-or-ip` — the authenticated Mergepay user id when the request has
@@ -20,24 +25,56 @@
  *  - `ip` — strictly the client IP, for routes that have no authenticated user
  *    yet (SEP-10) or are authenticated by a shared secret (anchor webhook).
  *
- * A key never contains a Stellar public key, so a 429 can't be used to probe
- * whether a given wallet account is known to the API.
+ * Authenticated buckets use the SEP-10 public key so separate wallets cannot
+ * exhaust one another's sensitive-route budget.
  */
+import type { FastifyContextConfig } from "fastify";
 import { config } from "../config";
 import { ipKey, userOrIpKey } from "../services/rate-limit-keys";
+
+/** The options object @fastify/rate-limit expects inside a route's config. */
+export type RouteRateLimitOptions = Exclude<
+  NonNullable<FastifyContextConfig["rateLimit"]>,
+  false
+>;
+
+/** Keep operational health checks and public API documentation available. */
+export function isGlobalRateLimitExempt(request: { url: string }): boolean {
+  const path = request.url.split("?", 1)[0];
+  return (
+    path === "/health" ||
+    path.startsWith("/health/") ||
+    path === "/docs" ||
+    path.startsWith("/docs/")
+  );
+}
 
 export type RateLimitPolicyName =
   | "global"
   | "authChallenge"
   | "authVerify"
+  | "authLogout"
+  | "expenseCreate"
+  | "expenseMutate"
+  | "treasuryConfig"
+  | "webhookTest"
   | "settlementCreate"
   | "settlementConfirm"
+  | "settlementExecute"
   | "treasurySubmit"
+  | "treasuryPropose"
   | "anchorInit"
   | "anchorPoll"
   | "anchorWebhook"
+  | "sep24Callback"
+  | "sep24Webhook"
   | "groupCreate"
-  | "history";
+  | "groupInvite"
+  | "groupJoin"
+  | "history"
+  | "exchangeRates"
+  | "webhookCreate"
+  | "uploadReceipt";
 
 export interface RateLimitPolicy {
   /** Requests permitted per window. */
@@ -83,6 +120,42 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       prefix: "auth.verify",
       hook: "onRequest",
     },
+    // Session teardown (#682). Keyed by IP on `onRequest` rather than by user,
+    // because the route answers `{ ok: true }` for an absent or invalid bearer
+    // token on purpose — it must not become an oracle for token validity — so
+    // there is no identity to key by on the path that matters. Each accepted
+    // call revokes every refresh token the user holds and writes an audit row.
+    authLogout: {
+      max: config.RATE_LIMIT_AUTH_LOGOUT_MAX,
+      timeWindow: config.RATE_LIMIT_AUTH_LOGOUT_WINDOW_MS,
+      keyBy: "ip",
+      prefix: "auth.logout",
+      hook: "onRequest",
+    },
+    // Its own bucket, keyed by the authenticated user. Expense creation is the
+    // write that opens an obligation for every other participant, so it is
+    // budgeted separately from the settlement routes that later close it: a
+    // client retrying a settlement cannot spend the allowance guarding expense
+    // creation, and vice versa.
+    expenseCreate: {
+      max: config.RATE_LIMIT_EXPENSE_CREATE_MAX,
+      timeWindow: config.RATE_LIMIT_EXPENSE_CREATE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "expense.create",
+      hook: "preHandler",
+    },
+    // The edits that follow a creation (#682). `expenseCreate` guards the
+    // write that opens the obligations; amending or deleting an expense
+    // rewrites what every other participant owes, and until now spent only
+    // the caller's global allowance. Its own bucket, so a client correcting a
+    // typo cannot exhaust the budget that guards creating new expenses.
+    expenseMutate: {
+      max: config.RATE_LIMIT_EXPENSE_MUTATE_MAX,
+      timeWindow: config.RATE_LIMIT_EXPENSE_MUTATE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "expense.mutate",
+      hook: "preHandler",
+    },
     settlementCreate: {
       max: config.RATE_LIMIT_SETTLEMENT_CREATE_MAX,
       timeWindow: config.RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS,
@@ -97,11 +170,41 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       prefix: "settlement.confirm",
       hook: "preHandler",
     },
+    // Its own bucket rather than sharing settlementConfirm's: execution is the
+    // endpoint clients retry after a network timeout, so its budget has to
+    // absorb legitimate retries without spending the confirm budget too.
+    settlementExecute: {
+      max: config.RATE_LIMIT_SETTLEMENT_EXECUTE_MAX,
+      timeWindow: config.RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "settlement.execute",
+      hook: "preHandler",
+    },
     treasurySubmit: {
       max: config.RATE_LIMIT_TREASURY_SUBMIT_MAX,
       timeWindow: config.RATE_LIMIT_TREASURY_SUBMIT_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "treasury.submit",
+      hook: "preHandler",
+    },
+    treasuryPropose: {
+      max: config.RATE_LIMIT_TREASURY_PROPOSE_MAX,
+      timeWindow: config.RATE_LIMIT_TREASURY_PROPOSE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "treasury.propose",
+      hook: "preHandler",
+    },
+    // Treasury signer configuration (#682): enabling a treasury, and
+    // validating a proposed signer set. Both read live account state from
+    // Horizon — so each call spends upstream budget — and both decide who may
+    // move group funds. Budgeted apart from `treasuryPropose` /
+    // `treasurySubmit`, which bound moving the money rather than deciding who
+    // can.
+    treasuryConfig: {
+      max: config.RATE_LIMIT_TREASURY_CONFIG_MAX,
+      timeWindow: config.RATE_LIMIT_TREASURY_CONFIG_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "treasury.config",
       hook: "preHandler",
     },
     anchorInit: {
@@ -125,18 +228,104 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       prefix: "anchor.webhook",
       hook: "onRequest",
     },
+    // The two SEP-24 callback surfaces. Both are unauthenticated until their own
+    // credential is checked (a shared HMAC secret, and a SEP-10 anchor token
+    // respectively) and both are keyed by IP for the same reason, but they get
+    // separate buckets: an anchor that saturates the token-authenticated
+    // callback must not also throttle secret-authenticated callbacks.
+    sep24Callback: {
+      max: config.SEP24_RATE_LIMIT_MAX,
+      timeWindow: config.SEP24_RATE_LIMIT_WINDOW_MS,
+      keyBy: "ip",
+      prefix: "sep24.callback",
+      hook: "onRequest",
+    },
+    sep24Webhook: {
+      max: config.SEP24_RATE_LIMIT_MAX,
+      timeWindow: config.SEP24_RATE_LIMIT_WINDOW_MS,
+      keyBy: "ip",
+      prefix: "sep24.webhook",
+      hook: "onRequest",
+    },
     groupCreate: {
       max: config.RATE_LIMIT_GROUP,
-      timeWindow: config.RATE_LIMIT_WINDOW_MS,
+      timeWindow: config.RATE_LIMIT_GROUP_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "group.create",
       hook: "preHandler",
     },
     history: {
       max: config.RATE_LIMIT_HISTORY,
-      timeWindow: config.RATE_LIMIT_WINDOW_MS,
+      timeWindow: config.RATE_LIMIT_HISTORY_WINDOW_MS,
       keyBy: "user-or-ip",
       prefix: "history.read",
+      hook: "preHandler",
+    },
+    // The only public unauthenticated read in the API. Without its own bucket
+    // it consumed the caller's global allowance — and there is no caller, so
+    // every anonymous scan spent the per-IP global budget that the same IP
+    // would later need for a real request. It also prices two asset pairs
+    // upstream per call, so it is the cheapest route to make someone else's
+    // infrastructure bill with.
+    exchangeRates: {
+      max: config.RATE_LIMIT_EXCHANGE_RATES_MAX,
+      timeWindow: config.RATE_LIMIT_EXCHANGE_RATES_WINDOW_MS,
+      keyBy: "ip",
+      prefix: "rates.read",
+      hook: "onRequest",
+    },
+    // Membership writes. `groupCreate` budgets group *creation*; nothing here
+    // bounded adding people to a group that already exists, which is the write
+    // a compromised admin session actually uses. Its own bucket keeps invite
+    // spam from also burning the caller's creation allowance.
+    groupInvite: {
+      max: config.RATE_LIMIT_GROUP_INVITE_MAX,
+      timeWindow: config.RATE_LIMIT_GROUP_INVITE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "group.invite",
+      hook: "preHandler",
+    },
+    // Redeeming an invite code is guessed at, not spent: the threat is walking
+    // codes that belong to other groups, which is a per-source property. Keyed
+    // by IP on `onRequest` so rotating sessions cannot widen the search.
+    groupJoin: {
+      max: config.RATE_LIMIT_GROUP_JOIN_MAX,
+      timeWindow: config.RATE_LIMIT_GROUP_JOIN_WINDOW_MS,
+      keyBy: "ip",
+      prefix: "group.join",
+      hook: "onRequest",
+    },
+    // Registering a webhook hands the server a URL to call — on a retry
+    // schedule, so one accepted request becomes many outbound attempts. Budgeted
+    // per account, separate from group writes, because the cost lands on egress
+    // rather than on the caller's own rows.
+    webhookCreate: {
+      max: config.RATE_LIMIT_WEBHOOK_CREATE_MAX,
+      timeWindow: config.RATE_LIMIT_WEBHOOK_CREATE_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "webhook.create",
+      hook: "preHandler",
+    },
+    // Ringing a registered endpoint (#693). `webhookCreate` bounds registering
+    // one; this bounds asking the server to call it. One inbound request
+    // becomes an outbound delivery with the same retry schedule as a real
+    // event, so this is the tightest write budget in the table — a test fire
+    // is something a client does once to confirm wiring, never in a loop.
+    webhookTest: {
+      max: config.RATE_LIMIT_WEBHOOK_TEST_MAX,
+      timeWindow: config.RATE_LIMIT_WEBHOOK_TEST_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "webhook.test",
+      hook: "preHandler",
+    },
+    // Multipart uploads write to disk. Sharing the global bucket with reads
+    // meant a client retrying a lost upload response could also starve its own
+    // dashboard polling, and vice versa.
+    uploadReceipt: {
+      max: config.RATE_LIMIT_UPLOAD_RECEIPT_MAX,
+      timeWindow: config.RATE_LIMIT_UPLOAD_RECEIPT_WINDOW_MS,
+      keyBy: "user-or-ip",
+      prefix: "upload.receipt",
       hook: "preHandler",
     },
   };
@@ -150,16 +339,31 @@ export function policyKeyGenerator(policy: RateLimitPolicy) {
 /**
  * Route options applying a named policy, e.g.
  * `app.post("/auth/verify", rateLimited("authVerify"), handler)`.
+ *
+ * The returned object also carries `rateLimitPolicy` — the policy's name,
+ * alongside `rateLimit` rather than inside it, so @fastify/rate-limit never
+ * sees it. It exists so the wiring can be audited: tests/rate-limit-wiring
+ * reads it back off every registered route to assert both that no route
+ * hand-rolls its numbers and that no policy in the table is declared without
+ * being applied. A table entry nothing routes name is a limit an operator can
+ * tune with no effect, which is exactly the failure this marker makes loud.
  */
 export function rateLimited(name: Exclude<RateLimitPolicyName, "global">) {
   const policy = rateLimitPolicies()[name];
   return {
     config: {
+      rateLimitPolicy: name,
       rateLimit: {
         max: policy.max,
         timeWindow: policy.timeWindow,
         hook: policy.hook,
         keyGenerator: policyKeyGenerator(policy),
+        onExceeded: (req: any, key: string) => {
+          req.log?.warn?.(
+            { key, policy: name, ip: req.ip, route: req.url },
+            `Rate limit exceeded for policy ${name}`
+          );
+        },
       },
     },
   };

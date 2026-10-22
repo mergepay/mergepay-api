@@ -1,17 +1,10 @@
--- AlterTable
-ALTER TABLE "idempotency_keys" ADD COLUMN "user_id" TEXT;
-ALTER TABLE "idempotency_keys" ADD COLUMN "status" TEXT NOT NULL DEFAULT 'in_progress';
-ALTER TABLE "idempotency_keys" ADD COLUMN "status_code" INTEGER;
-ALTER TABLE "idempotency_keys" ADD COLUMN "expires_at" TIMESTAMP(3);
-ALTER TABLE "idempotency_keys" ADD COLUMN "updated_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
-
--- Backfill: existing rows already hold a completed response — expire them 24h after creation.
-UPDATE "idempotency_keys"
-SET "status" = 'completed', "expires_at" = "created_at" + INTERVAL '24 hours'
-WHERE "expires_at" IS NULL;
-
-ALTER TABLE "idempotency_keys" ALTER COLUMN "expires_at" SET NOT NULL;
-ALTER TABLE "idempotency_keys" ALTER COLUMN "response_json" DROP NOT NULL;
-
--- CreateIndex
-CREATE INDEX "idempotency_keys_expires_at_idx" ON "idempotency_keys"("expires_at");
+-- Superseded no-op.
+--
+-- `20260728000000_scope_idempotency_keys` already added `user_id`, and
+-- `20260801000000_idempotency_key_lifecycle_state` adds `status`, `status_code`,
+-- `expires_at`, and `updated_at` (with `IF NOT EXISTS`), backfills completed
+-- rows, sets `expires_at NOT NULL`, and relaxes `response_json` — the exact work
+-- this migration attempted, done convergently. This step re-added `user_id` and
+-- aborted `prisma migrate deploy` with 42701 `column "user_id" of relation
+-- "idempotency_keys" already exists`. Retained as a documented no-op; safe for
+-- the ledger reason described in `20260724000000_add_webhooks`.

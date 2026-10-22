@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  ANCHOR_RETRY_POLICY,
   classifyJobFailure,
   retryDelayMs,
   safeFailureMessage,
   SETTLEMENT_RETRY_POLICY,
 } from "../src/services/job-retry";
+import { config } from "../src/config";
 import { AppError } from "../src/errors";
 import { TimeoutError, TransportError } from "../src/services/timeout";
 
@@ -45,6 +47,31 @@ describe("classifyJobFailure", () => {
     expect(classifyJobFailure(new Error("something nobody has seen before"))).toBe(
       "indeterminate"
     );
+  });
+});
+
+describe("retry policy configuration", () => {
+  it("builds the settlement policy from environment configuration", () => {
+    expect(SETTLEMENT_RETRY_POLICY).toEqual({
+      maxAttempts: config.WORKER_SETTLEMENT_MAX_ATTEMPTS,
+      initialDelayMs: config.WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS,
+      maxDelayMs: config.WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS,
+      jitterRatio: config.WORKER_SETTLEMENT_RETRY_JITTER_RATIO,
+    });
+  });
+
+  it("builds the anchor policy from environment configuration", () => {
+    expect(ANCHOR_RETRY_POLICY).toEqual({
+      maxAttempts: config.WORKER_ANCHOR_MAX_ATTEMPTS,
+      initialDelayMs: config.WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS,
+      maxDelayMs: config.WORKER_ANCHOR_RETRY_MAX_DELAY_MS,
+      jitterRatio: config.WORKER_ANCHOR_RETRY_JITTER_RATIO,
+    });
+  });
+
+  it("defaults to three bounded settlement attempts", () => {
+    expect(SETTLEMENT_RETRY_POLICY.maxAttempts).toBe(3);
+    expect(SETTLEMENT_RETRY_POLICY.maxDelayMs).toBe(30_000);
   });
 });
 

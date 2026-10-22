@@ -1,4 +1,4 @@
-<div align="center">
+<div align="center"> 
 
 # Mergepay — API
 
@@ -11,7 +11,8 @@ integration, treasury multisig, anchor (SEP-24) flows, and background jobs.
 [Web repo](https://github.com/mergepay/mergepay-web) ·
 [API repo](https://github.com/mergepay/mergepay-api)
 
-![CI](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml/badge.svg)](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict%20mode-3178C6?logo=typescript&logoColor=white)](https://github.com/mergepay/mergepay-api/blob/main/tsconfig.json)
 ![License](https://img.shields.io/github/license/mergepay/mergepay-api)
 ![Stellar](https://img.shields.io/badge/stellar-testnet-blueviolet)
 
@@ -87,6 +88,8 @@ its own SEP-10 signing key.
 
 ## Setup
 
+For the quickest local dev path against Stellar testnet, see [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
+
 ```bash
 git clone https://github.com/mergepay/mergepay-api.git
 cd mergepay-api
@@ -108,6 +111,70 @@ npm run dev                   # API on :4000
 npm run worker                # background reconciliation worker (separate shell)
 ```
 
+### Local database setup
+
+For local development, use PostgreSQL 14+ and Node.js 20+. Start PostgreSQL,
+then create the `mergepay` database once:
+
+```bash
+createdb mergepay
+```
+
+Copy `.env.example` to `.env` if you have not already, and set `DATABASE_URL`
+to a connection string for that database, for example:
+
+```env
+DATABASE_URL=postgresql://postgres:your-password@localhost:5432/mergepay
+```
+
+Generate the Prisma client and apply the migrations to initialize the schema:
+
+```bash
+npm run prisma:generate
+npm run prisma:migrate
+```
+
+To add the local development seed data, run:
+
+```bash
+npm run db:seed
+```
+
+### Seed data
+
+`npm run db:seed` runs [prisma/seed.ts](prisma/seed.ts) and populates a
+disposable demo dataset so API endpoints can be exercised immediately, without
+manual bootstrapping. The script is **idempotent**: every row is written with
+an upsert keyed by a deterministic id (or another natural unique key), so
+running it again never throws a unique constraint violation and never
+duplicates data. A re-run also restores any seed-owned row to its canonical
+demo values. Rows left behind by older versions of the seed (random ids) are
+untouched — delete them by hand if you want a clean slate.
+
+| Row | Details |
+| --- | --- |
+| Users | `Ada`, `Kola`, `Zo`, `Tunde` — deterministic testnet keypairs |
+| Groups | `Lagos Trip` (4 members) and `Flat 12B` (3 members, treasury enabled) |
+| Expenses | `Dinner` (equal), `Airport transfer` (equal), `Groceries` (custom split), `Wi-Fi subscription` (equal) |
+| Settlements | `SEEDSETTLE` confirmed, `SEEDQUEUE2` pending signature, `SEEDRETRY2` failed and retryable — each with status history |
+| Treasury | confirmed deposit `SEEDTREASR` (100 XLM) and pending deposit `SEEDGRANT2` (50 XLM) in `Flat 12B` |
+| Invite | code `SEEDCLUB` for `Lagos Trip` (max 10 uses) |
+
+The demo accounts are derived from public labels (`mergepay:demo:…`), so their
+secret keys are recomputable by anyone: use them only in local or testnet
+databases and never fund them with anything of value. To sign demo
+transactions (for example in Stellar Laboratory), print the secret seeds with:
+
+```bash
+SEED_PRINT_SECRETS=1 npm run db:seed
+```
+
+Seeded intents carry `expiresAt = null`, which the API reads as "no recorded
+deadline", so demo rows stay actionable instead of expiring while the database
+sits idle.
+
+New to the codebase? The typing standards enforced across `src/` are documented in [TypeScript strict mode](#typescript-strict-mode).
+
 ## Environment variables
 
 See [.env.example](.env.example). Key ones:
@@ -115,57 +182,188 @@ See [.env.example](.env.example). Key ones:
 | Variable | Description |
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string |
-| `JWT_SECRET` | Secret for signing session JWTs (12h expiry) |
+| `JWT_SECRET` | Secret for signing session JWTs (default 15min expiry, configurable via `ACCESS_TOKEN_TTL_SECONDS`) |
+| `JWT_ISSUER` | JWT issuer claim (default: `mergepay-api`) |
+| `JWT_AUDIENCE` | JWT audience claim (default: `mergepay-app`) |
+| `ACCESS_TOKEN_TTL_SECONDS` | Access token lifetime in seconds (default: 900 / 15 minutes) |
+| `REFRESH_TOKEN_TTL_MS` | Refresh token lifetime in milliseconds (default: 30 days) |
 | `STELLAR_NETWORK` | `testnet` or `public` |
 | `HORIZON_URL` | Horizon server |
 | `SEP10_SIGNING_SECRET` | Server's SEP-10 signing key (`npm run gen:sep10key`) |
-| `WEB_URL` | Frontend origin (CORS + invite links) |
+| `SEP10_CHALLENGE_VALIDITY_SECONDS` | How long an issued SEP-10 challenge stays redeemable (default: 300, allowed 30–600) |
+| `WEB_URL` | Frontend origin allow-list for CORS + invite links (comma-separated; `*` for local dev) |
 | `ANCHOR_HOME_DOMAIN` | SEP-24 anchor home domain (default SDF test anchor) |
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
+| `REQUEST_TIMEOUT_MS` | Per-request wall-clock budget in milliseconds (default 10000, must be positive) |
+
+#### Database connection & query timeouts
+
+Prisma is initialized in [src/db.ts](src/db.ts) with explicit connection
+resilience settings so a slow, saturated, or partitioned PostgreSQL **fails
+fast instead of hanging request workers indefinitely**. The values below are
+appended to `DATABASE_URL` as query parameters (`buildDatasourceUrl`) and
+forwarded to the underlying driver; a per-query middleware adds a wall-clock
+budget on top.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | 10 | Max time to establish a socket to Postgres |
+| `DATABASE_POOL_TIMEOUT_SECONDS` | 10 | Max wait for a free pooled connection before erroring |
+| `DATABASE_CONNECTION_LIMIT` | 5 | Max pooled connections per instance |
+| `DATABASE_QUERY_TIMEOUT_MS` | 10000 | Per-query wall-clock budget enforced by middleware |
+
+Parameters already present in `DATABASE_URL` are overridden by these values,
+so the effective timeout policy is always the one configured here. When a
+query exceeds `DATABASE_QUERY_TIMEOUT_MS` it rejects with `Query timeout after
+Nms`, the request fails promptly, and the health check
+(`checkDatabaseConnection`, used by `/health/ready`) applies the same budget.
+
+#### CORS configuration
+
+Cross-origin access for the frontend (`mergepay-web`) is configured entirely
+from the environment: `src/app.ts` registers `@fastify/cors` with the options
+built by `src/lib/cors.ts`. Preflights are answered `204` inside the plugin's
+`onRequest` hook — ahead of authentication and rate limiting — because a
+browser never sends an `Authorization` header on an `OPTIONS` probe.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WEB_URL` | `""` (deny cross-origin) | Origin allow-list, comma-separated; `*` reflects any origin and is for local development only (the shipped `.env.example` sets `*`) |
+| `CORS_ALLOW_CREDENTIALS` | `false` | Whether cross-origin requests may carry credentials; never enable alongside `WEB_URL=*` outside local development |
+| `CORS_ALLOW_METHODS` | `GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS` | Methods advertised on a preflight — restricted to this list, never echoed from the request |
+| `CORS_ALLOW_HEADERS` | `Content-Type,Authorization,X-Requested-With,Idempotency-Key` | Request headers a cross-origin request may send |
+| `CORS_EXPOSE_HEADERS` | `X-Request-ID,X-Correlation-ID,X-RateLimit-*`,`Retry-After` | Response headers made readable to the caller |
+| `CORS_MAX_AGE` | `86400` | Preflight cache lifetime in seconds |
+
+An empty `WEB_URL` denies every cross-origin request while leaving same-origin
+and non-browser clients (no `Origin` header) to the routes' own
+authentication. If `WEB_URL` names a `*.vercel.app` host, preview deployments
+of the frontend (`mergepay-web-*.vercel.app`) are allowed too.
+
+#### Horizon read retries
+
+Read-only Horizon calls (currently fee statistics) retry transient failures —
+timeouts, connection resets, and selected 5xx responses — with bounded,
+configurable backoff so a temporary upstream blip does not immediately fail a
+recoverable read. Transaction submission is **never** transparently retried by
+this helper.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `HORIZON_READ_RETRY_MAX_ATTEMPTS` | 3 | Total attempts (including the first) for a transiently failing read |
+| `HORIZON_READ_RETRY_INITIAL_DELAY_MS` | 250 | Backoff before the first retry |
+| `HORIZON_READ_RETRY_MAX_DELAY_MS` | 2000 | Cap on the exponential backoff |
+
+#### Upstream retry configuration
+
+General retry configuration for safe Horizon and anchor reads (see `src/services/retry.ts`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `UPSTREAM_RETRY_MAX_ATTEMPTS` | 3 | Total retry attempts for safe upstream calls |
+| `UPSTREAM_RETRY_INITIAL_DELAY_MS` | 200 | Initial delay before first retry |
+| `UPSTREAM_RETRY_MAX_DELAY_MS` | 2000 | Maximum delay cap for exponential backoff |
+| `UPSTREAM_RETRY_JITTER_RATIO` | 0.25 | Fraction of delay applied as random jitter |
+| `HORIZON_RETRY_ON_RATE_LIMIT` | true | Horizon reads in `src/services/stellar.ts` also retry HTTP 429 (honouring `Retry-After` up to `UPSTREAM_RETRY_MAX_DELAY_MS`). Submissions are never retried. |
+
+#### Idempotency configuration
+
+Idempotency for `POST /api/v1/settlements/execute` prevents duplicate submissions:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `IDEMPOTENCY_TTL_MS` | 86400000 (24h) | How long a completed reservation replays its stored status |
+| `IDEMPOTENCY_IN_PROGRESS_TIMEOUT_MS` | 60000 (1m) | Timeout for in-progress reservations before they can be reclaimed |
+
+#### SEP-24 webhook configuration
+
+Configuration for SEP-24 anchor callbacks (`POST /api/v1/webhooks/sep24`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SEP24_WEBHOOK_SECRETS` | "" | Per-anchor HMAC secrets as "anchorName:secret,anchorName:secret" |
+| `SEP24_WEBHOOK_TOLERANCE_MS` | 300000 (5m) | Maximum timestamp deviation allowed for anchor callbacks |
+
+#### Request timeout
+
+Every request gets a wall-clock budget (`REQUEST_TIMEOUT_MS`, default 10s) so a
+hung handler cannot hold its connection or a worker forever.
+[src/plugins/request-timeout.ts](src/plugins/request-timeout.ts) arms the timer
+on `onRequest` — covering auth, validation, database work, and upstream calls,
+not just the handler body — and answers a request that overruns it with the
+standard error envelope:
+
+```json
+{
+  "error": { "code": "REQUEST_TIMEOUT", "message": "Request timed out", "timestamp": "…" },
+  "code": "REQUEST_TIMEOUT",
+  "message": "Request timed out"
+}
+```
+
+The timer is disarmed on the response's `finish`/`close`, so promises or
+streams the handler leaves behind cannot fire a 408 onto a response that was
+already sent. There are no per-route exemptions — health probes are subject to
+the same bound — so an operator can reason about one budget rather than a
+matrix of them.
 
 ### Rate limiting
 
 Every route is covered by a global default limit
 (`RATE_LIMIT_GLOBAL_MAX` / `RATE_LIMIT_GLOBAL_WINDOW_MS`, default 100 per
-minute), plus route-appropriate overrides for endpoints with different
-traffic patterns or trust boundaries:
+minute). `/health` and `/docs` are exempt from it so probes and the API
+reference stay reachable during an incident. Endpoints with a different
+traffic pattern or trust boundary replace that default with their own bucket:
 
 | Route(s) | Variables | Default |
 | --- | --- | --- |
 | `POST /auth/challenge` | `RATE_LIMIT_AUTH_CHALLENGE_MAX` / `_WINDOW_MS` | 20 / 1 min |
-| `POST /auth/verify` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /auth/verify`, `POST /auth/refresh` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /auth/logout` | `RATE_LIMIT_AUTH_LOGOUT_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /groups/:id/expenses` | `RATE_LIMIT_EXPENSE_CREATE_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `PATCH /expenses/:id`, `DELETE /expenses/:id` | `RATE_LIMIT_EXPENSE_MUTATE_MAX` / `_WINDOW_MS` | 30 / 1 min |
 | `POST /expenses/:id/settle`, `POST /groups/:id/settlements`, `POST /groups/:id/treasury/deposit`, `POST /groups/:id/treasury/withdraw` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
-| `POST /settlements/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 30 / 1 min |
-| `POST /treasury-transactions/:id/confirm` | `RATE_LIMIT_TREASURY_SUBMIT_MAX` / `_WINDOW_MS` | 30 / 1 min |
-| `POST /anchors/deposit`, `POST /anchors/withdraw`, `POST /anchors/sessions/:id/complete` | `RATE_LIMIT_ANCHOR_INIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
-| `GET /anchors`, `GET /anchors/sessions` | `RATE_LIMIT_ANCHOR_POLL_MAX` / `_WINDOW_MS` | 60 / 1 min |
-| `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 60 / 1 min |
-| `POST /groups` | `RATE_LIMIT_GROUP` | 30 / 1 min |
-| `GET /history` | `RATE_LIMIT_HISTORY` | 60 / 1 min |
+| `POST /settlements/:id/confirm`, `POST /withdraw/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /api/v1/settlements/execute` | `RATE_LIMIT_SETTLEMENT_EXECUTE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /treasury-transactions/:id/confirm`, `POST /groups/:groupId/treasury/proposals/:proposalId/sign`, `POST /api/v1/treasury/proposals/:id/signatures` | `RATE_LIMIT_TREASURY_SUBMIT_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /groups/:groupId/treasury/proposals`, `POST /api/v1/treasury/proposals` | `RATE_LIMIT_TREASURY_PROPOSE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /groups/:id/treasury/enable`, `POST /groups/:id/treasury/validate-signers` | `RATE_LIMIT_TREASURY_CONFIG_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /anchors/deposit`, `POST /anchors/withdraw`, `POST /anchors/sessions/:id/complete`, `POST /api/v1/sep24/deposit`, `POST /api/v1/sep24/withdraw`, `POST /withdraw` | `RATE_LIMIT_ANCHOR_INIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `GET /anchors`, `GET /anchors/sessions`, `GET /anchors/sessions/:id`, `GET /api/v1/sep24/transaction`, `GET /api/v1/sep24/transactions`, `GET /withdraw/:id` | `RATE_LIMIT_ANCHOR_POLL_MAX` / `_WINDOW_MS` | 60 / 1 min |
+| `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 50 / 1 min |
+| `POST /api/v1/sep24/callback`, `POST /api/v1/webhooks/sep24` | `SEP24_RATE_LIMIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /groups` | `RATE_LIMIT_GROUP` / `_WINDOW_MS` | 10 / 1 min |
+| `GET /history` | `RATE_LIMIT_HISTORY` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /groups/:groupId/webhooks/:webhookId/test` | `RATE_LIMIT_WEBHOOK_TEST_MAX` / `_WINDOW_MS` | 5 / 1 min |
 
 **Tuning a deployment.** Every value above is an environment variable with a
 safe default, so a deployment overrides only what it needs — for example a
 wallet integration that legitimately retries submissions can raise
 `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` without loosening SEP-10 or anchor
-budgets. Windows are milliseconds and capped at one hour; maximums must be
-positive integers, so a typo cannot silently disable limiting. The single
-source of truth for which route gets which policy is the table in
-[src/lib/rate-limit.ts](src/lib/rate-limit.ts); routes name a policy rather
-than repeating numbers, and each policy has its own key prefix, which is what
-makes the buckets independent.
+budgets. Windows are milliseconds and are rejected at startup above one hour;
+maximums must be positive integers. Both bounds exist so a typo cannot silently
+disable limiting. The single source of truth for which route gets which policy
+is the table in [src/lib/rate-limit.ts](src/lib/rate-limit.ts); routes name a
+policy rather than repeating numbers, and each policy has its own key prefix,
+which is what makes the buckets independent. The registration of the limiter
+itself — global limits, key strategy, counter store, and the 429 body — is in
+[src/plugins/rate-limit.ts](src/plugins/rate-limit.ts).
 
 Every route above has a bucket separate from ordinary authenticated reads, so
 exhausting a submission or anchor budget never blocks a client from reading its
 own groups, expenses, or settlement status.
 
-Limit keys are the authenticated user's internal id when available
-(never a Stellar public key), or the resolved client IP otherwise —
-`req.ip` does not trust `X-Forwarded-For` unless Fastify's `trustProxy`
-option is explicitly enabled, which this app does not do by default. If
-you deploy behind a reverse proxy or load balancer and want per-client
-(rather than per-proxy) limiting, enable `trustProxy` in `src/app.ts` and
-make sure only your proxy can reach the app directly.
+Limit keys are the authenticated user's SEP-10 public key when the request
+carries a session, and the resolved client IP otherwise. SEP-10 has no session
+yet, so `/auth/challenge`, `/auth/verify`, and `/auth/refresh` are keyed by IP
+alone: a public-key bucket there would make the 429 threshold depend on whether
+an account is known to the API, turning the limiter into an account oracle.
+`req.ip` does not trust `X-Forwarded-For` unless Fastify's `trustProxy` option
+is explicitly enabled, which this app does not do by default. If you deploy
+behind a reverse proxy or load balancer and want per-client (rather than
+per-proxy) limiting, enable `trustProxy` in `src/app.ts` and make sure only your
+proxy can reach the app directly.
 
 The anchor webhook's rate limit is abuse protection only — it never
 replaces the shared-secret (`ANCHOR_WEBHOOK_SECRET`) check, which remains
@@ -179,7 +377,8 @@ store (`rate_limit_buckets` table, see
 query errors (e.g. a transient database outage), the request is allowed
 through rather than the whole API returning 500s — a degraded rate limiter
 is preferable to a full outage. Every 429 response includes standard
-`Retry-After` / `X-RateLimit-*` headers.
+`Retry-After` / `X-RateLimit-*` headers and the standard error envelope
+(`{"error": ..., "code": "RATE_LIMITED", "message": ..., "requestId": ...}`).
 
 ### Request size limits
 
@@ -200,19 +399,47 @@ validator runs efficiently.
 
 ### Worker job tracking and recovery
 
-The background worker tracks job claims and retry attempts for settlement
-submissions and anchor polling. In the event of a worker crash or deployment
-interruption, stale jobs (claimed for longer than 15 minutes) are automatically
-recovered and re-eligible for processing. Job state is tracked via:
+The background worker drives settlement submission and SEP-24 anchor polling
+with the same claim-based rules (see `src/worker/index.ts`):
 
-- `jobAttemptCount`: Number of times the job has been claimed for processing
-- `jobClaimedAt`: Timestamp when the job was last claimed (null if released)
-- `jobEligibleAt`: Earliest time the job is eligible for the next retry attempt
-- `jobErrorSummary`: Truncated error message from the last attempt (for operator review)
+- **Claim before work.** A job is claimed with a conditional update that writes
+  a lease (`claimedBy`, `leaseExpiresAt`). Two workers can never drive the same
+  transition. A crashed process leaves its lease behind; at the top of every
+  cycle `recoverStaleSettlements()`/`recoverStaleAnchorSessions()` free
+  expired leases (default lease timeout: `WORKER_LEASE_TIMEOUT_MS`, 60s), so a
+  restart resumes work without duplicating it.
+- **Classify before retrying.** Every failure is categorised by
+  `src/services/job-retry.ts` into `transient` (rate limits, outages — safe to
+  retry), `indeterminate` (timeout, dropped socket — the worker checks Horizon
+  by the envelope's deterministic hash *before* resubmitting, so an already
+  applied transaction is never submitted twice), and `permanent` (rejected
+  transaction, expired intent, authorization — no retry, the job fails).
+- **Persist the job state.** Attempts, the next eligible time, the failure
+  category, and the final reason are columns on the row (`retryCount`,
+  `nextAttemptAt`, `errorCategory`, `failureReason`), never process memory.
+  An exhausted job stops retrying and is marked `failed` with a sanitized
+  reason; retries and failures are also recorded in the audit log / status
+  history.
 
-Terminal failures (exhausted retries, permanent errors) are marked with status
-`failed` and retain an error summary for support investigation. Each job has
-a maximum of 5 attempts with exponential backoff (5s, 30s, 5m, 30m, 60m).
+Retry budgets are exponential with jitter and fully configurable via env vars
+(see `.env.example`):
+
+- `WORKER_SETTLEMENT_MAX_ATTEMPTS` (default 3), `WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS`
+  (default 1000), `WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS` (default 30000),
+  `WORKER_SETTLEMENT_RETRY_JITTER_RATIO` (default 0.25)
+- `WORKER_ANCHOR_MAX_ATTEMPTS` (default 5), `WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS`
+  (default 5000), `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` (default 120000),
+  `WORKER_ANCHOR_RETRY_JITTER_RATIO` (default 0.25)
+- `WORKER_CYCLE_TASK_MAX_ATTEMPTS` (default 3), `WORKER_CYCLE_TASK_RETRY_INITIAL_DELAY_MS`
+  (default 500), `WORKER_CYCLE_TASK_RETRY_MAX_DELAY_MS` (default 10000) — retries
+  for the *cycle tasks* themselves (issue #708). A sweep that throws a transient
+  database or Horizon error is retried in-cycle with exponential backoff;
+  permanent and indeterminate failures are left to the next cycle. A task whose
+  budget is exhausted is dead-lettered as a critical log line for that cycle
+  while its sibling tasks continue.
+- `WORKER_HEALTH_UNHEALTHY_THRESHOLD` (default 3) — consecutive failed cycles
+  before the per-cycle `worker_health` heartbeat reports `healthy: false` and a
+  critical health line is emitted.
 
 ## How it works
 
@@ -220,6 +447,18 @@ a maximum of 5 attempts with exponential backoff (5s, 30s, 5m, 30m, 60m).
 `POST /auth/challenge` builds a challenge transaction signed by the server key.
 The wallet signs it; `POST /auth/verify` validates the signature (handling
 unfunded accounts via the master key), upserts the user, and returns a JWT.
+
+Challenge transactions carry a **strictly validated validity window**: the
+envelope's own `minTime`/`maxTime` are checked against server time with a
+bounded 30-second clock-skew tolerance. A challenge whose `maxTime` has elapsed
+is rejected with 401 `CHALLENGE_EXPIRED` (the remedy is to request and sign a
+fresh one); one whose `minTime` has not been reached returns
+`CHALLENGE_NOT_YET_VALID`, and a window longer than the 300s validity the
+server issues returns `CHALLENGE_WINDOW_TOO_LONG`. All other verification
+failures stay the generic 401 `UNAUTHORIZED`, so rejections cannot be probed
+for which structural check failed. Challenges are single-use (durable replay
+detection), and the worker's challenge cleanup purges replay records once
+their window closes, keeping them for 24h forensics before deletion.
 
 ### Settlement
 1. `POST /expenses/:id/settle` (or `POST /groups/:id/settlements`) builds an
@@ -278,7 +517,74 @@ treasury account and, when `treasuryRequiredSigners > 1`, returned in
 exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signed
 `POST /anchors/webhook` updates session status; the worker also polls.
 
+`/api/v1/sep24/deposit|withdraw` are aliases of the same two routes and share the
+same request contract. Both are validated by the Zod schemas in
+[src/validations/sep24.ts](src/validations/sep24.ts) before the anchor is
+contacted, so a malformed request never reaches an upstream call, the database,
+or the audit log:
+
+- The body is `.strict()`: `assetCode` (1–12 alphanumeric characters,
+  upper-cased), an optional `assetIssuer`, `account`/`to`/`refundAddress` as
+  checksum-valid Stellar public keys, an optional `amount` (required to
+  withdraw) that must be a positive decimal string with at most 7 places, and
+  `memo`/`refundMemo` bounded by their `memoType` (`text` ≤ 28 UTF-8 bytes with
+  no control characters, `id` an unsigned 64-bit integer, `hash` a
+  base64-encoded 32-byte value). `memo` and `memoType` must be supplied
+  together, unknown keys are rejected, and `extraMetadata` is capped at 20 keys
+  and 2 KB serialized.
+- The query string is validated too, and carries nothing but an optional `lang`.
+  A parameter the body does not define — `?asset_code=XLM`, the SEP-24 wire
+  spelling of the body's `assetCode` — is a 400 naming that parameter, not a
+  silently dropped hint that the body then contradicts.
+- The asset is checked against the configured registry *as a pair*: an issuer
+  Mergepay does not issue that asset under is rejected instead of being dropped
+  in favour of the configured one.
+- Every rejection is the shared `VALIDATION_ERROR` envelope with per-field
+  `details` and `issues`. The routes document the same schemas through
+  `openApiBody(..., { enforce: false })`, so Fastify's ajv cannot pre-empt the
+  handler and answer in its own words — the Zod schema is the only validator.
+
+Status tracking (`src/services/anchor.ts`, `src/services/anchor-status.ts`):
+
+- `anchorService.getTransaction` reads `GET /transaction` and validates it with
+  the Zod schema in `src/services/anchor-schemas.ts`. `id`, `kind` and `status`
+  are required, unknown fields are stripped, and amounts stay decimal strings
+  (a malformed optional field is dropped and logged, never coerced). Failures
+  raise typed errors from `src/services/anchor-errors.ts`, all 502 over HTTP.
+  Each attempt is bounded by `ANCHOR_POLL_TIMEOUT_MS`, and transient failures
+  are retried per `UPSTREAM_RETRY_*`.
+- Every status change goes through `applyAnchorSessionTransition`: a
+  conditional update on the current status plus a `status_history` row and an
+  audit row, all in one transaction. Re-delivering the same status is a no-op,
+  terminal states (`completed`, `refunded`, `expired`, `no_market`,
+  `too_small`, `too_large`; `error` may still become `refunded`) are never
+  walked back, and concurrent writers record the transition exactly once.
+- A status outside the SEP-24 set is logged and ignored. The session keeps its
+  last known state and the worker keeps polling.
+
+## API versioning
+
+Domain routes are served under the **`/api/v1`** prefix: `/api/v1/auth/challenge`,
+`/api/v1/groups`, `/api/v1/anchors/deposit`, and so on. The prefix is a single
+constant (`API_V1_PREFIX` in [src/app.ts](src/app.ts)) passed to every route
+plugin's registration, so the fastify route table, the OpenAPI document, and
+the rate-limit wiring all describe the same versioned surfaces.
+
+Clients written against the pre-version paths keep working: a `rewriteUrl` hook
+maps the legacy root spellings (`/auth/challenge`, `/groups/…`) and the old
+`/api/…` aliases (`/api/sep24/deposit`, `/api/treasury/proposals`, …) onto the
+canonical versioned routes before routing, preserving the query string. The
+rewrite is a compatibility layer, not a second surface — both spellings reach
+the same handler, validators, and audit entries — and new integrations should
+use `/api/v1`. The operational endpoints (`/health`, `/health/live`,
+`/health/ready`, `/docs`, and the static `/uploads/…` receipt files) stay at
+the root: they are outside the versioned API contract and probes must not have
+to track an API version.
+
 ## Endpoints
+
+All paths below are relative to `/api/v1` (see
+[API versioning](#api-versioning)).
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -292,8 +598,10 @@ exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signe
 | GET | `/groups/:id/balances` · `/groups/:id/ledger` | Balances & ledger |
 | POST/GET | `/groups/:id/treasury/*` · `/treasury-transactions/:id/confirm` | Treasury |
 | GET/POST | `/anchors` · `/anchors/deposit` · `/anchors/withdraw` · `/anchors/sessions/:id/complete` · `/anchors/sessions` · `/anchors/webhook` | Anchors |
+| POST/GET | `/withdraw` · `/withdraw/:id` · `/withdraw/:id/confirm` | SEP-24 withdrawals |
 | GET | `/history` | Cross-group history |
 | POST/GET | `/uploads/receipt` · `/uploads/:file` | Receipts |
+| GET | `/health` · `/health/live` · `/health/ready` | Liveness & readiness probes (see [HEALTH.md](HEALTH.md)) |
 
 All request bodies are validated with Zod; every group action checks membership
 (and admin rights where required). The full contract — error envelope and codes,
@@ -327,10 +635,58 @@ ordering coordinates, never a group or user id: access is decided by each
 query's own scope plus its membership check, so a cursor from one resource
 replayed against another cannot widen what the caller can read.
 
-Covers `GET /groups`, `/groups/:id/expenses`, `/groups/:id/ledger`,
-`/groups/:id/treasury/history`, `/anchors/sessions`, and `/history` (which
+Covers `GET /groups`, `/groups/:id`, `/groups/:id/expenses`,
+`/groups/:id/settlements`, `/groups/:id/ledger`,
+`/groups/:id/treasury/history`, `/groups/:groupId/treasury/proposals`,
+`/groups/:groupId/webhooks`, `/groups/:groupId/webhooks/:webhookId/deliveries`,
+`/anchors/sessions`, `/api/v1/sep24/transactions`, and `/history` (which
 paginates its expense and settlement streams independently, via `cursor` and
 `settlementCursor`).
+
+### Filtering the transaction history
+
+The history endpoints take filters alongside the pagination parameters above.
+Filters are pushed into the database query, never applied to an already-fetched
+page: a filter applied after the fact would return pages shorter than the
+requested `limit` and make `hasMore` describe the unfiltered scan.
+
+| Endpoint | Filters |
+| --- | --- |
+| `GET /groups/:id/expenses` | `asset` (`XLM`\|`USDC`), `status` (`PENDING`\|`SETTLED`), `startDate`, `endDate`, `includeTotal` |
+| `GET /groups/:id/settlements` | `status` (`awaiting_signature`\|`submitted`\|`confirmed`\|`failed`\|`expired`), `asset`, `startDate`, `endDate`, `includeTotal` |
+| `GET /groups/:id/ledger` | `type` (one or more of `expense`,`settlement`,`treasury`), `startDate`, `endDate` |
+| `GET /groups/:groupId/webhooks/:webhookId/deliveries` | `status` (`pending`\|`delivered`\|`failed`), `event` |
+| `GET /groups/:groupId/audit-logs` | `action`, `actorUserId`, `startDate`, `endDate` |
+
+Notes that matter when integrating:
+
+- **Dates** are ISO-8601 with an offset, and both bounds are inclusive. A
+  reversed range is `INVALID_RANGE`, not an empty page.
+- **Unknown filter values** are `VALIDATION_ERROR`. A typo never silently
+  returns nothing.
+- **`includeTotal=true`** adds `meta.total`, the count of the *filtered* set
+  ignoring the cursor. It is opt-in because counting is a second query over
+  every matching row, which the cursor contract otherwise never pays for.
+- **`status` on settlements** filters by the same public status the settlement
+  status endpoint reports, including the two values derived from the signing
+  deadline rather than stored (`expired`, and `submitted` vs
+  `awaiting_signature`). The five values partition the history: every
+  settlement matches exactly one.
+- **`type` on the ledger** decides which tables are read at all, so
+  `?type=expense` issues one query instead of three.
+
+## TypeScript strict mode
+
+The whole of `src/` compiles under TypeScript's [`strict`](https://www.typescriptlang.org/tsconfig/#strict) flag — see [tsconfig.json](tsconfig.json) for the exact configuration. `strict` turns on every strict type-checking family at once (`strictNullChecks`, `noImplicitAny`, `strictFunctionTypes`, `strictBindCallApply`, `strictPropertyInitialization`, `noImplicitThis`, `alwaysStrict`, and `useUnknownInCatchVariables`), so `null`/`undefined` flows, implicit `any`s, and unbound `this` are compile errors rather than production incidents.
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `strict` | `true` | All strict checks on across `src/` — no per-file opt-outs |
+| `forceConsistentCasingInFileNames` | `true` | Casing differences cannot break Linux CI builds |
+| `noUnusedLocals` | `false` | Deliberate: readability over lint-by-compiler (ESLint's `no-unused-vars` covers it) |
+| `noUncheckedIndexedAccess` | `false` | Deliberate: index accesses are guarded where they matter |
+
+CI enforces it: [`npm run build`](CONTRIBUTING.md#pr-checklist) must pass with zero TS errors before a PR merges. When contributing, keep new code strict-clean — narrow unknowns explicitly, annotate catch variables, and never suppress with `any` casts where a real type exists (see [CONTRIBUTING.md](CONTRIBUTING.md#coding-standards)).
 
 ## Testing
 
@@ -376,6 +732,177 @@ path end-to-end:
 
 Subsequent requests use `{{token}}` automatically. Response variables
 (`@name` / `{{…}}`) chain group and expense IDs for you.
+
+## Architecture notes
+
+### Error handling standardization (#654)
+
+All errors flow through a single Fastify plugin (`src/plugins/error-handler.ts`)
+that maps framework, validation, database, and upstream failures to a canonical
+envelope while keeping operator-visible details server-side only. The mapping is
+deterministic and tested end-to-end:
+
+| Source | HTTP status | Error code | Details |
+| --- | --- | --- | --- |
+| Zod validation failure | 400 | `VALIDATION_ERROR` | Field-level issues with message and code |
+| Prisma P2002 (unique constraint) | 409 | `DUPLICATE_RECORD` | Conflicting fields, model name |
+| Prisma P2025/P2001 (record not found) | 404 | `NOT_FOUND` | — |
+| Prisma P2003 (foreign key) | 400 | `VALIDATION_ERROR` | Referenced field name |
+| Prisma lifecycle codes (P1000-P1017) | 503 | `SERVICE_UNAVAILABLE` | Retryable, driver text logged only |
+| Horizon upstream failure | 502 | `UPSTREAM_ERROR` | Provider error category |
+| Timeout / transport error | 502 | `UPSTREAM_ERROR` | Transient network issue |
+| Rate limit exceeded | 429 | `RATE_LIMIT_EXCEEDED` | Retry-After header |
+| Generic unhandled error | 500 | `INTERNAL_ERROR` | Sanitized message only |
+
+Tests: [`tests/prisma-error.test.ts`](tests/prisma-error.test.ts),
+[`tests/plugins/error-handler.test.ts`](tests/plugins/error-handler.test.ts).
+
+### Background worker retry and idempotency (#652)
+
+The settlement and SEP-24 anchor workers run as a separate process
+(`npm run worker:start`) and follow strict rules for resilience:
+
+**Claim before work.** Each job is claimed with a conditional update that writes
+a lease (`claimedBy`, `leaseExpiresAt`). Only one worker can win; two processes
+can never drive the same transition. A crashed worker's lease lapses and the job
+becomes eligible again.
+
+**Classify before retrying.** Every failure is categorised
+([`src/services/job-retry.ts`](src/services/job-retry.ts)):
+
+| Category | Meaning | Action |
+| --- | --- | --- |
+| `transient` | Call demonstrably did not take effect (rate limit, timeout, connection refused) | Retry with bounded exponential backoff + jitter |
+| `indeterminate` | Outcome unknown (dropped socket, timeout after submission) | Check Horizon by transaction hash **before** resubmitting |
+| `permanent` | Request itself is wrong (validation, authorization, rejected transaction) | Stop immediately, persist reason, visible to operators |
+
+**Idempotency guards.** Before any indeterminate failure is retried, the worker
+calls `alreadyApplied()` which queries Horizon by the envelope's deterministic
+hash. If the transaction already succeeded on-chain, the settlement advances to
+`confirmed` without resubmitting — preventing double payments when the response
+was lost but the payment went through.
+
+**Bounded backoff.** Exponential backoff with jitter prevents thundering herds:
+`delay = min(maxDelay, initialDelay × 2^(attempt-1)) ± jitter`. Policies are
+configurable via environment variables (see table below).
+
+**Permanent failure marking.** Terminal failures record three columns in the
+`Settlement` row:
+
+- `errorCategory`: retry decision (`transient` / `indeterminate` / `permanent`)
+- `failureReason`: sanitized, length-capped explanation (no secrets, no XDR)
+- `failureCategory`: why it failed (`validation` / `insufficient_funds` /
+  `expired` / `upstream` / `ledger_rejected` / `internal`)
+
+Tests: [`tests/worker.test.ts`](tests/worker.test.ts),
+[`tests/settlement-execute-idempotency.test.ts`](tests/settlement-execute-idempotency.test.ts).
+
+#### Worker retry configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WORKER_SETTLEMENT_MAX_ATTEMPTS` | 5 | Total submission attempts per settlement |
+| `WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS` | 1000 | Initial backoff delay |
+| `WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS` | 30000 | Maximum backoff cap |
+| `WORKER_SETTLEMENT_RETRY_JITTER_RATIO` | 0.25 | Jitter fraction (0–1) |
+| `WORKER_ANCHOR_MAX_ATTEMPTS` | 5 | Total poll attempts per anchor session |
+| `WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS` | 2000 | Anchor poll backoff start |
+| `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` | 60000 | Anchor poll backoff cap |
+| `WORKER_ANCHOR_RETRY_JITTER_RATIO` | 0.25 | Anchor jitter fraction |
+
+### Horizon SDK isolation (#650)
+
+Routes never call the Stellar SDK directly. The only import of
+`@stellar/stellar-sdk` in `src/routes/` is in
+[`src/routes/treasury.ts`](src/routes/treasury.ts:3) for `StrKey` (key format
+validation, not Horizon calls). All Horizon interaction goes through service
+modules (`src/services/stellar.ts`, `src/services/horizonService.ts`), ensuring
+a clean separation between request handling and blockchain interaction.
+
+### SEP-10 Zod validation (#647)
+
+Both SEP-10 endpoints parse their body against strict Zod schemas that reject
+unknown keys rather than silently ignoring them:
+
+- **`POST /auth/challenge`**: validates `account` as a 56-character Stellar
+  public key with checksum refinement
+  ([`src/validations/sep10.ts`](src/validations/sep10.ts:28-39))
+- **`POST /auth/verify`**: validates `transaction` as canonical base64 XDR
+  (whole number of 4-byte words, max 50KB), and `home_domain` / `client_domain`
+  as valid domains when they are present
+  ([`src/validations/sep10.ts`](src/validations/sep10.ts:168-176))
+
+Unknown query parameters are also rejected, so a client mistakenly sending
+`GET /auth?account=...` gets a 400 VALIDATION_ERROR instead of being silently
+ignored.
+
+**Domain claims (#659)** — the schema's question is shape; what the server does
+with those two values is decided by the route, before any envelope is parsed and
+before this server's challenge is consumed:
+
+- `client_domain`, and the legacy `clientDomain` spelling, → **400
+  CLIENT_DOMAIN_UNSUPPORTED**. This server performs no client-domain
+  verification ([`src/services/sep10.ts`](src/services/sep10.ts) refuses a
+  challenge envelope carrying that operation), so accepting the field and
+  dropping it left a wallet integration believing it had one.
+- a `home_domain` other than the one challenges are issued for (`SEP10_HOME_DOMAIN`,
+  compared case-insensitively) → **400 HOME_DOMAIN_MISMATCH**, naming the
+  expected domain.
+
+Both answer a question about the *request*, not the credential, so they add no
+way to probe how a signature check failed. Neither burns the challenge: a
+corrected retry of the same signed envelope still works.
+
+**Challenge lifetime.** `SEP10_CHALLENGE_VALIDITY_SECONDS` (default 300,
+accepted 30–600, bounded in [`src/config.ts`](src/config.ts)) is a single value
+shared by challenge generation and the redemption bounds check, so the two can
+never disagree about how long an envelope stays redeemable.
+
+**Store outages.** When the durable single-use store cannot be reached,
+verification fails closed with **503 SERVICE_UNAVAILABLE** instead of a 401:
+still no session, but the client is told to retry and an incident shows up as an
+unavailable dependency rather than as a wave of bad credentials. The database's
+own error text is never returned.
+
+Tests: [`tests/validations/sep10.test.ts`](tests/validations/sep10.test.ts),
+[`tests/sep10-request-validation.test.ts`](tests/sep10-request-validation.test.ts),
+[`tests/sep10-generation-and-redemption.test.ts`](tests/sep10-generation-and-redemption.test.ts).
+
+### SEP-24 withdrawal request validation (#663)
+
+`POST /withdraw`, `POST /withdraw/:id/confirm` and `GET /withdraw/:id` were the
+three SEP-24 withdrawal routes that parsed their input inline and carried no
+`schema` at all, so they were invisible in `/docs`. They now parse against
+shared Zod schemas and document the same contract:
+
+- **Withdrawal body** — `sep24WithdrawalRequestBodySchema`
+  ([`src/validations/sep24.ts`](src/validations/sep24.ts)): a decimal amount
+  with at most 7 fractional places, a 1–12 character alphanumeric asset code,
+  an optional `MP:`-prefixed memo, strict about unknown keys. Positivity and
+  asset *support* stay in the handler, so `INVALID_AMOUNT` and
+  `UNSUPPORTED_ASSET` keep their own answers instead of being swallowed by a
+  generic validation error.
+- **Signed envelope** — `POST /withdraw/:id/confirm` takes the same
+  `signedXdrRequestSchema` as the settlement and treasury confirmations
+  ([`src/validations/stellar-transaction.ts`](src/validations/stellar-transaction.ts)):
+  canonical base64 that the SDK can decode as a transaction envelope. Any other
+  string is a 400 naming `signedXdr` *before* the anchor's auth endpoint is
+  contacted; previously it was forwarded upstream and came back as a 502.
+- **`:id`** — one `sep24WithdrawalParamsSchema` shared by both `:id` routes, so
+  the pair cannot drift apart. Its rule is presence, which is what both routes
+  have always applied.
+- All three are annotated `openApiBody(..., { enforce: false })`, so the Zod
+  parse in the handler stays the only validator and every rejection arrives in
+  the `VALIDATION_ERROR` envelope with `details` and `issues`.
+
+`POST /withdraw/:id/confirm` answers with the withdrawal **flat**
+(`{ id, status, transaction_id, … }`), while initiation and the read route wrap
+the same record under a `withdrawal` key. The annotation documents that as it
+is: reshaping a published response is a client-visible change, not a validation
+one.
+
+Tests: [`tests/withdraw.test.ts`](tests/withdraw.test.ts),
+[`tests/openapi-annotations.test.ts`](tests/openapi-annotations.test.ts).
 
 ## Deployment
 

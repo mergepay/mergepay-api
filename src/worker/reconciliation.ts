@@ -1,10 +1,11 @@
-import pino from "pino";
+import { env } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import { type CorrelationContext, jobContext, loggerWithContext } from "../lib/correlation";
+import { createLogger } from "../lib/logger";
 
-const log = pino({ name: "transaction-reconciliation" });
+const log = createLogger({ name: "transaction-reconciliation" });
 
 type ReconciliationTable = "settlement" | "withdrawal" | "treasuryProposal";
 
@@ -14,6 +15,8 @@ type ReconciliationRecord = {
   stellarTxHash: string | null;
   updatedAt: Date;
   createdAt?: Date;
+  /** Present for `settlement` and `treasuryProposal`; `withdrawal` has no group. */
+  groupId?: string;
   expenseShareId?: string | null;
   retryCount?: number;
   ledger?: number | null;
@@ -69,19 +72,16 @@ export function reconciliationConfig(
   return {
     intervalMs:
       options.intervalMs ??
-      positiveInteger(process.env.RECONCILIATION_INTERVAL, DEFAULT_INTERVAL_MS),
+      positiveInteger(String(env.RECONCILIATION_INTERVAL), DEFAULT_INTERVAL_MS),
     confirmationThreshold:
       options.confirmationThreshold ??
-      positiveInteger(
-        process.env.CONFIRMATION_THRESHOLD,
-        DEFAULT_CONFIRMATION_THRESHOLD
-      ),
+      positiveInteger(String(env.CONFIRMATION_THRESHOLD), DEFAULT_CONFIRMATION_THRESHOLD),
     timeoutMs:
       options.timeoutMs ??
-      positiveInteger(process.env.TX_TIMEOUT, DEFAULT_TIMEOUT_MS),
+      positiveInteger(String(env.TX_TIMEOUT), DEFAULT_TIMEOUT_MS),
     maxRetries:
       options.maxRetries ??
-      nonNegativeInteger(process.env.MAX_RETRIES, DEFAULT_MAX_RETRIES),
+      nonNegativeInteger(String(env.MAX_RETRIES), DEFAULT_MAX_RETRIES),
   };
 }
 
@@ -186,6 +186,8 @@ async function writeStatus(
 
   await audit({
     userId: null,
+    groupId: record.groupId,
+    actorType: "worker",
     action: `stellar_transaction_${status}`,
     entityType: table,
     entityId: record.id,

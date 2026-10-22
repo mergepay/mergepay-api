@@ -6,8 +6,59 @@
  */
 
 import { bigIntAbs, fromStroops, toStroops } from "./money";
+import { isSupportedAsset } from "../lib/money";
 
 export type SplitType = "equal" | "custom" | "percentage";
+
+/**
+ * Stable machine-readable codes for the errors this engine can raise.
+ *
+ * The engine is pure and its callers are spread across the API (the expense
+ * creation route, the balance preview routes, and this file itself), so the
+ * codes — not prose — are the contract a client branches on. They are
+ * exported so routes can map them onto HTTP responses without re-deriving
+ * the distinction from message text.
+ */
+export const SETTLEMENT_ENGINE_ERROR_CODES = {
+  /** The expense total was missing, zero, or negative. */
+  INVALID_SPLIT_AMOUNT: "INVALID_SPLIT_AMOUNT",
+  /** A split was requested with no participants at all. */
+  INVALID_SPLIT_PARTICIPANT: "INVALID_SPLIT_PARTICIPANT",
+  /** Custom amounts did not sum exactly to the expense total. */
+  INVALID_SPLIT_SUM: "INVALID_SPLIT_SUM",
+  /** Percentage weights did not sum to 100. */
+  INVALID_SPLIT_PERCENT: "INVALID_SPLIT_PERCENT",
+  /** The asset is outside Mergepay's supported settlement registry. */
+  UNSUPPORTED_ASSET: "UNSUPPORTED_ASSET",
+} as const;
+
+export type SettlementEngineErrorCode =
+  (typeof SETTLEMENT_ENGINE_ERROR_CODES)[keyof typeof SETTLEMENT_ENGINE_ERROR_CODES];
+
+/**
+ * An error raised by the settlement engine, carrying a stable code.
+ *
+ * Deliberately not an `AppError`: the engine has no HTTP opinion, and routes
+ * decide how a code maps to a status. The message is written for clients —
+ * it names the request's own fields, never internal state — so a caller may
+ * forward it verbatim once the code has been validated against this map.
+ */
+export class SettlementEngineError extends Error {
+  readonly code: SettlementEngineErrorCode;
+
+  constructor(code: SettlementEngineErrorCode, message: string) {
+    super(message);
+    this.name = "SettlementEngineError";
+    this.code = code;
+  }
+}
+
+/** Narrow an unknown thrown value to an engine error. */
+export function isSettlementEngineError(
+  error: unknown
+): error is SettlementEngineError {
+  return error instanceof SettlementEngineError;
+}
 
 export interface ShareInput {
   userId: string;
@@ -29,19 +80,31 @@ export function computeShares(
   splitType: SplitType,
   shares: ShareInput[]
 ): ComputedShare[] {
-  if (shares.length === 0) throw new Error("At least one participant required");
+  if (shares.length === 0)
+    throw new SettlementEngineError(
+      SETTLEMENT_ENGINE_ERROR_CODES.INVALID_SPLIT_PARTICIPANT,
+      "At least one participant required"
+    );
   const total = toStroops(amount);
-  if (total <= 0n) throw new Error("Amount must be greater than zero");
+  if (total <= 0n)
+    throw new SettlementEngineError(
+      SETTLEMENT_ENGINE_ERROR_CODES.INVALID_SPLIT_AMOUNT,
+      "Amount must be greater than zero"
+    );
 
   if (splitType === "custom") {
     const computed = shares.map((s) => {
       if (s.amount === undefined)
-        throw new Error("custom split requires an amount per share");
+        throw new SettlementEngineError(
+          SETTLEMENT_ENGINE_ERROR_CODES.INVALID_SPLIT_SUM,
+          "Custom split requires an amount for every participant"
+        );
       return { userId: s.userId, stroops: toStroops(s.amount) };
     });
     const sum = computed.reduce((a, c) => a + c.stroops, 0n);
     if (sum !== total) {
-      throw new Error(
+      throw new SettlementEngineError(
+        SETTLEMENT_ENGINE_ERROR_CODES.INVALID_SPLIT_SUM,
         `Custom amounts must sum to ${amount} (got ${fromStroops(sum)})`
       );
     }
@@ -55,11 +118,17 @@ export function computeShares(
     let pctTotal = 0;
     for (const s of shares) {
       if (s.percent === undefined)
-        throw new Error("percentage split requires a percent per share");
+        throw new SettlementEngineError(
+          SETTLEMENT_ENGINE_ERROR_CODES.INVALID_SPLIT_PERCENT,
+          "Percentage split requires a percent for every participant"
+        );
       pctTotal += s.percent;
     }
     if (Math.abs(pctTotal - 100) > 0.001) {
-      throw new Error(`Percentages must sum to 100 (got ${pctTotal})`);
+      throw new SettlementEngineError(
+        SETTLEMENT_ENGINE_ERROR_CODES.INVALID_SPLIT_PERCENT,
+        `Percentages must sum to 100 (got ${pctTotal})`
+      );
     }
     const computed = shares.map((s) => {
       // total * percent / 100, in stroops
@@ -117,6 +186,65 @@ export interface NetBalance {
 }
 
 /**
+ * A share row tagged with the asset its amount is denominated in.
+ *
+ * A group can hold expenses in several assets (XLM and USDC), and a stroop of
+ * one is not worth a stroop of another. Every amount therefore carries the
+ * asset it belongs to so balances never net across currencies.
+ */
+export interface AssetBalanceShareRow extends BalanceShareRow {
+  assetCode: string;
+  assetIssuer: string | null;
+}
+
+/** A settlement row tagged with the asset it settles in. */
+export interface AssetBalanceSettlementRow extends BalanceSettlementRow {
+  assetCode: string;
+  assetIssuer: string | null;
+}
+
+/** Net balances for a single asset within a group. */
+export interface AssetNetBalances {
+  assetCode: string;
+  assetIssuer: string | null;
+  balances: NetBalance[];
+}
+
+/**
+ * Stable grouping key for an asset. The code is upper-cased so `xlm` and `XLM`
+ * group together, while the issuer is kept verbatim so two assets that share a
+ * code but not an issuer never collapse into one balance bucket.
+ */
+export function balanceAssetKey(
+  assetCode: string,
+  assetIssuer: string | null
+): string {
+  return `${assetCode.toUpperCase()}::${assetIssuer ?? ""}`;
+}
+
+/**
+ * Validate that a settlement asset is one Mergepay supports — native XLM, or
+ * the configured stablecoin (USDC).
+ *
+ * Throws on anything else so a stray asset code can never enter balance math
+ * or be attached to a settlement transaction. This is the service-level guard
+ * behind the request-level Zod checks (see `refineStellarAsset`); it exists for
+ * values that reach the engine from the database rather than a request body.
+ */
+export function assertSupportedSettlementAsset(
+  assetCode: string,
+  assetIssuer: string | null
+): void {
+  if (!isSupportedAsset(assetCode, assetIssuer)) {
+    throw new SettlementEngineError(
+      SETTLEMENT_ENGINE_ERROR_CODES.UNSUPPORTED_ASSET,
+      `Unsupported settlement asset "${assetCode}"` +
+        (assetIssuer ? ` (issuer ${assetIssuer})` : "")
+    );
+  }
+}
+
+/**
  * Net = (what others owe this user) - (what this user owes others).
  *
  * Each unsettled share where user != payer means the share owner owes the payer.
@@ -151,6 +279,73 @@ export function computeNetBalances(
     userId,
     net: fromStroops(stroops),
   }));
+}
+
+/**
+ * Net balances segregated by asset.
+ *
+ * Each distinct asset gets its own balance sheet: an XLM debt can never offset
+ * a USDC credit, because that would claim a debt was paid in a currency it was
+ * not denominated in. Rows are grouped by `(assetCode, assetIssuer)` and each
+ * group is netted independently with `computeNetBalances`.
+ *
+ * Every asset encountered is validated against the supported registry, so a
+ * bad code surfaces as an error instead of a quietly mis-grouped balance.
+ * Asset groups are returned in first-seen order, which keeps the output stable
+ * for a given input and lets callers pick a "primary" asset if they need one.
+ */
+export function computeNetBalancesByAsset(
+  shares: AssetBalanceShareRow[],
+  settlements: AssetBalanceSettlementRow[]
+): AssetNetBalances[] {
+  interface Group {
+    assetCode: string;
+    assetIssuer: string | null;
+    shares: BalanceShareRow[];
+    settlements: BalanceSettlementRow[];
+  }
+
+  const groups = new Map<string, Group>();
+
+  const groupFor = (
+    assetCode: string,
+    assetIssuer: string | null
+  ): Group => {
+    assertSupportedSettlementAsset(assetCode, assetIssuer);
+    const key = balanceAssetKey(assetCode, assetIssuer);
+    let group = groups.get(key);
+    if (!group) {
+      group = { assetCode, assetIssuer, shares: [], settlements: [] };
+      groups.set(key, group);
+    }
+    return group;
+  };
+
+  for (const s of shares) {
+    groupFor(s.assetCode, s.assetIssuer).shares.push({
+      payerUserId: s.payerUserId,
+      userId: s.userId,
+      shareAmount: s.shareAmount,
+      settled: s.settled,
+    });
+  }
+
+  for (const st of settlements) {
+    groupFor(st.assetCode, st.assetIssuer).settlements.push({
+      fromUserId: st.fromUserId,
+      toUserId: st.toUserId,
+      amount: st.amount,
+      confirmed: st.confirmed,
+    });
+  }
+
+  return [...groups.values()]
+    .map((g) => ({
+      assetCode: g.assetCode,
+      assetIssuer: g.assetIssuer,
+      balances: computeNetBalances(g.shares, g.settlements),
+    }))
+    .filter((g) => g.balances.length > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +396,11 @@ export function suggestSettlements(balances: NetBalance[]): Suggestion[] {
   }
 
   return suggestions;
+}
+
+/** Public name used by the settlement preview API. */
+export function calculateSimplifiedDebts(balances: NetBalance[]): Suggestion[] {
+  return suggestSettlements(balances);
 }
 
 /** Convenience: are all balances effectively zero? */

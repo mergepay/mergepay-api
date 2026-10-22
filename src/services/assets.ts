@@ -13,14 +13,20 @@
  *   const asset = getAssetConfig("USDC", "G…");   // → AssetConfig
  *   validateAsset("XLM");                          // → never throws
  *   validateAsset("BADCOIN", "G…");                // → throws AppError
- *   validatePrecision("123.4567890");               // → ok
- *   validatePrecision("123.45678901");              // → throws
+ *   validateAmount("123.4567890");                  // → ok
+ *   validateAmount("123.45678901");                 // → throws
  */
 
 import { StrKey } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { Errors } from "../errors";
 import type { AssetSpec } from "./stellar";
+import {
+  validateAsset as libValidateAsset,
+  validateAmount as libValidateAmount,
+  isSupportedAsset as libIsSupportedAsset,
+  supportedAssetCodes as libSupportedAssetCodes,
+} from "../lib/money";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -115,60 +121,11 @@ export function getAssetConfig(
   code: string,
   issuer?: string | null
 ): AssetConfig {
-  const upper = code.toUpperCase().trim();
-  if (!upper) {
-    throw Errors.badRequest("invalid_asset", "Asset code is required");
+  const result = libValidateAsset(code, issuer);
+  if (!result.ok) {
+    throw Errors.badRequest("invalid_asset", result.message);
   }
-
-  // ── 1. Check by (code + issuer) first ──────────────────────────────
-  if (issuer) {
-    const exact = _byCodeIssuer.get(issuerKey(upper, issuer));
-    if (exact) {
-      assertNetwork(exact);
-      return stripNetwork(exact);
-    }
-  }
-
-  // ── 2. Check by code only ──────────────────────────────────────────
-  const entry = _byCode.get(upper);
-  if (!entry) {
-    throw Errors.badRequest(
-      "invalid_asset",
-      `Unsupported asset code "${code}". Supported codes: ${[..._byCode.keys()].join(", ")}`
-    );
-  }
-
-  // Native asset with an issuer supplied?  That's a mistake.
-  if (entry.type === "native" && issuer) {
-    throw Errors.badRequest(
-      "invalid_asset",
-      `"${entry.code}" is a native asset and does not take an issuer`
-    );
-  }
-
-  // Issued asset without an issuer provided?  Use the default.
-  if (entry.type === "issued" && !issuer) {
-    // The configured issuer is the only acceptable one.
-    if (!entry.issuer) {
-      throw Errors.badRequest(
-        "invalid_asset",
-        `"${code}" issuer is not configured. Set STABLE_ASSET_ISSUER or provide an issuer.`
-      );
-    }
-    assertNetwork(entry);
-    return stripNetwork(entry);
-  }
-
-  // Issued asset with a mismatched issuer?
-  if (entry.type === "issued" && issuer && entry.issuer && issuer !== entry.issuer) {
-    throw Errors.badRequest(
-      "invalid_asset",
-      `"${code}" issuer mismatch. Expected ${entry.issuer}, got ${issuer}`
-    );
-  }
-
-  assertNetwork(entry);
-  return stripNetwork(entry);
+  return result.value;
 }
 
 /**
@@ -201,36 +158,23 @@ export function validateIssuer(issuer: string): void {
 
 /**
  * Assert that an amount string respects Stellar's 7‑decimal precision limit
- * and is a positive number.  Returns the validated amount string.
+ * and is a positive number.  Returns the validated amount string (canonical form).
  *
  * Rejects:
  * - Empty or non‑numeric strings.
  * - Zero or negative amounts.
  * - Values with more than 7 decimal places.
+ * - Exponent notation, whitespace padding.
+ * - Amounts exceeding Stellar's Int64 range.
+ *
+ * Uses BigInt arithmetic only — never floating point.
  */
 export function validateAmount(value: string): string {
-  const trimmed = value.trim();
-  if (!/^\d+(\.\d+)?$/.test(trimmed)) {
-    throw Errors.badRequest(
-      "invalid_amount",
-      `"${value}" is not a valid numeric amount`
-    );
+  const result = libValidateAmount(value);
+  if (!result.ok) {
+    throw Errors.badRequest("invalid_amount", result.message);
   }
-
-  const [_, frac = ""] = trimmed.split(".");
-  if (frac.length > ASSET_PRECISION) {
-    throw Errors.badRequest(
-      "invalid_amount",
-      `Amount "${value}" exceeds ${ASSET_PRECISION}‑decimal precision`
-    );
-  }
-
-  const num = Number(trimmed);
-  if (!Number.isFinite(num) || num <= 0) {
-    throw Errors.badRequest("invalid_amount", "Amount must be greater than zero");
-  }
-
-  return trimmed;
+  return result.value.decimal;
 }
 
 /**
@@ -253,19 +197,14 @@ export function assetConfigToSpec(asset: AssetConfig): AssetSpec {
  * Returns `true`/`false` — no throw.
  */
 export function isSupportedAsset(code: string, issuer?: string | null): boolean {
-  try {
-    getAssetConfig(code, issuer);
-    return true;
-  } catch {
-    return false;
-  }
+  return libIsSupportedAsset(code, issuer);
 }
 
 /**
  * Return the list of supported asset codes for use in Zod schemas etc.
  */
 export function supportedAssetCodes(): string[] {
-  return [..._byCode.keys()];
+  return libSupportedAssetCodes();
 }
 
 /**

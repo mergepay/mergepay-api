@@ -1,8 +1,10 @@
--- AlterTable
-ALTER TABLE "audit_logs" ADD COLUMN "group_id" TEXT;
-
--- CreateIndex
-CREATE INDEX "audit_logs_group_id_created_at_idx" ON "audit_logs"("group_id", "created_at");
-
--- AddForeignKey
-ALTER TABLE "audit_logs" ADD CONSTRAINT "audit_logs_group_id_fkey" FOREIGN KEY ("group_id") REFERENCES "groups"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+-- Superseded no-op.
+--
+-- `20260725000001_add_audit_log` (applied earlier) already adds `audit_logs.group_id`,
+-- its index, and its foreign key to `groups`. This migration re-added the same
+-- column and aborted `prisma migrate deploy` with 42701 `column "group_id" of
+-- relation "audit_logs" already exists`.
+--
+-- Any index schema.prisma still expects from this step is reconciled by
+-- `..._reconcile_schema_drift`. Retained as a documented no-op; safe for the
+-- same ledger reason described in `20260724000000_add_webhooks`.

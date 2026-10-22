@@ -19,6 +19,9 @@
  *                  and stays visible to operators.
  */
 
+import { config } from "../config";
+import { ProviderError } from "../lib/provider-error";
+
 export type JobFailureCategory = "transient" | "indeterminate" | "permanent";
 
 export interface RetryPolicy {
@@ -30,18 +33,22 @@ export interface RetryPolicy {
   jitterRatio: number;
 }
 
+/**
+ * Bounded retry budgets, tunable via environment variables (see
+ * src/config.ts). Defaults preserve the pre-configuration behavior.
+ */
 export const SETTLEMENT_RETRY_POLICY: RetryPolicy = {
-  maxAttempts: 3,
-  initialDelayMs: 1_000,
-  maxDelayMs: 30_000,
-  jitterRatio: 0.25,
+  maxAttempts: config.WORKER_SETTLEMENT_MAX_ATTEMPTS,
+  initialDelayMs: config.WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS,
+  maxDelayMs: config.WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS,
+  jitterRatio: config.WORKER_SETTLEMENT_RETRY_JITTER_RATIO,
 };
 
 export const ANCHOR_RETRY_POLICY: RetryPolicy = {
-  maxAttempts: 5,
-  initialDelayMs: 5_000,
-  maxDelayMs: 120_000,
-  jitterRatio: 0.25,
+  maxAttempts: config.WORKER_ANCHOR_MAX_ATTEMPTS,
+  initialDelayMs: config.WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS,
+  maxDelayMs: config.WORKER_ANCHOR_RETRY_MAX_DELAY_MS,
+  jitterRatio: config.WORKER_ANCHOR_RETRY_JITTER_RATIO,
 };
 
 /**
@@ -132,11 +139,26 @@ const TRANSIENT_MARKERS = [
   "stale",
 ];
 
+/** How a normalized provider failure category maps to a job retry decision. */
+const PROVIDER_CATEGORY_JOB: Record<ProviderError["category"], JobFailureCategory> = {
+  timeout: "indeterminate",
+  transport: "transient",
+  rate_limited: "transient",
+  unavailable: "transient",
+  malformed: "transient",
+  rejected: "permanent",
+};
+
 /**
- * Classify a job failure. Error *types* and status codes are consulted before
- * message text, so classification does not hinge on provider wording.
+ * Classify a job failure. Typed provider errors are consulted first (their
+ * category is authoritative), then error *types* and status codes, and only
+ * then message text — classification never hinges on provider wording alone.
  */
 export function classifyJobFailure(error: unknown): JobFailureCategory {
+  if (error instanceof ProviderError) {
+    return PROVIDER_CATEGORY_JOB[error.category];
+  }
+
   const name = error instanceof Error ? error.name : "";
   if (name === "TimeoutError") return "indeterminate";
   if (name === "TransportError") return "transient";

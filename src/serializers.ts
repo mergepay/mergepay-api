@@ -4,6 +4,19 @@
  */
 
 import type { Prisma } from "@prisma/client";
+import type {
+  User,
+  Group,
+  GroupMember,
+  Expense,
+  ExpenseShare,
+  Settlement,
+  TreasuryTransaction,
+  TreasuryProposal,
+  AnchorSession,
+  AuditLogEntry,
+  StatusHistory,
+} from "./types/contract";
 
 function dec(v: Prisma.Decimal | string | number): string {
   return v.toString();
@@ -13,7 +26,7 @@ function iso(d: Date): string {
   return d.toISOString();
 }
 
-export function serializeStatusHistory(h: any) {
+export function serializeStatusHistory(h: any): StatusHistory {
   return {
     id: h.id,
     entityType: h.entityType,
@@ -25,7 +38,7 @@ export function serializeStatusHistory(h: any) {
   };
 }
 
-export function serializeUser(u: any) {
+export function serializeUser(u: any): User {
   return {
     id: u.id,
     stellarPublicKey: u.stellarPublicKey,
@@ -35,7 +48,7 @@ export function serializeUser(u: any) {
   };
 }
 
-export function serializeGroup(g: any) {
+export function serializeGroup(g: any): Group {
   return {
     id: g.id,
     name: g.name,
@@ -49,7 +62,7 @@ export function serializeGroup(g: any) {
   };
 }
 
-export function serializeMember(m: any) {
+export function serializeMember(m: any): GroupMember {
   return {
     id: m.id,
     groupId: m.groupId,
@@ -60,23 +73,23 @@ export function serializeMember(m: any) {
   };
 }
 
-export function serializeShare(s: any) {
+export function serializeShare(s: any): ExpenseShare {
   return {
     id: s.id,
     expenseId: s.expenseId,
     userId: s.userId,
-    user: serializeUser(s.user),
+    user: s.user ? serializeUser(s.user) : undefined,
     shareAmount: dec(s.shareAmount),
     status: s.status,
   };
 }
 
-export function serializeExpense(e: any) {
+export function serializeExpense(e: any): Expense {
   return {
     id: e.id,
     groupId: e.groupId,
     payerUserId: e.payerUserId,
-    payer: serializeUser(e.payer),
+    payer: e.payer ? serializeUser(e.payer) : undefined,
     title: e.title,
     description: e.description ?? null,
     amount: dec(e.amount),
@@ -90,14 +103,14 @@ export function serializeExpense(e: any) {
   };
 }
 
-export function serializeSettlement(s: any) {
+export function serializeSettlement(s: any): Settlement {
   return {
     id: s.id,
     groupId: s.groupId,
     fromUserId: s.fromUserId,
-    from: serializeUser(s.from),
+    from: s.from ? serializeUser(s.from) : undefined,
     toUserId: s.toUserId,
-    to: serializeUser(s.to),
+    to: s.to ? serializeUser(s.to) : undefined,
     amount: dec(s.amount),
     assetCode: s.assetCode,
     assetIssuer: s.assetIssuer ?? null,
@@ -116,7 +129,7 @@ export function serializeSettlement(s: any) {
   };
 }
 
-export function serializeTreasuryTx(t: any) {
+export function serializeTreasuryTx(t: any): TreasuryTransaction {
   return {
     id: t.id,
     groupId: t.groupId,
@@ -135,7 +148,7 @@ export function serializeTreasuryTx(t: any) {
   };
 }
 
-export function serializeTreasuryProposal(p: any) {
+export function serializeTreasuryProposal(p: any): TreasuryProposal {
   return {
     id: p.id,
     groupId: p.groupId,
@@ -144,6 +157,38 @@ export function serializeTreasuryProposal(p: any) {
     threshold: p.threshold,
     signatures: p.signatures ?? [],
     signatureCount: Array.isArray(p.signatures) ? p.signatures.length : 0,
+    status: p.status,
+    stellarTxHash: p.stellarTxHash ?? null,
+    failureReason: p.failureReason ?? null,
+    createdAt: iso(p.createdAt),
+    updatedAt: iso(p.updatedAt),
+  };
+}
+
+export function serializeTreasurySignature(s: any) {
+  return {
+    id: s.id,
+    signerPublicKey: s.signerPublicKey,
+    weight: s.weight,
+    createdAt: iso(s.createdAt),
+  };
+}
+
+export function serializeTreasuryTxProposal(p: any) {
+  return {
+    id: p.id,
+    groupId: p.groupId,
+    creatorId: p.creatorId,
+    xdr: p.xdr,
+    description: p.description ?? null,
+    sourceAccount: p.sourceAccount,
+    requiredWeight: p.requiredWeight,
+    signatures: Array.isArray(p.signatures)
+      ? p.signatures.map(serializeTreasurySignature)
+      : [],
+    totalWeight: Array.isArray(p.signatures)
+      ? p.signatures.reduce((sum: number, s: any) => sum + s.weight, 0)
+      : undefined,
     status: p.status,
     stellarTxHash: p.stellarTxHash ?? null,
     failureReason: p.failureReason ?? null,
@@ -176,7 +221,7 @@ export function serializeInvite(i: any, webUrl: string) {
   };
 }
 
-export function serializeAnchorSession(s: any) {
+export function serializeAnchorSession(s: any): AnchorSession {
   return {
     id: s.id,
     userId: s.userId,
@@ -186,7 +231,14 @@ export function serializeAnchorSession(s: any) {
     interactiveUrl: s.interactiveUrl ?? null,
     externalTransactionId: s.externalTransactionId ?? null,
     status: s.status,
-    statusHistory: (s.statusHistory ?? []).map(serializeStatusHistory),
+    // Present only when the caller loaded the rows: `status_history` is keyed
+    // by (entityType, entityId) rather than by a Prisma relation, so a plain
+    // session query has no history to show. Emitting `[]` for those reads makes
+    // "this transaction never changed status" — a claim — out of "this route
+    // did not look" — an absence. The field is optional in the contract.
+    ...(s.statusHistory
+      ? { statusHistory: s.statusHistory.map(serializeStatusHistory) }
+      : {}),
     failureReason: s.failureReason ?? null,
     retryCount: s.retryCount ?? 0,
     lastPolledAt: s.lastPolledAt ? iso(s.lastPolledAt) : null,
@@ -220,15 +272,16 @@ function redactAuditMetadata(metadata: unknown): Record<string, unknown> | null 
   return redacted;
 }
 
-export function serializeAuditLogEntry(e: any) {
+export function serializeAuditLogEntry(e: any): AuditLogEntry {
   return {
     id: e.id,
     createdAt: iso(e.createdAt),
     actorUserId: e.userId ?? null,
     actorDisplayName: e.user?.displayName ?? null,
     action: e.action,
-    entityType: e.entityType,
-    entityId: e.entityId,
+    entityType: e.entityType ?? null,
+    entityId: e.entityId ?? null,
     metadata: redactAuditMetadata(e.metadata),
   };
 }
+

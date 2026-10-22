@@ -6,10 +6,11 @@ import { PrismaRateLimitStore } from "../src/services/rate-limit-store";
 
 /**
  * These build small, self-contained Fastify instances with a deterministic
- * limiter configuration — mirroring exactly how app.ts wires
- * @fastify/rate-limit for the sensitive routes — rather than exercising the
- * full app, since buildApp() disables rate limiting entirely in test mode
- * (config.isTest) for the rest of the test suite's convenience.
+ * limiter configuration — mirroring exactly how src/plugins/rate-limit.ts
+ * wires @fastify/rate-limit for the sensitive routes — rather than exercising
+ * the full app. Which real route names which policy is asserted in
+ * tests/rate-limit-wiring.test.ts; which policy a booted app enforces, in
+ * tests/rate-limit-sensitive-routes.test.ts.
  */
 async function buildLimitedApp(opts: { max: number; timeWindow: number }) {
   const app = Fastify({ logger: false });
@@ -56,7 +57,7 @@ describe("rate limiting — allowed and rejected requests", () => {
     });
     app.post("/protected", { preHandler: async (req) => {
       const userId = req.headers["x-user"] as string | undefined;
-      if (userId) (req as any).user = { id: userId };
+      if (userId) (req as any).user = { id: userId, stellarPublicKey: `GTEST_${userId}` };
     } }, async () => ({ ok: true }));
     await app.ready();
 

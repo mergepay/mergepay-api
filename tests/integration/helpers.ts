@@ -8,6 +8,26 @@ export const HORIZON_URL = process.env.HORIZON_URL || "https://horizon-testnet.s
 export const FRIENDBOT_URL = "https://friendbot.stellar.org";
 export const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:3000";
 
+let _serverCheckPromise: Promise<boolean> | null = null;
+
+/** Check if the live API server is reachable */
+export async function isLiveServerAvailable(): Promise<boolean> {
+  if (!_serverCheckPromise) {
+    _serverCheckPromise = (async () => {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1500);
+        const res = await fetch(`${API_BASE_URL}/health/live`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        return res.ok;
+      } catch {
+        return false;
+      }
+    })();
+  }
+  return _serverCheckPromise;
+}
+
 /** Generate a new keypair and fund it via friendbot. */
 export async function createTestAccount(): Promise<Keypair> {
   const keypair = Keypair.random();

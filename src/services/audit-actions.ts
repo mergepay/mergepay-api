@@ -12,6 +12,13 @@
  * Example: `treasury.deposit.create`, `settlement.confirm.submitted`
  */
 export const AuditAction = {
+  // ── Authentication / SEP-10 ────────────────────────────────────────
+  AUTH_CHALLENGE_CREATED: "auth.challenge.created",
+  AUTH_CHALLENGE_VERIFIED: "auth.challenge.verified",
+  AUTH_CHALLENGE_EXPIRED: "auth.challenge.expired",
+  AUTH_CHALLENGE_REJECTED: "auth.challenge.rejected",
+  AUTH_TOKEN_ISSUED: "auth.token.issued",
+
   // ── Group / membership ──────────────────────────────────────────────
   GROUP_CREATE: "group.create",
   GROUP_ARCHIVE: "group.archive",
@@ -20,11 +27,7 @@ export const AuditAction = {
   GROUP_JOIN: "group.join",
   GROUP_LEAVE: "group.leave",
   GROUP_MEMBER_REMOVE: "group.member_remove",
-
-  // ── Expenses ────────────────────────────────────────────────────────
-  EXPENSE_CREATE: "expense.create",
-  EXPENSE_UPDATE: "expense.update",
-  EXPENSE_DELETE: "expense.delete",
+  GROUP_MEMBER_ROLE_CHANGE: "group.member_role_change",
 
   // ── Treasury ────────────────────────────────────────────────────────
   TREASURY_ENABLE: "treasury.enable",
@@ -33,6 +36,8 @@ export const AuditAction = {
   TREASURY_CONFIRM: "treasury.confirm",
   TREASURY_CONFIRM_FAILED: "treasury.confirm.failed",
   TREASURY_SIGNER_VALIDATION: "treasury.signer_validation",
+  TREASURY_TRANSACTION_CONFIRMED: "treasury.transaction.confirmed",
+  TREASURY_TRANSACTION_FAILED: "treasury.transaction.failed",
 
   // ── Treasury proposals (multisig) ───────────────────────────────────
   TREASURY_PROPOSAL_CREATED: "treasury.proposal.created",
@@ -40,8 +45,18 @@ export const AuditAction = {
   TREASURY_PROPOSAL_SUBMITTED: "treasury.proposal.submitted",
   TREASURY_PROPOSAL_FAILED: "treasury.proposal.failed",
 
+  // ── Treasury tx proposals (signature collector, caller-supplied XDR) ──
+  TREASURY_TX_PROPOSAL_CREATED: "treasury.tx_proposal.created",
+  TREASURY_TX_PROPOSAL_SIGNATURE_ADDED: "treasury.tx_proposal.signature_added",
+  TREASURY_TX_PROPOSAL_READY: "treasury.tx_proposal.ready",
+  TREASURY_TX_PROPOSAL_SUBMITTED: "treasury.tx_proposal.submitted",
+  TREASURY_TX_PROPOSAL_FAILED: "treasury.tx_proposal.failed",
+
   // ── Settlements ─────────────────────────────────────────────────────
   SETTLEMENT_CREATED: "settlement.created",
+  EXPENSE_CREATE: "expense.create",
+  EXPENSE_UPDATE: "expense.update",
+  EXPENSE_DELETE: "expense.delete",
   SETTLEMENT_CONFIRM_RETRY: "settlement.confirm.retry",
   SETTLEMENT_CONFIRM_SUBMITTED: "settlement.confirm.submitted",
   SETTLEMENT_CONFIRM_VALIDATION_FAILED: "settlement.confirm.validation_failed",
@@ -50,6 +65,12 @@ export const AuditAction = {
   SETTLEMENT_CONFIRMED: "settlement.confirmed",
   SETTLEMENT_FAILED: "settlement.failed",
   SETTLEMENT_RETRIED: "settlement.retried",
+
+  // ── Worker (background jobs) ────────────────────────────────────────
+  // A cycle task that exhausted its in-cycle retry budget. Sweep tasks keep no
+  // row of their own to fail, so this record is the durable trace that a job
+  // stopped running — see src/worker/index.ts `runCycleTask`.
+  WORKER_TASK_DEAD_LETTER: "worker.task.dead_letter",
 } as const;
 
 export type AuditActionValue = (typeof AuditAction)[keyof typeof AuditAction];

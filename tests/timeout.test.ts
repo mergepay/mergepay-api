@@ -6,6 +6,8 @@ import {
   TransportError,
   classifyExternalError,
   toAppError,
+  retryRead,
+  readRetryDelayMs,
 } from "../src/services/timeout";
 import { Errors } from "../src/errors";
 
@@ -124,6 +126,100 @@ describe("classifyExternalError", () => {
   it("classifies other errors as unknown", () => {
     expect(classifyExternalError(new Error("generic"))).toBe("unknown");
     expect(classifyExternalError("string error")).toBe("unknown");
+  });
+});
+
+describe("readRetryDelayMs", () => {
+  const policy = { maxAttempts: 5, initialDelayMs: 100, maxDelayMs: 800 };
+
+  it("backs off exponentially and never exceeds the cap", () => {
+    const noJitter = () => 0.5;
+    expect(readRetryDelayMs(1, policy, noJitter)).toBe(100);
+    expect(readRetryDelayMs(2, policy, noJitter)).toBe(200);
+    expect(readRetryDelayMs(3, policy, noJitter)).toBe(400);
+    expect(readRetryDelayMs(4, policy, noJitter)).toBe(800);
+    expect(readRetryDelayMs(50, policy, noJitter)).toBe(800);
+  });
+
+  it("jitters within a small bound so processes do not retry in lockstep", () => {
+    const base = policy.initialDelayMs;
+    const spread = base * 0.1;
+    expect(readRetryDelayMs(1, policy, () => 0)).toBe(base - spread);
+    expect(readRetryDelayMs(1, policy, () => 1)).toBe(base + spread);
+  });
+
+  it("returns no delay for a nonsensical attempt number", () => {
+    expect(readRetryDelayMs(0, policy)).toBe(0);
+    expect(readRetryDelayMs(Number.NaN, policy)).toBe(0);
+  });
+});
+
+describe("retryRead", () => {
+  const policy = { maxAttempts: 3, initialDelayMs: 1, maxDelayMs: 2 };
+  const sleep = vi.fn().mockResolvedValue(undefined);
+
+  beforeEach(() => {
+    sleep.mockClear();
+  });
+
+  it("returns the first success without retrying", async () => {
+    const fn = vi.fn().mockResolvedValue("ok");
+    await expect(retryRead("op", policy, fn, { sleep })).resolves.toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("retries transient failures and succeeds on a later attempt", async () => {
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(new TransportError("op", "ECONNRESET"))
+      .mockRejectedValueOnce(new TimeoutError("op", 100))
+      .mockResolvedValue("ok");
+    const onRetry = vi.fn();
+
+    await expect(
+      retryRead("op", policy, fn, { sleep, onRetry })
+    ).resolves.toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(3);
+    expect(onRetry).toHaveBeenCalledTimes(2);
+    // Only after the failing attempts, never on success.
+    expect(onRetry.mock.calls[0][0]).toMatchObject({ attempt: 1, maxAttempts: 3 });
+    expect(onRetry.mock.calls[1][0]).toMatchObject({ attempt: 2, maxAttempts: 3 });
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a 5xx upstream error as transient after the budget is exhausted", async () => {
+    const upstream = Errors.upstream("Horizon is having a bad day");
+    const fn = vi.fn().mockRejectedValue(upstream);
+
+    await expect(retryRead("op", policy, fn, { sleep })).rejects.toBe(upstream);
+    expect(fn).toHaveBeenCalledTimes(policy.maxAttempts);
+  });
+
+  it("re-throws the original error category after exhausting retries", async () => {
+    const timeout = new TimeoutError("op", 100);
+    const fn = vi.fn().mockRejectedValue(timeout);
+
+    await expect(retryRead("op", policy, fn, { sleep })).rejects.toBe(timeout);
+    expect(fn).toHaveBeenCalledTimes(policy.maxAttempts);
+  });
+
+  it("fails immediately on a non-retryable error without extra calls", async () => {
+    const badRequest = Errors.badRequest("xdr_malformed", "nope");
+    const fn = vi.fn().mockRejectedValue(badRequest);
+
+    await expect(retryRead("op", policy, fn, { sleep })).rejects.toBe(badRequest);
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("fails immediately on an authentication failure without retrying", async () => {
+    const unauthorized = Errors.unauthorized("invalid token");
+    const fn = vi.fn().mockRejectedValue(unauthorized);
+
+    await expect(retryRead("op", policy, fn, { sleep })).rejects.toBe(unauthorized);
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 });
 

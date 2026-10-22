@@ -1,13 +1,10 @@
--- DropIndex (old single-column uniqueness on key alone)
-DROP INDEX IF EXISTS "idempotency_keys_key_key";
-
--- AlterTable
-ALTER TABLE "idempotency_keys" ADD COLUMN "user_id" TEXT NOT NULL DEFAULT '';
-ALTER TABLE "idempotency_keys" ADD COLUMN "status" TEXT NOT NULL DEFAULT 'succeeded';
-ALTER TABLE "idempotency_keys" ADD COLUMN "updated_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
-ALTER TABLE "idempotency_keys" ALTER COLUMN "response_json" DROP NOT NULL;
-ALTER TABLE "idempotency_keys" ALTER COLUMN "user_id" DROP DEFAULT;
-ALTER TABLE "idempotency_keys" ALTER COLUMN "status" DROP DEFAULT;
-
--- CreateIndex (compound uniqueness scoped to the authenticated principal)
-CREATE UNIQUE INDEX "idempotency_keys_user_id_key_key" ON "idempotency_keys"("user_id", "key");
+-- Superseded no-op.
+--
+-- `20260728000000_scope_idempotency_keys` (applied earlier) already adds
+-- `user_id`, `scope`, the `idempotency_keys_user_id_scope_key_key` unique index
+-- and the FK to `users`; `20260801000000_idempotency_key_lifecycle_state` adds
+-- the lifecycle columns (`status`, `status_code`, `expires_at`, `updated_at`)
+-- defensively with `IF NOT EXISTS`. This migration re-added `user_id` and aborted
+-- `prisma migrate deploy` with 42701 `column "user_id" of relation
+-- "idempotency_keys" already exists`. Retained as a documented no-op; safe for
+-- the ledger reason described in `20260724000000_add_webhooks`.

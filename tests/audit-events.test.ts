@@ -229,6 +229,19 @@ describe("auditData helper", () => {
     );
   });
 
+  it("records a safe actor public key in metadata", () => {
+    const data = auditData({
+      action: "treasury.proposal.signed",
+      entityType: "treasury_proposal",
+      entityId: "proposal_1",
+      actorPublicKey: "GACTOR",
+    });
+    expect(data.metadata).toEqual(
+      expect.objectContaining({ actorPublicKey: "GACTOR" })
+    );
+    expect(data.metadata).not.toHaveProperty("privateKey");
+  });
+
   it("omits outcome and actorType when not provided", () => {
     const data = auditData({
       action: "test.action",

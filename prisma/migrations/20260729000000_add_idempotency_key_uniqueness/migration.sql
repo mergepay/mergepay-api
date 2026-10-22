@@ -1,4 +1,9 @@
--- Ensure an idempotency key is unique for an authenticated user and operation.
--- The scope prevents a key used by one endpoint from colliding with another.
-CREATE UNIQUE INDEX IF NOT EXISTS "IdempotencyKey_userId_scope_key_key"
-ON "IdempotencyKey" ("userId", "scope", "key");
+-- Superseded no-op.
+--
+-- This migration created a unique index on a PascalCase `"IdempotencyKey"` table
+-- that `prisma/schema.prisma` never declares, so it aborted `prisma migrate
+-- deploy` with 42P01 `relation "IdempotencyKey" does not exist`. The scoped
+-- uniqueness it intended already exists on the real table, created by
+-- `20260728000000_scope_idempotency_keys` as
+-- `idempotency_keys_user_id_scope_key_key`. Retained as a documented no-op; safe
+-- for the ledger reason described in `20260724000000_add_webhooks`.

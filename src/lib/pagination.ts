@@ -69,12 +69,25 @@ export type SortOrder = "asc" | "desc";
  * The shared query schema. Routes with no extra parameters parse `req.query`
  * with this directly; routes with their own filters extend it with `.extend()`
  * so the pagination contract stays identical across all of them.
+ *
+ * `strict()` rejects unknown query parameters rather than silently stripping
+ * them: `?page=3` on a cursor-based endpoint is a client bug, and dropping the
+ * key would let a caller believe page-based paging worked. Routes that need
+ * extra filters should add them with `.extend()` (which preserves strictness
+ * for the pagination keys), not by loosening this schema.
  */
-export const paginationQuerySchema = z.object({
-  cursor: z.string().min(1).max(512).optional(),
-  limit: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).default(DEFAULT_PAGE_SIZE),
-  order: z.enum(["asc", "desc"]).default("desc"),
-});
+export const paginationQuerySchema = z
+  .object({
+    cursor: z.string().min(1).max(512).optional(),
+    limit: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_PAGE_SIZE)
+      .default(DEFAULT_PAGE_SIZE),
+    order: z.enum(["asc", "desc"]).default("desc"),
+  })
+  .strict();
 
 export type PaginationQuery = z.infer<typeof paginationQuerySchema>;
 

@@ -1,0 +1,293 @@
+/**
+ * Issue #346 — rate-limit wiring audit.
+ *
+ * The policy table in src/lib/rate-limit.ts can be correct and the server can
+ * still be effectively unlimited: what matters is which routes actually name a
+ * policy, and whether the limiter they inherit is the one the table describes.
+ * This suite reads the registered routes back off a real `buildApp()` instance
+ * and asserts the wiring, which is the class of defect unit tests over the
+ * policy table structurally cannot see.
+ *
+ * Three defects it exists to prevent, all of which shipped at some point:
+ *
+ *  1. A route that hand-writes `config: { rateLimit: { max, timeWindow } }`.
+ *     @fastify/rate-limit merges route options onto the *global* ones, so such
+ *     a route silently inherits `keyGenerator: globalRateLimitKey` — the very
+ *     key the global bucket counts. `POST /groups` and `GET /history` were
+ *     written that way, which made their budgets non-independent: a caller
+ *     burning its group-creation budget also burned 10 of its 100 global
+ *     requests, and unrelated global traffic could 429 a route that had spent
+ *     nothing of its own.
+ *  2. A policy declared in the table that no route names. `RATE_LIMIT_GROUP`,
+ *     `RATE_LIMIT_HISTORY`, and `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` were all
+ *     documented tunables that nothing read, so an operator could raise or
+ *     lower them and see no change.
+ *  3. Two policy tables. src/config/ratelimit.ts was a near-copy of
+ *     src/lib/rate-limit.ts that no module imported — except the test suite,
+ *     which therefore asserted against code the server never ran.
+ *
+ * `onRoute` fires while the route plugins load, and buildApp exposes that hook
+ * through `BuildAppOptions.onRoute` because a hook attached to the returned
+ * instance would be too late — the plugins are already loaded by then.
+ */
+import { describe, it, expect, beforeAll } from "vitest";
+import { buildApp } from "../src/app";
+import {
+  rateLimitPolicies,
+  type RateLimitPolicy,
+  type RateLimitPolicyName,
+} from "../src/lib/rate-limit";
+
+interface RegisteredRoute {
+  method: string;
+  url: string;
+  policy?: string;
+  rateLimit?: Record<string, any>;
+}
+
+let routes: RegisteredRoute[] = [];
+let policies: Record<RateLimitPolicyName, RateLimitPolicy>;
+
+function describeRoute(route: RegisteredRoute) {
+  return `${route.method} ${route.url}`;
+}
+
+beforeAll(async () => {
+  policies = rateLimitPolicies();
+  // Deliberately not closed: the static-file plugin and the Prisma pool keep
+  // handles open, and this suite holds no request-level state to release.
+  await buildApp({
+    onRoute: (routeOptions) => {
+      const config = (routeOptions.config ?? {}) as Record<string, any>;
+      // `method` is a bare string for a normal `app.post(...)` and an array
+      // only for `app.all(...)`. Calling `.join` on the string form throws, and
+      // a throwing onRoute hook leaves Fastify's boot promise pending rather
+      // than rejecting — the suite then dies as a hook timeout.
+      const { method } = routeOptions;
+      routes.push({
+        method: Array.isArray(method) ? method.join(",") : String(method ?? ""),
+        url: routeOptions.url ?? "",
+        policy: config.rateLimitPolicy,
+        rateLimit: config.rateLimit,
+      });
+    },
+  });
+});
+
+describe("rate-limit registration options", () => {
+  it("registers every route, so the audit below is looking at the real route table", () => {
+    expect(routes.length).toBeGreaterThan(30);
+    expect(routes.some((r) => r.url === "/api/v1/auth/challenge")).toBe(true);
+    expect(routes.some((r) => r.url === "/api/v1/settlements/:id/confirm")).toBe(true);
+  });
+});
+
+describe("no route hand-rolls its rate-limit numbers", () => {
+  it("every route that declares a limit names a policy from the table", () => {
+    const handRolled = routes
+      .filter((route) => route.rateLimit !== undefined && route.policy === undefined)
+      .map(describeRoute);
+
+    expect(handRolled).toEqual([]);
+  });
+
+  it("every named policy actually exists in the table", () => {
+    const unknown = routes
+      .filter((route) => route.policy !== undefined)
+      .map((route) => route.policy as string)
+      .filter((name) => !(name in policies));
+
+    expect([...new Set(unknown)]).toEqual([]);
+  });
+
+  it("a named policy's numbers are the ones the table declares", () => {
+    // Guards against a route spreading a policy and then overriding `max`,
+    // which would leave the table describing a limit nothing enforces.
+    const drifted = routes
+      .filter((route) => route.policy !== undefined)
+      .filter((route) => {
+        const policy = policies[route.policy as RateLimitPolicyName];
+        const applied = route.rateLimit ?? {};
+        return (
+          applied.max !== policy.max ||
+          applied.timeWindow !== policy.timeWindow ||
+          applied.hook !== policy.hook
+        );
+      })
+      .map(describeRoute);
+
+    expect(drifted).toEqual([]);
+  });
+
+  it("user-keyed policies run on preHandler, so authenticate has resolved the user first", () => {
+    // On `onRequest` the limiter cannot read `req.user`; every such policy would
+    // silently fall back to keying by IP, which lets one client exhaust a
+    // budget the table intends to share across a user's devices.
+    for (const route of routes) {
+      const policy = policies[route.policy as RateLimitPolicyName];
+      if (policy?.keyBy !== "user-or-ip") continue;
+      expect({ route: describeRoute(route), hook: route.rateLimit?.hook }).toEqual({
+        route: describeRoute(route),
+        hook: "preHandler",
+      });
+    }
+  });
+});
+
+describe("no policy is declared without being applied", () => {
+  it("every policy in the table is named by at least one route", () => {
+    const used = new Set(
+      routes.map((route) => route.policy).filter((name): name is string => !!name)
+    );
+    const orphans = (Object.keys(policies) as RateLimitPolicyName[]).filter(
+      (name) => name !== "global" && !used.has(name)
+    );
+
+    expect(orphans).toEqual([]);
+  });
+});
+
+describe("sensitive routes carry the tighter per-route budget", () => {
+  const expected: Array<[string, string, RateLimitPolicyName]> = [
+    // SEP-10. Keyed by IP: there is no session yet, and a public-key bucket
+    // would make 429s an oracle for whether an account is known.
+    ["POST", "/api/v1/auth/challenge", "authChallenge"],
+    ["POST", "/api/v1/auth/verify", "authVerify"],
+    ["POST", "/api/v1/auth/refresh", "authVerify"],
+    // Session teardown (#682). Keyed by IP for the same reason as the two
+    // above: the route answers `ok` without a valid token on purpose, so
+    // there is no identity to key by on the path that does the work.
+    ["POST", "/api/v1/auth/logout", "authLogout"],
+    // Expense creation writes a row and starts a payment split, so it is
+    // budgeted on its own rather than drawing on the settlement budget.
+    ["POST", "/api/v1/groups/:id/expenses", "expenseCreate"],
+    // Issue #682 — the writes after creation. Amending or deleting an expense
+    // rewrites every other participant's obligations, and was on the global
+    // bucket while creation had its own.
+    ["PATCH", "/api/v1/expenses/:id", "expenseMutate"],
+    ["DELETE", "/api/v1/expenses/:id", "expenseMutate"],
+    // Settlement submission and confirmation.
+    ["POST", "/api/v1/expenses/:id/settle", "settlementCreate"],
+    ["POST", "/api/v1/groups/:id/settlements", "settlementCreate"],
+    ["POST", "/api/v1/settlements/execute", "settlementExecute"],
+    ["POST", "/api/v1/settlements/:id/confirm", "settlementConfirm"],
+    ["POST", "/api/v1/groups/:id/treasury/deposit", "settlementCreate"],
+    ["POST", "/api/v1/groups/:id/treasury/withdraw", "settlementCreate"],
+    // On-chain payment submission (issues #363 / #403): withdrawal initiation
+    // fans out to the anchor like the other anchor-init routes, and the
+    // confirmation submits a signed XDR like the other confirm routes.
+    ["POST", "/api/v1/withdraw", "anchorInit"],
+    ["POST", "/api/v1/withdraw/:id/confirm", "settlementConfirm"],
+    ["POST", "/api/v1/treasury-transactions/:id/confirm", "treasurySubmit"],
+    // Treasury multisig: creating a proposal is bounded separately from adding
+    // a signature to one.
+    ["POST", "/api/v1/treasury/proposals", "treasuryPropose"],
+    ["POST", "/api/v1/groups/:groupId/treasury/proposals", "treasuryPropose"],
+    ["POST", "/api/v1/treasury/proposals/:id/signatures", "treasurySubmit"],
+    ["POST", "/api/v1/groups/:groupId/treasury/proposals/:proposalId/sign", "treasurySubmit"],
+    // Issue #657's collection-style aliases of the same two operations.
+    ["POST", "/api/v1/treasury/propose", "treasuryPropose"],
+    ["POST", "/api/v1/treasury/:id/sign", "treasurySubmit"],
+    // Issue #682 — deciding *who* may move group funds, as opposed to moving
+    // it. Both routes read live account state from Horizon per call.
+    ["POST", "/api/v1/groups/:id/treasury/enable", "treasuryConfig"],
+    ["POST", "/api/v1/groups/:id/treasury/validate-signers", "treasuryConfig"],
+    // Anchor / SEP-24. Initiation fans out upstream, so it is the tightest.
+    ["POST", "/api/v1/anchors/deposit", "anchorInit"],
+    ["POST", "/api/v1/anchors/withdraw", "anchorInit"],
+    ["POST", "/api/v1/anchors/sessions/:id/complete", "anchorInit"],
+    ["POST", "/api/v1/sep24/deposit", "anchorInit"],
+    ["POST", "/api/v1/sep24/withdraw", "anchorInit"],
+    ["GET", "/api/v1/anchors", "anchorPoll"],
+    ["GET", "/api/v1/anchors/sessions", "anchorPoll"],
+    ["GET", "/api/v1/anchors/sessions/:id", "anchorPoll"],
+    // SEP-24 status polling (#651) — same budget as the session reads, because
+    // it is the same DB-only status read under a spec-shaped response.
+    ["GET", "/api/v1/sep24/transaction", "anchorPoll"],
+    // The list form of the same poll (#655): one page of the same DB-only
+    // status reads, so it takes the same budget rather than a new one.
+    ["GET", "/api/v1/sep24/transactions", "anchorPoll"],
+    // Issue #693 — the withdrawal status read a client polls through an
+    // interactive anchor flow. The same DB-only status read as the session
+    // polls above, and it was the one anchor-transaction route left on the
+    // global bucket.
+    ["GET", "/api/v1/withdraw/:id", "anchorPoll"],
+    ["POST", "/api/v1/anchors/webhook", "anchorWebhook"],
+    ["POST", "/api/v1/sep24/callback", "sep24Callback"],
+    ["POST", "/api/v1/webhooks/sep24", "sep24Webhook"],
+    // Group creation and history.
+    ["POST", "/api/v1/groups", "groupCreate"],
+    ["GET", "/api/v1/history", "history"],
+    // Issue #668 — the categories the table did not model: the one public
+    // unauthenticated read, the membership writes, outbound-webhook
+    // registration, and the only multipart upload route.
+    ["GET", "/api/v1/exchange-rates", "exchangeRates"],
+    ["POST", "/api/v1/groups/:id/invite", "groupInvite"],
+    ["POST", "/api/v1/groups/join", "groupJoin"],
+    ["POST", "/api/v1/webhooks", "webhookCreate"],
+    ["POST", "/api/v1/groups/:groupId/webhooks", "webhookCreate"],
+    // Issue #693 — ringing a registered endpoint. `webhookCreate` bounded
+    // registering one; this is the cheaper half of the same amplification, so
+    // it takes the tightest budget in the table.
+    ["POST", "/api/v1/groups/:groupId/webhooks/:webhookId/test", "webhookTest"],
+    ["POST", "/api/v1/uploads/receipt", "uploadReceipt"],
+  ];
+
+  it("covers every route the application declares a limit on", () => {
+    // The reverse direction: a policy applied to a route the table above does
+    // not know about is a new surface, and belongs in the audited list.
+    // Fastify's synthesised HEAD routes are excluded here and asserted
+    // separately below.
+    const listed = new Set(expected.map(([method, url]) => `${method} ${url}`));
+    const unlisted = routes
+      .filter((route) => route.policy !== undefined && route.method !== "HEAD")
+      .map(describeRoute)
+      .filter((route) => !listed.has(route));
+
+    expect(unlisted).toEqual([]);
+  });
+
+  it("no HEAD route is a way around its GET route's budget", () => {
+    // Fastify adds a HEAD route for every GET, copying the route options. If
+    // the copy ever lost `config`, HEAD would answer from the global bucket
+    // while GET answers from the per-route one.
+    const heads = routes.filter((route) => route.method === "HEAD");
+    expect(heads.length).toBeGreaterThan(0);
+
+    for (const head of heads) {
+      const get = routes.find((r) => r.method === "GET" && r.url === head.url);
+      expect({ url: head.url, policy: head.policy }).toEqual({
+        url: head.url,
+        policy: get?.policy,
+      });
+    }
+  });
+
+  it.each(expected)("%s %s applies the %s policy", (method, url, policy) => {
+    const route = routes.find((r) => r.method === method && r.url === url);
+    expect(route, `route ${method} ${url} is not registered`).toBeDefined();
+    expect(route?.policy).toBe(policy);
+  });
+
+  it("every sensitive budget is tighter than the global default", () => {
+    for (const [method, url] of expected) {
+      const route = routes.find((r) => r.method === method && r.url === url);
+      expect(
+        route?.rateLimit?.max,
+        `${method} ${url} is not limited below the global default`
+      ).toBeLessThan(policies.global.max);
+    }
+  });
+
+  it("sensitive buckets stay independent of the global one", () => {
+    // Two routes sharing a key prefix would share a counter, so burning one
+    // budget would silently throttle the other.
+    for (const [method, url, policy] of expected) {
+      const route = routes.find((r) => r.method === method && r.url === url);
+      expect(
+        policies[policy].prefix,
+        `${method} ${url} shares the global bucket`
+      ).not.toBe(policies.global.prefix);
+    }
+  });
+});

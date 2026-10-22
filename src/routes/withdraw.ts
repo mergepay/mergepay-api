@@ -1,21 +1,33 @@
 import { FastifyInstance } from "fastify";
-import { z } from "zod";
 import { prisma } from "../db";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
+import { rateLimited } from "../lib/rate-limit";
+import {
+  openApiBody,
+  openApiEnvelope,
+  openApiErrorResponses,
+  openApiIdParams,
+} from "../lib/openapi";
 import { anchorService } from "../services/anchor";
 import { stellar } from "../services/stellar";
-import { audit } from "../services/audit";
+import { auditTx } from "../services/audit";
+import { applyWithdrawalTransition } from "../services/withdrawal-status";
 import { isPositive } from "../services/money";
+import {
+  sep24WithdrawalParamsSchema,
+  sep24WithdrawalRequestBodySchema,
+} from "../validations/sep24";
+import { signedXdrRequestSchema } from "../validations/stellar-transaction";
 
 const SUPPORTED_ASSET_CODES = ["USDC", "XLM"] as const;
 
-const withdrawalBody = z.object({
-  amount: z.string().min(1),
-  assetCode: z.string().min(1),
-  memo: z.string().max(28).optional(),
-});
+// The request contracts these routes parse with live in
+// src/validations/sep24.ts (body, path id) and src/validations/stellar-transaction.ts
+// (the signed envelope), shared with the other surfaces that take the same
+// shapes. `src/validations/sep24.ts` explains why the withdrawal body validates
+// *shape* here and leaves positivity and asset support to the handler below.
 
 function units(value: string): bigint {
   const [whole, fraction = ""] = value.split(".");
@@ -44,9 +56,42 @@ function serializeWithdrawal(withdrawal: any) {
 export default async function withdrawalRoutes(app: FastifyInstance) {
   const withdrawalModel = (prisma as any).withdrawal;
 
-  app.post("/withdraw", { preHandler: [app.authenticate] }, async (req) => {
+  // On-chain payment submission surfaces (issues #363 / #403). Both draw on
+  // dedicated per-route budgets rather than the 100/min global allowance:
+  //
+  //  - `POST /withdraw` initiates a withdrawal that fans out to the anchor's
+  //    SEP-24 transfer server, so it shares the tight `anchorInit` budget
+  //    (RATE_LIMIT_ANCHOR_INIT_MAX, default 10/min) used by the other anchor
+  //    initiation routes — brute-forcing it must not exhaust a caller's
+  //    global traffic.
+  //  - `POST /withdraw/:id/confirm` exchanges a signed envelope for an anchor
+  //    token and starts the interactive flow, so it shares the
+  //    `settlementConfirm` budget (RATE_LIMIT_SETTLEMENT_CONFIRM_MAX, default
+  //    20/min) with the other payment-confirmation routes, absorbing legitimate
+  //    retries while bounding brute-force submission attempts.
+  app.post(
+    "/withdraw",
+    {
+      preHandler: [app.authenticate],
+      ...rateLimited("anchorInit"),
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Start a SEP-24 withdrawal",
+        description:
+          "Validates the amount, asset code and optional memo with Zod, checks the caller's account for funding and a trustline, then returns the anchor's interactive withdrawal URL and a `pending` withdrawal record.",
+        // Documented from the same Zod schema the handler parses with, but with
+        // the rules stripped: the handler is the only validator, so a rejection
+        // arrives in the documented VALIDATION_ERROR envelope with `issues`.
+        body: openApiBody(sep24WithdrawalRequestBodySchema, { enforce: false }),
+        response: {
+          ...openApiEnvelope("withdrawal"),
+          ...openApiErrorResponses(400, 401, 429),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
-    const body = withdrawalBody.parse(req.body);
+    const body = sep24WithdrawalRequestBodySchema.parse(req.body);
 
     if (!isPositive(body.amount)) {
       throw Errors.badRequest(
@@ -91,23 +136,25 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
       `&account=${encodeURIComponent(auth.stellarPublicKey)}` +
       `&amount=${encodeURIComponent(body.amount)}`;
 
-    const withdrawal = await withdrawalModel.create({
-      data: {
+    const withdrawal = await prisma.$transaction(async (tx) => {
+      const created = await (tx as any).withdrawal.create({
+        data: {
+          userId: auth.id,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          memo: body.memo ?? null,
+          interactiveUrl,
+          status: "pending",
+        },
+      });
+      await auditTx(tx, {
         userId: auth.id,
-        amount: body.amount,
-        assetCode: body.assetCode,
-        memo: body.memo ?? null,
-        interactiveUrl,
-        status: "pending",
-      },
-    });
-
-    await audit({
-      userId: auth.id,
-      action: "withdrawal.start",
-      entityType: "withdrawal",
-      entityId: withdrawal.id,
-      metadata: { amount: body.amount, assetCode: body.assetCode },
+        action: "withdrawal.start",
+        entityType: "withdrawal",
+        entityId: created.id,
+        metadata: { amount: body.amount, assetCode: body.assetCode },
+      });
+      return created;
     });
 
     return {
@@ -120,16 +167,48 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
 
   app.post(
     "/withdraw/:id/confirm",
-    { preHandler: [app.authenticate] },
+    {
+      preHandler: [app.authenticate],
+      ...rateLimited("settlementConfirm"),
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Confirm a withdrawal with a signed transaction",
+        description:
+          "Exchanges the caller's signed SEP-10 challenge XDR for an anchor token, starts the interactive withdrawal, and moves the record from `pending` to `processing`. The token is stored with the transition so the worker can keep polling the anchor if the callback never arrives. Repeating the call once the record has advanced is idempotent.",
+        params: openApiIdParams(),
+        // Unenforced, like the initiation body above: the handler's Zod parse
+        // is the validator, and it is what names `signedXdr` in the response.
+        body: openApiBody(signedXdrRequestSchema, { enforce: false }),
+        response: {
+          // Permissive, and not `openApiEnvelope("withdrawal")`: this step
+          // answers with the withdrawal *flat* (`{ id, status, … }` plus
+          // `transaction_id`), while initiation and the read route above and
+          // below wrap the same record in a `withdrawal` key. Declaring the
+          // envelope here would make Fastify's serializer reject a successful
+          // confirmation, and re-shaping the body is a client-visible contract
+          // change that is not this route's to make.
+          200: { type: "object", additionalProperties: true },
+          ...openApiErrorResponses(400, 401, 404, 429),
+        },
+      },
+    },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
-      const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+      const { id } = sep24WithdrawalParamsSchema.parse(req.params);
+      // The shared signed-XDR contract (issue #419): canonical base64 that the
+      // SDK can decode as a transaction envelope. Before it, any non-empty
+      // string was forwarded to the anchor's `GET /challenge` endpoint and
+      // failed there as an upstream error — a 502 for what is a bad request.
+      const body = signedXdrRequestSchema.parse(req.body);
       const withdrawal = await withdrawalModel.findUnique({ where: { id } });
 
       if (!withdrawal || withdrawal.userId !== auth.id) {
         throw Errors.notFound("Withdrawal not found");
       }
+      // Fast path only — avoids a wasted round trip to the anchor for the
+      // common case of a retried confirm call. The actual correctness
+      // guarantee against a concurrent duplicate is the guarded update
+      // inside applyWithdrawalTransition below.
       if (withdrawal.status !== "pending") {
         return serializeWithdrawal(withdrawal);
       }
@@ -147,9 +226,17 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           assetCode: withdrawal.assetCode,
           account: auth.stellarPublicKey,
         });
-        const updated = await withdrawalModel.update({
-          where: { id },
-          data: { anchorTxId: result.id, status: "pending" },
+        const { withdrawal: updated } = await applyWithdrawalTransition({
+          withdrawalId: id,
+          nextStatus: "processing",
+          source: "user",
+          ownerUserId: auth.id,
+          // The JWT is stored atomically with the transition so the worker
+          // can poll the anchor for this withdrawal's status later — the
+          // server cannot mint one itself (the SEP-10 challenge must be
+          // signed by the user's key), and without it a lost webhook would
+          // leave the withdrawal stuck in `processing` forever.
+          extraData: { anchorTxId: result.id, anchorToken: token },
         });
         return {
           ...serializeWithdrawal(updated),
@@ -157,9 +244,11 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
           transaction_id: result.id,
         };
       } catch (error) {
-        await withdrawalModel.update({
-          where: { id },
-          data: { status: "failed" },
+        await applyWithdrawalTransition({
+          withdrawalId: id,
+          nextStatus: "failed",
+          source: "user",
+          ownerUserId: auth.id,
         });
         if (error instanceof AppError) throw error;
         throw Errors.upstream("Withdrawal confirmation failed");
@@ -167,9 +256,30 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
     }
   );
 
-  app.get("/withdraw/:id", { preHandler: [app.authenticate] }, async (req) => {
+  app.get(
+    "/withdraw/:id",
+    {
+      // The anchor-transaction status read a client polls while an
+      // interactive withdrawal runs, so it takes the same budget as the other
+      // anchor polls (#693) rather than the global one it shares with every
+      // unrelated read.
+      ...rateLimited("anchorPoll"),
+      preHandler: [app.authenticate],
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Read a withdrawal",
+        description:
+          "Returns one withdrawal owned by the caller, including the anchor transaction id once the interactive flow has started.",
+        params: openApiIdParams(),
+        response: {
+          ...openApiEnvelope("withdrawal"),
+          ...openApiErrorResponses(401, 403, 404),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
-    const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+    const { id } = sep24WithdrawalParamsSchema.parse(req.params);
     const withdrawal = await withdrawalModel.findUnique({ where: { id } });
     if (!withdrawal) {
       throw Errors.notFound("Withdrawal not found");

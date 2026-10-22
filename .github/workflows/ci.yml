@@ -19,3 +19,101 @@ jobs:
       - run: npm run prisma:generate
       - run: npm run build
       - run: npm test
+
+  # Issue #646 — the integration suite runs against a real Postgres.
+  #
+  # It is a separate job rather than extra steps in `build-test` because it needs
+  # a database the unit suite must not have: `npm test` replaces `src/db` with a
+  # mock and must stay runnable with no service behind it. Keeping them apart also
+  # means a red unit gate does not hide whether the flows themselves still work.
+  #
+  # `build-test` excludes `tests/` from `tsc`, so nothing else in CI compiles this
+  # suite; the job therefore has no build step — Vitest transpiles it directly.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mergepay_test
+        ports:
+          - 5432:5432
+        # The postgres image ships no HEALTHCHECK, so without this the runner
+        # starts the job the instant the container is created, while Postgres is
+        # still initialising, and the first connection is refused.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL_TEST: postgresql://postgres:postgres@localhost:5432/mergepay_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+      - run: npm ci
+      - run: npm run prisma:generate
+      - run: npm run test:integration
+
+  # Issue #671 — the migration history must be *deployable* and must *converge*
+  # on `prisma/schema.prisma`.
+  #
+  # Neither `build-test` (no database) nor `integration` catches this: the
+  # integration job provisions its schema with `prisma db push`, which builds the
+  # database directly from `schema.prisma` and never reads `prisma/migrations/`.
+  # So a migration that errors on a real `migrate deploy`, or a history whose
+  # end state drifts from the schema, passed CI untouched — which is exactly how
+  # the schema and the migrations came to disagree.
+  #
+  # This job is the only place `prisma migrate deploy` runs. It applies the whole
+  # history to a fresh Postgres, asserts the schema is up to date, then asserts a
+  # zero diff between the deployed database and `schema.prisma`. Because the
+  # database is fresh, the drift check is authoritative: any difference is the
+  # migrations not reproducing the schema, not a stale manual edit.
+  migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mergepay_migration
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mergepay_migration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+      - run: npm ci
+      - run: npm run prisma:generate
+      # `prisma validate` fails on a schema `prisma migrate` could never apply —
+      # a missing relation, an invalid field type — before any database is touched.
+      - name: Validate schema
+        run: npm run prisma:validate
+      # Applies every migration in order to the empty `mergepay_migration`
+      # database. A non-zero exit here means the history cannot be deployed.
+      - name: Apply all migrations
+        run: npx prisma migrate deploy
+      - name: Confirm migration status
+        run: npm run prisma:status
+      # Exit code 0 (Empty) means the deployed database equals `schema.prisma`;
+      # exit 2 (Not empty) means the migrations drifted from the schema and must
+      # be reconciled before merge.
+      - name: Assert schema and migrations do not drift
+        run: npm run prisma:check-drift
+

@@ -1,6 +1,6 @@
 import { customAlphabet } from "nanoid";
 
-const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous chars
+export const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous chars
 
 /** 8-char invite code. */
 export const inviteCode = customAlphabet(ALPHABET, 8);

@@ -234,7 +234,18 @@ export interface MultisigAuditParams {
     | typeof AuditAction.TREASURY_PROPOSAL_SIGNED
     | typeof AuditAction.TREASURY_PROPOSAL_SUBMITTED
     | typeof AuditAction.TREASURY_PROPOSAL_FAILED
+    | typeof AuditAction.TREASURY_TX_PROPOSAL_CREATED
+    | typeof AuditAction.TREASURY_TX_PROPOSAL_SIGNATURE_ADDED
+    | typeof AuditAction.TREASURY_TX_PROPOSAL_READY
+    | typeof AuditAction.TREASURY_TX_PROPOSAL_SUBMITTED
+    | typeof AuditAction.TREASURY_TX_PROPOSAL_FAILED
     | string;
+  /**
+   * Target resource type. Defaults to `treasury_proposal` (the server-built
+   * payment flow); the signature-collector flow passes `treasury_tx_proposal`
+   * so both tables' rows are attributable to the right resource.
+   */
+  entityType?: "treasury_proposal" | "treasury_tx_proposal" | string;
   actorPublicKey?: string | null;
   outcome?: AuditOutcome;
   metadata?: Record<string, unknown>;
@@ -242,8 +253,16 @@ export interface MultisigAuditParams {
 
 /**
  * Transactional audit logging helper for treasury multisig operations.
- * Records multisig proposal creation, signature collection, and submission events
- * atomically within a database transaction.
+ * Records multisig proposal creation, signature collection, and submission
+ * events atomically within the same transaction as the state change, in one
+ * standardized shape: actor (user id + public key), group, action, target
+ * proposal, outcome, and sanitized metadata (see src/lib/audit-logger.ts,
+ * which redacts private keys, tokens, and signed envelopes).
+ *
+ * Both multisig services use this helper so a signature-collector event and a
+ * server-built-proposal event land the same columns and mirror the same Pino
+ * audit schema, differing only in `entityType` and the action vocabulary of
+ * their flow.
  */
 export async function auditMultisigActionTx(
   tx: Prisma.TransactionClient,
@@ -254,7 +273,7 @@ export async function auditMultisigActionTx(
     groupId: params.groupId,
     actorPublicKey: params.actorPublicKey ?? null,
     action: params.action,
-    entityType: "treasury_proposal",
+    entityType: params.entityType ?? "treasury_proposal",
     entityId: params.proposalId,
     outcome: params.outcome ?? "success",
     metadata: params.metadata,

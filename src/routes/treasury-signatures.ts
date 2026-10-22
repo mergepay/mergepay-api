@@ -27,8 +27,6 @@ import { requireAdmin, requireMembership } from "../services/access";
 import { treasurySignaturesService } from "../services/treasury-signatures";
 import { treasuryTxProposalCreateSchema } from "../validations/treasury";
 import { serializeTreasuryTxProposal } from "../serializers";
-import { audit } from "../services/audit";
-import { AuditAction } from "../services/audit-actions";
 
 const signatureBodySchema = z.object({
   signedXdr: z.string().min(1),
@@ -60,16 +58,11 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
           description: body.description ?? null,
         });
 
-      await audit({
-        userId: auth.id,
-        groupId: body.treasuryId,
-        action: AuditAction.TREASURY_PROPOSAL_CREATED,
-        entityType: "treasury_tx_proposal",
-        entityId: proposal.id,
-        outcome: "success",
-        actorPublicKey: auth.stellarPublicKey,
-        metadata: { description: body.description },
-      });
+      // The service writes the `treasury.tx_proposal.created` audit row inside
+      // the same transaction as the proposal insert. Do not add a second,
+      // best-effort record here: it would duplicate the event under the
+      // server-built-proposal action vocabulary and could disagree with the
+      // durable row if the two writes straddle a failure.
 
       return {
         proposal: serializeTreasuryTxProposal(proposal),
@@ -116,36 +109,10 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
         signedXdr: body.signedXdr,
       });
 
-      // Audit the signature submission regardless of whether threshold was met
-      await audit({
-        userId: auth.id,
-        groupId: existing.groupId,
-        action: AuditAction.TREASURY_PROPOSAL_SIGNED,
-        entityType: "treasury_tx_proposal",
-        entityId: id,
-        outcome: "success",
-        actorPublicKey: auth.stellarPublicKey,
-        metadata: {
-          status: result.status,
-          totalWeight: result.totalWeight,
-          requiredWeight: result.requiredWeight,
-          submitted: result.stellarTxHash ? true : false,
-        },
-      });
-
-      // If auto-submitted, log that too
-      if (result.stellarTxHash) {
-        await audit({
-          userId: auth.id,
-          groupId: existing.groupId,
-          action: AuditAction.TREASURY_PROPOSAL_SUBMITTED,
-          entityType: "treasury_tx_proposal",
-          entityId: id,
-          outcome: "success",
-          actorPublicKey: auth.stellarPublicKey,
-          metadata: { stellarTxHash: result.stellarTxHash },
-        });
-      }
+      // Signature, threshold, and submission audit rows are written by the
+      // service inside the signature transaction (signature_added, ready,
+      // submitted/failed). Re-logging them here would double-count the same
+      // action and record a submission under the wrong flow's action name.
 
       const proposal = await prisma.treasuryTxProposal.findUnique({
         where: { id },

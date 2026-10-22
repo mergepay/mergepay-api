@@ -64,7 +64,7 @@ import {
   assertTreasuryEnvelopePolicy,
   parseTreasuryXdr,
 } from "./treasury-stellar";
-import { auditTx } from "./audit";
+import { auditMultisigActionTx } from "./audit";
 import { AuditAction } from "./audit-actions";
 
 export const STATUS = {
@@ -164,13 +164,13 @@ export const treasurySignaturesService = {
           status: STATUS.pendingSignatures,
         },
       });
-      await auditTx(db, {
+      await auditMultisigActionTx(db, {
         userId: params.creatorId,
         groupId: params.groupId,
+        proposalId: created.id,
+        entityType: "treasury_tx_proposal",
         actorPublicKey: params.creatorPublicKey,
         action: AuditAction.TREASURY_TX_PROPOSAL_CREATED,
-        entityType: "treasury_tx_proposal",
-        entityId: created.id,
         metadata: {
           sourceAccount: created.sourceAccount,
           // Hash of the caller-supplied unsigned envelope; every later
@@ -365,13 +365,13 @@ export const treasurySignaturesService = {
             }
             throw e;
           }
-          await auditTx(db, {
+          await auditMultisigActionTx(db, {
             userId: sig.userId,
             groupId: proposal.groupId,
+            proposalId: proposal.id,
+            entityType: "treasury_tx_proposal",
             actorPublicKey: sig.publicKey,
             action: AuditAction.TREASURY_TX_PROPOSAL_SIGNATURE_ADDED,
-            entityType: "treasury_tx_proposal",
-            entityId: proposal.id,
             metadata: {
               signerPublicKey: sig.publicKey,
               // The transaction this signature contributes weight to.
@@ -404,13 +404,13 @@ export const treasurySignaturesService = {
           where: { id: proposal.id },
           data: { status: STATUS.ready, requiredWeight },
         });
-        await auditTx(db, {
+        await auditMultisigActionTx(db, {
           userId: args.userId,
           groupId: proposal.groupId,
+          proposalId: proposal.id,
+          entityType: "treasury_tx_proposal",
           actorPublicKey,
           action: AuditAction.TREASURY_TX_PROPOSAL_READY,
-          entityType: "treasury_tx_proposal",
-          entityId: proposal.id,
           metadata: { totalWeight, requiredWeight },
         });
 
@@ -433,13 +433,13 @@ export const treasurySignaturesService = {
             where: { id: proposal.id },
             data: { status: STATUS.submitted, stellarTxHash: hash },
           });
-          await auditTx(db, {
+          await auditMultisigActionTx(db, {
             userId: args.userId,
             groupId: proposal.groupId,
+            proposalId: proposal.id,
+            entityType: "treasury_tx_proposal",
             actorPublicKey,
             action: AuditAction.TREASURY_TX_PROPOSAL_SUBMITTED,
-            entityType: "treasury_tx_proposal",
-            entityId: proposal.id,
             metadata: { stellarTxHash: hash, totalWeight, requiredWeight },
           });
           return {
@@ -454,13 +454,13 @@ export const treasurySignaturesService = {
             where: { id: proposal.id },
             data: { status: STATUS.failed, failureReason: reason },
           });
-          await auditTx(db, {
+          await auditMultisigActionTx(db, {
             userId: args.userId,
             groupId: proposal.groupId,
+            proposalId: proposal.id,
+            entityType: "treasury_tx_proposal",
             actorPublicKey,
             action: AuditAction.TREASURY_TX_PROPOSAL_FAILED,
-            entityType: "treasury_tx_proposal",
-            entityId: proposal.id,
             outcome: "failure",
             metadata: { reason, totalWeight, requiredWeight },
           });

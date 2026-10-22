@@ -11,6 +11,7 @@
  *  4. Audit metadata captures required fields (group ID, actor, action, timestamp)
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import pino from "pino";
 import {
   Keypair,
   Transaction,
@@ -118,6 +119,7 @@ vi.mock("@stellar/stellar-sdk", async (importActual) => {
 import { buildApp } from "../src/app";
 import { signToken } from "../src/plugins/auth";
 import { AuditAction } from "../src/services/audit-actions";
+import { setAuditEventLogger } from "../src/lib/audit-logger";
 
 const prisma = h.prisma;
 let app: Awaited<ReturnType<typeof buildApp>>;
@@ -306,7 +308,10 @@ describe("Treasury signatures audit records", () => {
       (c: any) =>
         c[0]?.data?.action === AuditAction.TREASURY_TX_PROPOSAL_CREATED
     );
-    expect(createAuditCalls.length).toBeGreaterThanOrEqual(1);
+    // Exactly one row: the service writes it atomically with the insert. A
+    // second route-level record would double-count the action in the group's
+    // audit feed.
+    expect(createAuditCalls).toHaveLength(1);
     for (const call of createAuditCalls) {
       expect(call[0].data.groupId).toBe("group_1");
       expect(call[0].data.userId).toBe(admin.id);
@@ -314,6 +319,13 @@ describe("Treasury signatures audit records", () => {
       // The audit record must bind the entry to the exact transaction intent.
       expect(call[0].data.metadata?.txHash).toBe("abc123");
     }
+    // No row is recorded under the server-built-proposal vocabulary: the
+    // signature-collector flow has its own `treasury.tx_proposal.*` actions.
+    expect(
+      prisma.auditLog.create.mock.calls.filter(
+        (c: any) => c[0]?.data?.action === AuditAction.TREASURY_PROPOSAL_CREATED
+      )
+    ).toHaveLength(0);
   });
 
   it("accepts the treasuryId alias and stores the optional description", async () => {
@@ -383,6 +395,136 @@ describe("Treasury signatures audit records", () => {
     expect(res.statusCode).toBe(400);
     expect(res.json().code).toBe("VALIDATION_ERROR");
     expect(prisma.treasuryTxProposal.create).not.toHaveBeenCalled();
+  });
+
+  it("records exactly one signature_added row, atomically, without the signed envelope", async () => {
+    const signerKp = Keypair.random();
+    const signer = { ...admin, id: "admin_signer", stellarPublicKey: signerKp.publicKey() };
+    const source = treasuryAccount.publicKey();
+    const unsignedXdr = makeUnsignedXdr({
+      source,
+      destination: Keypair.random().publicKey(),
+      amount: "5",
+    });
+    const signedTx = new Transaction(unsignedXdr, config.networkPassphrase);
+    signedTx.sign(signerKp);
+    const signedXdr = signedTx.toXDR();
+    const txHash = new Transaction(unsignedXdr, config.networkPassphrase)
+      .hash()
+      .toString("hex");
+
+    const proposal = {
+      id: "txprop_sign_1",
+      groupId: "group_1",
+      creatorId: signer.id,
+      xdr: unsignedXdr,
+      txHash,
+      sourceAccount: source,
+      requiredWeight: 2,
+      status: "PENDING_SIGNATURES",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      signatures: [],
+    };
+
+    prisma.groupMember.findUnique.mockResolvedValue({
+      groupId: "group_1",
+      userId: signer.id,
+      role: "admin",
+    });
+    prisma.groupMember.findMany.mockResolvedValue([
+      { userId: signer.id, user: { stellarPublicKey: signerKp.publicKey() } },
+    ]);
+    // 1: the route resolves the proposal's group; 2: the service locks the
+    // proposal inside its transaction; 3: the route re-reads it for the body.
+    prisma.treasuryTxProposal.findUnique
+      .mockResolvedValueOnce({ groupId: "group_1" })
+      .mockResolvedValueOnce(proposal)
+      .mockResolvedValueOnce(proposal);
+    // First read: signatures already recorded (none). Second: the merged view
+    // used for the threshold decision (the one just persisted).
+    prisma.treasurySignature.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ weight: 1 }]);
+    prisma.auditLog.create.mockResolvedValue({});
+
+    const { stellar } = await import("../src/services/stellar");
+    vi.mocked(stellar.loadAccount).mockResolvedValue({
+      exists: true,
+      sequence: "12345",
+      balances: [],
+      signers: [{ key: signerKp.publicKey(), weight: 1 }],
+      thresholds: { low: 1, med: 1, high: 2 },
+    });
+
+    // Capture the structured Pino audit stream for this request only.
+    const lines: any[] = [];
+    setAuditEventLogger(
+      pino(
+        { level: "info" },
+        {
+          write(chunk: string) {
+            try {
+              lines.push(JSON.parse(chunk));
+            } catch {
+              // ignore non-JSON chunks
+            }
+          },
+        } as any
+      )
+    );
+
+    let res;
+    try {
+      res = await app.inject({
+        method: "POST",
+        url: "/api/treasury/proposals/txprop_sign_1/signatures",
+        headers: authHeader(signer),
+        payload: { signedXdr },
+      });
+    } finally {
+      setAuditEventLogger(null);
+    }
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("PENDING_SIGNATURES");
+
+    const rows = prisma.auditLog.create.mock.calls.map((c: any) => c[0].data);
+    const signatureRows = rows.filter(
+      (row: any) => row.action === AuditAction.TREASURY_TX_PROPOSAL_SIGNATURE_ADDED
+    );
+    // One signature, one row — written with the state change, not after it,
+    // and never duplicated under the server-built-proposal vocabulary.
+    expect(signatureRows).toHaveLength(1);
+    expect(signatureRows[0]).toMatchObject({
+      groupId: "group_1",
+      userId: signer.id,
+      entityType: "treasury_tx_proposal",
+      entityId: "txprop_sign_1",
+      metadata: expect.objectContaining({
+        signerPublicKey: signerKp.publicKey(),
+        txHash,
+      }),
+    });
+    expect(
+      rows.filter((row: any) => row.action === AuditAction.TREASURY_PROPOSAL_SIGNED)
+    ).toHaveLength(0);
+    expect(
+      rows.filter((row: any) => row.action === AuditAction.TREASURY_PROPOSAL_SUBMITTED)
+    ).toHaveLength(0);
+
+    // Neither the durable row nor the operator-facing line carries the signed
+    // envelope (or any XDR field), only the public key and the transaction hash.
+    expect(signatureRows[0].metadata).not.toHaveProperty("xdr");
+    expect(signatureRows[0].metadata).not.toHaveProperty("signedXdr");
+    expect(JSON.stringify(signatureRows[0])).not.toContain(signedXdr);
+    const auditLines = lines.filter((line) => line.event === "audit");
+    expect(auditLines).toHaveLength(1);
+    expect(JSON.stringify(auditLines)).not.toContain(signedXdr);
+    for (const line of auditLines) {
+      expect(line.action).toBe(AuditAction.TREASURY_TX_PROPOSAL_SIGNATURE_ADDED);
+      expect(Object.keys(line.metadata)).not.toContain("signedXdr");
+    }
   });
 });
 

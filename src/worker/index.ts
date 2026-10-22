@@ -62,6 +62,7 @@ import {
 } from "../services/job-retry";
 import { reconcileSettlements } from "../services/settlement-reconciliation";
 import { startReconciliation } from "./reconciliation";
+import { reconcilePendingSettlementStatuses } from "./tasks/settlement-status-reconciliation";
 import {
   type CorrelationContext,
   jobContext,
@@ -922,6 +923,8 @@ export async function runWorkerCycle(): Promise<void> {
     processSubmittedSettlements(),
     reconcileAnchors(),
     reconcileSettlements(),
+    // Resolves settlements the submission job parked in needs_review.
+    reconcilePendingSettlementStatuses({ workerId: WORKER_ID }),
     expireInvites(),
   ]);
 }

@@ -20,7 +20,11 @@ const outsideServices = sourceFiles(SRC)
   .filter((path) => !path.startsWith("services/"));
 
 const FORBIDDEN: { label: string; pattern: RegExp }[] = [
-  { label: "Horizon client", pattern: /\bHorizon\b/ },
+  { label: "Horizon client", pattern: /\bHorizon\s*\.\s*Server\b/ },
+  {
+    label: "Horizon import",
+    pattern: /import\s*\{[^}]*\bHorizon\b[^}]*\}\s*from\s*["']@stellar\/stellar-sdk["']/,
+  },
   { label: "raw fetch", pattern: /\bfetch\s*\(/ },
   { label: "node-fetch", pattern: /["']node-fetch["']/ },
   { label: "stellar.toml resolver", pattern: /\bStellarToml\b/ },

@@ -61,6 +61,12 @@ const schema = z.object({
   WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   // Maximum jobs of one kind pulled per cycle.
   WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
+  // Settlement status reconciliation (needs_review → confirmed/failed): how
+  // long to wait before re-checking a hash Horizon has not shown yet, and how
+  // far past the envelope's maxTime a missing transaction is still given
+  // before it is declared never-landed.
+  SETTLEMENT_RECHECK_DELAY_MS: z.coerce.number().int().positive().default(60000),
+  SETTLEMENT_EXPIRY_GRACE_MS: z.coerce.number().int().nonnegative().default(300000),
   // Per-call network timeouts (ms) — every outbound Horizon/anchor request
   // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
   // a slow or hung upstream can't block a worker cycle indefinitely.

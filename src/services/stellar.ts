@@ -317,6 +317,10 @@ async function submitToHorizon(tx: Transaction): Promise<string> {
     );
     return res.hash;
   } catch (e: any) {
+    // A timed-out submission may still have applied. Keep it a TimeoutError so
+    // the worker classifies it as indeterminate and checks the ledger before
+    // resubmitting; API callers wrap it as UPSTREAM_ERROR themselves.
+    if (e instanceof TimeoutError) throw e;
     const err = unwrapHorizonError(e) as any;
     const codes = horizonResultCodes(err);
     const detail = codes ? JSON.stringify(codes) : err?.message ?? "submit failed";

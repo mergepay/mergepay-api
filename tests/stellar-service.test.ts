@@ -23,7 +23,8 @@ vi.mock("../src/services/horizon", async (importActual) => {
 
 import { stellar } from "../src/services/stellar";
 import { getFeeStats, clearFeeStatsCache } from "../src/services/network";
-import { TransportError } from "../src/services/timeout";
+import { TimeoutError, TransportError } from "../src/services/timeout";
+import { classifyJobFailure } from "../src/services/job-retry";
 import { config } from "../src/config";
 
 const source = Keypair.random();
@@ -129,6 +130,20 @@ describe("stellar.submitSigned", () => {
       code: "UPSTREAM_ERROR",
       message: expect.stringContaining("tx_bad_seq"),
     });
+  });
+
+  it("keeps a submission timeout a TimeoutError so the worker checks the ledger first", async () => {
+    vi.useFakeTimers();
+    try {
+      h.fake.submitTransaction.mockReturnValue(new Promise(() => {}));
+      const pending = stellar.submitSigned(signedXdr());
+      const assertion = expect(pending).rejects.toBeInstanceOf(TimeoutError);
+      await vi.advanceTimersByTimeAsync(config.HORIZON_SUBMIT_TIMEOUT_MS + 1);
+      await assertion;
+      expect(classifyJobFailure(await pending.catch((e) => e))).toBe("indeterminate");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("turns an unexpected transport failure into an upstream error", async () => {

@@ -509,6 +509,9 @@ model AuditLog {
   @@index([userId])
   @@index([groupId])
   @@index([entityType, entityId])
+  // Audit feeds filter by action type and read newest-first; this keeps a
+  // large trail's most common query from scanning the whole table.
+  @@index([action, createdAt])
   @@map("audit_logs")
 }
 

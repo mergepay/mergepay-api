@@ -511,7 +511,8 @@ export const treasuryProposalsService = {
           tx,
           proposal.id,
           verified,
-          verified.at(-1)?.publicKey ?? null
+          verified.at(-1)?.publicKey ?? null,
+          args.userId
         );
       },
       { timeout: 15_000 }
@@ -526,6 +527,9 @@ export const treasuryProposalsService = {
    * @param proposalId - The `TreasuryProposal` id whose signatures should be merged.
    * @param storedSignatures - Verified `(publicKey, signature)` pairs to attach to
    *   a fresh copy of the stored unsigned envelope.
+   * @param actorUserId - The authenticated user who submitted the final
+   *   signature. Recorded on the execution's audit rows; the signer's public key
+   *   alone would not identify the account that acted.
    * @returns The proposal state after submission: `status` (`confirmed` on success),
    *   `signatureCount`, `threshold`, and the resulting `stellarTxHash`.
    * @throws {AppError} `upstream` when Stellar rejects the merged transaction; the
@@ -535,7 +539,8 @@ export const treasuryProposalsService = {
     tx: Prisma.TransactionClient,
     proposalId: string,
     storedSignatures: StoredSignature[],
-    actorPublicKey: string | null
+    actorPublicKey: string | null,
+    actorUserId: string | null
   ): Promise<{
     status: string;
     signatureCount: number;
@@ -568,6 +573,7 @@ export const treasuryProposalsService = {
         },
       });
       await auditMultisigActionTx(tx, {
+        userId: actorUserId,
         groupId: proposal.groupId,
         actorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_SUBMITTED,
@@ -592,6 +598,7 @@ export const treasuryProposalsService = {
         data: { status: STATUS.failed, failureReason: msg },
       });
       await auditMultisigActionTx(tx, {
+        userId: actorUserId,
         groupId: proposal.groupId,
         actorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_FAILED,

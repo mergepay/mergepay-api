@@ -9,7 +9,15 @@ Thanks for helping build an open-source, Stellar-native public good!
 - The API contract is mirrored in `mergepay-web/src/lib/types.ts` — keep them in sync.
 - Never store or handle user private keys. Build unsigned XDRs; the wallet signs; validate the signed XDR against the intent before submitting.
 - Every group action must check membership; admin-only actions must check the role.
-- Write audit logs for state-changing actions.
+- Write audit logs for state-changing actions. Group and treasury mutations use
+  the transactional helpers in `src/services/audit.ts` (`auditTx` /
+  `logActionTx`) with an action from `src/services/audit-actions.ts`:
+  `group.create`, `group.join`, `group.member_remove`,
+  `group.member_role_change`, `treasury.proposal.created`,
+  `treasury.proposal.signed`, `treasury.proposal.submitted`, and their
+  `treasury.tx_proposal.*` equivalents. Metadata carries identifiers, outcomes,
+  and before/after values only — never private keys, seeds, tokens, or signed
+  envelope bytes.
 - Keep Horizon/anchor I/O inside `src/services/*` so it stays mockable.
 
 ## Branching model

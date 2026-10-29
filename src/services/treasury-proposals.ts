@@ -167,6 +167,10 @@ export const treasuryProposalsService = {
       await audit({
         userId: params.creatorId,
         groupId: params.groupId,
+        // The attempt is still the creator's, even though no proposal row
+        // exists to hold their key — issue #924 asks every multisig audit
+        // record to name the actor who acted.
+        actorPublicKey: params.creatorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_FAILED,
         entityType: "treasury_proposal_build",
         entityId: `${params.groupId}:${params.creatorId}`,
@@ -218,6 +222,7 @@ export const treasuryProposalsService = {
       await audit({
         userId: params.creatorId,
         groupId: params.groupId,
+        actorPublicKey: params.creatorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_FAILED,
         entityType: "treasury_proposal_build",
         entityId: `${params.groupId}:${params.creatorId}`,
@@ -258,6 +263,13 @@ export const treasuryProposalsService = {
     signedXdr: string;
     /** The authenticated user ID submitting the signature. */
     userId: string;
+    /**
+     * Stellar public key of the authenticated submitter, supplied by the
+     * route from the verified session. Used as the actor's key on the
+     * submission/failure rows when the caller carries no live on-chain
+     * weight of their own (public material only — issue #924).
+     */
+    actorPublicKey?: string | null;
   }): Promise<{
     status: string;
     signatureCount: number;
@@ -511,7 +523,10 @@ export const treasuryProposalsService = {
           tx,
           proposal.id,
           verified,
-          verified.at(-1)?.publicKey ?? null,
+          // The row records `args.userId` as the actor, so the key must be
+          // that same caller's; the last verified signature is only a
+          // fallback for callers that supply no key of their own.
+          args.actorPublicKey ?? verified.at(-1)?.publicKey ?? null,
           args.userId
         );
       },
@@ -580,6 +595,9 @@ export const treasuryProposalsService = {
         proposalId: proposal.id,
         metadata: {
           sourceAccount: baseTx.source,
+          // The envelope hash every approval was verified against — the
+          // durable link between this row and the submitted transaction.
+          txHash: proposal.txHash,
           signatureCount: storedSignatures.length,
           threshold: proposal.threshold,
           stellarTxHash: hash,
@@ -605,6 +623,9 @@ export const treasuryProposalsService = {
         proposalId: proposal.id,
         outcome: "failure",
         metadata: {
+          // Failed attempts are traced to the same transaction identity as
+          // successful ones, so a rejection can be tied to its envelope.
+          txHash: proposal.txHash,
           signatureCount: storedSignatures.length,
           threshold: proposal.threshold,
           reason: msg,

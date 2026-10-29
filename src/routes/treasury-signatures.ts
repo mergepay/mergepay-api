@@ -133,6 +133,9 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
         proposalId: id,
         groupId: existing.groupId,
         userId: auth.id,
+        // The verified session's public key, so the audit row for the
+        // threshold/submission transitions names the caller who acted.
+        actorPublicKey: auth.stellarPublicKey,
         signedXdr: body.signedXdr,
       });
 

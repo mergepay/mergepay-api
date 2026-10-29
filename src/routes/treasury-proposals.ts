@@ -162,6 +162,9 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
         memberPublicKeys,
         signedXdr: body.signedXdr,
         userId: auth.id,
+        // The verified session's public key, recorded as the actor on the
+        // submission/failure audit rows the service writes transactionally.
+        actorPublicKey: auth.stellarPublicKey,
       });
 
       // The service writes signature/submission audit records inside its

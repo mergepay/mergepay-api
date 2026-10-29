@@ -90,6 +90,13 @@ export interface SubmitSignatureParams {
   userId: string;
   /** Base64 XDR carrying one or more new signatures over the proposal's envelope. */
   signedXdr: string;
+  /**
+   * Stellar public key of the authenticated submitter, supplied by the route
+   * from the verified session. Recorded as the actor's key on the threshold,
+   * submission and failure rows when that caller carries no live on-chain
+   * weight — public material only (issue #924).
+   */
+  actorPublicKey?: string | null;
 }
 
 export interface SignatureSubmissionResult {
@@ -255,7 +262,11 @@ export const treasurySignaturesService = {
           }))
           .filter((a) => a.weight > 0);
         const actorPublicKey =
-          authorizedAdmins.find((admin) => admin.userId === args.userId)?.publicKey ?? null;
+          authorizedAdmins.find((admin) => admin.userId === args.userId)?.publicKey ??
+          // A caller who is an admin but no longer holds on-chain weight
+          // still acts: their own session key keeps the row attributable.
+          args.actorPublicKey ??
+          null;
 
         const submitted = parseTreasuryXdr(args.signedXdr, "Could not parse signed XDR");
         const submittedHash = submitted.hash().toString("hex");
@@ -411,7 +422,12 @@ export const treasurySignaturesService = {
           entityType: "treasury_tx_proposal",
           actorPublicKey,
           action: AuditAction.TREASURY_TX_PROPOSAL_READY,
-          metadata: { totalWeight, requiredWeight },
+          metadata: {
+            totalWeight,
+            requiredWeight,
+            // The envelope hash this threshold decision was made against.
+            txHash: proposal.txHash,
+          },
         });
 
         // Merge every stored signature onto a fresh copy of the original
@@ -440,7 +456,14 @@ export const treasurySignaturesService = {
             entityType: "treasury_tx_proposal",
             actorPublicKey,
             action: AuditAction.TREASURY_TX_PROPOSAL_SUBMITTED,
-            metadata: { stellarTxHash: hash, totalWeight, requiredWeight },
+            metadata: {
+              stellarTxHash: hash,
+              totalWeight,
+              requiredWeight,
+              // On-chain hash and envelope hash together: which transaction
+              // was broadcast, and which proposal it was collected for.
+              txHash: proposal.txHash,
+            },
           });
           return {
             status: STATUS.submitted,
@@ -462,7 +485,12 @@ export const treasurySignaturesService = {
             actorPublicKey,
             action: AuditAction.TREASURY_TX_PROPOSAL_FAILED,
             outcome: "failure",
-            metadata: { reason, totalWeight, requiredWeight },
+            metadata: {
+              reason,
+              totalWeight,
+              requiredWeight,
+              txHash: proposal.txHash,
+            },
           });
           throw Errors.upstream(`Stellar rejected the multisig transaction: ${reason}`);
         }

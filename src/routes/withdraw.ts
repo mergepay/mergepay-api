@@ -15,19 +15,29 @@ import { stellar } from "../services/stellar";
 import { auditTx } from "../services/audit";
 import { applyWithdrawalTransition } from "../services/withdrawal-status";
 import { isPositive } from "../services/money";
+import { validateRequest } from "../middleware/validate-request";
 import {
   sep24WithdrawalParamsSchema,
   sep24WithdrawalRequestBodySchema,
+  type Sep24WithdrawalRequestBody,
 } from "../validations/sep24";
-import { signedXdrRequestSchema } from "../validations/stellar-transaction";
+import {
+  signedXdrRequestSchema,
+  type SignedXdrRequest,
+} from "../validations/stellar-transaction";
 
 const SUPPORTED_ASSET_CODES = ["USDC", "XLM"] as const;
 
-// The request contracts these routes parse with live in
+// The request contracts these routes validate live in
 // src/validations/sep24.ts (body, path id) and src/validations/stellar-transaction.ts
 // (the signed envelope), shared with the other surfaces that take the same
-// shapes. `src/validations/sep24.ts` explains why the withdrawal body validates
-// *shape* here and leaves positivity and asset support to the handler below.
+// shapes. Each route parses them with a `validateRequest` preHandler (#923)
+// registered after `app.authenticate`, so a malformed payload is a 400 before
+// the handler touches the balance, the anchor, or the database — while an
+// unauthenticated request is still a 401 rather than a 400. The handlers below
+// read the parsed values back off the request. `src/validations/sep24.ts`
+// explains why the withdrawal body validates *shape* at the boundary and
+// leaves positivity and asset support to the handler.
 
 function units(value: string): bigint {
   const [whole, fraction = ""] = value.split(".");
@@ -72,16 +82,20 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
   app.post(
     "/withdraw",
     {
-      preHandler: [app.authenticate],
+      preHandler: [
+        app.authenticate,
+        validateRequest({ body: sep24WithdrawalRequestBodySchema }),
+      ],
       ...rateLimited("anchorInit"),
       schema: {
         tags: ["SEP-24"],
         summary: "Start a SEP-24 withdrawal",
         description:
           "Validates the amount, asset code and optional memo with Zod, checks the caller's account for funding and a trustline, then returns the anchor's interactive withdrawal URL and a `pending` withdrawal record.",
-        // Documented from the same Zod schema the handler parses with, but with
-        // the rules stripped: the handler is the only validator, so a rejection
-        // arrives in the documented VALIDATION_ERROR envelope with `issues`.
+        // Documented from the same Zod schema the preHandler parses with, but
+        // with the rules stripped: the middleware is the validator, so a
+        // rejection arrives in the documented VALIDATION_ERROR envelope with
+        // `issues`.
         body: openApiBody(sep24WithdrawalRequestBodySchema, { enforce: false }),
         response: {
           ...openApiEnvelope("withdrawal"),
@@ -91,7 +105,8 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
     },
     async (req) => {
     const auth = requireUser(req);
-    const body = sep24WithdrawalRequestBodySchema.parse(req.body);
+    // Parsed — and written back — by the validation preHandler above.
+    const body = req.body as Sep24WithdrawalRequestBody;
 
     if (!isPositive(body.amount)) {
       throw Errors.badRequest(
@@ -168,7 +183,13 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
   app.post(
     "/withdraw/:id/confirm",
     {
-      preHandler: [app.authenticate],
+      preHandler: [
+        app.authenticate,
+        validateRequest({
+          params: sep24WithdrawalParamsSchema,
+          body: signedXdrRequestSchema,
+        }),
+      ],
       ...rateLimited("settlementConfirm"),
       schema: {
         tags: ["SEP-24"],
@@ -176,7 +197,7 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
         description:
           "Exchanges the caller's signed SEP-10 challenge XDR for an anchor token, starts the interactive withdrawal, and moves the record from `pending` to `processing`. The token is stored with the transition so the worker can keep polling the anchor if the callback never arrives. Repeating the call once the record has advanced is idempotent.",
         params: openApiIdParams(),
-        // Unenforced, like the initiation body above: the handler's Zod parse
+        // Unenforced, like the initiation body above: the validation preHandler
         // is the validator, and it is what names `signedXdr` in the response.
         body: openApiBody(signedXdrRequestSchema, { enforce: false }),
         response: {
@@ -194,12 +215,14 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = sep24WithdrawalParamsSchema.parse(req.params);
+      // Path and body are parsed by the validation preHandler above.
+      const { id } = req.params as { id: string };
       // The shared signed-XDR contract (issue #419): canonical base64 that the
-      // SDK can decode as a transaction envelope. Before it, any non-empty
-      // string was forwarded to the anchor's `GET /challenge` endpoint and
-      // failed there as an upstream error — a 502 for what is a bad request.
-      const body = signedXdrRequestSchema.parse(req.body);
+      // SDK can decode as a transaction envelope, enforced by that preHandler.
+      // Before that contract, any non-empty string was forwarded to the
+      // anchor's `GET /challenge` endpoint and failed there as an upstream
+      // error — a 502 for what is a bad request.
+      const { signedXdr } = req.body as SignedXdrRequest;
       const withdrawal = await withdrawalModel.findUnique({ where: { id } });
 
       if (!withdrawal || withdrawal.userId !== auth.id) {
@@ -217,7 +240,7 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
         const anchor = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
         const token = await anchorService.getToken(
           anchor.webAuthEndpoint,
-          body.signedXdr
+          signedXdr
         );
         const result = await anchorService.startInteractive({
           transferServer: anchor.transferServerSep24,
@@ -264,7 +287,10 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
       // anchor polls (#693) rather than the global one it shares with every
       // unrelated read.
       ...rateLimited("anchorPoll"),
-      preHandler: [app.authenticate],
+      preHandler: [
+        app.authenticate,
+        validateRequest({ params: sep24WithdrawalParamsSchema }),
+      ],
       schema: {
         tags: ["SEP-24"],
         summary: "Read a withdrawal",
@@ -279,7 +305,8 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
     },
     async (req) => {
     const auth = requireUser(req);
-    const { id } = sep24WithdrawalParamsSchema.parse(req.params);
+    // Parsed by the validation preHandler above.
+    const { id } = req.params as { id: string };
     const withdrawal = await withdrawalModel.findUnique({ where: { id } });
     if (!withdrawal) {
       throw Errors.notFound("Withdrawal not found");

@@ -311,16 +311,21 @@ describe("rate limiting on the real app wiring", () => {
 
   it("POST /withdraw — per-route budget, headers, and 429 envelope", async () => {
     // On-chain payment submission (issues #363 / #403): withdrawal
-    // initiation shares the tight anchor-init budget. Malformed bodies fail
-    // body validation before any anchor call, so the suite measures the
-    // limiter itself.
+    // initiation shares the tight anchor-init budget. The body is
+    // well-formed because request validation now runs in a `preHandler`
+    // (#923) and @fastify/rate-limit appends its own hook *after* the
+    // route's, so a malformed body would be answered 400 before the limiter
+    // ever counted it — the same ordering the four SEP-24 initiation routes
+    // already have. The payload still fails fast: the mocked account is
+    // unfunded, so no anchor call and no database write happen, and the
+    // suite measures the limiter itself.
     const max = policies.anchorInit.max;
     await exhaustAndAssert({
       method: "POST",
       url: "/withdraw",
       max,
       headers: authHeader(),
-      payload: {},
+      payload: { amount: "1", assetCode: "XLM" },
       label: "withdraw",
     });
   });

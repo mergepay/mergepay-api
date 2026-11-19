@@ -17,7 +17,7 @@
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:status": "prisma migrate status",
+    "prisma:status": "prisma migrate status && tsx scripts/check-migration-health.ts",
     "prisma:deploy": "prisma db push --accept-data-loss",
     "prisma:check-drift": "prisma migrate diff --from-url \"$DATABASE_URL\" --to-schema-datamodel prisma/schema.prisma --exit-code",
     "db:seed": "tsx prisma/seed.ts",

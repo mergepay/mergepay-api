@@ -65,6 +65,7 @@ import {
   parseTreasuryXdr,
 } from "./treasury-stellar";
 import { auditMultisigActionTx } from "./audit";
+import { verifyTreasuryProposalSignature } from "./treasury-signature-verification";
 import { AuditAction } from "./audit-actions";
 
 export const STATUS = {
@@ -326,21 +327,12 @@ export const treasurySignaturesService = {
             );
           }
 
-          let verified = false;
-          try {
-            verified = Keypair.fromPublicKey(matched.publicKey).verify(
-              submitted.hash(),
-              signature
-            );
-          } catch {
-            verified = false;
-          }
-          if (!verified) {
-            throw Errors.badRequest(
-              "invalid_signature",
-              `Signature for ${matched.publicKey} did not verify against the proposed transaction`
-            );
-          }
+          verifyTreasuryProposalSignature({
+            xdr: submitted.toXDR(),
+            signerPublicKey: matched.publicKey,
+            signature,
+            networkPassphrase: config.networkPassphrase,
+          });
 
           // Already recorded (from a prior request or earlier in this same
           // envelope) — skip without error so re-submitting a previously

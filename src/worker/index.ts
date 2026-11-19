@@ -383,6 +383,53 @@ async function alreadyApplied(
   }
 }
 
+/**
+ * If the signed envelope's hash is already on the ledger, conclude the job
+ * from that outcome instead of submitting again (#1082). Returns true when the
+ * job was concluded (confirmed or failed) and the caller must stop.
+ */
+async function settleIfAlreadyApplied(
+  job: SettlementJob,
+  attempt: number,
+  ctx: CorrelationContext
+): Promise<boolean> {
+  const applied = await alreadyApplied(job);
+  if (!applied) return false;
+  if (applied.successful) {
+    loggerWithContext(log, ctx).warn(
+      {
+        jobType: "settlement",
+        jobId: job.id,
+        attempt,
+        outcome: "already_applied",
+        hash: applied.hash,
+      },
+      "transaction already applied on the ledger; not resubmitting"
+    );
+    await transitionSettlement(
+      job,
+      "confirmed",
+      {
+        stellarTxHash: applied.hash,
+        retryCount: 0,
+        errorCategory: null,
+        failureReason: null,
+        nextAttemptAt: null,
+      },
+      true
+    );
+    return true;
+  }
+  await failSettlement({
+    job,
+    attempt,
+    category: "permanent",
+    reason: `Transaction ${applied.hash} failed on Stellar`,
+    ctx,
+  });
+  return true;
+}
+
 /** Record a successful submission and verify it reached the ledger. */
 async function confirmSubmission(params: {
   job: SettlementJob;
@@ -575,6 +622,17 @@ export async function processSettlementJob(
 
   while (attempt < policy.maxAttempts) {
     attempt += 1;
+
+    // Idempotency: a job a previous worker already attempted (retryCount > 0)
+    // may have crashed after Horizon accepted the envelope but before the
+    // outcome was recorded. Look the envelope's hash up before submitting
+    // again so such a job is concluded, never double-submitted. Retries within
+    // this loop already run this check for indeterminate failures, and a
+    // transient failure is one that demonstrably did not take effect.
+    if (attempt === job.retryCount + 1 && job.retryCount > 0) {
+      if (await settleIfAlreadyApplied(job, attempt, ctx)) return;
+    }
+
     await recordAttemptStarted(job, attempt);
 
     try {
@@ -602,42 +660,7 @@ export async function processSettlementJob(
 
       if (category === "indeterminate") {
         // The call may have taken effect. Check the ledger before deciding.
-        const applied = await alreadyApplied(job);
-if (applied?.successful) {
-        jobLog.warn(
-          {
-            jobType: "settlement",
-            jobId: job.id,
-            attempt,
-            outcome: "already_applied",
-            hash: applied.hash,
-          },
-          "submission response was lost but the transaction had applied"
-        );
-        await transitionSettlement(
-          job,
-          "confirmed",
-          {
-            stellarTxHash: applied.hash,
-            retryCount: 0,
-            errorCategory: null,
-            failureReason: null,
-            nextAttemptAt: null,
-          },
-          true
-        );
-        return;
-      }
-        if (applied && !applied.successful) {
-          await failSettlement({
-            job,
-            attempt,
-            category: "permanent",
-            reason: `Transaction ${applied.hash} failed on Stellar`,
-            ctx,
-          });
-          return;
-        }
+        if (await settleIfAlreadyApplied(job, attempt, ctx)) return;
         // Horizon has no record of it: nothing applied, so retry as transient.
         category = "transient";
       }
@@ -1944,10 +1967,12 @@ if (env.NODE_ENV !== "test") {
     .then(() => startWorker())
     .catch(() => process.exit(1));
 }
-
+
+
 export {
   executeWorkerJobWithRetry,
   DEFAULT_WORKER_JOB_POLICY,
   type WorkerJobExecutionOptions,
   type WorkerJobExecutionResult,
-} from "./job-retry-handler";
+} from "./job-retry-handler";
+

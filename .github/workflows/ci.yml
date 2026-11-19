@@ -131,4 +131,8 @@ jobs:
       # be reconciled before merge.
       - name: Assert schema and migrations do not drift
         run: npm run prisma:check-drift
+      # Issue #1081 — the enhanced health script (pending/failed migrations,
+      # drift) must report healthy against the freshly migrated database.
+      - name: Migration health check
+        run: npm run migrate:health
 

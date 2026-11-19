@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { z } from "zod";
 import { Networks } from "@stellar/stellar-sdk";
-import { rateLimitConfigSchema } from "./config/env";
+import { rateLimitConfigSchema, validateEnv } from "./config/env";
 import { sep10DomainSchema } from "./lib/sep10-domain";
 
 // URL validation helper
@@ -522,15 +522,18 @@ export type Env = z.infer<typeof schema>;
 
 export const envSchema = schema;
 
-let parsed: Env;
-try {
-  parsed = schema.parse(process.env);
-} catch (error) {
-  const message = safeErrorMessage(error);
-  console.error(`\n❌ Configuration validation failed:\n  ${message}\n`);
+const validation = validateEnv(schema, process.env);
+if (!validation.ok) {
+  // Fail fast: list every invalid variable by name (never its value) and exit.
+  console.error(
+    `\n❌ Configuration validation failed (${validation.errors.length} invalid variable${
+      validation.errors.length === 1 ? "" : "s"
+    }):\n${validation.errors.map((line) => `  - ${line}`).join("\n")}\n`
+  );
   console.error("Please check your environment variables and try again.\n");
   process.exit(1);
 }
+const parsed: Env = validation.env;
 
 export const env = parsed;
 

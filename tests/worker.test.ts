@@ -509,7 +509,12 @@ describe("processSubmittedSettlements", () => {
     // picked up again on the next cycle rather than sitting stuck forever.
     setupSettlement({ status: "verifying", retryCount: 1 });
     h.submitPayment.mockResolvedValue("hash_recovered");
-    h.getTransaction.mockResolvedValue({ successful: true });
+    // The envelope itself is not on the ledger (the restart pre-check finds
+    // nothing), but the hash the resubmission returns verifies as applied.
+    h.hashOf.mockReturnValue("hash_envelope");
+    h.getTransaction.mockImplementation(async (hash: string) =>
+      hash === "hash_envelope" ? null : { successful: true }
+    );
 
     const promise = processSubmittedSettlements();
     await vi.runAllTimersAsync();
@@ -748,12 +753,46 @@ describe("processSubmittedSettlements", () => {
     expect(currentSettlementState?.status).toBe("confirmed");
   });
 
+  it("does not resubmit a restarted job whose envelope already applied (#1082)", async () => {
+    // The previous worker crashed after Horizon accepted the envelope but
+    // before the outcome was recorded; the pre-submit hash lookup finds it.
+    setupSettlement({ status: "submitted", retryCount: 1 });
+    h.hashOf.mockReturnValue("hash_envelope");
+    h.getTransaction.mockResolvedValue({ successful: true });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(h.submitPayment).not.toHaveBeenCalled();
+    expect(currentSettlementState?.status).toBe("confirmed");
+    expect(currentSettlementState?.stellarTxHash).toBe("hash_envelope");
+  });
+
+  it("fails a restarted job whose envelope already failed on the ledger (#1082)", async () => {
+    setupSettlement({ status: "submitted", retryCount: 1 });
+    h.hashOf.mockReturnValue("hash_envelope");
+    h.getTransaction.mockResolvedValue({ successful: false });
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(h.submitPayment).not.toHaveBeenCalled();
+    expect(currentSettlementState?.status).toBe("failed");
+  });
+
   it("resumes from the persisted retry count after a restart", async () => {
     // A worker restarted after one failed attempt must continue at attempt 2
     // from the persisted retryCount, not reset the budget to 1.
     setupSettlement({ status: "submitted", retryCount: 1 });
     h.submitPayment.mockResolvedValue("hash_after_restart");
-    h.getTransaction.mockResolvedValue({ successful: true });
+    // The envelope itself is not on the ledger (the restart pre-check finds
+    // nothing), but the hash the resubmission returns verifies as applied.
+    h.hashOf.mockReturnValue("hash_envelope");
+    h.getTransaction.mockImplementation(async (hash: string) =>
+      hash === "hash_envelope" ? null : { successful: true }
+    );
 
     const promise = processSubmittedSettlements();
     await vi.runAllTimersAsync();

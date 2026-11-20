@@ -108,6 +108,64 @@ describe("Database Migration Health Check Script (#806)", () => {
       expect(result.diagnostics.some((d) => d.includes("pending unapplied migrations"))).toBe(true);
     });
 
+    it("reports pending_migrations when `migrate status` exits non-zero with pending output (#1081)", () => {
+      const mockRunner = (cmd: string) => {
+        if (cmd.includes("prisma migrate status")) {
+          throw Object.assign(new Error("Command failed"), {
+            stdout: "2 migrations have not yet been applied: a, b",
+          });
+        }
+        return "";
+      };
+      const result = checkMigrationHealth({
+        databaseUrl: "postgresql://localhost:5432/test",
+        execSyncFn: mockRunner,
+      });
+      expect(result.statusCode).toBe("pending_migrations");
+      expect(result.pendingMigrationsCount).toBe(2);
+    });
+
+    it("reports failed_migration when a migration failed to apply (#1081)", () => {
+      const mockRunner = (cmd: string) => {
+        if (cmd.includes("prisma migrate status")) {
+          throw Object.assign(new Error("Command failed"), {
+            stdout: "Following migration have failed to apply: 20261024_x",
+          });
+        }
+        return "";
+      };
+      const result = checkMigrationHealth({
+        databaseUrl: "postgresql://localhost:5432/test",
+        execSyncFn: mockRunner,
+      });
+      expect(result.statusCode).toBe("failed_migration");
+      expect(result.healthy).toBe(false);
+    });
+
+    it("reports schema_drift when migrate diff finds differences (#1081)", () => {
+      const mockRunner = (cmd: string) => {
+        if (cmd.includes("prisma migrate diff")) {
+          throw Object.assign(new Error("exit code 2"), { status: 2, stdout: "-- drift" });
+        }
+        return "";
+      };
+      const result = checkMigrationHealth({
+        databaseUrl: "postgresql://localhost:5432/test",
+        execSyncFn: mockRunner,
+      });
+      expect(result.healthy).toBe(false);
+      expect(result.statusCode).toBe("schema_drift");
+    });
+
+    it("stays healthy when migrations are applied and there is no drift (#1081)", () => {
+      const result = checkMigrationHealth({
+        databaseUrl: "postgresql://localhost:5432/test",
+        execSyncFn: () => "",
+      });
+      expect(result.statusCode).toBe("synced");
+      expect(result.diagnostics.some((d) => d.includes("No drift"))).toBe(true);
+    });
+
     it("reports connection_error with descriptive message when connection fails", () => {
       const mockRunner = (cmd: string) => {
         if (cmd.includes("prisma validate")) return "Schema is valid";

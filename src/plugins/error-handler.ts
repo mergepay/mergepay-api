@@ -6,6 +6,7 @@ import { formatErrorResponse } from "../utils/error-response";
 import { toRequestLimitError } from "../lib/request-limits";
 import { toPrismaError } from "../lib/prisma-error";
 import { ProviderError } from "../lib/provider-error";
+import { resolveHorizonFailure } from "../middleware/horizon-error";
 import { TimeoutError, TransportError, toProviderError } from "../services/timeout";
 
 function isHorizonError(error: unknown): error is Error & {
@@ -283,6 +284,29 @@ export const errorHandlerPlugin = fp(async function errorHandlerPlugin(app: Fast
       );
       return reply.code(prismaError.status).send(
         formatErrorResponse(prismaError.code, prismaError.message, requestId, prismaError.details)
+      );
+    }
+
+    // Stellar SDK / Horizon failures that carry ledger result codes (or a
+    // network timeout) answer with a stable STELLAR_* / UPSTREAM_TIMEOUT code.
+    // Only allow-listed fields are logged — never the request body, signed XDR,
+    // or the raw upstream payload (#1083).
+    const horizonFailure = resolveHorizonFailure(
+      err,
+      typeof (err as any).operation === "string" ? (err as any).operation : undefined
+    );
+    if (horizonFailure) {
+      req.log[horizonFailure.level](
+        { requestId, ...horizonFailure.logFields },
+        "Horizon error mapped"
+      );
+      return reply.code(horizonFailure.status).send(
+        formatErrorResponse(
+          horizonFailure.code,
+          horizonFailure.message,
+          requestId,
+          horizonFailure.details
+        )
       );
     }
 

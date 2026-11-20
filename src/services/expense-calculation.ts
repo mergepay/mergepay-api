@@ -755,7 +755,7 @@ export interface GroupExpenseBreakdown {
   normalized?: NormalizedExpenseBreakdown;
 }
 
-interface AssetAccumulator {
+export interface AssetAccumulator {
   asset: AssetRef;
   paid: Map<string, bigint>;
   owed: Map<string, bigint>;
@@ -809,114 +809,95 @@ function assertNoDuplicateShares(
   }
 }
 
-/**
- * Compute a group's expense breakdown, per asset and optionally normalized.
- *
- * For each asset the result records, per participant:
- *   - `paid` — the sum of expenses that participant fronted,
- *   - `owed` — the sum of that participant's shares, and
- *   - `net` — `paid - owed` (positive: the group owes them).
- *
- * Within every asset, `sum(paid) === sum(owed) === total` and the nets sum to
- * zero exactly, because each expense is validated to have shares summing to its
- * amount. This is the gross picture used to construct settlement intents; it
- * does not subtract already-confirmed settlements (see
- * `computeNetBalancesByAsset` in `services/settlement` for outstanding
- * balances).
- *
- * When `targetAsset` is supplied, each asset's per-participant paid/owed
- * allocations are converted with the integer rate for that asset (see
- * `ConversionRateInput`), preserving each asset total exactly. Participants are
- * then aggregated across assets into one net figure, so XLM and USDC amounts
- * can be compared and offset in a single settlement currency without ever
- * letting a floating-point conversion leak into the ledger.
- *
- * @throws {ExpenseCalculationError} `UNSUPPORTED_ASSET`, `INVALID_AMOUNT`,
- *   `INVALID_PARTICIPANTS`, `DUPLICATE_PARTICIPANT`, `INCONSISTENT_EXPENSE`,
- *   `INVALID_RATE`, `MISSING_RATE`, or `AMOUNT_OVERFLOW`.
- */
-export function calculateGroupExpenseBreakdown(
-  expenses: ExpenseRecord[],
-  options: GroupBreakdownOptions = {}
-): GroupExpenseBreakdown {
-  if (!Array.isArray(expenses)) {
-    fail(
-      EXPENSE_CALCULATION_ERROR_CODES.INVALID_PARTICIPANTS,
-      "Expenses must be an array"
-    );
-  }
+type RateTable = Map<string, { rate: string; rateScaled: bigint }>;
 
-  // Build the rate table up front so a malformed or duplicate rate is reported
-  // even when the breakdown happens to contain no expenses in that asset.
-  const rates = new Map<string, { rate: string; rateScaled: bigint }>();
-  for (const entry of options.rates ?? []) {
+/**
+ * Build the rate table up front so a malformed or duplicate rate is reported
+ * even when the breakdown happens to contain no expenses in that asset.
+ */
+export function buildRateTable(rates: ConversionRateInput[] | undefined): RateTable {
+  const table: RateTable = new Map();
+  for (const entry of rates ?? []) {
     const asset = normalizeAsset(entry.fromAssetCode, entry.fromAssetIssuer);
     const key = balanceAssetKey(asset.assetCode, asset.assetIssuer);
-    if (rates.has(key)) {
+    if (table.has(key)) {
       fail(
         EXPENSE_CALCULATION_ERROR_CODES.INVALID_RATE,
         `Duplicate conversion rate for asset "${asset.assetCode}"`
       );
     }
-    rates.set(key, {
-      rate: entry.rate,
-      rateScaled: parseRate(entry.rate),
-    });
+    table.set(key, { rate: entry.rate, rateScaled: parseRate(entry.rate) });
+  }
+  return table;
+}
+
+/** Structural checks: payer present, shares present, no duplicate sharer. */
+export function assertExpenseShape(expense: ExpenseRecord): void {
+  if (
+    !expense ||
+    typeof expense.payerUserId !== "string" ||
+    expense.payerUserId.trim() === ""
+  ) {
+    fail(
+      EXPENSE_CALCULATION_ERROR_CODES.INVALID_PARTICIPANTS,
+      "Every expense requires a non-empty payerUserId"
+    );
+  }
+  if (!Array.isArray(expense.shares) || expense.shares.length === 0) {
+    fail(
+      EXPENSE_CALCULATION_ERROR_CODES.INVALID_PARTICIPANTS,
+      `Expense${expense.id ? ` "${expense.id}"` : ""} has no shares`
+    );
+  }
+  assertNoDuplicateShares(expense.shares, expense.id);
+}
+
+/**
+ * Parse and cross-check an expense's amounts; returns share amounts in stroops
+ * (same order as `expense.shares`).
+ */
+export function parseExpenseShares(expense: ExpenseRecord): bigint[] {
+  const shareStroops = expense.shares.map((share) =>
+    parseAmount(share.shareAmount, `share amount for "${share.userId}"`)
+  );
+  const shareTotal = sumAmounts(shareStroops);
+  if (shareTotal <= 0n) {
+    fail(
+      EXPENSE_CALCULATION_ERROR_CODES.INVALID_AMOUNT,
+      `Expense${expense.id ? ` "${expense.id}"` : ""} must be greater than zero`
+    );
   }
 
+  // A stored `amount` is the payer's outlay. If it disagrees with the shares
+  // the row is corrupt: netting it would report a phantom debt.
+  if (expense.amount !== undefined) {
+    const declared = parseAmount(
+      expense.amount,
+      `amount for expense${expense.id ? ` "${expense.id}"` : ""}`,
+      { allowZero: false }
+    );
+    if (declared !== shareTotal) {
+      fail(
+        EXPENSE_CALCULATION_ERROR_CODES.INCONSISTENT_EXPENSE,
+        `Expense${expense.id ? ` "${expense.id}"` : ""} amount ${fromStroops(declared)} does not equal the sum of its shares ${fromStroops(shareTotal)}`
+      );
+    }
+  }
+  return shareStroops;
+}
+
+/** Group expenses into one paid/owed accumulator per asset. */
+export function accumulateExpensesByAsset(
+  expenses: ExpenseRecord[]
+): Map<string, AssetAccumulator> {
   const accumulators = new Map<string, AssetAccumulator>();
 
   for (const expense of expenses) {
-    if (
-      !expense ||
-      typeof expense.payerUserId !== "string" ||
-      expense.payerUserId.trim() === ""
-    ) {
-      fail(
-        EXPENSE_CALCULATION_ERROR_CODES.INVALID_PARTICIPANTS,
-        "Every expense requires a non-empty payerUserId"
-      );
-    }
-    if (!Array.isArray(expense.shares) || expense.shares.length === 0) {
-      fail(
-        EXPENSE_CALCULATION_ERROR_CODES.INVALID_PARTICIPANTS,
-        `Expense${expense.id ? ` "${expense.id}"` : ""} has no shares`
-      );
-    }
-    assertNoDuplicateShares(expense.shares, expense.id);
-
+    assertExpenseShape(expense);
     const asset = normalizeAsset(expense.assetCode, expense.assetIssuer);
     const key = balanceAssetKey(asset.assetCode, asset.assetIssuer);
-
-    const shareStroops = expense.shares.map((share) =>
-      parseAmount(
-        share.shareAmount,
-        `share amount for "${share.userId}"`
-      )
-    );
+    const shareStroops = parseExpenseShares(expense);
     const shareTotal = sumAmounts(shareStroops);
-    if (shareTotal <= 0n) {
-      fail(
-        EXPENSE_CALCULATION_ERROR_CODES.INVALID_AMOUNT,
-        `Expense${expense.id ? ` "${expense.id}"` : ""} must be greater than zero`
-      );
-    }
-
-    // A stored `amount` is the payer's outlay. If it disagrees with the shares
-    // the row is corrupt: netting it would report a phantom debt.
-    if (expense.amount !== undefined) {
-      const declared = parseAmount(
-        expense.amount,
-        `amount for expense${expense.id ? ` "${expense.id}"` : ""}`,
-        { allowZero: false }
-      );
-      if (declared !== shareTotal) {
-        fail(
-          EXPENSE_CALCULATION_ERROR_CODES.INCONSISTENT_EXPENSE,
-          `Expense${expense.id ? ` "${expense.id}"` : ""} amount ${fromStroops(declared)} does not equal the sum of its shares ${fromStroops(shareTotal)}`
-        );
-      }
-    }
 
     let accumulator = accumulators.get(key);
     if (!accumulator) {
@@ -940,54 +921,77 @@ export function calculateGroupExpenseBreakdown(
     });
   }
 
-  const assets: AssetExpenseBreakdown[] = [...accumulators.values()].map(
-    (accumulator) => {
-      const participants = accumulator.order.map((userId) => {
-        const paid = accumulator.paid.get(userId) ?? 0n;
-        const owed = accumulator.owed.get(userId) ?? 0n;
-        assertWithinStroopRange(
-          paid,
-          EXPENSE_CALCULATION_ERROR_CODES.AMOUNT_OVERFLOW,
-          `Paid total for "${userId}" exceeds the maximum representable Stellar value`
-        );
-        assertWithinStroopRange(
-          owed,
-          EXPENSE_CALCULATION_ERROR_CODES.AMOUNT_OVERFLOW,
-          `Owed total for "${userId}" exceeds the maximum representable Stellar value`
-        );
-        return {
-          userId,
-          paid: fromStroops(paid),
-          owed: fromStroops(owed),
-          net: fromStroops(paid - owed),
-        };
-      });
+  return accumulators;
+}
 
-      const total = sumAmounts([...accumulator.owed.values()]);
-      assertWithinStroopRange(
-        total,
-        EXPENSE_CALCULATION_ERROR_CODES.AMOUNT_OVERFLOW,
-        "Expense total exceeds the maximum representable Stellar value"
-      );
+/**
+ * Turn per-user paid/owed stroop maps into participant rows (`net = paid -
+ * owed`), range-checking every figure. `label` prefixes overflow messages.
+ */
+export function buildParticipantAmounts(
+  order: string[],
+  paidMap: Map<string, bigint>,
+  owedMap: Map<string, bigint>,
+  label: string
+): ParticipantAmounts[] {
+  const paidLabel = label ? `${label} paid total` : "Paid total";
+  const owedLabel = label ? `${label} owed total` : "Owed total";
+  return order.map((userId) => {
+    const paid = paidMap.get(userId) ?? 0n;
+    const owed = owedMap.get(userId) ?? 0n;
+    assertWithinStroopRange(
+      paid,
+      EXPENSE_CALCULATION_ERROR_CODES.AMOUNT_OVERFLOW,
+      `${paidLabel} for "${userId}" exceeds the maximum representable Stellar value`
+    );
+    assertWithinStroopRange(
+      owed,
+      EXPENSE_CALCULATION_ERROR_CODES.AMOUNT_OVERFLOW,
+      `${owedLabel} for "${userId}" exceeds the maximum representable Stellar value`
+    );
+    return {
+      userId,
+      paid: fromStroops(paid),
+      owed: fromStroops(owed),
+      net: fromStroops(paid - owed),
+    };
+  });
+}
 
-      return {
-        assetCode: accumulator.asset.assetCode,
-        assetIssuer: accumulator.asset.assetIssuer,
-        total: fromStroops(total),
-        expenseCount: accumulator.expenseCount,
-        participants,
-      };
-    }
-  );
+/** Per-asset breakdown rows (no conversion). */
+export function buildAssetBreakdowns(
+  accumulators: Map<string, AssetAccumulator>
+): AssetExpenseBreakdown[] {
+  return [...accumulators.values()].map((accumulator) => {
+    const participants = buildParticipantAmounts(
+      accumulator.order,
+      accumulator.paid,
+      accumulator.owed,
+      ""
+    );
+    const total = sumAmounts([...accumulator.owed.values()]);
+    assertWithinStroopRange(
+      total,
+      EXPENSE_CALCULATION_ERROR_CODES.AMOUNT_OVERFLOW,
+      "Expense total exceeds the maximum representable Stellar value"
+    );
+    return {
+      assetCode: accumulator.asset.assetCode,
+      assetIssuer: accumulator.asset.assetIssuer,
+      total: fromStroops(total),
+      expenseCount: accumulator.expenseCount,
+      participants,
+    };
+  });
+}
 
-  if (!options.targetAsset) {
-    return { assets };
-  }
-
-  const target = normalizeAsset(
-    options.targetAsset.assetCode,
-    options.targetAsset.assetIssuer
-  );
+/** Convert every asset into the target asset and aggregate per participant. */
+export function normalizeToTargetAsset(
+  accumulators: Map<string, AssetAccumulator>,
+  rates: RateTable,
+  targetAsset: { assetCode: string; assetIssuer?: string | null }
+): NormalizedExpenseBreakdown {
+  const target = normalizeAsset(targetAsset.assetCode, targetAsset.assetIssuer);
   const targetKey = balanceAssetKey(target.assetCode, target.assetIssuer);
 
   const normalizedPaid = new Map<string, bigint>();
@@ -1003,12 +1007,8 @@ export function calculateGroupExpenseBreakdown(
       accumulator.asset.assetIssuer
     );
     const userIds = accumulator.order;
-    const paidAmounts = userIds.map(
-      (userId) => accumulator.paid.get(userId) ?? 0n
-    );
-    const owedAmounts = userIds.map(
-      (userId) => accumulator.owed.get(userId) ?? 0n
-    );
+    const paidAmounts = userIds.map((userId) => accumulator.paid.get(userId) ?? 0n);
+    const owedAmounts = userIds.map((userId) => accumulator.owed.get(userId) ?? 0n);
 
     let convertedPaid = paidAmounts;
     let convertedOwed = owedAmounts;
@@ -1051,35 +1051,61 @@ export function calculateGroupExpenseBreakdown(
     "Normalized expense total exceeds the maximum representable Stellar value"
   );
 
-  const participants = order.map((userId) => {
-    const paid = normalizedPaid.get(userId) ?? 0n;
-    const owed = normalizedOwed.get(userId) ?? 0n;
-    assertWithinStroopRange(
-      paid,
-      EXPENSE_CALCULATION_ERROR_CODES.AMOUNT_OVERFLOW,
-      `Normalized paid total for "${userId}" exceeds the maximum representable Stellar value`
-    );
-    assertWithinStroopRange(
-      owed,
-      EXPENSE_CALCULATION_ERROR_CODES.AMOUNT_OVERFLOW,
-      `Normalized owed total for "${userId}" exceeds the maximum representable Stellar value`
-    );
-    return {
-      userId,
-      paid: fromStroops(paid),
-      owed: fromStroops(owed),
-      net: fromStroops(paid - owed),
-    };
-  });
+  return {
+    assetCode: target.assetCode,
+    assetIssuer: target.assetIssuer,
+    total: fromStroops(normalizedTotal),
+    participants: buildParticipantAmounts(order, normalizedPaid, normalizedOwed, "Normalized"),
+    appliedRates,
+  };
+}
 
+/**
+ * Compute a group's expense breakdown, per asset and optionally normalized.
+ *
+ * For each asset the result records, per participant:
+ *   - `paid` — the sum of expenses that participant fronted,
+ *   - `owed` — the sum of that participant's shares, and
+ *   - `net` — `paid - owed` (positive: the group owes them).
+ *
+ * Within every asset, `sum(paid) === sum(owed) === total` and the nets sum to
+ * zero exactly, because each expense is validated to have shares summing to its
+ * amount. This is the gross picture used to construct settlement intents; it
+ * does not subtract already-confirmed settlements (see
+ * `computeNetBalancesByAsset` in `services/settlement` for outstanding
+ * balances).
+ *
+ * When `targetAsset` is supplied, each asset's per-participant paid/owed
+ * allocations are converted with the integer rate for that asset (see
+ * `ConversionRateInput`), preserving each asset total exactly. Participants are
+ * then aggregated across assets into one net figure, so XLM and USDC amounts
+ * can be compared and offset in a single settlement currency without ever
+ * letting a floating-point conversion leak into the ledger.
+ *
+ * @throws {ExpenseCalculationError} `UNSUPPORTED_ASSET`, `INVALID_AMOUNT`,
+ *   `INVALID_PARTICIPANTS`, `DUPLICATE_PARTICIPANT`, `INCONSISTENT_EXPENSE`,
+ *   `INVALID_RATE`, `MISSING_RATE`, or `AMOUNT_OVERFLOW`.
+ */
+export function calculateGroupExpenseBreakdown(
+  expenses: ExpenseRecord[],
+  options: GroupBreakdownOptions = {}
+): GroupExpenseBreakdown {
+  if (!Array.isArray(expenses)) {
+    fail(
+      EXPENSE_CALCULATION_ERROR_CODES.INVALID_PARTICIPANTS,
+      "Expenses must be an array"
+    );
+  }
+
+  const rates = buildRateTable(options.rates);
+  const accumulators = accumulateExpensesByAsset(expenses);
+  const assets = buildAssetBreakdowns(accumulators);
+
+  if (!options.targetAsset) {
+    return { assets };
+  }
   return {
     assets,
-    normalized: {
-      assetCode: target.assetCode,
-      assetIssuer: target.assetIssuer,
-      total: fromStroops(normalizedTotal),
-      participants,
-      appliedRates,
-    },
+    normalized: normalizeToTargetAsset(accumulators, rates, options.targetAsset),
   };
 }

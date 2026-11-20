@@ -9,7 +9,9 @@
  * 2. Validates Prisma schema syntax and model integrity (`prisma validate`).
  * 3. Inspects migration history against target database (`prisma migrate status`).
  * 4. Gracefully catches and describes connection errors (P1001, timeouts, auth failures).
- * 5. Exits 0 on clean synced migrations; exits 1 on unapplied migrations or errors.
+ * 5. Detects failed migrations and schema drift (`prisma migrate diff --exit-code`) (#1081).
+ * 6. Exits 0 on clean synced migrations; exits 1 on unapplied migrations, drift or errors.
+ *    Pass `--json` for a machine-readable report (used by CI).
  */
 
 import { execSync } from "node:child_process";
@@ -20,6 +22,8 @@ dotenv.config();
 export type MigrationHealthStatusCode =
   | "synced"
   | "pending_migrations"
+  | "failed_migration"
+  | "schema_drift"
   | "schema_invalid"
   | "connection_error"
   | "missing_database_url";
@@ -36,6 +40,16 @@ export type CommandRunner = (
   cmd: string,
   opts?: { env?: Record<string, string | undefined>; stdio?: "pipe" | "inherit" | "ignore" }
 ) => string | Buffer;
+
+/** Combined message, stdout and stderr of a failed child process. */
+function errorOutput(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const e = err as Error & { stdout?: unknown; stderr?: unknown };
+  return [err.message, e.stdout, e.stderr]
+    .filter((v) => v !== undefined && v !== null)
+    .map((v) => String(v))
+    .join("\n");
+}
 
 /**
  * Parses connection error details from Prisma error messages.
@@ -123,6 +137,27 @@ export function checkMigrationHealth(options?: {
     }
 
     diagnostics.push("✅ Database schema is up to date: All migrations successfully applied");
+
+    // 3. Confirm the migrated database matches schema.prisma (exit 2 = drift).
+    try {
+      runner(
+        'npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code',
+        { env: { ...process.env, DATABASE_URL: dbUrl }, stdio: "pipe" }
+      );
+      diagnostics.push("✅ No drift between the database and prisma/schema.prisma");
+    } catch (driftErr: unknown) {
+      if (/P100[0-3]|P1017|authentication failed/i.test(errorOutput(driftErr))) {
+        throw driftErr;
+      }
+      diagnostics.push("❌ Schema drift detected between the database and prisma/schema.prisma");
+      return {
+        healthy: false,
+        statusCode: "schema_drift",
+        message: "Database schema has drifted from prisma/schema.prisma: add a migration to reconcile",
+        diagnostics,
+      };
+    }
+
     return {
       healthy: true,
       statusCode: "synced",
@@ -130,7 +165,30 @@ export function checkMigrationHealth(options?: {
       diagnostics,
     };
   } catch (err: unknown) {
-    const errorText = err instanceof Error ? err.message : String(err);
+    // `prisma migrate status` exits non-zero when migrations are pending or
+    // failed, so its output must be classified before assuming a connection
+    // problem.
+    const errorText = errorOutput(err);
+    if (/failed to apply|migration.*(?:failed|was started but)/i.test(errorText)) {
+      diagnostics.push("❌ A migration failed to apply and must be resolved");
+      return {
+        healthy: false,
+        statusCode: "failed_migration",
+        message: "Target database has a failed migration: resolve it with `prisma migrate resolve`",
+        diagnostics,
+      };
+    }
+    if (/have not yet been applied|unapplied migration/i.test(errorText)) {
+      const match = errorText.match(/(\d+)\s+migrations?.*have not yet been applied/i);
+      diagnostics.push("⚠️ Database has pending unapplied migrations");
+      return {
+        healthy: false,
+        statusCode: "pending_migrations",
+        message: "Target database is behind: Pending migrations require execution",
+        diagnostics,
+        pendingMigrationsCount: match ? parseInt(match[1], 10) : undefined,
+      };
+    }
     const connectionReason = parseConnectionError(errorText);
 
     diagnostics.push(`❌ Migration status check failed: ${connectionReason}`);
@@ -172,7 +230,11 @@ export function formatHealthReport(status: MigrationHealthStatus): string {
 
 if (typeof require !== "undefined" && require.main === module) {
   const result = checkMigrationHealth();
-  console.log(formatHealthReport(result));
+  console.log(
+    process.argv.includes("--json")
+      ? JSON.stringify(result, null, 2)
+      : formatHealthReport(result)
+  );
   if (!result.healthy) {
     process.exit(1);
   }

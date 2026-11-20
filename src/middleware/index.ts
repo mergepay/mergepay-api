@@ -5,3 +5,4 @@ export * from "./group-expense-audit";
 export * from "./state-mutation-audit";
 export * from "./sep24-validation";
 export * from "./group-admin-audit";
+export * from "./horizon-error";

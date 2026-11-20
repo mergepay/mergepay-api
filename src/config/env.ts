@@ -46,3 +46,36 @@ export const rateLimitConfigSchema = z.object({
 });
 
 export type RateLimitConfig = z.infer<typeof rateLimitConfigSchema>;
+
+/**
+ * Startup environment validation reporting (issue #1086).
+ *
+ * Turns a Zod failure over `process.env` into one line per invalid variable —
+ * `NAME: message` — so an operator sees every misconfiguration at once rather
+ * than fixing them one restart at a time. Only the variable name and the rule
+ * that failed are reported; the offending value is never printed, since an
+ * invalid `JWT_SECRET` or `DATABASE_URL` is still a secret. Zod's built-in enum
+ * message ends with "received '<value>'", which is stripped for the same
+ * reason.
+ */
+export function formatEnvIssues(error: z.ZodError): string[] {
+  return error.issues.map((issue) => {
+    const name = issue.path.length > 0 ? issue.path.join(".") : "configuration";
+    const message = issue.message.replace(/,?\s*received\s.*$/i, "").trim();
+    return `${name}: ${message}`;
+  });
+}
+
+export type EnvValidationResult<T> =
+  | { ok: true; env: T }
+  | { ok: false; errors: string[] };
+
+/** Validates `source` against `schema` without throwing or exiting. */
+export function validateEnv<T>(
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
+  source: Record<string, string | undefined>
+): EnvValidationResult<T> {
+  const result = schema.safeParse(source);
+  if (result.success) return { ok: true, env: result.data };
+  return { ok: false, errors: formatEnvIssues(result.error) };
+}

@@ -14,6 +14,7 @@ import {
   type MultisigAuditParams,
 } from "./audit";
 import { treasurySignaturesService } from "./treasury-signatures";
+import { verifyTreasuryProposalSignature } from "./treasury-signature-verification";
 import { reconcileTreasuryBalance } from "./treasuryService";
 import {
   validateProposedSignerConfig,
@@ -23,6 +24,7 @@ import {
 } from "./treasury-validation";
 
 export {
+  verifyTreasuryProposalSignature,
   treasurySignaturesService,
   reconcileTreasuryBalance,
   auditTreasurySignerChange,

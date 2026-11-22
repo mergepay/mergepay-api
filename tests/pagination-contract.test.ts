@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   DEFAULT_PAGE_SIZE,
+  GROUP_LIST_MAX_PAGE_SIZE,
   MAX_PAGE_SIZE,
   buildPage,
   cursorFilter,
@@ -240,7 +241,9 @@ describe("list endpoints share one pagination contract", () => {
     it(`${route.name}: rejects a page size over the maximum`, async () => {
       const res = await app.inject({
         method: "GET",
-        url: `${route.url}?limit=${MAX_PAGE_SIZE + 1}`,
+        url: `${route.url}?limit=${
+          (route.name === "group expenses" ? GROUP_LIST_MAX_PAGE_SIZE : MAX_PAGE_SIZE) + 1
+        }`,
         headers: authHeader(),
       });
 

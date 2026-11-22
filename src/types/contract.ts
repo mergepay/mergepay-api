@@ -138,6 +138,8 @@ export interface TreasuryProposal {
   status: string;
   stellarTxHash: string | null;
   failureReason: string | null;
+  expiresAt: string | null;
+  actionable: boolean;
   createdAt: string;
   updatedAt: string;
 }

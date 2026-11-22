@@ -13,6 +13,10 @@
  *
  *  - **userId** — the *authenticated* caller. A key one user chose is invisible
  *    to every other user, so nothing about it is reusable across accounts.
+ *
+ * The header is optional on every route that uses this service, including
+ * settlement confirmation: existing clients keep working unchanged, while a
+ * wallet that retries gets its original response replayed.
  *  - **scope** — the operation ("settlement.create", "settlement.confirm", …),
  *    so the same client-chosen string can't be replayed across unrelated
  *    endpoints.
@@ -107,24 +111,6 @@ export function readIdempotencyKey(headers: Record<string, unknown>): string | n
   return parsed.data;
 }
 
-/**
- * Same as `readIdempotencyKey`, but for endpoints where the key is mandatory —
- * submission, where a retry that slipped through could mean a second payment.
- */
-export function requireIdempotencyKey(
-  headers: Record<string, unknown>,
-  operation: string
-): string {
-  const key = readIdempotencyKey(headers);
-  if (!key) {
-    throw Errors.badRequest(
-      "missing_idempotency_key",
-      `Idempotency-Key header is required for ${operation}`
-    );
-  }
-  return key;
-}
-
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
 
@@ -210,6 +196,38 @@ function isAbandoned(row: KeyRow, now: number): boolean {
   const started = (row.updatedAt ?? row.createdAt ?? null)?.getTime();
   if (started === undefined) return false;
   return now - started > IN_PROGRESS_TIMEOUT_MS;
+}
+
+/**
+ * Resolve a key before the route does any expensive or validating work.
+ *
+ * A completed reservation returns the stored response immediately, and a
+ * reused key with a different payload conflicts here rather than after XDR
+ * validation — a client that reuses a key must always get the same answer,
+ * regardless of whether its new payload happens to be valid. Returns
+ * `undefined` when no replay exists and the operation should proceed.
+ */
+export async function readIdempotentResponse<T>(params: {
+  userId: string;
+  scope: IdempotencyScope;
+  key: string | null;
+  resourceId: string;
+  payload: unknown;
+}): Promise<T | undefined> {
+  const { userId, scope, key, resourceId, payload } = params;
+  if (!key) return undefined;
+
+  const requestHash = hashRequest(scope, resourceId, payload);
+  const existing = (await prisma.idempotencyKey.findUnique({
+    where: { userId_scope_key: { userId, scope, key } },
+  })) as KeyRow | null;
+  if (!existing) return undefined;
+  if (existing.requestHash !== requestHash) conflict();
+
+  const state = stateOf(existing);
+  if (state === "completed") return parseStoredResponse<T>(existing.responseJson);
+  if (state === "in_progress" && !isAbandoned(existing, Date.now())) inProgress();
+  return undefined;
 }
 
 type ClientWithWrites = {
@@ -378,19 +396,25 @@ async function finalize<T>(params: {
   const { where, operation, timeoutMs } = params;
 
   try {
-    const result = await prisma.$transaction((tx) => operation(tx), {
-      timeout: timeoutMs,
-    });
-
-    await prisma.idempotencyKey.update({
-      where,
-      data: {
-        status: "completed",
-        statusCode: 200,
-        responseJson: JSON.stringify(result),
-      } as never,
-    });
-    return result;
+    return await prisma.$transaction(
+      async (tx) => {
+        const result = await operation(tx);
+        // The replayable response and the settlement mutation share one
+        // transaction: either both commit or neither does. A response that was
+        // cached without its state change would be a replay of a payment that
+        // never happened.
+        await tx.idempotencyKey.update({
+          where,
+          data: {
+            status: "completed",
+            statusCode: 200,
+            responseJson: JSON.stringify(result),
+          },
+        });
+        return result;
+      },
+      { timeout: timeoutMs }
+    );
   } catch (error) {
     // The operation ran inside a transaction, so nothing durable survives a
     // failure. Marking the key `failed` — rather than leaving it wedged

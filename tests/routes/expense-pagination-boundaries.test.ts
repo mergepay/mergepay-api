@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { signToken } from "../../src/plugins/auth";
-import { MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE } from "../../src/lib/pagination";
+import { GROUP_LIST_MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE } from "../../src/lib/pagination";
 
 const h = vi.hoisted(() => {
   const model = () => ({
@@ -130,15 +130,15 @@ describe("GET /groups/:id/expenses — page size validation", () => {
     expect(res.json().code).toBe("VALIDATION_ERROR");
   });
 
-  it(`accepts limit=${MAX_PAGE_SIZE} (the ceiling itself is valid)`, async () => {
-    const res = await list(`?limit=${MAX_PAGE_SIZE}`);
+  it(`accepts limit=${GROUP_LIST_MAX_PAGE_SIZE} (the ceiling itself is valid)`, async () => {
+    const res = await list(`?limit=${GROUP_LIST_MAX_PAGE_SIZE}`);
 
     expect(res.statusCode).toBe(200);
-    expect(res.json().meta.limit).toBe(MAX_PAGE_SIZE);
+    expect(res.json().meta.limit).toBe(GROUP_LIST_MAX_PAGE_SIZE);
   });
 
-  it(`rejects limit=${MAX_PAGE_SIZE + 1} rather than silently clamping`, async () => {
-    const res = await list(`?limit=${MAX_PAGE_SIZE + 1}`);
+  it(`rejects limit=${GROUP_LIST_MAX_PAGE_SIZE + 1} rather than silently clamping`, async () => {
+    const res = await list(`?limit=${GROUP_LIST_MAX_PAGE_SIZE + 1}`);
 
     expect(res.statusCode).toBe(400);
     expect(res.json().code).toBe("VALIDATION_ERROR");
@@ -174,7 +174,7 @@ describe("GET /groups/:id/expenses — bounded read contract", () => {
     expect(lastArgs().take).toBe(8);
   });
 
-  it("fetches MAX_PAGE_SIZE + 1 even when no limit is given", async () => {
+  it("fetches GROUP_LIST_MAX_PAGE_SIZE + 1 even when no limit is given", async () => {
     await list("");
 
     expect(lastArgs().take).toBe(DEFAULT_PAGE_SIZE + 1);

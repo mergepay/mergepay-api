@@ -10,9 +10,9 @@
  *    key and an equivalent payload returns the original settlement and XDR
  *    instead of creating a second record.
  *  - **submission** (`POST /settlements/:id/confirm`) accepts the wallet's
- *    signed envelope. `Idempotency-Key` is **required** here — this is the
- *    request that leads to money moving, and a retry that slipped through
- *    could mean a second on-chain payment.
+ *    signed envelope. `Idempotency-Key` is optional but honoured here: existing
+ *    clients keep working, and a wallet that retries with the same key gets its
+ *    original response instead of a second on-chain submission.
  *
  * The API never holds a private key. Everything Horizon-facing lives in
  * src/services/stellar.ts so it can be mocked in tests.
@@ -49,7 +49,7 @@ import {
 } from "../services/ledger";
 import {
   readIdempotencyKey,
-  requireIdempotencyKey,
+  readIdempotentResponse,
   runIdempotent,
 } from "../services/idempotency";
 import {
@@ -100,6 +100,8 @@ const settlementInclude = { from: true, to: true } as const;
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });
+
+type ConfirmResponse = { settlement: ReturnType<typeof serializeSettlement> };
 
 /**
  * A settlement's public identifier: either its cuid or its short code. Both are
@@ -459,7 +461,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         tags: ["Settlements"],
         summary: "Confirm a settlement with a signed transaction",
         description:
-          "Validates the wallet's signed XDR against the original intent and submits it for on-chain execution. `Idempotency-Key` is required. Only the settlement's payer may confirm it.",
+          "Validates the wallet's signed XDR against the original intent and submits it for on-chain execution. An optional `Idempotency-Key` replays the original response on retry; reusing it with a different body returns 409. Only the settlement's payer may confirm it.",
         params: openApiIdParams(),
         body: openApiBody(settlementConfirmPayloadSchema),
         response: {
@@ -473,13 +475,20 @@ export default async function settlementRoutes(app: FastifyInstance) {
     const { id } = idParamSchema.parse(req.params);
     const body = settlementConfirmPayloadSchema.parse(req.body);
 
-    // Required, not optional: this is the request that ends in a payment, and a
-    // wallet or mobile client retrying after a timeout must never be able to
-    // produce a second submission.
-    const idempotencyKey = requireIdempotencyKey(
-      req.headers,
-      "settlement confirmation"
-    );
+    const idempotencyKey = readIdempotencyKey(req.headers);
+
+    // Resolve a replay first, before XDR validation or any database mutation.
+    // A retry with the same key must return the same response even if its new
+    // payload would otherwise fail validation, and a different payload under
+    // the same key must be a conflict rather than a fresh submission.
+    const replay = await readIdempotentResponse<ConfirmResponse>({
+      userId: auth.id,
+      scope: "settlement.confirm",
+      key: idempotencyKey,
+      resourceId: id,
+      payload: body,
+    });
+    if (replay !== undefined) return replay;
 
     // Load the *original* intent and validate the signed envelope against it
     // BEFORE entering the idempotent operation. Two reasons: a validation

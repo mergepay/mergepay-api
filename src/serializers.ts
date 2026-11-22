@@ -17,6 +17,7 @@ import type {
   AuditLogEntry,
   StatusHistory,
 } from "./types/contract";
+import { isProposalExpired } from "./services/treasury-proposal-expiry";
 
 function dec(v: Prisma.Decimal | string | number): string {
   return v.toString();
@@ -160,6 +161,14 @@ export function serializeTreasuryProposal(p: any): TreasuryProposal {
     status: p.status,
     stellarTxHash: p.stellarTxHash ?? null,
     failureReason: p.failureReason ?? null,
+    expiresAt: p.expiresAt ? iso(p.expiresAt) : null,
+    actionable:
+      p.status !== "expired" &&
+      !isProposalExpired({
+        status: p.status,
+        expiresAt: p.expiresAt ?? null,
+        createdAt: p.createdAt ?? null,
+      }),
     createdAt: iso(p.createdAt),
     updatedAt: iso(p.updatedAt),
   };

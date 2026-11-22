@@ -12,6 +12,7 @@ import { auditTx } from "../services/audit";
 import { AuditAction } from "../services/audit-actions";
 import { stellar } from "../services/stellar";
 import { type RetryPolicy } from "../services/job-retry";
+import { isProposalExpired } from "../services/treasury-proposal-expiry";
 import { executeWorkerJobWithRetry } from "./job-retry-handler";
 
 export interface ProcessPendingMultisigResult {
@@ -38,11 +39,13 @@ export async function processPendingTreasuryMultisig(params: {
   sleep?: (ms: number) => Promise<void>;
 } = {}): Promise<ProcessPendingMultisigResult> {
   const { batchSize = config.WORKER_BATCH_SIZE ?? 50, policy, sleep } = params;
+  const now = new Date();
 
   // Retrieve candidate proposals that are ready or awaiting submission
   const proposals = await prisma.treasuryProposal.findMany({
     where: {
       status: { in: [MULTISIG_STATUS.ready, MULTISIG_STATUS.pending, MULTISIG_STATUS.awaitingSignatures] },
+      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
     },
     take: batchSize,
     orderBy: { createdAt: "asc" },
@@ -53,6 +56,8 @@ export async function processPendingTreasuryMultisig(params: {
   let failed = 0;
 
   for (const proposal of proposals) {
+    if (isProposalExpired(proposal, now)) continue;
+
     const rawSignatures = (proposal.signatures as unknown as Array<{ publicKey: string; signature: string }>) || [];
     const signatureCount = rawSignatures.length;
 

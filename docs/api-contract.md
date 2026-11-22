@@ -99,7 +99,7 @@ Defined in [../src/lib/pagination.ts](../src/lib/pagination.ts).
 
 | Parameter | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `limit` | integer 1–100 | `50` | Out of range → `VALIDATION_ERROR` (never silently clamped) |
+| `limit` | integer 1–100 (1–200 for group expenses and members) | `50` | Out of range → `VALIDATION_ERROR` (never silently clamped) |
 | `cursor` | opaque string | — | From a previous response's `meta.nextCursor`; malformed → `INVALID_CURSOR` |
 | `order` | `"desc"` \| `"asc"` | `"desc"` | Applies to the `(createdAt, id)` ordering |
 
@@ -130,6 +130,15 @@ Guarantees:
 `GET /history` paginates two resources independently: `cursor` walks the expense
 stream, `settlementCursor` walks the settlement stream, with metadata in `meta`
 and `settlementMeta` respectively.
+
+### Group member ordering (`GET /groups/:id`)
+
+The member list is ordered alphabetically by `user.displayName`, with the
+membership `id` as a tiebreaker, so two members with the same name never skip
+or repeat across pages. Its cursor encodes `(displayName, id)` rather than the
+shared `(createdAt, id)` pair, and `order=asc` is the default. `order=desc`
+reverses the same total order. Cursors are resource-specific: a member cursor
+cannot be replayed against an expense or settlement list.
 
 ### Expense list filters (`GET /groups/:id/expenses`)
 
@@ -224,11 +233,12 @@ state-changing settlement request can be replayed safely.
 | --- | --- |
 | `POST /expenses/:id/settle` | optional, honoured when sent |
 | `POST /groups/:id/settlements` | optional, honoured when sent |
-| `POST /settlements/:id/confirm` | **required** — missing is `MISSING_IDEMPOTENCY_KEY` (400) |
+| `POST /settlements/:id/confirm` | optional, honoured when sent |
 | `POST /groups/:id/treasury/{deposit,withdraw}`, `POST /treasury-transactions/:id/confirm` | optional, honoured when sent |
 
-Submission requires a key because it is the request that ends in money moving:
-a retry that slipped through unguarded could mean a second on-chain payment.
+Submission honours a key because it is the request that ends in money moving: a
+wallet that retries after a timeout gets its original response instead of a
+second on-chain submission. Requests without a header behave exactly as before.
 
 ### Semantics
 
@@ -249,17 +259,23 @@ with a hash of the request's intent (scope, resource id, body).
   runs, and the unique constraint serializes racing retries. The loser gets
   `409 IDEMPOTENCY_IN_PROGRESS` rather than a second execution, so concurrent
   requests produce exactly one durable outcome.
-- **Failure** — the guarded operation runs inside a database transaction, so a
-  failure rolls back completely and the key is marked `failed`. The same key may
-  then be retried and will run exactly once more. A settlement is never left
-  looking complete without a confirmed transaction: the request path only
-  records a signed envelope, and the status only advances past `submitted` once
-  the worker has a Horizon result.
+ - **Atomic completion** — the settlement mutation and the key's `completed`
+   response are written in the same transaction, so a key can never replay a
+   response for a state change that did not commit.
+ - **Failure** — the guarded operation runs inside a database transaction, so a
+   failure rolls back completely and the key is marked `failed`. The same key may
+   then be retried and will run exactly once more. A settlement is never left
+   looking complete without a confirmed transaction: the request path only
+   records a signed envelope, and the status only advances past `submitted` once
+   the worker has a Horizon result.
 - **Retention** — keys replay for 24 hours, then are swept.
 
-Signed XDR validation happens **before** the key's operation begins, so an
-invalid envelope is never recorded as an idempotent success — every retry with a
-bad envelope gets the same fresh `XDR_MISMATCH`.
+For `POST /settlements/:id/confirm`, an existing key is resolved **before** XDR
+validation: a completed key replays its stored response immediately, and a key
+reused with a different body returns `409 IDEMPOTENCY_CONFLICT` before any
+validation error can mask it. New requests still validate the signed envelope
+before the guarded operation begins, so an invalid envelope is never recorded as
+an idempotent success.
 
 ---
 
@@ -518,6 +534,29 @@ request, and repeating it in two places invites them to disagree. It also
 reveals nothing about the caller's identity or whether a wallet account is
 known to the API — `/auth/*` budgets are keyed by client IP precisely so that a
 429 cannot be used as an account oracle.
+
+### SEP-24 hardening
+
+Every SEP-24 route uses a bucket stricter than the global 100 requests/window:
+`anchorInit` 10/window for interactive starts, `anchorPoll` 60/window for
+database-only status reads, `anchorWebhook` 50/window for the shared-secret
+callback, and `sep24Callback` / `sep24Webhook` 10/window for the JWT/HMAC
+callback surfaces. The numbers are in the route comments and
+[../README.md](../README.md#rate-limiting); the policies live in
+[../src/lib/rate-limit.ts](../src/lib/rate-limit.ts).
+
+Query, params, and body are parsed by the Zod schemas in
+[../src/validations/sep24.ts](../src/validations/sep24.ts) before any anchor or
+database work. Asset codes (1-12 alphanumerics), amounts (positive Stellar
+decimals bounded by Int64), account IDs (checksum-valid ed25519 `G…` keys), and
+opaque transaction IDs (bounded, path-safe alphabet) are rejected with the
+standard `400 VALIDATION_ERROR` envelope.
+
+Owner-scoped reads answer the same `404 NOT_FOUND` for an absent or foreign
+transaction; successful callbacks return the same `200 { received, status,
+matched, updated }` envelope even when no session matched. The shared-secret
+`/anchors/webhook` deliberately answers `200 { ok: true }` for a bad secret so
+callers cannot use the response to probe credentials.
 
 ---
 

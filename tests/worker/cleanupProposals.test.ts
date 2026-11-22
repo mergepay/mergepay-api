@@ -30,6 +30,8 @@ const proposal = (over: Record<string, any> = {}) => ({
   id: "proposal_1",
   groupId: "group_1",
   creatorId: "user_1",
+  status: "pending",
+  expiresAt: null as Date | null,
   createdAt: new Date(NOW.getTime() - 30 * DAY_MS),
   ...over,
 });
@@ -62,14 +64,17 @@ describe("proposalExpiryCutoff", () => {
 });
 
 describe("expireStaleProposals", () => {
-  it("only considers proposals that are still pending and past the cutoff", async () => {
+  it("only considers open proposals past their expiry", async () => {
     await expireStaleProposals({ now: NOW, ageDays: 7 });
 
     expect(prisma.treasuryProposal.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
-          status: "pending",
-          createdAt: { lt: new Date(NOW.getTime() - 7 * DAY_MS) },
+          status: { in: ["open", "pending", "awaiting_signatures"] },
+          OR: [
+            { expiresAt: { lte: NOW } },
+            { expiresAt: null, createdAt: { lt: new Date(NOW.getTime() - 7 * DAY_MS) } },
+          ],
         },
       })
     );
@@ -94,7 +99,10 @@ describe("expireStaleProposals", () => {
     expect(result.expired).toBe(1);
     expect(prisma.treasuryProposal.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "proposal_1", status: "pending" },
+        where: {
+          id: "proposal_1",
+          status: { in: ["open", "pending", "awaiting_signatures"] },
+        },
         data: expect.objectContaining({ status: EXPIRED_STATUS }),
       })
     );
@@ -107,7 +115,7 @@ describe("expireStaleProposals", () => {
 
     // The status predicate is what makes the sweep safe next to live signing.
     const args = prisma.treasuryProposal.updateMany.mock.calls[0][0];
-    expect(args.where.status).toBe("pending");
+    expect(args.where.status.in).toContain("pending");
   });
 
   it("does not count a proposal signed between the query and the write", async () => {
@@ -131,7 +139,7 @@ describe("expireStaleProposals", () => {
     expect(prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          action: "treasury_proposal.expired",
+          action: "treasury.proposal.expired",
           entityType: "treasury_proposal",
           entityId: "proposal_1",
           groupId: "group_1",
@@ -197,5 +205,41 @@ describe("expireStaleProposals", () => {
 
     const args = prisma.treasuryProposal.updateMany.mock.calls[0][0];
     expect(args.data.failureReason).toEqual(expect.stringContaining("threshold"));
+  });
+
+  it("expires an awaiting-signatures proposal whose stored expiry has passed", async () => {
+    const expiredAt = new Date(NOW.getTime() - DAY_MS);
+    prisma.treasuryProposal.findMany.mockResolvedValue([
+      proposal({ status: "awaiting_signatures", expiresAt: expiredAt }),
+    ]);
+
+    const result = await expireStaleProposals({ now: NOW });
+
+    expect(result.expired).toBe(1);
+    expect(prisma.treasuryProposal.updateMany.mock.calls[0][0].data.status).toBe(EXPIRED_STATUS);
+  });
+
+  it("does not expire a proposal whose stored expiry is still in the future", async () => {
+    prisma.treasuryProposal.findMany.mockResolvedValue([
+      proposal({ expiresAt: new Date(NOW.getTime() + DAY_MS) }),
+    ]);
+
+    const result = await expireStaleProposals({ now: NOW });
+
+    expect(result.expired).toBe(0);
+    expect(prisma.treasuryProposal.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent when the sweep is run twice", async () => {
+    prisma.treasuryProposal.findMany
+      .mockResolvedValueOnce([proposal({ expiresAt: new Date(NOW.getTime() - DAY_MS) })])
+      .mockResolvedValueOnce([]);
+
+    const first = await expireStaleProposals({ now: NOW });
+    const second = await expireStaleProposals({ now: NOW });
+
+    expect(first.expired).toBe(1);
+    expect(second.expired).toBe(0);
+    expect(prisma.auditLog.create).toHaveBeenCalledTimes(1);
   });
 });

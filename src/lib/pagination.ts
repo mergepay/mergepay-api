@@ -63,6 +63,8 @@ export const DEFAULT_PAGE_SIZE = 50;
  */
 export const MAX_PAGE_SIZE = 100;
 
+export const GROUP_LIST_MAX_PAGE_SIZE = 200;
+
 export type SortOrder = "asc" | "desc";
 
 /**
@@ -107,6 +109,42 @@ export interface CursorPosition {
 
 export function encodeCursor(createdAt: Date, id: string): string {
   return Buffer.from(`${createdAt.getTime()}_${id}`).toString("base64url");
+}
+
+export interface MemberCursorPosition {
+  displayName: string;
+  id: string;
+}
+
+export function encodeMemberCursor(displayName: string, id: string): string {
+  return Buffer.from(JSON.stringify({ displayName, id })).toString("base64url");
+}
+
+export function decodeMemberCursor(cursor: string): MemberCursorPosition | null {
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+    if (
+      typeof decoded !== "object" ||
+      decoded === null ||
+      typeof decoded.displayName !== "string" ||
+      typeof decoded.id !== "string" ||
+      !decoded.id
+    ) {
+      return null;
+    }
+    return { displayName: decoded.displayName, id: decoded.id };
+  } catch {
+    return null;
+  }
+}
+
+export function requireMemberCursor(cursor: string | undefined): MemberCursorPosition | null {
+  if (!cursor) return null;
+  const position = decodeMemberCursor(cursor);
+  if (!position) {
+    throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
+  }
+  return position;
 }
 
 export function decodeCursor(cursor: string): CursorPosition | null {

@@ -365,6 +365,7 @@ model TreasuryProposal {
   /// by the group threshold, ~few entries per proposal).
   signatures Json     @default("[]")
   status     String   @default("pending")
+  expiresAt  DateTime? @map("expires_at")
   stellarTxHash String? @map("stellar_tx_hash")
   failureReason  String? @map("failure_reason")
   createdAt  DateTime @default(now()) @map("created_at")
@@ -378,6 +379,7 @@ model TreasuryProposal {
   @@index([status])
   @@index([creatorId])
   @@index([status, createdAt])
+  @@index([status, expiresAt])
   @@map("treasury_proposals")
 }
 

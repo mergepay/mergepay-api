@@ -29,6 +29,7 @@ import { getTreasuryAccount } from "../services/treasury-stellar";
 import { isPositive } from "../services/money";
 import { serializeGroup, serializeTreasuryProposal } from "../serializers";
 import { treasuryProposalsService } from "../services/treasury-proposals";
+import { treasuryProposalExpiryDaysSchema } from "../services/treasury-proposal-expiry";
 import {
   buildPage,
   cursorFilter,
@@ -64,6 +65,9 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
     const auth = requireUser(req);
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
     const body = treasuryMultisigProposalPayloadSchema.parse(req.body);
+    const { expiresInDays } = z
+      .object({ expiresInDays: treasuryProposalExpiryDaysSchema.optional() })
+      .parse(req.body ?? {});
 
     if (!isPositive(body.amount)) {
       throw Errors.badRequest("invalid_amount", "Amount must be positive");
@@ -90,6 +94,7 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
           assetCode: body.assetCode,
           assetIssuer: body.assetIssuer ?? null,
           memo: body.memo ?? null,
+          expiresInDays,
         },
         threshold
       );

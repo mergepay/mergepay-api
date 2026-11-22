@@ -8,10 +8,10 @@
  * - Dead-letter logging and database status transition to "failed"
  */
 import { createLogger } from "../lib/logger";
+import { jobLogger } from "../lib/worker-logger";
 import {
-  classifyJobFailure,
+  asJobError,
   retryDelayMs,
-  safeFailureMessage,
   type JobFailureCategory,
   type RetryPolicy,
 } from "../services/job-retry";
@@ -20,6 +20,8 @@ const log = createLogger({ name: "worker:retry-handler" });
 
 export interface WorkerJobExecutionOptions {
   taskName: string;
+  /** Job family used in structured logs; defaults to `worker_task`. */
+  jobType?: string;
   jobId?: string;
   userId?: string | null;
   groupId?: string | null;
@@ -66,13 +68,26 @@ export async function executeWorkerJobWithRetry<T>(
   const policy = options.policy ?? DEFAULT_WORKER_JOB_POLICY;
   const sleep = options.sleep ?? defaultSleep;
   const taskName = options.taskName;
+  const jobType = options.jobType ?? "worker_task";
   const jobId = options.jobId ?? taskName;
+  const job = jobLogger(jobType, jobId, log);
 
   let lastError: unknown;
+
+  job.log("started", {
+    task: taskName,
+    attempt: 1,
+    maxAttempts: policy.maxAttempts,
+  });
 
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
     try {
       const result = await task(attempt);
+      job.log("completed", {
+        task: taskName,
+        attempt,
+        maxAttempts: policy.maxAttempts,
+      });
       return {
         success: true,
         result,
@@ -81,27 +96,21 @@ export async function executeWorkerJobWithRetry<T>(
       };
     } catch (error) {
       lastError = error;
-      const category = classifyJobFailure(error);
-      const reason = safeFailureMessage(error);
+      const classified = asJobError(error);
+      const { category, retryable, message: reason } = classified;
 
-      // If permanent error or maximum retry attempts reached, stop and dead-letter
-      if (category === "permanent" || attempt >= policy.maxAttempts) {
-        log.error(
-          {
-            jobType: "worker_task",
-            task: taskName,
-            jobId,
-            attempt,
-            maxAttempts: policy.maxAttempts,
-            category,
-            reason,
-            err: error,
-            outcome: "dead_letter",
-          },
-          `Worker task '${taskName}' exceeded retry limit or encountered permanent failure - moving to dead-letter`
-        );
+      if (!retryable || attempt >= policy.maxAttempts) {
+        job.error(error, {
+          task: taskName,
+          attempt,
+          attempts: attempt,
+          maxAttempts: policy.maxAttempts,
+          category,
+          retryable,
+          reason,
+          outcome: "dead_letter",
+        });
 
-        // Notify dead-letter callback (e.g., to update database state to "failed")
         if (options.onDeadLetter) {
           await options.onDeadLetter({
             attempts: attempt,
@@ -111,8 +120,6 @@ export async function executeWorkerJobWithRetry<T>(
           });
         }
 
-        
-
         return {
           success: false,
           error,
@@ -121,22 +128,17 @@ export async function executeWorkerJobWithRetry<T>(
         };
       }
 
-      // Transient or indeterminate error - compute exponential backoff and retry
       const delayMs = retryDelayMs(attempt, policy);
-      log.warn(
-        {
-          jobType: "worker_task",
-          task: taskName,
-          jobId,
-          attempt,
-          maxAttempts: policy.maxAttempts,
-          category,
-          delayMs,
-          reason,
-          outcome: "retry_scheduled",
-        },
-        `Worker task '${taskName}' failed with ${category} error - retry ${attempt}/${policy.maxAttempts} scheduled`
-      );
+      job.warn("retry_scheduled", {
+        task: taskName,
+        attempt,
+        maxAttempts: policy.maxAttempts,
+        category,
+        retryable,
+        delayMs,
+        reason,
+        err: error,
+      });
 
       if (options.onRetry) {
         await options.onRetry({

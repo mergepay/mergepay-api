@@ -237,6 +237,15 @@ describe("validateAmount", () => {
 
   // Rejections
   describe("rejections", () => {
+    it("rejects non-string inputs without throwing", () => {
+      const result = validateAmount(42 as unknown as string);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe("malformed");
+        expect(result.code).toBe("INVALID_AMOUNT");
+      }
+    });
+
     it("rejects zero", () => {
       const result = validateAmount("0");
       expect(result.ok).toBe(false);

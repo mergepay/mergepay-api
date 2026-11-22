@@ -155,11 +155,15 @@ describe("Auth Service & SEP-10 Verification Error Handling (#885)", () => {
       expect(classified.code).toBe(ErrorCode.INVALID_SIGNATURE);
     });
 
-    it("classifies unrecognized error strings into INVALID_CHALLENGE", () => {
-      const err = new Error("Random unhandled parser error");
-      const classified = classifySep10Error(err);
+    it.each([
+      "Network fetch failed while parsing the transaction",
+      "Domain model failed to initialize",
+      "verify helper crashed while formatting output",
+    ])("does not treat unrelated internal errors as challenge failures: %s", (message) => {
+      const classified = classifySep10Error(new Error(message));
       expect(classified.status).toBe(401);
       expect(classified.code).toBe(ErrorCode.INVALID_CHALLENGE);
+      expect(classified.message).not.toContain(message);
     });
   });
 

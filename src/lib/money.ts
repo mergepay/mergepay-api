@@ -244,6 +244,17 @@ const RAW_DECIMAL_RE = /^\d+(?:\.\d+)?$/;
  * Rejects: malformed, zero/negative, >7dp, out of range, exponent, whitespace.
  */
 export function validateAmount(value: string): ValidationOutcome<ValidatedAmount> {
+  // Guard the runtime boundary: JavaScript callers and malformed payloads can
+  // pass a number or object even though TypeScript declares a string.
+  if (typeof value !== "string") {
+    return {
+      ok: false,
+      reason: "malformed",
+      message: "Amount must be a decimal string",
+      code: "INVALID_AMOUNT",
+    };
+  }
+
   // Reject whitespace padding (must be exact match after trim)
   const trimmed = value.trim();
   if (trimmed !== value) {

@@ -29,63 +29,81 @@ export {
 };
 export type { VerifiedChallenge, AuthUser, JwtClaims };
 
-/**
- * Classify any challenge verification error into a secure, explicit AppError
- * that does not leak internal stack traces or cryptographic secrets.
- */
+type Sep10FailureCode =
+  | typeof ErrorCode.CHALLENGE_EXPIRED
+  | typeof ErrorCode.CHALLENGE_NOT_YET_VALID
+  | typeof ErrorCode.CHALLENGE_WINDOW_TOO_LONG
+  | typeof ErrorCode.HOME_DOMAIN_MISMATCH
+  | typeof ErrorCode.NETWORK_MISMATCH
+  | typeof ErrorCode.INVALID_SIGNATURE
+  | typeof ErrorCode.INVALID_CHALLENGE;
+
+interface Sep10FailureRule {
+  code: Sep10FailureCode;
+  pattern: RegExp;
+  build: () => AppError;
+}
+
+const SEP10_FAILURE_RULES: readonly Sep10FailureRule[] = [
+  {
+    code: ErrorCode.CHALLENGE_EXPIRED,
+    pattern: /\b(expired past|has expired|transaction expired|timebound.*expired)\b/i,
+    build: () =>
+      Errors.challengeExpired(
+        "Authentication challenge has expired. Request a new challenge and sign it promptly.",
+        { challengeValiditySeconds: CHALLENGE_VALIDITY_SECONDS }
+      ),
+  },
+  {
+    code: ErrorCode.CHALLENGE_NOT_YET_VALID,
+    pattern: /\b(not yet valid|min_time|not_yet_valid)\b/i,
+    build: () =>
+      Errors.challengeNotYetValid(
+        "Authentication challenge is not valid yet. Request a new challenge and sign it promptly."
+      ),
+  },
+  {
+    code: ErrorCode.CHALLENGE_WINDOW_TOO_LONG,
+    pattern: /\b(window|timebounds?)\b.*\b(too long|exceeds|longer than)\b/i,
+    build: () =>
+      Errors.challengeWindowTooLong(
+        "Authentication challenge window is longer than this server issues. Request a new challenge."
+      ),
+  },
+  {
+    code: ErrorCode.HOME_DOMAIN_MISMATCH,
+    pattern: /\b(home\s*domain|homedomain|domain mismatch)\b/i,
+    build: () =>
+      Errors.challengeHomeDomainMismatch(
+        "Authentication challenge was issued for a different home domain. Request a new challenge from this server."
+      ),
+  },
+  {
+    code: ErrorCode.NETWORK_MISMATCH,
+    pattern: /\bnetwork\b.*\b(mismatch|passphrase)\b|\bpassphrase\b.*\b(mismatch|network)\b/i,
+    build: () =>
+      Errors.challengeNetworkMismatch(
+        "Authentication challenge was issued for a different Stellar network. Request a new challenge from this server and sign it for its network."
+      ),
+  },
+  {
+    code: ErrorCode.INVALID_SIGNATURE,
+    pattern: /\b(signatures?|signers?|thresholds?)\b/i,
+    build: () =>
+      Errors.challengeSignatureInvalid(
+        "Challenge signature verification failed. Ensure the challenge is signed by the account's signing key(s) before submitting."
+      ),
+  },
+];
+
 export function classifySep10Error(error: unknown, account?: string): AppError {
   if (error instanceof AppError) {
     return error;
   }
 
   const message = error instanceof Error ? error.message : String(error ?? "");
-  const lowerMsg = message.toLowerCase();
-
-  if (lowerMsg.includes("expired") || lowerMsg.includes("timebound") || lowerMsg.includes("max_time")) {
-    return Errors.challengeExpired(
-      "Authentication challenge has expired. Request a new challenge and sign it promptly.",
-      { challengeValiditySeconds: CHALLENGE_VALIDITY_SECONDS }
-    );
-  }
-
-  if (lowerMsg.includes("not yet valid") || lowerMsg.includes("min_time") || lowerMsg.includes("not_yet_valid")) {
-    return Errors.challengeNotYetValid(
-      "Authentication challenge is not valid yet. Request a new challenge and sign it promptly."
-    );
-  }
-
-  if (lowerMsg.includes("window") && (lowerMsg.includes("long") || lowerMsg.includes("exceeds"))) {
-    return Errors.challengeWindowTooLong(
-      "Authentication challenge window is longer than this server issues. Request a new challenge."
-    );
-  }
-
-  if (
-    lowerMsg.includes("homedomain") ||
-    lowerMsg.includes("home domain") ||
-    lowerMsg.includes("domain mismatch") ||
-    lowerMsg.includes("domain")
-  ) {
-    return Errors.challengeHomeDomainMismatch(
-      "Authentication challenge was issued for a different home domain. Request a new challenge from this server."
-    );
-  }
-
-  if (lowerMsg.includes("network") || lowerMsg.includes("passphrase")) {
-    return Errors.challengeNetworkMismatch(
-      "Authentication challenge was issued for a different Stellar network. Request a new challenge from this server and sign it for its network."
-    );
-  }
-
-  if (
-    lowerMsg.includes("signature") ||
-    lowerMsg.includes("signer") ||
-    lowerMsg.includes("threshold") ||
-    lowerMsg.includes("verify")
-  ) {
-    return Errors.challengeSignatureInvalid(
-      "Challenge signature verification failed. Ensure the challenge is signed by the account's signing key(s) before submitting."
-    );
+  for (const rule of SEP10_FAILURE_RULES) {
+    if (rule.pattern.test(message)) return rule.build();
   }
 
   return Errors.invalidChallenge();

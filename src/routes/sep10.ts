@@ -4,6 +4,19 @@
  * Implements Zod validation preHandler hooks to ensure invalid requests, malformed
  * public keys, and non-canonical base64 XDR envelopes are rejected with standard
  * 400 VALIDATION_ERROR before reaching cryptographic challenge handling.
+ *
+ * Stable `error.code` values documented for web client parity:
+ *
+ * | Code | HTTP | Cause |
+ * | --- | --- | --- |
+ * | `VALIDATION_ERROR` | 400 | Request schema rejected the account or XDR field. |
+ * | `INVALID_CHALLENGE` | 401 | Malformed, unrelated, replayed, or otherwise unclassifiable signed challenge. |
+ * | `CHALLENGE_EXPIRED` | 401 | Signed challenge's max time is past the validity window. |
+ * | `CHALLENGE_NOT_YET_VALID` | 401 | Signed challenge's min time is still ahead of the server clock. |
+ * | `CHALLENGE_WINDOW_TOO_LONG` | 401 | Signed challenge declares a longer window than this server issues. |
+ * | `HOME_DOMAIN_MISMATCH` | 400/401 | Challenge was issued for another home domain. |
+ * | `NETWORK_MISMATCH` | 401 | Challenge was signed for another Stellar network. |
+ * | `INVALID_SIGNATURE` | 401 | Signer or threshold check failed. |
  */
 import type { FastifyInstance } from "fastify";
 import { buildChallenge, authenticateChallenge } from "../services/sep10";

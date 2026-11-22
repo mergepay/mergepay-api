@@ -67,7 +67,7 @@ export default fp(async function openAPIPlugin(app: FastifyInstance) {
         {
           name: "System",
           description:
-            "System health checks, readiness probes, and liveness endpoints",
+            "System health checks, readiness and liveness probes, and the background worker's heartbeat contract",
         },
       ],
       components: {
@@ -151,6 +151,57 @@ export default fp(async function openAPIPlugin(app: FastifyInstance) {
               memo: { type: ["string", "null"] },
               expenseId: { type: ["string", "null"] },
               createdAt: { type: "string", format: "date-time" },
+            },
+          },
+          // The background worker runs as its own process and deliberately
+          // exposes no HTTP surface (see HEALTH.md), so its health is published
+          // as the `health` object on the structured `worker_health` heartbeat
+          // log line. This schema is the contract for that payload; it is
+          // derived from `getWorkerHealth()` in src/worker/health.ts, and a test
+          // asserts the two cannot drift.
+          WorkerHealth: {
+            type: "object",
+            description:
+              "Point-in-time background worker health, emitted as the `health` field of the `worker_health` heartbeat log line. Not served by an HTTP endpoint: the worker is a separate process, so monitor it through its logs and process supervisor.",
+            required: [
+              "workerId",
+              "healthy",
+              "startedAt",
+              "lastCycleOutcome",
+              "cyclesCompleted",
+              "cyclesFailed",
+              "consecutiveFailures",
+              "taskFailures",
+              "deadLetteredTasks",
+            ],
+            properties: {
+              workerId: { type: "string" },
+              healthy: {
+                type: "boolean",
+                description:
+                  "`false` once consecutive failed cycles reach WORKER_HEALTH_UNHEALTHY_THRESHOLD",
+              },
+              startedAt: { type: "string", format: "date-time" },
+              lastCycleStartedAt: { type: "string", format: "date-time", nullable: true },
+              lastCycleCompletedAt: { type: "string", format: "date-time", nullable: true },
+              lastCycleDurationMs: { type: "integer", nullable: true },
+              lastCycleOutcome: {
+                type: "string",
+                enum: ["never_run", "running", "success", "failed"],
+              },
+              cyclesCompleted: { type: "integer" },
+              cyclesFailed: { type: "integer" },
+              consecutiveFailures: { type: "integer" },
+              taskFailures: {
+                type: "object",
+                description: "Final (budget-exhausted) failures per cycle task, by task name",
+                additionalProperties: { type: "integer" },
+              },
+              deadLetteredTasks: {
+                type: "array",
+                description: "Tasks whose in-cycle retry budget was exhausted, newest first",
+                items: { type: "string" },
+              },
             },
           },
         },

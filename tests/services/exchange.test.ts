@@ -27,6 +27,33 @@ describe("exchange service", () => {
     expect(await convertAmount("2.5", "XLM", "USDC")).toBe("0.2500000");
   });
 
+  it("rejects malformed amounts before contacting Horizon", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(convertAmount("1e3", "XLM", "USDC")).rejects.toMatchObject({
+      statusCode: 400,
+      code: "INVALID_AMOUNT",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects unsupported asset codes", async () => {
+    await expect(convertAmount("1", "ETH" as "XLM" | "USDC", "XLM")).rejects.toMatchObject({
+      statusCode: 400,
+      code: "INVALID_ASSET",
+    });
+  });
+
+  it("converts at seven-decimal precision without binary-float drift", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ asks: [{ price: "0.1234567" }], bids: [{ price: "0.1234568" }] }),
+    }));
+
+    expect(await convertAmount("1", "XLM", "USDC")).toBe("0.1234568");
+  });
+
   it("refreshes the quote after the configured cache TTL", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ asks: [{ price: "0.10" }], bids: [{ price: "0.10" }] }) })

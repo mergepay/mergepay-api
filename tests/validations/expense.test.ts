@@ -189,6 +189,42 @@ describe("createExpenseSchema", () => {
       expect(result.success).toBe(false);
     });
 
+    it("rejects an unrepresentable share amount", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        splitType: "custom",
+        shares: [
+          { userId: "user_1", amount: "922337203685.4775808" },
+          { userId: "user_2", amount: "0.1" },
+        ],
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects whitespace-padded share amounts", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        splitType: "custom",
+        shares: [{ userId: "user_1", amount: " 60 " }, { userId: "user_2", amount: "40" }],
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("canonicalizes share amounts before checking the exact sum", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        splitType: "custom",
+        shares: [
+          { userId: "user_1", amount: "60.0000000" },
+          { userId: "user_2", amount: "40.0000000" },
+        ],
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.shares.map((s) => s.amount)).toEqual(["60", "40"]);
+      }
+    });
+
     it("rejects custom split where amounts do not sum to total", () => {
       const result = createExpenseSchema.safeParse({
         ...validBase,

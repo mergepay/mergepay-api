@@ -184,6 +184,35 @@ export function classifyJobFailure(error: unknown): JobFailureCategory {
   return "indeterminate";
 }
 
+/**
+ * A classified job failure.
+ *
+ * `retryable` is deliberately a boolean rather than a set of error names: the
+ * wrapper only needs to know whether another attempt can change the outcome.
+ * The original category is retained for operator-facing logs, and `original`
+ * keeps the untouched error for callbacks that need provider-specific detail.
+ */
+export class JobError extends Error {
+  readonly retryable: boolean;
+
+  constructor(
+    readonly category: JobFailureCategory,
+    message: string,
+    readonly original?: unknown
+  ) {
+    super(message);
+    this.name = "JobError";
+    this.retryable = category !== "permanent";
+  }
+}
+
+/** Classify an unknown failure as a JobError without mutating the original. */
+export function asJobError(error: unknown): JobError {
+  if (error instanceof JobError) return error;
+  const category = classifyJobFailure(error);
+  return new JobError(category, safeFailureMessage(error), error);
+}
+
 /** Whether a category should stop the job rather than schedule another attempt. */
 export function isPermanentJobFailure(category: JobFailureCategory): boolean {
   return category === "permanent";

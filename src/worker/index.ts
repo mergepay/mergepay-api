@@ -1883,16 +1883,17 @@ export async function startWorker(): Promise<() => Promise<void>> {
     if (timer) clearTimeout(timer);
     stopReconciliation();
 
-    const timeoutMs = Math.max(config.SHUTDOWN_TIMEOUT_MS, config.WORKER_SHUTDOWN_DRAIN_MS);
-    const timeoutHandle = setTimeout(() => {
-      log.error({ jobType: "worker_cycle", signal, timeoutMs }, "shutdown timed out, forcing exit");
-      if (!config.isTest) {
-        process.exit(1);
-      }
-    }, timeoutMs);
+    const timeoutMs = config.WORKER_SHUTDOWN_DRAIN_MS;
 
     try {
-      log.info({ jobType: "worker_cycle", signal, timeoutMs, outcome: "shutdown" }, "shutting down");
+      log.info(
+        { jobType: "worker_cycle", signal, timeoutMs, outcome: "shutdown_started" },
+        "shutdown started"
+      );
+      log.info(
+        { jobType: "worker_cycle", signal, outcome: "accepting_jobs_stopped" },
+        "stopped accepting new jobs"
+      );
 
       // Wait for the running cycle, but not forever — a hung upstream must not
       // hold the process open past the deployment's grace period.
@@ -1900,49 +1901,50 @@ export async function startWorker(): Promise<() => Promise<void>> {
       if (inFlight) {
         let drainTimer: ReturnType<typeof setTimeout> | undefined;
         const budget = new Promise<false>((resolve) => {
-          drainTimer = setTimeout(() => resolve(false), config.WORKER_SHUTDOWN_DRAIN_MS);
+          drainTimer = setTimeout(() => resolve(false), timeoutMs);
         });
         drained = await Promise.race([inFlight.then(() => true), budget]);
         if (drainTimer) clearTimeout(drainTimer);
       }
 
-      if (!drained) {
+      if (drained) {
+        log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_drained" }, "in-flight work drained");
+        // Nothing of ours is running now, so releasing is safe: the next worker
+        // picks these up immediately instead of waiting for them to lapse.
+        await Promise.allSettled([
+          prisma.settlement.updateMany({
+            where: { claimedBy: WORKER_ID },
+            data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+          }),
+          prisma.anchorSession.updateMany({
+            where: { claimedBy: WORKER_ID },
+            data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
+          }),
+        ]);
+      } else {
         // A job is still running and still holds its lease. Releasing it now
         // would invite a duplicate submission, so leave every lease in place and
         // let it expire; the next worker recovers it through the normal path.
         log.warn(
-          { jobType: "worker_cycle", outcome: "shutdown_drain_timeout" },
+          { jobType: "worker_cycle", signal, timeoutMs, outcome: "shutdown_drain_timeout" },
           "in-flight job outran the drain budget, leaving leases to expire"
         );
-        // Leases stay claimed, but the process is on its way out regardless:
-        // the connection pool must still be released so a restart never
-        // inherits dangling database connections.
-        await prisma.$disconnect();
-        log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
-        return;
       }
-
-      // Nothing of ours is running now, so releasing is safe: the next worker
-      // picks these up immediately instead of waiting for them to lapse.
-      await Promise.allSettled([
-        prisma.settlement.updateMany({
-          where: { claimedBy: WORKER_ID },
-          data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
-        }),
-        prisma.anchorSession.updateMany({
-          where: { claimedBy: WORKER_ID },
-          data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
-        }),
-      ]);
-      await prisma.$disconnect();
-      log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
-
-      log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "worker claims released");
     } catch (error) {
       log.error({ jobType: "worker_cycle", signal, reason: safeFailureMessage(error) }, "worker shutdown failed");
-      throw error;
     } finally {
-      clearTimeout(timeoutHandle);
+      // The pool must be released on every path — including a drain timeout and
+      // a failed lease release — so a restart never inherits dangling connections.
+      try {
+        await prisma.$disconnect();
+        log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
+      } catch (error) {
+        log.error(
+          { jobType: "worker_cycle", signal, outcome: "database_disconnect_failed", reason: safeFailureMessage(error) },
+          "failed to disconnect the database cleanly"
+        );
+      }
+      log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "shutdown complete");
       if (!config.isTest) {
         process.exit(0);
       }

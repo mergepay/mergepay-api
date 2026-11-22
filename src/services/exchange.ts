@@ -1,6 +1,7 @@
 import { config } from "../config";
 import { Errors } from "../errors";
 import { createLogger } from "../lib/logger";
+import { stroopsToStellarAmount, validateAmount } from "../lib/money";
 import { fetchWithRetry } from "./retry";
 
 const log = createLogger({ name: "exchange" });
@@ -16,6 +17,47 @@ export interface ExchangeRate { pair: string; rate: number; source: "horizon" | 
 const cache = new Map<string, { rate: ExchangeRate; expiresAt: number }>();
 const fallbacks: Record<string, number> = { "XLM/USDC": 0.1, "USDC/XLM": 10 };
 function pair(from: AssetCode, to: AssetCode): string { return `${from.toUpperCase()}/${to.toUpperCase()}`; }
+
+const RATE_DECIMALS = 15;
+const RATE_SCALE = 10n ** BigInt(RATE_DECIMALS);
+
+function assertAssetCode(asset: AssetCode, field: string): void {
+  if (asset !== "XLM" && asset !== "USDC") {
+    throw Errors.badRequest("invalid_asset", `${field} must be XLM or USDC`);
+  }
+}
+
+/**
+ * Convert a quoted rate into a fixed-point integer with `RATE_DECIMALS` places.
+ * Keeping the multiplier integral makes the final conversion exact to the
+ * stroop instead of inheriting binary floating-point drift.
+ */
+function rateToScaled(rate: number): bigint {
+  if (!Number.isFinite(rate) || rate <= 0) {
+    throw Errors.upstream("Exchange rate unavailable");
+  }
+  const [whole = "0", frac = ""] = rate.toFixed(RATE_DECIMALS).split(".");
+  return BigInt(whole) * RATE_SCALE + BigInt(frac.padEnd(RATE_DECIMALS, "0"));
+}
+
+/** Convert a supported input into validated stroops; zero is allowed here. */
+function amountToStroops(amount: string | number): bigint {
+  let raw: string;
+  if (typeof amount === "number") {
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw Errors.badRequest("invalid_amount", "Amount must be a non-negative number");
+    }
+    const fixed = amount.toFixed(7);
+    raw = Number(fixed) === amount ? fixed : amount.toString();
+  } else {
+    raw = amount;
+  }
+
+  const result = validateAmount(raw);
+  if (result.ok) return result.value.stroops;
+  if (/^0+(?:\.0+)?$/.test(raw) && result.reason === "zero_or_negative") return 0n;
+  throw Errors.badRequest("invalid_amount", result.message);
+}
 
 /**
  * Quote `fromAsset` in terms of `toAsset`, reading Horizon's XLM/USDC order
@@ -37,6 +79,8 @@ function pair(from: AssetCode, to: AssetCode): string { return `${from.toUpperCa
  *   configured for the pair.
  */
 export async function getExchangeRate(fromAsset: AssetCode, toAsset: AssetCode): Promise<ExchangeRate> {
+  assertAssetCode(fromAsset, "fromAsset");
+  assertAssetCode(toAsset, "toAsset");
   const key = pair(fromAsset, toAsset);
   if (fromAsset === toAsset) return { pair: key, rate: 1, source: "fallback", cached: true, fetchedAt: new Date().toISOString() };
   const existing = cache.get(key);
@@ -88,10 +132,15 @@ export async function getExchangeRate(fromAsset: AssetCode, toAsset: AssetCode):
  *   propagated from {@link getExchangeRate}.
  */
 export async function convertAmount(amount: string | number, fromAsset: AssetCode, toAsset: AssetCode): Promise<string> {
-  const value = Number(amount);
-  if (!Number.isFinite(value) || value < 0) throw Errors.badRequest("invalid_amount", "Amount must be a non-negative number");
+  assertAssetCode(fromAsset, "fromAsset");
+  assertAssetCode(toAsset, "toAsset");
+  const stroops = amountToStroops(amount);
+  if (stroops === 0n) return stroopsToStellarAmount(0n);
+
   const quote = await getExchangeRate(fromAsset, toAsset);
-  return (value * quote.rate).toFixed(7);
+  const multiplier = rateToScaled(quote.rate);
+  const converted = (stroops * multiplier + RATE_SCALE / 2n) / RATE_SCALE;
+  return stroopsToStellarAmount(converted);
 }
 
 /**

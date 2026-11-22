@@ -31,6 +31,9 @@ import { signedXdrRequestSchema } from "./stellar-transaction";
 /** Language tag accepted by SEP-24 start, read, and callback endpoints. */
 export const sep24LangSchema = z.string().min(2).max(10);
 
+export const sep24NoParamsSchema = z.object({}).strict();
+export const sep24NoQuerySchema = z.object({}).strict();
+
 // ─── Callback query-parameter schema ─────────────────────────────────────────
 
 /**

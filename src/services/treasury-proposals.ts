@@ -52,6 +52,11 @@ import { stellar } from "./stellar";
 import { buildTreasuryPaymentXdr } from "./treasury-stellar";
 import { audit, auditMultisigActionTx } from "./audit";
 import { AuditAction } from "./audit-actions";
+import {
+  assertProposalActionable,
+  proposalExpiryDate,
+  treasuryProposalExpiryDaysSchema,
+} from "./treasury-proposal-expiry";
 
 export interface CreateProposalParams {
   groupId: string;
@@ -62,6 +67,7 @@ export interface CreateProposalParams {
   assetCode: string;
   assetIssuer: string | null;
   memo: string | null;
+  expiresInDays?: number;
 }
 
 export interface SignatureSubmission {
@@ -182,6 +188,10 @@ export const treasuryProposalsService = {
 
     const initialStatus =
       threshold > 1 ? STATUS.awaitingSignatures : STATUS.pending;
+    const expiresInDays = treasuryProposalExpiryDaysSchema.parse(
+      params.expiresInDays ?? config.TREASURY_PROPOSAL_EXPIRY_DAYS
+    );
+    const expiresAt = proposalExpiryDate(expiresInDays, new Date());
 
     let proposal;
     try {
@@ -195,6 +205,7 @@ export const treasuryProposalsService = {
           threshold,
           signatures: [] as any,
           status: initialStatus,
+          expiresAt,
         },
       });
       await auditMultisigActionTx(tx, {
@@ -213,6 +224,7 @@ export const treasuryProposalsService = {
           amount: params.amount,
           assetCode: params.assetCode,
           threshold,
+          expiresAt: created.expiresAt ? new Date(created.expiresAt).toISOString() : null,
         },
       });
         return created;
@@ -291,12 +303,15 @@ export const treasuryProposalsService = {
             threshold: true,
             signatures: true,
             status: true,
+            expiresAt: true,
+            createdAt: true,
           },
         });
         if (!proposal) throw Errors.notFound("Treasury proposal not found");
         if (proposal.groupId !== args.groupId) {
           throw Errors.notFound("Treasury proposal not found");
         }
+        assertProposalActionable(proposal);
         if (
           proposal.status === STATUS.confirmed ||
           proposal.status === STATUS.submitted
@@ -566,6 +581,7 @@ export const treasuryProposalsService = {
       where: { id: proposalId },
     });
     if (!proposal) throw Errors.notFound("Treasury proposal not found");
+    assertProposalActionable(proposal);
 
     // Re-build a fresh base envelope so we don't double-up signatures.
     const baseTx = new Transaction(proposal.xdr, config.networkPassphrase);

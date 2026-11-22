@@ -41,11 +41,10 @@ import {
   sep24CallbackQuerySchema,
   sep24DepositRequestSchema,
   sep24InitQuerySchema,
+  sep24NoParamsSchema,
   sep24TransactionQuerySchema,
   sep24TransactionsQuerySchema,
   sep24WithdrawRequestSchema,
-  type Sep24DepositRequest,
-  type Sep24WithdrawRequest,
 } from "../validations/sep24";
 import {
   sep24DepositValidationMiddleware,
@@ -132,21 +131,30 @@ interface Sep24SessionRow {
 }
 
 export default async function sep24Routes(app: FastifyInstance) {
+  // SEP-24 rate limits (#1026). The global budget is 100 requests per window
+  // (`RATE_LIMIT_GLOBAL_MAX`); every route here is deliberately tighter.
+  //  - `anchorInit` is 10/window: each start fetches stellar.toml and a SEP-10
+  //    challenge, so a caller must not be able to amplify one API request into
+  //    unbounded upstream traffic.
+  //  - `anchorPoll` is 60/window: these reads are database-only, but clients
+  //    poll them in a loop, so they stay well below the global budget.
+  //  - `sep24Callback` is 10/window: this endpoint is unauthenticated until the
+  //    anchor JWT is verified, and callbacks retry, so its IP-keyed bucket must
+  //    be narrow without punishing legitimate anchor retries.
   const initLimit = rateLimited("anchorInit");
   const pollLimit = rateLimited("anchorPoll");
 
   async function handleStartInteractive(
     kind: "deposit" | "withdrawal",
-    req: FastifyRequest,
-    body: Sep24DepositRequest | Sep24WithdrawRequest
+    req: FastifyRequest
   ) {
     const auth = requireUser(req);
 
     // Validate payload with dedicated Zod schemas before touching anchor or database
     const validatedBody =
       kind === "deposit"
-        ? validateSep24DepositRequest(body ?? req.body)
-        : validateSep24WithdrawalRequest(body ?? req.body);
+        ? validateSep24DepositRequest(req.body)
+        : validateSep24WithdrawalRequest(req.body);
 
     validateAsset(validatedBody.assetCode, validatedBody.assetIssuer);
 
@@ -209,8 +217,11 @@ export default async function sep24Routes(app: FastifyInstance) {
         },
       },
     },
-    (req) =>
-      handleStartInteractive("deposit", req, req.body as Sep24DepositRequest)
+    async (req) => {
+      sep24NoParamsSchema.parse(req.params ?? {});
+      sep24InitQuerySchema.parse(req.query ?? {});
+      return handleStartInteractive("deposit", req);
+    }
   );
 
   app.post(
@@ -237,8 +248,11 @@ export default async function sep24Routes(app: FastifyInstance) {
         },
       },
     },
-    (req) =>
-      handleStartInteractive("withdrawal", req, req.body as Sep24WithdrawRequest)
+    async (req) => {
+      sep24NoParamsSchema.parse(req.params ?? {});
+      sep24InitQuerySchema.parse(req.query ?? {});
+      return handleStartInteractive("withdrawal", req);
+    }
   );
 
   // SEP-24 status polling (#651).
@@ -276,6 +290,7 @@ export default async function sep24Routes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
+      sep24NoParamsSchema.parse(req.params ?? {});
       const { id } = sep24TransactionQuerySchema.parse(req.query ?? {});
 
       // Scoped to the caller, so another user's transaction is a 404 rather
@@ -355,6 +370,7 @@ export default async function sep24Routes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
+      sep24NoParamsSchema.parse(req.params ?? {});
       const { cursor, limit, order, kind } = sep24TransactionsQuerySchema.parse(
         req.query ?? {}
       );
@@ -421,6 +437,7 @@ export default async function sep24Routes(app: FastifyInstance) {
       // reaches the schema, the database, or the audit log.
       await verifyAnchorToken(req.headers.authorization);
 
+      sep24NoParamsSchema.parse(req.params ?? {});
       sep24CallbackQuerySchema.parse(req.query ?? {});
 
       const callback = sep24CallbackSchema.parse(req.body ?? {});

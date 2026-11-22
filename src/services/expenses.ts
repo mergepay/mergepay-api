@@ -18,6 +18,7 @@ import {
   buildPage,
   cursorFilter,
   DEFAULT_PAGE_SIZE,
+  GROUP_LIST_MAX_PAGE_SIZE,
   cursorOrderBy,
   paginationQuerySchema,
   requireCursor,
@@ -57,6 +58,12 @@ export const FILTERABLE_ASSETS = ["XLM", "USDC"] as const;
  * identically to every other paginated route; the filters are additive.
  */
 export const expenseListQuerySchema = paginationQuerySchema.extend({
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(GROUP_LIST_MAX_PAGE_SIZE)
+    .default(DEFAULT_PAGE_SIZE),
   asset: z.enum(FILTERABLE_ASSETS).optional(),
   status: z.enum(EXPENSE_STATUSES).optional(),
   startDate: z.string().datetime({ offset: true }).optional(),

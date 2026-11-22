@@ -32,6 +32,11 @@
 
 import { z } from "zod";
 import { stellarAccountIdSchema } from "../lib/stellar-validation";
+import {
+  DEFAULT_PAGE_SIZE,
+  GROUP_LIST_MAX_PAGE_SIZE,
+  paginationQuerySchema,
+} from "../lib/pagination";
 
 // ---------------------------------------------------------------------------
 // Field primitives
@@ -78,6 +83,24 @@ export const groupParamsSchema = z.object({ id: groupIdSchema });
 export const groupMemberParamsSchema = z.object({
   id: groupIdSchema,
   memberId: memberIdSchema,
+});
+
+/**
+ * Query for the paginated member list on `GET /groups/:id`.
+ *
+ * Members sort alphabetically by display name, so the shared `(createdAt, id)`
+ * cursor does not apply: this endpoint uses a `(displayName, id)` cursor with
+ * an ascending-by-default order. The page-size ceiling is 200 here and on the
+ * expense list, matching the group-list contract.
+ */
+export const groupMemberListQuerySchema = paginationQuerySchema.extend({
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(GROUP_LIST_MAX_PAGE_SIZE)
+    .default(DEFAULT_PAGE_SIZE),
+  order: z.enum(["asc", "desc"]).default("asc"),
 });
 
 // ---------------------------------------------------------------------------

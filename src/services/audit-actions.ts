@@ -45,6 +45,7 @@ export const AuditAction = {
   TREASURY_PROPOSAL_CREATED: "treasury.proposal.created",
   TREASURY_PROPOSAL_SIGNED: "treasury.proposal.signed",
   TREASURY_PROPOSAL_SUBMITTED: "treasury.proposal.submitted",
+  TREASURY_PROPOSAL_EXPIRED: "treasury.proposal.expired",
   TREASURY_PROPOSAL_FAILED: "treasury.proposal.failed",
 
   // ── Treasury tx proposals (signature collector, caller-supplied XDR) ──

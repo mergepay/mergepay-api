@@ -12,6 +12,10 @@ import {
   sep24CallbackSchema,
   verifySep24Signature,
 } from "../services/sep24";
+import {
+  sep24CallbackQuerySchema,
+  sep24NoParamsSchema,
+} from "../validations/sep24";
 import { createWebhookSecret, dispatchWebhook } from "../services/webhook";
 import {
   deliveryListQuerySchema,
@@ -87,6 +91,10 @@ async function sep24CallbackRoute(app: FastifyInstance) {
   app.post(
     "/webhooks/sep24",
     {
+      // SEP-24 HMAC webhook (#1026): 10 requests per window from
+      // `SEP24_RATE_LIMIT_MAX`, far below the global 100. It is keyed by IP
+      // because the caller authenticates with a shared HMAC secret, not a
+      // Mergepay session, so there is no safe user identity to key by.
       ...rateLimited("sep24Webhook"),
       schema: {
         tags: ["SEP-24"],
@@ -130,6 +138,8 @@ async function sep24CallbackRoute(app: FastifyInstance) {
 
       // Parsing happens only after verification, so an unauthenticated caller
       // can never reach the schema, the database, or the audit log.
+      sep24NoParamsSchema.parse(req.params ?? {});
+      sep24CallbackQuerySchema.parse(req.query ?? {});
       let payload: unknown;
       try {
         payload = JSON.parse(rawBody.toString("utf8"));

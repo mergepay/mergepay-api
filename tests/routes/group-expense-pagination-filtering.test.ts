@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { signToken } from "../../src/plugins/auth";
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "../../src/lib/pagination";
+import { DEFAULT_PAGE_SIZE, GROUP_LIST_MAX_PAGE_SIZE } from "../../src/lib/pagination";
 
 const h = vi.hoisted(() => {
   const model = () => ({
@@ -171,10 +171,10 @@ describe("Group Expense Category Filtering and Page Pagination (#800)", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("rejects invalid limit query exceeding MAX_PAGE_SIZE with 400 bad request", async () => {
+  it("rejects invalid limit query exceeding the group-list maximum with 400 bad request", async () => {
     const res = await app.inject({
       method: "GET",
-      url: `/groups/${GROUP_ID}/expenses?limit=${MAX_PAGE_SIZE + 1}`,
+      url: `/groups/${GROUP_ID}/expenses?limit=${GROUP_LIST_MAX_PAGE_SIZE + 1}`,
       headers: authHeader(),
     });
 

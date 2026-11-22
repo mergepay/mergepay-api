@@ -28,6 +28,8 @@ export {
   sep24LangSchema,
   sep24MemoSchema,
   sep24MemoTypeSchema,
+  sep24NoParamsSchema,
+  sep24NoQuerySchema,
   sep24OpaqueIdSchema,
   sep24SessionParamsSchema,
   sep24SessionQuerySchema,

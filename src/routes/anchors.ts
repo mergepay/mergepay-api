@@ -25,35 +25,43 @@ import { serializeAnchorSession } from "../serializers";
 import { getStatusHistory } from "../services/status-history";
 import { validateAsset } from "../services/assets";
 import {
+  sep24CallbackQuerySchema,
   sep24CompleteRequestSchema,
   sep24DepositRequestSchema,
   sep24InitQuerySchema,
+  sep24NoParamsSchema,
+  sep24NoQuerySchema,
   sep24SessionParamsSchema,
   sep24SessionQuerySchema,
   sep24WithdrawRequestSchema,
-  type Sep24DepositRequest,
-  type Sep24WithdrawRequest,
 } from "../validations/sep24";
 import {
   sep24CallbackSchema,
   sep24DepositValidationMiddleware,
   sep24WithdrawValidationMiddleware,
+  validateSep24DepositRequest,
+  validateSep24WithdrawalRequest,
 } from "../schemas/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {
   // Every anchor route that reaches an anchor gets an explicit budget so a
   // client cannot amplify one Mergepay request into unbounded upstream ones.
+  // The global budget is 100 requests per window (`RATE_LIMIT_GLOBAL_MAX`).
   //
-  //  - anchorInit  — deposit/withdraw start and interactive completion. Each
-  //    call fans out to stellar.toml + SEP-10 + SEP-24, so it is the tightest
-  //    policy in the API.
-  //  - anchorPoll  — status reads. Cheaper, but still upstream-amplifying (or,
-  //    for the DB-backed session list, the endpoint clients poll in a loop).
+  //  - anchorInit  — 10/window (RATE_LIMIT_ANCHOR_INIT_MAX) for deposit/withdraw
+  //    start and interactive completion. Each call fans out to stellar.toml +
+  //    SEP-10 + SEP-24, so it is the tightest policy in the API.
+  //  - anchorPoll  — 60/window (RATE_LIMIT_ANCHOR_POLL_MAX) for status reads.
+  //    Cheaper, but still upstream-amplifying (or, for the DB-backed session
+  //    list, the endpoint clients poll in a loop).
+  //  - anchorWebhook — 50/window (RATE_LIMIT_ANCHOR_WEBHOOK_MAX) for the
+  //    shared-secret callback, below the global budget but loose enough for
+  //    anchor retries.
   //
-  // Both are keyed by the authenticated user, so one caller can never exhaust
-  // another's budget. The webhook is keyed by IP because it is authenticated
-  // by shared secret rather than a session.
+  // Both authenticated policies are keyed by user, so one caller can never
+  // exhaust another's budget. The webhook is keyed by IP because it is
+  // authenticated by shared secret rather than a session.
   const initLimit = rateLimited("anchorInit");
   const pollLimit = rateLimited("anchorPoll");
 
@@ -70,55 +78,56 @@ export default async function anchorRoutes(app: FastifyInstance) {
         response: openApiEnvelope("anchors"),
       },
     },
-    async () => {
-    try {
-      const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
-      return {
-        anchors: [
-          {
-            name: config.ANCHOR_NAME,
-            homeDomain: config.ANCHOR_HOME_DOMAIN,
-            assets: t.assets.length
-              ? t.assets
-              : [
-                  { code: "SRT", issuer: null },
-                  { code: config.STABLE_ASSET_CODE, issuer: config.STABLE_ASSET_ISSUER },
-                ],
-          },
-        ],
-      };
-    } catch {
-      // Fall back to a static descriptor if the toml can't be fetched.
-      return {
-        anchors: [
-          {
-            name: config.ANCHOR_NAME,
-            homeDomain: config.ANCHOR_HOME_DOMAIN,
-            assets: [
-              { code: "SRT", issuer: null },
-              { code: config.STABLE_ASSET_CODE, issuer: config.STABLE_ASSET_ISSUER },
-            ],
-          },
-        ],
-      };
+    async (req) => {
+      sep24NoParamsSchema.parse(req.params ?? {});
+      sep24NoQuerySchema.parse(req.query ?? {});
+      try {
+        const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
+        return {
+          anchors: [
+            {
+              name: config.ANCHOR_NAME,
+              homeDomain: config.ANCHOR_HOME_DOMAIN,
+              assets: t.assets.length
+                ? t.assets
+                : [
+                    { code: "SRT", issuer: null },
+                    { code: config.STABLE_ASSET_CODE, issuer: config.STABLE_ASSET_ISSUER },
+                  ],
+            },
+          ],
+        };
+      } catch {
+        // Fall back to a static descriptor if the toml can't be fetched.
+        return {
+          anchors: [
+            {
+              name: config.ANCHOR_NAME,
+              homeDomain: config.ANCHOR_HOME_DOMAIN,
+              assets: [
+                { code: "SRT", issuer: null },
+                { code: config.STABLE_ASSET_CODE, issuer: config.STABLE_ASSET_ISSUER },
+              ],
+            },
+          ],
+        };
+      }
     }
-  }
   );
 
   // -- start deposit / withdraw -----------------------------------------------
   //
-  // The request shape is enforced by the `validateSep24Deposit` /
-  // `validateSep24Withdraw` preHandler hooks on the routes below, not here: the
-  // handler receives a request whose query and body have already been parsed
-  // (and normalised — asset codes are upper-cased on parse) against the SEP-24
-  // schemas. Re-parsing them in the handler would be a second, silent source of
-  // truth for the same contract.
-  async function start(
-    kind: "deposit" | "withdrawal",
-    req: FastifyRequest,
-    body: Sep24DepositRequest | Sep24WithdrawRequest
-  ) {
+  // The `validateSep24Deposit` / `validateSep24Withdraw` preHandler hooks reject
+  // malformed requests before any anchor I/O. The handler re-parses through the
+  // same exported schema functions so it reads typed, normalised values without
+  // introducing a second source of truth.
+  async function start(kind: "deposit" | "withdrawal", req: FastifyRequest) {
     const auth = requireUser(req);
+
+    const body =
+      kind === "deposit"
+        ? validateSep24DepositRequest(req.body)
+        : validateSep24WithdrawalRequest(req.body);
 
     // Validate that the requested asset is supported. The issuer is part of
     // the request contract, so it is validated *with* the code rather than
@@ -187,7 +196,11 @@ export default async function anchorRoutes(app: FastifyInstance) {
         },
       },
     },
-    (req) => start("deposit", req, req.body as Sep24DepositRequest)
+    async (req) => {
+      sep24NoParamsSchema.parse(req.params ?? {});
+      sep24InitQuerySchema.parse(req.query ?? {});
+      return start("deposit", req);
+    }
   );
 
   app.post(
@@ -214,7 +227,11 @@ export default async function anchorRoutes(app: FastifyInstance) {
         },
       },
     },
-    (req) => start("withdrawal", req, req.body as Sep24WithdrawRequest)
+    async (req) => {
+      sep24NoParamsSchema.parse(req.params ?? {});
+      sep24InitQuerySchema.parse(req.query ?? {});
+      return start("withdrawal", req);
+    }
   );
 
   // -- complete (exchange signed challenge for interactive url) ---------------
@@ -322,6 +339,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
+      sep24NoParamsSchema.parse(req.params ?? {});
       const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
       const position = requireCursor(cursor);
 
@@ -391,6 +409,9 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // Rate limiting here is abuse protection for an unauthenticated-until-
   // checked endpoint; it never substitutes for the shared-secret check
   // below, which remains the actual authentication/authorization gate.
+  // `anchorWebhook` is 50 requests per window from
+  // `RATE_LIMIT_ANCHOR_WEBHOOK_MAX`, below the global 100: enough headroom for
+  // anchor retries without leaving this credential-gated ingress unlimited.
   app.post(
     "/anchors/webhook",
     {
@@ -421,6 +442,8 @@ export default async function anchorRoutes(app: FastifyInstance) {
         return reply.code(200).send({ ok: true }); // don't reveal verification result
       }
 
+      sep24NoParamsSchema.parse(req.params ?? {});
+      sep24CallbackQuerySchema.parse(req.query ?? {});
       const callback = sep24CallbackSchema.parse(req.body ?? {});
       const result = await applySep24Callback(callback);
 

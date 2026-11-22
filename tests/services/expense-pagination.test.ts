@@ -24,7 +24,7 @@ import {
   decodeCursor,
   buildPage,
   DEFAULT_PAGE_SIZE,
-  MAX_PAGE_SIZE,
+  GROUP_LIST_MAX_PAGE_SIZE,
 } from "../../src/lib/pagination";
 
 describe("Group Expense Pagination & Filtering (#912)", () => {
@@ -70,9 +70,9 @@ describe("Group Expense Pagination & Filtering (#912)", () => {
       expect(result.endDate).toBe("2026-12-31T23:59:59+00:00");
     });
 
-    it("rejects limit exceeding MAX_PAGE_SIZE", () => {
+    it("rejects limit exceeding the group-list maximum", () => {
       expect(() =>
-        expenseListQuerySchema.parse({ limit: MAX_PAGE_SIZE + 1 })
+        expenseListQuerySchema.parse({ limit: GROUP_LIST_MAX_PAGE_SIZE + 1 })
       ).toThrow();
     });
 

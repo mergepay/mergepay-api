@@ -256,6 +256,7 @@ export interface MultisigAuditParams {
     | typeof AuditAction.TREASURY_PROPOSAL_CREATED
     | typeof AuditAction.TREASURY_PROPOSAL_SIGNED
     | typeof AuditAction.TREASURY_PROPOSAL_SUBMITTED
+    | typeof AuditAction.TREASURY_PROPOSAL_EXPIRED
     | typeof AuditAction.TREASURY_PROPOSAL_FAILED
     | typeof AuditAction.TREASURY_TX_PROPOSAL_CREATED
     | typeof AuditAction.TREASURY_TX_PROPOSAL_SIGNATURE_ADDED

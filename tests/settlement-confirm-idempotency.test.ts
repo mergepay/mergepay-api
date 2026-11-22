@@ -106,6 +106,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   if (!app) app = await buildApp();
 
+  prisma.idempotencyKey.findUnique.mockReset();
   prisma.settlement.findUnique.mockResolvedValue(pendingSettlement());
   prisma.groupMember.findUnique.mockResolvedValue({ groupId: "group_1", userId: "user_1", role: "member" });
   prisma.settlement.findUniqueOrThrow.mockResolvedValue(pendingSettlement());
@@ -117,7 +118,7 @@ beforeEach(async () => {
 });
 
 describe("POST /settlements/:id/confirm — idempotency", () => {
-  it("rejects a request with no Idempotency-Key header", async () => {
+  it("falls through to normal handling when the Idempotency-Key header is absent", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
@@ -125,9 +126,9 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
       payload: { signedXdr: "AAAA..." },
     });
 
-    expect(res.statusCode).toBe(400);
-    expect(res.json().error.code).toBe("MISSING_IDEMPOTENCY_KEY");
-    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(prisma.settlement.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.idempotencyKey.create).not.toHaveBeenCalled();
   });
 
   it("accepts the first request and transitions the settlement to submitted", async () => {
@@ -160,6 +161,7 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
 
   it("returns the cached response for a repeated key without re-submitting", async () => {
     prisma.idempotencyKey.findUnique
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({
         userId: "user_1",
@@ -217,6 +219,7 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
   it("resolves to the winner's cached response on concurrent duplicate-key races", async () => {
     prisma.idempotencyKey.findUnique
       .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({
         userId: "user_1",
         scope: "settlement.confirm",
@@ -263,7 +266,7 @@ describe("POST /settlements/:id/confirm — idempotency", () => {
       payload: { signedXdr: "NEW_XDR..." },
     });
 
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode, res.body).toBe(200);
     expect(res.json().settlement.status).toBe("submitted");
     expect(prisma.settlement.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({

@@ -28,6 +28,7 @@ import {
   changeMemberRoleSchema,
   groupParamsSchema,
   groupMemberParamsSchema,
+  groupMemberListQuerySchema,
 } from "../schemas/groups";
 import {
   groupPrimaryAsset,
@@ -37,7 +38,8 @@ import { removeGroupMember } from "../services/groups";
 import {
   buildPage,
   encodeCursor,
-  decodeCursor,
+  encodeMemberCursor,
+  requireMemberCursor,
   paginationQuerySchema,
   requireCursor,
   takeForPage,
@@ -315,52 +317,45 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
     },
     async (req) => {
     const { id } = groupParamsSchema.parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    const { cursor, limit, order } = groupMemberListQuerySchema.parse(req.query ?? {});
+    const position = requireMemberCursor(cursor);
     const ctx = groupMembership(req);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group) throw Errors.notFound("Group not found");
 
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
-
-    const members = await prisma.groupMember.findMany({
-      where: {
-        groupId: id,
-        ...(decodedCursor && {
+    const comparator = order === "asc" ? "gt" : "lt";
+    const cursorScope = position
+      ? {
           OR: [
-            { joinedAt: { gt: decodedCursor.createdAt } },
+            { user: { displayName: { [comparator]: position.displayName } } },
             {
-              joinedAt: decodedCursor.createdAt,
-              id: { gt: decodedCursor.id },
+              user: { displayName: position.displayName },
+              id: { [comparator]: position.id },
             },
           ],
-        }),
-      },
+        }
+      : {};
+
+    const members = await prisma.groupMember.findMany({
+      where: { groupId: id, ...cursorScope },
       include: { user: true },
-      orderBy: [{ joinedAt: "asc" }, { id: "asc" }],
-      take: limit + 1,
+      orderBy: [{ user: { displayName: order } }, { id: order }],
+      take: takeForPage(limit),
     });
 
     const hasMore = members.length > limit;
     const results = hasMore ? members.slice(0, limit) : members;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].joinedAt,
-          results[results.length - 1].id
-        )
+    const last = results[results.length - 1];
+    const nextCursor = hasMore && last
+      ? encodeMemberCursor(last.user.displayName, last.id)
       : null;
 
     return {
       group: serializeGroup(group),
       members: results.map(serializeMember),
       yourRole: ctx.role,
-      meta: { nextCursor, hasMore },
+      meta: { nextCursor, hasMore, limit, order },
     };
   });
 

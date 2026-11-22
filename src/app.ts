@@ -480,11 +480,83 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   );
 
   const { getDeepHealth } = await import("./services/health.js");
-  app.get("/health/deep", async (request, reply) => {
-    const deepHealth = await getDeepHealth();
-    const statusCode = deepHealth.status === "ok" ? 200 : 503;
-    return reply.code(statusCode).send(deepHealth);
-  });
+  // Documented from the exact shape `getDeepHealth()` returns (src/services/health.ts).
+  // Every property is spelled out rather than left to `additionalProperties`,
+  // because Fastify serializes a response through its schema: a field missing
+  // here would be stripped from the payload instead of merely undocumented.
+  const dependencyHealthSchema = {
+    type: "object",
+    required: ["status", "latencyMs"],
+    properties: {
+      status: { type: "string", enum: ["up", "down"] },
+      latencyMs: {
+        type: "integer",
+        description:
+          "Measured probe latency in milliseconds, or -1 when the dependency did not answer within the deadline",
+      },
+    },
+  };
+  const deepHealthResponseSchema = {
+    type: "object",
+    required: ["status", "timestamp", "uptime", "checks", "environment"],
+    properties: {
+      status: {
+        type: "string",
+        enum: ["ok", "degraded"],
+        description: "`ok` when every critical dependency is reachable, `degraded` otherwise",
+      },
+      timestamp: { type: "string", format: "date-time" },
+      uptime: {
+        type: "integer",
+        description: "Process uptime in whole seconds",
+      },
+      checks: {
+        type: "object",
+        required: ["database", "stellar"],
+        properties: {
+          // Inlined rather than a `$ref`: Fastify compiles a route response
+          // schema into a serializer and cannot resolve components refs.
+          database: dependencyHealthSchema,
+          stellar: dependencyHealthSchema,
+        },
+      },
+      environment: {
+        type: "object",
+        required: ["nodeEnv", "stellarNetwork"],
+        properties: {
+          nodeEnv: { type: "string", example: "production" },
+          stellarNetwork: { type: "string", enum: ["testnet", "public"] },
+        },
+      },
+    },
+  };
+
+  app.get(
+    "/health/deep",
+    {
+      schema: {
+        tags: ["System"],
+        summary: "Deep health check with dependency latency",
+        description:
+          "Measures each critical dependency independently and reports its status and latency. Returns 200 when both the database and Stellar Horizon answer, and 503 when either is unreachable so an orchestrator can drain the instance. Unlike the cached readiness probe, every call performs the checks. The response contains dependency state only — never connection strings, URLs, credentials, or upstream error text.",
+        response: {
+          200: {
+            description: "All critical dependencies are reachable",
+            ...deepHealthResponseSchema,
+          },
+          503: {
+            description: "At least one critical dependency is unreachable",
+            ...deepHealthResponseSchema,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const deepHealth = await getDeepHealth();
+      const statusCode = deepHealth.status === "ok" ? 200 : 503;
+      return reply.code(statusCode).send(deepHealth);
+    }
+  );
 
   // Every domain route plugin is mounted under /api/v1 (issue #386), so no
   // route file spells the version itself. Health, docs, and the static

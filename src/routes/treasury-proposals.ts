@@ -15,7 +15,12 @@
  */
 
 import { FastifyInstance } from "fastify";
-import { treasuryMultisigProposalPayloadSchema, validateTreasuryProposalHook } from "../validations/treasury";
+import { Prisma } from "@prisma/client";
+import {
+  type TreasuryMultisigProposalPayload,
+  treasuryProposalListQuerySchema,
+  validateTreasuryMultisigProposalCreateRequest,
+} from "../validations/treasury";
 import { z } from "zod";
 import { prisma } from "../db";
 import { mpMemoSchema, stellarAccountIdSchema } from "../lib/stellar-validation";
@@ -34,7 +39,6 @@ import {
   buildPage,
   cursorFilter,
   cursorOrderBy,
-  paginationQuerySchema,
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
@@ -59,12 +63,15 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
     "/groups/:groupId/treasury/proposals",
     {
       ...rateLimited("treasuryPropose"),
-      preHandler: requireGroupRole("admin", { param: "groupId" }),
+      preHandler: [
+        requireGroupRole("admin", { param: "groupId" }),
+        validateTreasuryMultisigProposalCreateRequest,
+      ],
     },
     async (req) => {
     const auth = requireUser(req);
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
-    const body = treasuryMultisigProposalPayloadSchema.parse(req.body);
+    const body = req.body as TreasuryMultisigProposalPayload;
     const { expiresInDays } = z
       .object({ expiresInDays: treasuryProposalExpiryDaysSchema.optional() })
       .parse(req.body ?? {});
@@ -123,11 +130,25 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
     async (req) => {
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
 
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const { cursor, limit, order, status, creatorId, startDate, endDate } =
+      treasuryProposalListQuerySchema.parse(req.query ?? {});
     const position = requireCursor(cursor);
 
+    const where: Prisma.TreasuryProposalWhereInput = {
+      groupId,
+      ...cursorFilter(position, order),
+    };
+    if (status) where.status = status;
+    if (creatorId) where.creatorId = creatorId;
+    if (startDate || endDate) {
+      where.createdAt = {
+        ...(startDate ? { gte: new Date(startDate) } : {}),
+        ...(endDate ? { lte: new Date(endDate) } : {}),
+      };
+    }
+
     const proposals = await prisma.treasuryProposal.findMany({
-      where: { groupId, ...cursorFilter(position, order) },
+      where,
       orderBy: cursorOrderBy(order),
       take: takeForPage(limit),
     });

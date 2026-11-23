@@ -52,6 +52,7 @@ import { stellar } from "./stellar";
 import { buildTreasuryPaymentXdr } from "./treasury-stellar";
 import { audit, auditMultisigActionTx } from "./audit";
 import { AuditAction } from "./audit-actions";
+import { emitEvent, type MergepayEvent } from "./event";
 import {
   assertProposalActionable,
   proposalExpiryDate,
@@ -245,6 +246,28 @@ export const treasuryProposalsService = {
       throw classified;
     }
 
+    announceTreasuryProposalEvent({
+      eventType: "treasury.proposal.created",
+      groupId: params.groupId,
+      userId: params.creatorId,
+      payload: {
+        proposalId: proposal.id,
+        groupId: params.groupId,
+        creatorId: params.creatorId,
+        status: proposal.status,
+        txHash: proposal.txHash,
+        threshold: proposal.threshold,
+        signatureCount: 0,
+        destination: params.destination,
+        amount: params.amount,
+        assetCode: params.assetCode,
+        assetIssuer: params.assetIssuer,
+        expiresAt: proposal.expiresAt
+          ? new Date(proposal.expiresAt).toISOString()
+          : null,
+      },
+    });
+
     return { proposal, xdr, networkPassphrase: config.networkPassphrase };
   },
 
@@ -289,7 +312,8 @@ export const treasuryProposalsService = {
     threshold: number;
     stellarTxHash: string | null;
   }> {
-    return prisma.$transaction(
+    const events: MergepayEvent[] = [];
+    const result = await prisma.$transaction(
       async (tx) => {
         // Lock the proposal row for the duration of this transaction.
         // `findUnique` with `SELECT ... FOR UPDATE` prevents concurrent
@@ -525,6 +549,20 @@ export const treasuryProposalsService = {
               threshold: proposal.threshold,
             },
           });
+          events.push({
+            eventType: "treasury.proposal.signed",
+            groupId: proposal.groupId,
+            userId: signerUserId ?? undefined,
+            payload: {
+              proposalId: proposal.id,
+              groupId: proposal.groupId,
+              signerPublicKey: pk,
+              txHash: proposal.txHash,
+              signatureCount: verified.length,
+              threshold: proposal.threshold,
+              status: meetsThreshold ? STATUS.submitted : STATUS.awaitingSignatures,
+            },
+          });
         }
 
         if (!meetsThreshold) {
@@ -537,7 +575,7 @@ export const treasuryProposalsService = {
         }
 
         // Merge all verified signatures onto the base envelope, then submit.
-        return await this.mergeAndSubmit(
+        const submitResult = await this.mergeAndSubmit(
           tx,
           proposal.id,
           verified,
@@ -547,9 +585,31 @@ export const treasuryProposalsService = {
           args.actorPublicKey ?? verified.at(-1)?.publicKey ?? null,
           args.userId
         );
+        events.push({
+          eventType: "treasury.proposal.submitted",
+          groupId: proposal.groupId,
+          userId: args.userId,
+          payload: {
+            proposalId: proposal.id,
+            groupId: proposal.groupId,
+            status: submitResult.status,
+            txHash: proposal.txHash,
+            stellarTxHash: submitResult.stellarTxHash,
+            signatureCount: submitResult.signatureCount,
+            threshold: submitResult.threshold,
+          },
+        });
+        return submitResult;
       },
       { timeout: 15_000 }
     );
+
+    // Announce only after the transaction commits: a rolled-back mutation
+    // must never reach a subscriber's endpoint.
+    for (const event of events) {
+      announceTreasuryProposalEvent(event);
+    }
+    return result;
   },
 
   /**
@@ -659,6 +719,19 @@ export const treasuryProposalsService = {
   /** Memo-helper exposed for reuse by routes. */
   STATUS,
 };
+
+/**
+ * Publish a committed proposal transition on the event bus, which the webhook
+ * dispatcher (src/services/webhook.ts) turns into queued deliveries. A failed
+ * announcement must never turn an already-committed mutation into an error.
+ */
+function announceTreasuryProposalEvent(event: MergepayEvent): void {
+  try {
+    emitEvent(event);
+  } catch {
+    // Swallow — webhook queueing is best-effort relative to the mutation.
+  }
+}
 
 /** Tiny alphanumeric rune used for default memo text when none provided. */
 function shortCodeRunes(): string {

@@ -768,6 +768,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
       actorUserId: auth.id,
       groupId: id,
       targetUserId: memberId,
+      correlationId: req.id,
     });
 
     return { ok: true };

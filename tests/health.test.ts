@@ -123,6 +123,9 @@ describe("GET /health", () => {
 
 describe("GET /health/deep", () => {
   it("returns detailed health with dependency status when healthy", async () => {
+    h.queryRaw.mockResolvedValueOnce([{ 1: 1 }]);
+    h.queryRawUnsafe.mockResolvedValueOnce([{ 1: 1 }]);
+    h.feeStats.mockResolvedValueOnce({ minAcceptedFee: 100 });
     const response = await app.inject({ method: "GET", url: "/health/deep" });
 
     expect(response.statusCode).toBe(200);

@@ -5,6 +5,7 @@ import { AppError, Errors } from "../errors";
 import { verifyToken } from "../services/jwt";
 import type { AuthUser } from "../services/jwt";
 import { authenticateChallenge, classifySep10Error, type VerifiedChallenge } from "../services/auth";
+import { assertSep10TransactionEnvelope } from "../validations/sep10";
 
 /*
  * The JWT utilities live in src/services/jwt.ts (issue #421) and the unified auth
@@ -72,6 +73,7 @@ async function authenticate(req: FastifyRequest, _reply: FastifyReply) {
       throw Errors.malformedToken("Authorization header must contain valid SEP-10 transaction XDR");
     }
     try {
+      assertSep10TransactionEnvelope(xdr);
       const verified = await authenticateChallenge(xdr);
       req.sep10Account = verified.account;
       req.sep10Challenge = verified;
@@ -148,6 +150,7 @@ async function authenticateSep10(req: FastifyRequest, _reply: FastifyReply) {
   }
 
   try {
+    assertSep10TransactionEnvelope(xdr.trim());
     const verified = await authenticateChallenge(xdr.trim());
     req.sep10Account = verified.account;
     req.sep10Challenge = verified;

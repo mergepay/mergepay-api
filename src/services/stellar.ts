@@ -35,13 +35,29 @@ import {
   readTimeBounds,
 } from "../lib/time-bounds";
 
+const horizonClients = new Map<string, Horizon.Server>();
 let _servers: Horizon.Server[] | null = null;
 let activeServer = 0;
 const failedUntil = new Map<number, number>();
 const log = createLogger({ name: "stellar" });
 
+/**
+ * Return the process-wide Horizon client for `url`, constructing it on first
+ * use. All Horizon I/O in the service layer shares this helper so endpoint
+ * failover, fee reads, and transaction verification reuse one client per URL
+ * instead of each maintaining its own constructor and connection pool.
+ */
+export function getHorizonClient(url: string): Horizon.Server {
+  let client = horizonClients.get(url);
+  if (!client) {
+    client = new Horizon.Server(url);
+    horizonClients.set(url, client);
+  }
+  return client;
+}
+
 function servers(): Horizon.Server[] {
-  if (!_servers) _servers = config.HORIZON_ENDPOINTS.map((url) => new Horizon.Server(url));
+  if (!_servers) _servers = config.HORIZON_ENDPOINTS.map((url) => getHorizonClient(url));
   return _servers;
 }
 function server(): Horizon.Server {

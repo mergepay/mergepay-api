@@ -1,5 +1,7 @@
 import { Errors } from "../errors";
 import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
+import { dateRangeQueryShape, identifierQuerySchema } from "../schemas/common";
+import { paginationQuerySchema } from "../lib/pagination";
 import { mpMemoSchema } from "../lib/stellar-validation";
 import { validateRequest } from "../middleware/validate-request";
 import { treasuryProposalExpiryDaysSchema } from "../services/treasury-proposal-expiry";
@@ -26,7 +28,6 @@ import { treasuryProposalExpiryDaysSchema } from "../services/treasury-proposal-
 import { z } from "zod";
 import { stellarPublicKeySchema } from "../lib/stellar-validation";
 import { sanitizedTextField } from "../lib/sanitize-text";
-import { paginationQuerySchema } from "../lib/pagination";
 import { isValidXdr } from "../utils/stellar-xdr";
 
 /** A Stellar weight/threshold: integer in [0, 255]. */
@@ -334,3 +335,14 @@ export async function validateTreasuryProposalHook(req: any) {
   }
   req.treasuryProposal = parsed.data;
 }
+
+/** Query for `GET /groups/:id/treasury/history`. */
+export const treasuryHistoryQuerySchema = paginationQuerySchema.extend({
+  direction: z.enum(["deposit", "withdrawal"]).optional(),
+  status: z.enum(["pending", "submitting", "confirmed", "failed"]).optional(),
+  assetCode: assetCodeSchema.optional(),
+  userId: identifierQuerySchema.optional(),
+  ...dateRangeQueryShape,
+});
+
+export type TreasuryHistoryQuery = z.infer<typeof treasuryHistoryQuerySchema>;

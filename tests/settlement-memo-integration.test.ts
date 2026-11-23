@@ -36,9 +36,13 @@ const h = vi.hoisted(() => {
 });
 
 vi.mock("../src/db", () => ({ prisma: h.prisma }));
-vi.mock("../src/services/stellar", () => ({
-  stellar: { getTransaction: h.getTransaction },
-}));
+vi.mock("../src/services/stellar", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    stellar: { ...(actual as any).stellar, getTransaction: h.getTransaction },
+  };
+});
 vi.mock("../src/services/audit", () => ({
   audit: h.audit,
   auditTx: vi.fn(),

@@ -24,10 +24,10 @@ import {
   buildPage,
   cursorFilter,
   cursorOrderBy,
-  paginationQuerySchema,
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
+import { composeWhere, dateRangeWhere } from "../schemas/common";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 import {
   buildTreasuryPaymentXdr,
@@ -43,7 +43,10 @@ import {
   snapshotToSignerConfig,
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
-import { treasurySignerConfigSchema } from "../validations/treasury";
+import {
+  treasuryHistoryQuerySchema,
+  treasurySignerConfigSchema,
+} from "../validations/treasury";
 import { signedXdrRequestSchema } from "../validations/stellar-transaction";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
@@ -617,18 +620,40 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       schema: {
         tags: ["Treasury"],
         summary: "Get treasury transaction history",
-        description: "Returns paginated transaction history for a group treasury.",
+        description:
+          "Returns paginated transaction history for a group treasury. Accepts the shared pagination parameters plus optional direction, status, assetCode, userId, startDate, and endDate filters.",
         params: openApiIdParams(),
       },
     },
     async (req) => {
     const { id: groupId } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const {
+      cursor,
+      limit,
+      order,
+      direction,
+      status,
+      assetCode,
+      userId,
+      startDate,
+      endDate,
+    } = treasuryHistoryQuerySchema.parse(req.query ?? {});
 
     const position = requireCursor(cursor);
+    const createdAt = dateRangeWhere({ startDate, endDate });
+    const cursorScope = cursorFilter(position, order);
+    const filters = [
+      { groupId },
+      ...(direction ? [{ direction }] : []),
+      ...(status ? [{ status }] : []),
+      ...(assetCode ? [{ assetCode }] : []),
+      ...(userId ? [{ userId }] : []),
+      ...(createdAt ? [{ createdAt }] : []),
+    ];
+    const where = composeWhere(filters, cursorScope, ["createdAt"]);
 
     const transactions = await prisma.treasuryTransaction.findMany({
-      where: { groupId, ...cursorFilter(position, order) },
+      where,
       include: { user: true },
       orderBy: cursorOrderBy(order),
       take: takeForPage(limit),

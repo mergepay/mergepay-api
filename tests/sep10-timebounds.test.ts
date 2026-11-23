@@ -177,6 +177,18 @@ describe("validateChallengeTimeBounds (unit)", () => {
     ).not.toThrow();
   });
 
+  it("accepts the canonical decimal strings the SDK decodes from XDR", () => {
+    expect(() =>
+      validateChallengeTimeBounds(
+        {
+          minTime: String(nowS - 10),
+          maxTime: String(nowS + CHALLENGE_VALIDITY_SECONDS),
+        },
+        NOW
+      )
+    ).not.toThrow();
+  });
+
   it("rejects a challenge whose maxTime has elapsed", () => {
     // maxTime 31s ago: past the 30s skew tolerance, so genuinely expired.
     expect(() =>
@@ -218,7 +230,26 @@ describe("validateChallengeTimeBounds (unit)", () => {
     expect(() =>
       validateChallengeTimeBounds({ minTime: 0, maxTime: 0 }, NOW)
     ).toThrow(expect.objectContaining({ code: "INVALID_CHALLENGE" }));
-  });  it("grants the clock-skew tolerance past maxTime", () => {
+  });
+
+  it.each([
+    ["NaN", Number.NaN],
+    ["positive infinity", Number.POSITIVE_INFINITY],
+    ["a fractional second", nowS + 0.5],
+    ["an unsafe integer", Number.MAX_SAFE_INTEGER + 1],
+  ])("rejects %s time bounds", (_label, value) => {
+    expect(() =>
+      validateChallengeTimeBounds({ minTime: value, maxTime: value }, NOW)
+    ).toThrow(expect.objectContaining({ code: "INVALID_CHALLENGE" }));
+  });
+
+  it("rejects a negative minTime", () => {
+    expect(() =>
+      validateChallengeTimeBounds({ minTime: -1, maxTime: nowS + 10 }, NOW)
+    ).toThrow(expect.objectContaining({ code: "INVALID_CHALLENGE" }));
+  });
+
+  it("grants the clock-skew tolerance past maxTime", () => {
     expect(() =>
       validateChallengeTimeBounds(
         {

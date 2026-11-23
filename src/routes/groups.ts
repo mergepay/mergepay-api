@@ -28,6 +28,7 @@ import {
   changeMemberRoleSchema,
   groupParamsSchema,
   groupMemberParamsSchema,
+  groupListQuerySchema,
   groupMemberListQuerySchema,
 } from "../schemas/groups";
 import {
@@ -35,12 +36,12 @@ import {
   loadGroupBalances,
 } from "../services/group-balances";
 import { removeGroupMember } from "../services/groups";
+import { composeWhere } from "../schemas/common";
 import {
   buildPage,
   encodeCursor,
   encodeMemberCursor,
   requireMemberCursor,
-  paginationQuerySchema,
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
@@ -177,7 +178,15 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
     },
     async (req) => {
     const auth = requireUser(req);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const {
+      cursor,
+      limit,
+      order,
+      role,
+      archived,
+      treasuryEnabled,
+      createdByUserId,
+    } = groupListQuerySchema.parse(req.query ?? {});
     const position = requireCursor(cursor);
 
     const cursorScope = position
@@ -192,8 +201,17 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         }
       : {};
 
+    const filters = [
+      { userId: auth.id },
+      ...(role ? [{ role }] : []),
+      ...(archived === undefined ? [] : [{ group: { archived } }]),
+      ...(treasuryEnabled === undefined ? [] : [{ group: { treasuryEnabled } }]),
+      ...(createdByUserId ? [{ group: { createdByUserId } }] : []),
+    ];
+    const where = composeWhere(filters, cursorScope);
+
     const memberships = await prisma.groupMember.findMany({
-      where: { userId: auth.id, ...cursorScope },
+      where,
       include: { group: { include: { _count: { select: { members: true } } } } },
       orderBy: [{ joinedAt: order }, { id: order }],
       take: takeForPage(limit),
@@ -325,7 +343,9 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
     },
     async (req) => {
     const { id } = groupParamsSchema.parse(req.params);
-    const { cursor, limit, order } = groupMemberListQuerySchema.parse(req.query ?? {});
+    const { cursor, limit, order, role, userId, search } = groupMemberListQuerySchema.parse(
+      req.query ?? {}
+    );
     const position = requireMemberCursor(cursor);
     const ctx = groupMembership(req);
 
@@ -345,8 +365,18 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         }
       : {};
 
+    const filters = [
+      { groupId: id },
+      ...(role ? [{ role }] : []),
+      ...(userId ? [{ userId }] : []),
+      ...(search
+        ? [{ user: { displayName: { contains: search, mode: "insensitive" as const } } }]
+        : []),
+    ];
+    const where = composeWhere(filters, cursorScope);
+
     const members = await prisma.groupMember.findMany({
-      where: { groupId: id, ...cursorScope },
+      where,
       include: { user: true },
       orderBy: [{ user: { displayName: order } }, { id: order }],
       take: takeForPage(limit),

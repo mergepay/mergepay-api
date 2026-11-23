@@ -19,7 +19,8 @@ vi.mock("../src/config", () => ({
   },
 }));
 
-vi.mock("@stellar/stellar-sdk", () => {
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
   const mockTransactions = () => ({
     transaction: vi.fn().mockReturnValue({ call: h.mockTransactionCall }),
   });
@@ -31,7 +32,9 @@ vi.mock("@stellar/stellar-sdk", () => {
     }),
   });
   return {
+    ...actual,
     Horizon: {
+      ...actual.Horizon,
       Server: vi.fn().mockImplementation(() => ({
         transactions: mockTransactions,
         operations: mockOperations,

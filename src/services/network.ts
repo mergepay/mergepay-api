@@ -8,6 +8,7 @@
  */
 import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "../config";
+import { getHorizonClient } from "./stellar";
 import { logRetryAttempt, withRetry } from "./retry";
 import { toProviderError } from "./timeout";
 
@@ -36,7 +37,7 @@ let cached: { stats: FeeStats; expiresAt: number } | null = null;
 let refresh: Promise<FeeStats> | null = null;
 
 function horizon(): Horizon.Server {
-  if (!server) server = new Horizon.Server(config.HORIZON_URL);
+  if (!server) server = getHorizonClient(config.HORIZON_URL);
   return server;
 }
 

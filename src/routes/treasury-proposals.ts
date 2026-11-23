@@ -15,7 +15,6 @@
  */
 
 import { FastifyInstance } from "fastify";
-import { Prisma } from "@prisma/client";
 import {
   type TreasuryMultisigProposalPayload,
   treasuryProposalListQuerySchema,
@@ -25,6 +24,7 @@ import { z } from "zod";
 import { prisma } from "../db";
 import { mpMemoSchema, stellarAccountIdSchema } from "../lib/stellar-validation";
 import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
+import { composeWhere, dateRangeWhere } from "../schemas/common";
 import { rateLimited } from "../lib/rate-limit";
 import { config } from "../config";
 import { Errors } from "../errors";
@@ -126,26 +126,28 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
   // that already-authorized scope; it never widens it.
   app.get(
     "/groups/:groupId/treasury/proposals",
-    { preHandler: requireGroupRole("member", { param: "groupId" }) },
+    {
+      preHandler: requireGroupRole("member", { param: "groupId" }),
+      schema: {
+        description:
+          "Accepts the shared pagination parameters plus optional status, creatorId, startDate, and endDate filters.",
+      },
+    },
     async (req) => {
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
 
     const { cursor, limit, order, status, creatorId, startDate, endDate } =
       treasuryProposalListQuerySchema.parse(req.query ?? {});
     const position = requireCursor(cursor);
-
-    const where: Prisma.TreasuryProposalWhereInput = {
-      groupId,
-      ...cursorFilter(position, order),
-    };
-    if (status) where.status = status;
-    if (creatorId) where.creatorId = creatorId;
-    if (startDate || endDate) {
-      where.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {}),
-      };
-    }
+    const createdAt = dateRangeWhere({ startDate, endDate });
+    const cursorScope = cursorFilter(position, order);
+    const filters = [
+      { groupId },
+      ...(status ? [{ status }] : []),
+      ...(creatorId ? [{ creatorId }] : []),
+      ...(createdAt ? [{ createdAt }] : []),
+    ];
+    const where = composeWhere(filters, cursorScope, ["createdAt"]);
 
     const proposals = await prisma.treasuryProposal.findMany({
       where,

@@ -212,7 +212,7 @@ describe("Expense mutation RBAC — POST /groups/:id/expenses", () => {
         amount: "100",
         assetCode: "XLM",
         splitType: "equal",
-        shares: [{ userId: MEMBER_USER, shareAmount: "100" }],
+        shares: [{ userId: MEMBER_USER }],
       },
     });
 
@@ -230,10 +230,7 @@ describe("Expense mutation RBAC — POST /groups/:id/expenses", () => {
         amount: "100",
         assetCode: "XLM",
         splitType: "equal",
-        shares: [
-          { userId: MEMBER_USER, shareAmount: "50" },
-          { userId: ADMIN_USER, shareAmount: "50" },
-        ],
+        shares: [{ userId: MEMBER_USER }, { userId: ADMIN_USER }],
       },
     });
 
@@ -251,10 +248,7 @@ describe("Expense mutation RBAC — POST /groups/:id/expenses", () => {
         amount: "200",
         assetCode: "XLM",
         splitType: "equal",
-        shares: [
-          { userId: MEMBER_USER, shareAmount: "100" },
-          { userId: ADMIN_USER, shareAmount: "100" },
-        ],
+        shares: [{ userId: MEMBER_USER }, { userId: ADMIN_USER }],
       },
     });
 
@@ -626,7 +620,7 @@ describe("Non-existent group — expense mutations return 404", () => {
         amount: "100",
         assetCode: "XLM",
         splitType: "equal",
-        shares: [{ userId: MEMBER_USER, shareAmount: "100" }],
+        shares: [{ userId: MEMBER_USER }],
       },
     });
 
@@ -658,7 +652,7 @@ describe("Archived group — expense mutations return 403 (#648)", () => {
         amount: "100",
         assetCode: "XLM",
         splitType: "equal",
-        shares: [{ userId: MEMBER_USER, shareAmount: "100" }],
+        shares: [{ userId: MEMBER_USER }],
       },
     });
 
@@ -682,5 +676,102 @@ describe("Archived group — expense mutations return 403 (#648)", () => {
 
     expect(res.statusCode).toBe(403);
     expect(prisma.expense.update).not.toHaveBeenCalled();
+  });
+});
+
+describe("Expense mutation request-body validation (#1041)", () => {
+  const validCreateBody = {
+    title: "Team Lunch",
+    amount: "100",
+    assetCode: "XLM",
+    splitType: "equal",
+    shares: [{ userId: MEMBER_USER }],
+  };
+
+  it("rejects unknown fields on create before touching the database", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${GROUP_ID}/expenses`,
+      headers: { authorization: bearer(MEMBER_USER) },
+      payload: { ...validCreateBody, total: "100" },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    expect(prisma.expense.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects duplicate split participants", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${GROUP_ID}/expenses`,
+      headers: { authorization: bearer(MEMBER_USER) },
+      payload: {
+        ...validCreateBody,
+        shares: [{ userId: MEMBER_USER }, { userId: MEMBER_USER }],
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.details).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: "shares" })])
+    );
+    expect(prisma.expense.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects memos longer than 28 UTF-8 bytes", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${GROUP_ID}/expenses`,
+      headers: { authorization: bearer(MEMBER_USER) },
+      payload: { ...validCreateBody, memo: "🍕".repeat(8) },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(prisma.expense.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty update body", async () => {
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/expenses/${EXPENSE_ID}`,
+      headers: { authorization: bearer(MEMBER_USER) },
+      payload: {},
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    expect(prisma.expense.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects immutable fields and invalid receipt URLs on update", async () => {
+    const immutable = await app.inject({
+      method: "PATCH",
+      url: `/expenses/${EXPENSE_ID}`,
+      headers: { authorization: bearer(MEMBER_USER) },
+      payload: { amount: "999" },
+    });
+    const badUrl = await app.inject({
+      method: "PATCH",
+      url: `/expenses/${EXPENSE_ID}`,
+      headers: { authorization: bearer(MEMBER_USER) },
+      payload: { receiptUrl: "not-a-url" },
+    });
+
+    expect(immutable.statusCode).toBe(400);
+    expect(badUrl.statusCode).toBe(400);
+    expect(prisma.expense.update).not.toHaveBeenCalled();
+  });
+
+  it("runs authorization before body validation", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${GROUP_ID}/expenses`,
+      headers: { authorization: bearer(NON_MEMBER) },
+      payload: { ...validCreateBody, total: "100" },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.expense.create).not.toHaveBeenCalled();
   });
 });

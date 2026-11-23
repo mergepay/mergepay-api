@@ -11,6 +11,8 @@ import {
   takeForPage,
   type SortOrder,
 } from "../lib/pagination";
+import { booleanQuerySchema, composeWhere } from "../schemas/common";
+import { groupRoleSchema } from "../schemas/groups";
 
 /**
  * This route predates the shared pagination contract and shipped with offset
@@ -37,6 +39,9 @@ const querySchema = z.object({
     .max(MAX_PAGE_SIZE, "Limit must be between 1 and 100")
     .default(10),
   order: z.enum(["asc", "desc"]).default("desc"),
+  role: groupRoleSchema.optional(),
+  archived: booleanQuerySchema.optional(),
+  treasuryEnabled: booleanQuerySchema.optional(),
 });
 
 export default async function userGroupsRoutes(app: FastifyInstance) {
@@ -84,8 +89,18 @@ export default async function userGroupsRoutes(app: FastifyInstance) {
         }
       : {};
 
+    const filters = [
+      { userId: id },
+      ...(query.role ? [{ role: query.role }] : []),
+      ...(query.archived === undefined ? [] : [{ group: { archived: query.archived } }]),
+      ...(query.treasuryEnabled === undefined
+        ? []
+        : [{ group: { treasuryEnabled: query.treasuryEnabled } }]),
+    ];
+    const where = composeWhere(filters, cursorScope);
+
     const memberships = await prisma.groupMember.findMany({
-      where: { userId: id, ...cursorScope },
+      where,
       include: {
         group: {
           include: {

@@ -13,6 +13,9 @@ import {
 export interface AuditLogFilter {
   action?: string;
   actorUserId?: string;
+  entityType?: string;
+  entityId?: string;
+  correlationId?: string;
   from?: Date;
   to?: Date;
 }
@@ -32,6 +35,9 @@ function auditLogWhere(groupId: string, filter: AuditLogFilter): Prisma.AuditLog
     groupId,
     ...(filter.action && { action: filter.action }),
     ...(filter.actorUserId && { userId: filter.actorUserId }),
+    ...(filter.entityType && { entityType: filter.entityType }),
+    ...(filter.entityId && { entityId: filter.entityId }),
+    ...(filter.correlationId && { correlationId: filter.correlationId }),
     ...((filter.from || filter.to) && {
       createdAt: {
         ...(filter.from && { gte: filter.from }),

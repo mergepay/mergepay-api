@@ -1,3 +1,4 @@
+import { config } from "../config";
 import { Errors } from "../errors";
 /**
  * Zod validation schemas for the SEP-10 authentication endpoints.
@@ -170,6 +171,46 @@ export const sep10VerifyRequestSchema = z
 
 export type Sep10VerifyRequest = z.infer<typeof sep10VerifyRequestSchema>;
 
+/**
+ * Answer SEP-10 domain claims before a challenge envelope is ever consumed.
+ * Shared by the body-validating hooks and the legacy auth routes so an
+ * unsupported `client_domain` or a wrong `home_domain` always gets the same
+ * explicit 400 rather than silently being dropped.
+ */
+export function validateSep10DomainClaims(claims: {
+  home_domain?: string;
+  client_domain?: string;
+  clientDomain?: string;
+}): void {
+  if (claims.client_domain !== undefined || claims.clientDomain !== undefined) {
+    throw Errors.badRequest(
+      "client_domain_unsupported",
+      "This server does not support SEP-10 client_domain authentication"
+    );
+  }
+  if (
+    claims.home_domain !== undefined &&
+    claims.home_domain.toLowerCase() !== config.SEP10_HOME_DOMAIN.toLowerCase()
+  ) {
+    throw Errors.badRequest(
+      "home_domain_mismatch",
+      `home_domain must match the domain this server issues challenges for (${config.SEP10_HOME_DOMAIN})`
+    );
+  }
+}
+
+/**
+ * Cheap shape check for XDR received outside a JSON body. Header transport has
+ * no request-body schema, so this keeps oversized and non-canonical envelopes
+ * out of the cryptographic verifier without changing its 401 error contract.
+ */
+export function assertSep10TransactionEnvelope(value: string): void {
+  if (!transactionXdrSchema.safeParse(value).success) invalidSep10Envelope();
+}
+
+function invalidSep10Envelope(): never {
+  throw Errors.invalidChallenge();
+}
 
 /**
  * Query schema for SEP-10 challenge requests via GET query parameters (#875).
@@ -204,6 +245,7 @@ export async function validateSep10ChallengeHook(req: any) {
       const field = issue?.path.join(".") || "account";
       throw Errors.badRequest("VALIDATION_ERROR", `${field}: ${issue?.message ?? "Invalid SEP-10 challenge parameters"}`);
     }
+    validateSep10DomainClaims(parsed.data);
     req.sep10Challenge = parsed.data;
   } else {
     const parsedQuery = sep10QuerySchema.safeParse(req.query ?? {});
@@ -234,5 +276,6 @@ export async function validateSep10VerifyHook(req: any) {
     const field = issue?.path.join(".") || "transaction";
     throw Errors.badRequest("VALIDATION_ERROR", `${field}: ${issue?.message ?? "Invalid SEP-10 verify payload"}`);
   }
+  validateSep10DomainClaims(parsedBody.data);
   req.sep10Verify = parsedBody.data;
 }

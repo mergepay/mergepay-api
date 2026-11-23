@@ -30,6 +30,7 @@ import {
   sep10VerifyRequestSchema,
 } from "../../src/validations/sep10";
 import errorHandlerPlugin from "../../src/plugins/error-handler";
+import { config } from "../../src/config";
 
 const validKeypair = Keypair.random();
 const VALID_STELLAR_PUBKEY = validKeypair.publicKey();
@@ -110,6 +111,28 @@ describe("SEP-10 Zod Request Validation Middleware (#875)", () => {
       expect(body.error.code).toBe("VALIDATION_ERROR");
       expect(h.buildChallenge).not.toHaveBeenCalled();
     });
+
+    it("rejects a home_domain claim for a different domain", async () => {
+      const res = await app.inject({
+        method: "GET",
+        url: `/sep10/challenge?account=${VALID_STELLAR_PUBKEY}&home_domain=evil.example.com`,
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe("HOME_DOMAIN_MISMATCH");
+      expect(h.buildChallenge).not.toHaveBeenCalled();
+    });
+
+    it("rejects a client_domain claim", async () => {
+      const res = await app.inject({
+        method: "GET",
+        url: `/sep10/challenge?account=${VALID_STELLAR_PUBKEY}&client_domain=wallet.example.com`,
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe("CLIENT_DOMAIN_UNSUPPORTED");
+      expect(h.buildChallenge).not.toHaveBeenCalled();
+    });
   });
 
   describe("POST /sep10/challenge route validation middleware", () => {
@@ -186,6 +209,41 @@ describe("SEP-10 Zod Request Validation Middleware (#875)", () => {
 
       expect(res.statusCode).toBe(200);
       expect(res.json().token).toBe("jwt_token_sample");
+      expect(h.authenticateChallenge).toHaveBeenCalledWith(VALID_CANONICAL_XDR);
+    });
+
+    it("rejects a verify payload with a home_domain claim for a different domain", async () => {
+      const res = await app.inject({
+        method: "POST",
+        url: "/sep10/verify",
+        payload: { transaction: VALID_CANONICAL_XDR, home_domain: "evil.example.com" },
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe("HOME_DOMAIN_MISMATCH");
+      expect(h.authenticateChallenge).not.toHaveBeenCalled();
+    });
+
+    it("rejects a verify payload with a client_domain claim", async () => {
+      const res = await app.inject({
+        method: "POST",
+        url: "/sep10/verify",
+        payload: { transaction: VALID_CANONICAL_XDR, client_domain: "wallet.example.com" },
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe("CLIENT_DOMAIN_UNSUPPORTED");
+      expect(h.authenticateChallenge).not.toHaveBeenCalled();
+    });
+
+    it("accepts a verify payload whose home_domain matches this server", async () => {
+      const res = await app.inject({
+        method: "POST",
+        url: "/sep10/verify",
+        payload: { transaction: VALID_CANONICAL_XDR, home_domain: config.SEP10_HOME_DOMAIN },
+      });
+
+      expect(res.statusCode).toBe(200);
       expect(h.authenticateChallenge).toHaveBeenCalledWith(VALID_CANONICAL_XDR);
     });
   });

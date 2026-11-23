@@ -291,6 +291,11 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
 
   it("rejects a non-Stellar destination", async () => {
     const user = fakeUser();
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
 
     const res = await app.inject({
       method: "POST",
@@ -303,6 +308,11 @@ describe("POST /groups/:groupId/treasury/proposals", () => {
 
   it("rejects an invalid assetIssuer public key", async () => {
     const user = fakeUser();
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
 
     const res = await app.inject({
       method: "POST",

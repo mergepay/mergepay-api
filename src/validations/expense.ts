@@ -29,11 +29,29 @@ function stroopsIfValid(amount: string): bigint | undefined {
   return result.ok ? result.value.stroops : undefined;
 }
 
-const shareInput = z.object({
-  userId: z.string().min(1),
-  amount: shareAmountSchema.optional(),
-  percent: z.number().min(0).max(100).optional(),
-});
+const identifierSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9_-]+$/, "Identifier must contain only letters, numbers, dashes, and underscores");
+
+const memoSchema = z
+  .string()
+  .trim()
+  .max(24)
+  .refine(
+    (value) => Buffer.byteLength(value, "utf8") <= 28,
+    "Memo must be at most 28 UTF-8 bytes"
+  )
+  .optional();
+
+const shareInput = z
+  .object({
+    userId: identifierSchema,
+    amount: shareAmountSchema.optional(),
+    percent: z.number().min(0).max(100).optional(),
+  })
+  .strict();
 
 export const createExpenseSchema = z
   .object({
@@ -43,13 +61,23 @@ export const createExpenseSchema = z
     assetCode: z.string().min(1).max(12),
     assetIssuer: z.string().nullable().optional(),
     splitType: SplitType,
-    shares: z.array(shareInput).min(1),
-    payerUserId: z.string().optional(),
-    memo: z.string().max(24).optional(),
+    shares: z.array(shareInput).min(1).max(100),
+    payerUserId: identifierSchema.optional(),
+    memo: memoSchema,
     receiptUrl: z.string().url("Receipt URL must be a valid URL").nullable().optional(),
   })
+  .strict()
   .superRefine((val, ctx) => {
     refineValidatedAsset(ctx, val.assetCode, val.assetIssuer);
+
+    const shareUserIds = val.shares.map((share) => share.userId);
+    if (new Set(shareUserIds).size !== shareUserIds.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "A user may appear only once in an expense split",
+        path: ["shares"],
+      });
+    }
 
     if (val.splitType === "custom") {
       // Every share must carry an amount.
@@ -108,11 +136,16 @@ export const createExpenseSchema = z
 
 export type CreateExpenseInput = z.infer<typeof createExpenseSchema>;
 
-export const updateExpenseSchema = z.object({
-  title: sanitizedTextField({ min: 1, max: 80 }).optional(),
-  description: sanitizedTextField({ max: 500 }).nullable().optional(),
-  memo: z.string().max(24).optional(),
-  receiptUrl: z.string().nullable().optional(),
-});
+export const updateExpenseSchema = z
+  .object({
+    title: sanitizedTextField({ min: 1, max: 80 }).optional(),
+    description: sanitizedTextField({ max: 500 }).nullable().optional(),
+    memo: memoSchema,
+    receiptUrl: z.string().url("Receipt URL must be a valid URL").nullable().optional(),
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "At least one field must be provided",
+  });
 
 export type UpdateExpenseInput = z.infer<typeof updateExpenseSchema>;

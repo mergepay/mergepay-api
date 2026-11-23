@@ -3,6 +3,7 @@ import { z } from "zod";
 import { Errors } from "../errors";
 import { requireGroupRole } from "../plugins/group-access";
 import { paginationQuerySchema, requireCursor } from "../lib/pagination";
+import { identifierQuerySchema } from "../schemas/common";
 import { openApiErrorResponses, openApiResponse } from "../lib/openapi";
 import { AuditAction } from "../services/audit-actions";
 import { queryAuditLogs } from "../services/audit-log";
@@ -13,7 +14,10 @@ const paramsSchema = z.object({ groupId: z.string().min(1).max(64) });
 
 const filterShape = {
   action: z.nativeEnum(AuditAction).optional(),
-  actorUserId: z.string().min(1).optional(),
+  actorUserId: identifierQuerySchema.optional(),
+  entityType: identifierQuerySchema.optional(),
+  entityId: identifierQuerySchema.optional(),
+  correlationId: identifierQuerySchema.optional(),
   startDate: z.string().datetime().optional(),
   endDate: z.string().datetime().optional(),
   from: z.string().datetime().optional(),
@@ -37,6 +41,9 @@ const auditLogQuerystringSchema = {
       description: `One of: ${Object.values(AuditAction).join(", ")}`,
     },
     actorUserId: { type: "string" },
+    entityType: { type: "string" },
+    entityId: { type: "string" },
+    correlationId: { type: "string" },
     startDate: { type: "string" },
     endDate: { type: "string" },
     from: { type: "string" },
@@ -73,7 +80,15 @@ export default async function auditLogRoutes(app: FastifyInstance) {
       const { from, to } = parseDateRange(query);
       const { events, nextCursor } = await getGroupAuditLogs(
         groupId,
-        { action: query.action, actorUserId: query.actorUserId, from, to },
+        {
+          action: query.action,
+          actorUserId: query.actorUserId,
+          entityType: query.entityType,
+          entityId: query.entityId,
+          correlationId: query.correlationId,
+          from,
+          to,
+        },
         query.cursor,
         query.limit
       );
@@ -129,7 +144,15 @@ export default async function auditLogRoutes(app: FastifyInstance) {
       const position = requireCursor(query.cursor);
       const { events, meta } = await queryAuditLogs(
         groupId,
-        { action: query.action, actorUserId: query.actorUserId, from, to },
+        {
+          action: query.action,
+          actorUserId: query.actorUserId,
+          entityType: query.entityType,
+          entityId: query.entityId,
+          correlationId: query.correlationId,
+          from,
+          to,
+        },
         position,
         query.limit,
         query.order

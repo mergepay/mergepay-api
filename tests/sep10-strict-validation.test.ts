@@ -64,6 +64,8 @@ interface ChallengeOptions {
   timebounds?: { minTime: number; maxTime: number };
   networkPassphrase?: string;
   memo?: Memo;
+  fee?: string;
+  nonce?: string | Buffer;
   /** Operations after the auth op; defaults to one correct `web_auth_domain`. */
   extraOps?: xdr.Operation[];
   /** Keys that sign the envelope; defaults to [server, client]. */
@@ -85,14 +87,14 @@ function challenge(opts: ChallengeOptions): Transaction {
     // Sequence "-1" makes the built transaction's sequence 0.
     new Account(source.publicKey(), opts.sequence ?? "-1"),
     {
-      fee: BASE_FEE,
+      fee: opts.fee ?? BASE_FEE,
       networkPassphrase: passphrase,
       timebounds: opts.timebounds ?? { minTime: now, maxTime: now + 300 },
     }
   ).addOperation(
     Operation.manageData({
       name: `${opts.homeDomain ?? config.SEP10_HOME_DOMAIN} auth`,
-      value: randomBytes(48).toString("base64"),
+      value: opts.nonce ?? randomBytes(48).toString("base64"),
       source: opts.clientAccountId ?? opts.client.publicKey(),
     })
   );
@@ -245,6 +247,23 @@ describe("structure and domains", () => {
 
   it.each(["not base64 at all!", "AAAA", ""])("rejects malformed XDR %j", async (bad) => {
     await expect(verifyChallenge(bad)).rejects.toMatchObject(INVALID_CHALLENGE);
+  });
+
+  it("rejects a challenge with an abnormal transaction fee", async () => {
+    const client = Keypair.random();
+    const tx = challenge({ client, fee: String(Number(BASE_FEE) * 100) });
+
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(INVALID_CHALLENGE);
+  });
+
+  it.each([
+    ["a short base64 nonce", () => randomBytes(16).toString("base64")],
+    ["raw random bytes instead of a base64 nonce", () => randomBytes(32)],
+  ])("rejects %s", async (_label, nonce) => {
+    const client = Keypair.random();
+    const tx = challenge({ client, nonce: nonce() });
+
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 });
 

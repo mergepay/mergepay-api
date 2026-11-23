@@ -234,8 +234,12 @@ export const errorHandlerPlugin = fp(async function errorHandlerPlugin(app: Fast
     }
 
     if (err instanceof AppError) {
-      if (err instanceof ProviderError && err.retryAfterSeconds !== undefined) {
-        reply.header("Retry-After", String(err.retryAfterSeconds));
+      const retryAfterSeconds =
+        err instanceof ProviderError && err.retryAfterSeconds !== undefined
+          ? err.retryAfterSeconds
+          : (err as AppError & { retryAfterSeconds?: number }).retryAfterSeconds;
+      if (retryAfterSeconds !== undefined) {
+        reply.header("Retry-After", String(retryAfterSeconds));
       }
       // RFC 6750 §3: a 401 for a bearer credential names the scheme, and — once
       // a credential was presented — what was wrong with it.
@@ -243,7 +247,7 @@ export const errorHandlerPlugin = fp(async function errorHandlerPlugin(app: Fast
         reply.header("WWW-Authenticate", err.wwwAuthenticate);
       }
       return reply.code(err.status).send(
-        formatErrorResponse(err.code, err.message, requestId, err.details)
+        formatErrorResponse(err.code, err.message, requestId, err.details, undefined, retryAfterSeconds)
       );
     }
 

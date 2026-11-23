@@ -70,6 +70,7 @@ export const AuditAction = {
   SETTLEMENT_FINALIZED: "settlement.confirmed",
   SETTLEMENT_FAILED: "settlement.failed",
   SETTLEMENT_RETRIED: "settlement.retried",
+  SETTLEMENT_IDEMPOTENT_REPLAY: "settlement.idempotent_replay",
 
   // ── Worker (background jobs) ────────────────────────────────────────
   // A cycle task that exhausted its in-cycle retry budget. Sweep tasks keep no

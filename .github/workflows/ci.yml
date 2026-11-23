@@ -69,6 +69,8 @@ jobs:
         run: npm run prisma:validate
       - name: Deploy Prisma migrations
         run: npx prisma migrate deploy
+      - name: Check migration health
+        run: npm run db:migration-health
       - name: Check migration status
         run: npm run prisma:status
       - name: Verify integration schema drift
@@ -124,6 +126,8 @@ jobs:
       # database. A non-zero exit here means the history cannot be deployed.
       - name: Apply all migrations
         run: npx prisma migrate deploy
+      - name: Check migration health
+        run: npm run db:migration-health
       - name: Confirm migration status
         run: npm run prisma:status
       # Exit code 0 (Empty) means the deployed database equals `schema.prisma`;

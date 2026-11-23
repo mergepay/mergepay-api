@@ -82,13 +82,14 @@ describe("On-Chain Group Expense Settlement Workflow Integration (#804)", () => 
     method: "GET" | "POST" | "PATCH" | "DELETE",
     url: string,
     actor?: TestActor,
-    payload?: Record<string, unknown>
+    payload?: Record<string, unknown>,
+    headers: Record<string, string> = {}
   ) {
     return app.inject({
       method,
       url,
       remoteAddress: nextIp(),
-      headers: actor ? { authorization: `Bearer ${actor.token}` } : {},
+      headers: { ...(actor ? { authorization: `Bearer ${actor.token}` } : {}), ...headers },
       payload,
     });
   }
@@ -151,16 +152,22 @@ describe("On-Chain Group Expense Settlement Workflow Integration (#804)", () => 
   });
 
   it("creates a group expense and records split shares accurately in PostgreSQL", async () => {
-    const expenseRes = await api("POST", `/groups/${groupId}/expenses`, payer, {
-      title: "Conference Accommodation",
-      amount: "150.0000000",
-      assetCode: "XLM",
-      splitType: "equal",
-      shares: [
-        { userId: payer.id },
-        { userId: debtor.id },
-      ],
-    });
+    const expenseRes = await api(
+      "POST",
+      `/groups/${groupId}/expenses`,
+      payer,
+      {
+        title: "Conference Accommodation",
+        amount: "150.0000000",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [
+          { userId: payer.id },
+          { userId: debtor.id },
+        ],
+      },
+      { "x-idempotency-key": "expense-onchain-workflow-1" }
+    );
 
     expect(expenseRes.statusCode).toBe(200);
     const body = expenseRes.json();

@@ -398,7 +398,7 @@ describe("member authorization — what an active member may do (#507)", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${GROUP_ID}/expenses`,
-      headers: authHeader(MEMBER_ID),
+      headers: { ...authHeader(MEMBER_ID), "x-idempotency-key": "expense-member-create-1" },
       payload: {
         title: "Dinner",
         amount: "50.0000000",
@@ -572,7 +572,7 @@ describe("outsider authorization — membership is the boundary (#507)", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${GROUP_ID}/expenses`,
-      headers: authHeader(OUTSIDER_ID),
+      headers: { ...authHeader(OUTSIDER_ID), "x-idempotency-key": "expense-auto" },
       payload: {
         title: "Freeload",
         amount: "10.0000000",

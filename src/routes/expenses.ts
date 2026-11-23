@@ -77,17 +77,25 @@ export default async function expenseRoutes(app: FastifyInstance) {
     "/groups/:id/expenses",
     {
       ...createLimit,
-      preHandler: requireGroupRole("member", { param: "id", active: true }),
+      preHandler: [
+        app.idempotent({
+          scope: "expense.create",
+          required: true,
+          resourceId: (req) => idParamSchema.parse(req.params).id,
+          afterGuards: true,
+        }),
+        requireGroupRole("member", { param: "id", active: true }),
+      ],
       schema: {
         tags: ["Expenses"],
         summary: "Create an expense in a group",
         description:
-          "Records a group expense and its payment split. The payer's share is settled immediately; every other participant's share is owed.",
+          "Records a group expense and its payment split. The payer's share is settled immediately; every other participant's share is owed. Supply `X-Idempotency-Key` to safely retry the same request.",
         params: openApiIdParams(),
         body: openApiBody(createExpenseSchema),
         response: {
           ...openApiEnvelope("expense"),
-          ...openApiErrorResponses(400, 401, 403, 404, 429),
+          ...openApiErrorResponses(400, 401, 403, 404, 409, 429),
         },
       },
     },

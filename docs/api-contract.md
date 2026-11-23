@@ -259,13 +259,14 @@ state-changing settlement request can be replayed safely.
 
 | | |
 | --- | --- |
-| Header | `Idempotency-Key` |
+| Header | `Idempotency-Key` or `X-Idempotency-Key` (`X-Idempotency-Key` is required for `POST /groups/:id/expenses`) |
 | Length | 1–255 characters |
 | Charset | `A–Z`, `a–z`, `0–9`, `-`, `_`, `.`, `:` |
-| Validation | Zod, before any database read — out of bounds is `INVALID_IDEMPOTENCY_KEY` (400) |
+| Validation | Zod, before the operation runs — out of bounds is `INVALID_IDEMPOTENCY_KEY` (400) |
 
 | Endpoint | Key |
 | --- | --- |
+| `POST /groups/:id/expenses` | required, uses `X-Idempotency-Key` |
 | `POST /expenses/:id/settle` | optional, honoured when sent |
 | `POST /groups/:id/settlements` | optional, honoured when sent |
 | `POST /settlements/:id/confirm` | optional, honoured when sent |
@@ -273,7 +274,8 @@ state-changing settlement request can be replayed safely.
 
 Submission honours a key because it is the request that ends in money moving: a
 wallet that retries after a timeout gets its original response instead of a
-second on-chain submission. Requests without a header behave exactly as before.
+second on-chain submission. Apart from expense creation, requests without a
+header behave exactly as before.
 
 ### Semantics
 

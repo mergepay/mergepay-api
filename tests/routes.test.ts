@@ -664,7 +664,7 @@ describe("expense routes", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${groupId}/expenses`,
-      headers: authHeader(user),
+      headers: { ...authHeader(user), "x-idempotency-key": "expense-create-1" },
       payload: {
         title: "Dinner",
         description: "Team dinner",
@@ -718,7 +718,7 @@ describe("expense routes", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${groupId}/expenses`,
-      headers: authHeader(user),
+      headers: { ...authHeader(user), "x-idempotency-key": "expense-auto" },
       payload: {
         title: "Dinner",
         amount: "100",

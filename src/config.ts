@@ -86,10 +86,10 @@ const schema = z.object({
   CORS_ALLOW_METHODS: z.string().default("GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS"),
   // Comma-separated list of allowed headers for CORS.
   // Defaults to common headers needed for API clients.
-  CORS_ALLOW_HEADERS: z.string().default("Content-Type,Authorization,X-Requested-With,Idempotency-Key"),
+  CORS_ALLOW_HEADERS: z.string().default("Content-Type,Authorization,X-Requested-With,Idempotency-Key,X-Idempotency-Key"),
   // Comma-separated list of headers exposed to the client.
   // Defaults to headers useful for debugging and pagination.
-  CORS_EXPOSE_HEADERS: z.string().default("X-Request-ID,X-Correlation-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,Retry-After"),
+  CORS_EXPOSE_HEADERS: z.string().default("X-Request-ID,X-Correlation-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,Retry-After,Idempotent-Replay"),
   // Max age (seconds) for CORS preflight cache.
   // Defaults to 24 hours to reduce preflight requests.
   CORS_MAX_AGE: z.coerce.number().int().positive().default(86400),

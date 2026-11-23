@@ -492,6 +492,7 @@ async function markTreasuryTransaction(
   if (count === 0) return false;
 
   await audit({
+    correlationId: `job_txsync_treasury_${row.id}`,
     userId: row.userId,
     groupId: row.groupId,
     // Horizon told the worker, not the user. `userId` is the row's owner.

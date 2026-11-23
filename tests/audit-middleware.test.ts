@@ -323,6 +323,7 @@ describe("auditTrail middleware — request-level audit (#914)", () => {
     // The metadata is exactly the request shape — nothing else leaked in.
     expect(Object.keys(row.metadata).sort()).toEqual([
       "actorType",
+      "correlationId",
       "method",
       "outcome",
       "route",

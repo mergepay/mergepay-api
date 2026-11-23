@@ -185,6 +185,7 @@ async function exhaustAndAssert(opts: {
   expect(body.code).toBe("RATE_LIMITED");
   expect(body.requestId).toBeTruthy();
   expect(typeof body.message).toBe("string");
+  expect(body.error?.retryAfter ?? body.retryAfter).toBeDefined();
   return blocked;
 }
 
@@ -442,12 +443,13 @@ describe("rate limiting on the real app wiring", () => {
       payload: {},
     });
     const body = blocked.json();
-    // The envelope carries only the documented fields.
+    // The envelope carries the documented fields.
     expect(Object.keys(body).sort()).toEqual([
       "code",
       "error",
       "message",
       "requestId",
+      "retryAfter",
     ]);
     expect(body.message).not.toContain("bucket");
     expect(body.message).not.toContain("key");

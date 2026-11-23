@@ -102,6 +102,7 @@ async function expireOne(
       action: AuditAction.TREASURY_PROPOSAL_EXPIRED,
       entityType: "treasury_proposal",
       entityId: proposal.id,
+      correlationId: `job_cleanup_${proposal.id}`,
       metadata: {
         from: proposal.status,
         to: EXPIRED_STATUS,

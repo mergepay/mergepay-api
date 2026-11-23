@@ -89,6 +89,7 @@ async function expireOneSettlement(
       action: "settlement.failed",
       entityType: "settlement",
       entityId: settlement.id,
+      correlationId: `job_expire_settlement_${settlement.id}`,
       outcome: "failure",
       metadata: {
         reason: "Settlement payment intent expired before on-chain execution",

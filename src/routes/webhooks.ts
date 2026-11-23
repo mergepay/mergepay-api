@@ -233,6 +233,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
       });
 
       await audit({
+        correlationId: req.id,
         userId: auth.id,
         groupId: body.groupId,
         action: "webhook.register",
@@ -261,6 +262,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     // join, and the 201 must not wait on the audit row (issue #914). The write
     // still runs, and a failure surfaces in the audit-event stream only.
     logAuditTrail({
+        correlationId: req.id,
       actorId: auth.id,
       actorType: "user",
       action: "webhook.register",
@@ -311,6 +313,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     });
 
     await audit({
+        correlationId: req.id,
       userId: auth.id,
       groupId,
       action: "webhook.register",
@@ -350,6 +353,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     // without them the trail says a webhook existed but not which endpoint
     // stopped receiving the group's events.
     await audit({
+        correlationId: req.id,
       userId: auth.id,
       groupId,
       action: "webhook.deregister",

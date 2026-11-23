@@ -247,13 +247,13 @@ export function rateLimitPolicies(): Record<RateLimitPolicyName, RateLimitPolicy
       prefix: "sep24.webhook",
       hook: "onRequest",
     },
-    groupCreate: {
-      max: config.RATE_LIMIT_GROUP,
-      timeWindow: config.RATE_LIMIT_GROUP_WINDOW_MS,
-      keyBy: "user-or-ip",
-      prefix: "group.create",
-      hook: "preHandler",
-    },
+  groupCreate: {
+    max: config.RATE_LIMIT_GROUP,
+    timeWindow: config.RATE_LIMIT_GROUP_WINDOW_MS,
+    keyBy: "user-or-ip",
+    prefix: "group.create",
+    hook: "preHandler",
+  },
     history: {
       max: config.RATE_LIMIT_HISTORY,
       timeWindow: config.RATE_LIMIT_HISTORY_WINDOW_MS,

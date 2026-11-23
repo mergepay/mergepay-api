@@ -295,6 +295,9 @@ export const Errors = {
   badRequest: (code: string, msg: string, details?: unknown) =>
     new AppError(400, code.toUpperCase(), msg, details),
 
+  unprocessable: (code: string, msg: string, details?: unknown) =>
+    new AppError(422, code.toUpperCase(), msg, details),
+
   conflict: (code: string, msg: string, details?: unknown) =>
     new AppError(409, code.toUpperCase(), msg, details),
 

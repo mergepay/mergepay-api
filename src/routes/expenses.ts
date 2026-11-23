@@ -195,6 +195,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
 req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense.create" }, "Audit: expense created");
       await logActionTx(tx, {
+        correlationId: req.id,
         actorId: auth.id,
         groupId,
         action: AuditAction.EXPENSE_CREATE,
@@ -332,6 +333,7 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
       });
 
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: expense.groupId,
         action: AuditAction.EXPENSE_UPDATE,
@@ -391,6 +393,7 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
 
       await tx.expense.delete({ where: { id } });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: found.groupId,
         action: AuditAction.EXPENSE_DELETE,

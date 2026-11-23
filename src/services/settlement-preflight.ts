@@ -115,12 +115,14 @@ export interface PreflightOk {
 export interface PreflightFailure {
   ok: false;
   reason: PreflightFailureReason;
-  /**
-   * Short, client-safe explanation. Deliberately free of balance figures: a
-   * settlement's counterparty can trigger this path, and the concise message is
-   * enough to act on without disclosing what the payer holds.
-   */
+  /** Short, client-safe explanation. */
   message: string;
+  /** Public key of the account checked, safe to display for self-service debugging. */
+  account: string;
+  /** Asset shortfall as a decimal string, when computable. */
+  shortfall?: string;
+  /** Asset code the shortfall applies to. */
+  shortfallAsset?: string;
 }
 
 export type PreflightResult = PreflightOk | PreflightFailure;
@@ -193,9 +195,20 @@ function issuedBalanceStroops(
 
 function failure(
   reason: PreflightFailureReason,
-  message: string
+  message: string,
+  account: string,
+  shortfall?: bigint,
+  shortfallAsset?: string
 ): PreflightFailure {
-  return { ok: false, reason, message };
+  return {
+    ok: false,
+    reason,
+    message,
+    account,
+    ...(shortfall !== undefined && shortfall > 0n
+      ? { shortfall: fromStroops(shortfall), shortfallAsset: shortfallAsset ?? "XLM" }
+      : {}),
+  };
 }
 
 /**
@@ -220,14 +233,16 @@ export function evaluatePreflight(
   if (!account || !Array.isArray(account.balances)) {
     return failure(
       "upstream_unavailable",
-      "Could not read your Stellar account to check your balance. Try again shortly."
+      "Could not read your Stellar account to check your balance. Try again shortly.",
+      params.sourcePublicKey
     );
   }
 
   if (!account.exists) {
     return failure(
       "account_not_found",
-      "Your Stellar account is not funded yet. Fund it before settling."
+      "Your Stellar account is not funded yet. Fund it before settling.",
+      params.sourcePublicKey
     );
   }
 
@@ -240,7 +255,8 @@ export function evaluatePreflight(
   if (amount <= 0n) {
     return failure(
       "insufficient_asset_balance",
-      "Settlement amount must be greater than zero."
+      "Settlement amount must be greater than zero.",
+      params.sourcePublicKey
     );
   }
   const isNative = params.assetIssuer === null;
@@ -250,10 +266,15 @@ export function evaluatePreflight(
     // One balance covers both the payment and its fee, so they are checked
     // together against a single spendable figure — checking them separately
     // would pass an account that can afford either but not both.
-    if (spendableXlmStroops(account) < amount + SETTLEMENT_FEE_STROOPS) {
+    const spendable = spendableXlmStroops(account);
+    const required = amount + SETTLEMENT_FEE_STROOPS;
+    if (spendable < required) {
       return failure(
         "insufficient_asset_balance",
-        "Not enough XLM to cover this payment, the network fee, and the account reserve."
+        "Not enough XLM to cover this payment, the network fee, and the account reserve.",
+        params.sourcePublicKey,
+        required - spendable,
+        "XLM"
       );
     }
     return { ok: true, feeXlm };
@@ -271,23 +292,31 @@ export function evaluatePreflight(
   if (assetBalance === null) {
     return failure(
       "missing_trustline",
-      `Your account has no ${params.assetCode} trustline. Add one before settling in ${params.assetCode}.`
+      `Your account has no ${params.assetCode} trustline. Add one before settling in ${params.assetCode}.`,
+      params.sourcePublicKey
     );
   }
   if (assetBalance < amount) {
     return failure(
       "insufficient_asset_balance",
-      `Not enough ${params.assetCode} to cover this payment.`
+      `Not enough ${params.assetCode} to cover this payment.`,
+      params.sourcePublicKey,
+      amount - assetBalance,
+      params.assetCode
     );
   }
 
   // The fee is always paid in XLM, never in the asset being sent. An account
   // rich in USDC and empty of XLM cannot settle, and this is the check that
   // says so rather than letting Horizon reject it after signing.
-  if (spendableXlmStroops(account) < SETTLEMENT_FEE_STROOPS) {
+  const spendableXlm = spendableXlmStroops(account);
+  if (spendableXlm < SETTLEMENT_FEE_STROOPS) {
     return failure(
       "insufficient_fee_balance",
-      "Not enough XLM to cover the network fee and the account reserve."
+      "Not enough XLM to cover the network fee and the account reserve.",
+      params.sourcePublicKey,
+      SETTLEMENT_FEE_STROOPS - spendableXlm,
+      "XLM"
     );
   }
 
@@ -312,23 +341,37 @@ export async function checkSettlementPreflight(
     // an unreachable Horizon says nothing about the account's balance.
     return failure(
       "upstream_unavailable",
-      "Could not reach the Stellar network to check your balance. Try again shortly."
+      "Could not reach the Stellar network to check your balance. Try again shortly.",
+      params.sourcePublicKey
     );
   }
 
   return evaluatePreflight(account, params);
 }
 
-/** Maps each failure reason to the error the API responds with. */
-const FAILURE_ERRORS: Record<PreflightFailureReason, (message: string) => Error> = {
-  account_not_found: (message) => Errors.badRequest("account_unfunded", message),
-  missing_trustline: (message) => Errors.badRequest("missing_trustline", message),
-  insufficient_asset_balance: (message) =>
-    Errors.badRequest("insufficient_balance", message),
-  insufficient_fee_balance: (message) =>
-    Errors.badRequest("insufficient_fee_balance", message),
+/** Maps each failure reason to the HTTP/AppError shape returned to callers. */
+const FAILURE_ERRORS: Record<
+  PreflightFailureReason,
+  (failure: PreflightFailure) => Error
+> = {
+  account_not_found: (f) =>
+    Errors.badRequest("account_unfunded", f.message, { account: f.account, shortfall: f.shortfall, shortfallAsset: f.shortfallAsset }),
+  missing_trustline: (f) =>
+    Errors.badRequest("missing_trustline", f.message, { account: f.account }),
+  insufficient_asset_balance: (f) =>
+    Errors.unprocessable("insufficient_balance", f.message, {
+      account: f.account,
+      shortfall: f.shortfall,
+      shortfallAsset: f.shortfallAsset,
+    }),
+  insufficient_fee_balance: (f) =>
+    Errors.unprocessable("insufficient_fee_balance", f.message, {
+      account: f.account,
+      shortfall: f.shortfall,
+      shortfallAsset: f.shortfallAsset,
+    }),
   // Not the caller's fault, and retrying may well succeed — so 502, not 400.
-  upstream_unavailable: (message) => Errors.upstream(message),
+  upstream_unavailable: (f) => Errors.upstream(f.message),
 };
 
 /**
@@ -343,7 +386,7 @@ const FAILURE_ERRORS: Record<PreflightFailureReason, (message: string) => Error>
  */
 export function assertPreflightResult(result: PreflightResult): PreflightOk {
   if (result.ok) return result;
-  throw FAILURE_ERRORS[result.reason](result.message);
+  throw FAILURE_ERRORS[result.reason](result);
 }
 
 /**

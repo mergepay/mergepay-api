@@ -163,6 +163,7 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
         },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         action: "withdrawal.start",
         entityType: "withdrawal",

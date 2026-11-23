@@ -172,12 +172,14 @@ export async function reconcileSingleSettlement(
           },
         });
         await audit({
+          correlationId: `job_recon_settlement_${settlement.id}`,
           userId: null,
           groupId: settlement.groupId,
           actorType: "worker",
           action: "settlement.verification_failed",
           entityType: "settlement",
           entityId: settlement.id,
+          outcome: "failure",
           metadata: {
             stellarTxHash: hash,
             reason: err.message,
@@ -230,6 +232,7 @@ export async function reconcileSingleSettlement(
     },
   });
   await audit({
+    correlationId: `job_recon_settlement_${settlement.id}`,
     userId: null,
     groupId: settlement.groupId,
     actorType: "worker",
@@ -315,14 +318,17 @@ async function handleTransactionNotFound(
       },
     });
     await audit({
+      correlationId: `job_recon_settlement_${settlement.id}`,
       userId: null,
       groupId: settlement.groupId,
       actorType: "worker",
-      action: "settlement.reconciliation.exhausted",
+      action: "settlement.failed",
       entityType: "settlement",
       entityId: settlement.id,
+      outcome: "failure",
       metadata: {
         stellarTxHash: hash,
+        reason: "reconciliation_exhausted",
         attempts: nextRetryCount,
         maxRetries,
       },

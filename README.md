@@ -334,6 +334,8 @@ traffic pattern or trust boundary replace that default with their own bucket:
 | `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 50 / 1 min |
 | `POST /api/v1/sep24/callback`, `POST /api/v1/webhooks/sep24` | `SEP24_RATE_LIMIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
 | `POST /groups` | `RATE_LIMIT_GROUP` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /groups/:id/invite` | `RATE_LIMIT_GROUP_INVITE_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /groups/join` | `RATE_LIMIT_GROUP_JOIN_MAX` / `_WINDOW_MS` | 10 / 1 min |
 | `GET /history` | `RATE_LIMIT_HISTORY` / `_WINDOW_MS` | 30 / 1 min |
 | `POST /groups/:groupId/webhooks/:webhookId/test` | `RATE_LIMIT_WEBHOOK_TEST_MAX` / `_WINDOW_MS` | 5 / 1 min |
 

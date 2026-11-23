@@ -488,7 +488,21 @@ export default async function settlementRoutes(app: FastifyInstance) {
       resourceId: id,
       payload: body,
     });
-    if (replay !== undefined) return replay;
+    if (replay !== undefined) {
+      const replaySettlement = replay.settlement as { groupId?: string } | undefined;
+      const groupId = replaySettlement?.groupId ?? (await prisma.settlement.findUnique({ where: { id }, select: { groupId: true } }))?.groupId;
+      if (groupId) {
+        await audit({
+          userId: auth.id,
+          groupId,
+          action: "settlement.idempotent_replay",
+          entityType: "settlement",
+          entityId: id,
+          metadata: { idempotencyKey, endpoint: "POST /settlements/:id/confirm" },
+        });
+      }
+      return replay;
+    }
 
     // Load the *original* intent and validate the signed envelope against it
     // BEFORE entering the idempotent operation. Two reasons: a validation

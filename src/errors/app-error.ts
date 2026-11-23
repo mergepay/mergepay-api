@@ -14,6 +14,8 @@ export class AppError extends Error {
   readonly code: string;
   /** Structured detail payload (e.g. Zod validation issues). */
   readonly details?: unknown;
+  /** Optional retry hint for 429 responses. */
+  readonly retryAfterSeconds?: number;
   /** Correlation ID injected by the error handler, not set by callers. */
   requestId?: string;
 
@@ -21,7 +23,8 @@ export class AppError extends Error {
     status: number,
     code: string,
     message: string,
-    details?: unknown
+    details?: unknown,
+    retryAfterSeconds?: number
   ) {
     super(message);
     this.name = "AppError";
@@ -29,6 +32,7 @@ export class AppError extends Error {
     this.statusCode = status;
     this.code = code;
     this.details = details;
+    this.retryAfterSeconds = retryAfterSeconds;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }

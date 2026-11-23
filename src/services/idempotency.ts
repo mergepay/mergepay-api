@@ -55,6 +55,7 @@ import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "../db";
 import { Errors } from "../errors";
+import { config } from "../config";
 
 /**
  * Idempotency keys are scoped per (user, operation, key) so a client-chosen
@@ -73,7 +74,9 @@ export const IDEMPOTENCY_KEY_MAX_LENGTH = 255;
 export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_.:-]+$/;
 
 /** How long a completed key replays before it is swept. */
-export const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
+export function idempotencyRetentionMs(): number {
+  return config.IDEMPOTENCY_TTL_MS ?? 24 * 60 * 60 * 1000;
+}
 
 /**
  * How long an `in_progress` reservation blocks a retry before it is treated as
@@ -81,6 +84,11 @@ export const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
  * transaction times out at 15s), short enough that a crashed process does not
  * wedge a client's key for the full retention window.
  */
+export function inProgressTimeoutMs(): number {
+  return config.IDEMPOTENCY_IN_PROGRESS_TIMEOUT_MS ?? 60_000;
+}
+
+export const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const IN_PROGRESS_TIMEOUT_MS = 60_000;
 
 export type IdempotencyState = "in_progress" | "completed" | "failed";
@@ -174,6 +182,7 @@ interface KeyRow {
   status?: string | null;
   updatedAt?: Date | null;
   createdAt?: Date | null;
+  expiresAt?: Date | null;
 }
 
 /**
@@ -195,7 +204,12 @@ function stateOf(row: KeyRow): IdempotencyState {
 function isAbandoned(row: KeyRow, now: number): boolean {
   const started = (row.updatedAt ?? row.createdAt ?? null)?.getTime();
   if (started === undefined) return false;
-  return now - started > IN_PROGRESS_TIMEOUT_MS;
+  return now - started > inProgressTimeoutMs();
+}
+
+function isExpired(row: KeyRow & { expiresAt?: Date | null }, now: number): boolean {
+  const expires = row.expiresAt?.getTime();
+  return expires !== undefined && expires <= now;
 }
 
 /**
@@ -222,6 +236,7 @@ export async function readIdempotentResponse<T>(params: {
     where: { userId_scope_key: { userId, scope, key } },
   })) as KeyRow | null;
   if (!existing) return undefined;
+  if (isExpired(existing, Date.now())) return undefined;
   if (existing.requestHash !== requestHash) conflict();
 
   const state = stateOf(existing);
@@ -285,7 +300,7 @@ export async function runIdempotent<T>(params: {
 
   const existing = (await prisma.idempotencyKey.findUnique({ where })) as KeyRow | null;
 
-  if (existing) {
+  if (existing && !isExpired(existing, Date.now())) {
     // Bound to the payload as well as the caller: the same key with different
     // content is a client bug, and answering it with the first request's result
     // would hide a real divergence.
@@ -302,13 +317,18 @@ export async function runIdempotent<T>(params: {
       if (!reclaimed) {
         const winner = (await prisma.idempotencyKey.findUnique({ where })) as KeyRow | null;
         if (!winner) inProgress();
-        if (winner.requestHash !== requestHash) conflict();
-        if (stateOf(winner) === "completed") {
-          return parseStoredResponse<T>(winner.responseJson);
+        if (isExpired(winner, Date.now())) {
+          // expired while racing; fall through to reserve a fresh row
+        } else {
+          if (winner.requestHash !== requestHash) conflict();
+          if (stateOf(winner) === "completed") {
+            return parseStoredResponse<T>(winner.responseJson);
+          }
+          inProgress();
         }
-        inProgress();
+      } else {
+        return finalize({ where, requestHash, resourceId, operation, timeoutMs });
       }
-      return finalize({ where, requestHash, resourceId, operation, timeoutMs });
     }
   }
 
@@ -336,7 +356,7 @@ export async function runIdempotent<T>(params: {
         requestHash,
         status: "in_progress",
         responseJson: null,
-        expiresAt: new Date(Date.now() + IDEMPOTENCY_RETENTION_MS),
+        expiresAt: new Date(Date.now() + idempotencyRetentionMs()),
       } as never,
     });
   } catch (error) {
@@ -344,6 +364,19 @@ export async function runIdempotent<T>(params: {
 
     const winner = (await prisma.idempotencyKey.findUnique({ where })) as KeyRow | null;
     if (!winner) throw error;
+    if (isExpired(winner, Date.now())) {
+      const deleted = await prisma.idempotencyKey.deleteMany({
+        where: {
+          userId,
+          scope,
+          key,
+          expiresAt: { lte: new Date() },
+        } as never,
+      });
+      if (deleted.count > 0) {
+        return runIdempotent({ userId, scope, key, resourceId, payload, operation, timeoutMs });
+      }
+    }
     if (winner.requestHash !== requestHash) conflict();
     if (stateOf(winner) === "completed") {
       return parseStoredResponse<T>(winner.responseJson);
@@ -364,7 +397,7 @@ async function reclaim(params: {
   key: string;
   requestHash: string;
 }): Promise<boolean> {
-  const staleBefore = new Date(Date.now() - IN_PROGRESS_TIMEOUT_MS);
+  const staleBefore = new Date(Date.now() - inProgressTimeoutMs());
   const { count } = await prisma.idempotencyKey.updateMany({
     where: {
       userId: params.userId,
@@ -379,7 +412,7 @@ async function reclaim(params: {
     data: {
       status: "in_progress",
       responseJson: null,
-      expiresAt: new Date(Date.now() + IDEMPOTENCY_RETENTION_MS),
+      expiresAt: new Date(Date.now() + idempotencyRetentionMs()),
     } as never,
   });
   return count === 1;
@@ -464,7 +497,7 @@ async function runCreateAtCommit<T>(params: {
             status: "completed",
             statusCode: 200,
             responseJson: JSON.stringify(result),
-            expiresAt: new Date(Date.now() + IDEMPOTENCY_RETENTION_MS),
+            expiresAt: new Date(Date.now() + idempotencyRetentionMs()),
           } as never,
         });
         return result;

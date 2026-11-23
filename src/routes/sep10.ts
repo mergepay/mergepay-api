@@ -29,6 +29,7 @@ import {
   validateSep10VerifyHook,
 } from "../validations/sep10";
 import { openApiBody, openApiErrorResponses, openApiResponse } from "../lib/openapi";
+import { rateLimited } from "../lib/rate-limit";
 
 export {
   validateSep10ChallengeHook,
@@ -36,20 +37,29 @@ export {
 };
 
 export default async function sep10Routes(app: FastifyInstance) {
+  const challengeLimit = rateLimited("authChallenge");
+  const verifyLimit = rateLimited("authVerify");
+
   // GET /sep10/challenge with preHandler query validation
   app.get(
     "/sep10/challenge",
     {
+      ...challengeLimit,
       preHandler: [validateSep10ChallengeHook],
       schema: {
         tags: ["Auth"],
         summary: "Request SEP-10 challenge via query parameter",
         description: "Validates account query parameter via Zod and issues challenge transaction.",
         response: {
-          ...openApiResponse({
-            transaction: { type: "string" },
-            networkPassphrase: { type: "string" },
-          }),
+          200: {
+            description: "Challenge issued",
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              transaction: { type: "string", example: "AAAAAgAAAAB..." },
+              networkPassphrase: { type: "string", example: "Test SDF Network ; September 2015" },
+            },
+          },
           ...openApiErrorResponses(400, 429),
         },
       },
@@ -64,17 +74,25 @@ export default async function sep10Routes(app: FastifyInstance) {
   app.post(
     "/sep10/challenge",
     {
+      ...challengeLimit,
       preHandler: [validateSep10ChallengeHook],
       schema: {
         tags: ["Auth"],
         summary: "Request SEP-10 challenge via request body",
         description: "Validates account payload via Zod and issues challenge transaction.",
-        body: openApiBody(sep10ChallengeRequestSchema, { enforce: false }),
+        body: {
+          ...openApiBody(sep10ChallengeRequestSchema, { enforce: false }),
+        },
         response: {
-          ...openApiResponse({
-            transaction: { type: "string" },
-            networkPassphrase: { type: "string" },
-          }),
+          200: {
+            description: "Challenge issued",
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              transaction: { type: "string", example: "AAAAAgAAAAB..." },
+              networkPassphrase: { type: "string", example: "Test SDF Network ; September 2015" },
+            },
+          },
           ...openApiErrorResponses(400, 429),
         },
       },
@@ -89,16 +107,22 @@ export default async function sep10Routes(app: FastifyInstance) {
   app.post(
     "/sep10/verify",
     {
+      ...verifyLimit,
       preHandler: [validateSep10VerifyHook],
       schema: {
         tags: ["Auth"],
         summary: "Verify signed SEP-10 challenge transaction",
         description: "Validates transaction XDR via Zod before verifying signatures.",
-        body: openApiBody(sep10VerifyRequestSchema, { enforce: false }),
+        body: {
+          ...openApiBody(sep10VerifyRequestSchema, { enforce: false }),
+        },
         response: {
-          ...openApiResponse({
-            token: { type: "string" },
-          }),
+          200: {
+            description: "Verified",
+            type: "object",
+            additionalProperties: true,
+            properties: { token: { type: "string", example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." } },
+          },
           ...openApiErrorResponses(400, 401, 429),
         },
       },

@@ -46,10 +46,16 @@ function isHorizonError(error: unknown): error is Error & {
  * client only that something at the root is wrong, when the whole point of
  * rejecting unknown keys is that the client learn which one to delete.
  */
-function zodIssueField(issue: ZodError["errors"][number] | undefined): string {
+function zodIssueField(issue: ZodError["issues"][number] | undefined): string {
   if (!issue) return "";
   if (issue.code === "unrecognized_keys") return issue.keys?.[0] ?? "";
   return issue.path.join(".");
+}
+
+function zodIssuePath(issue: ZodError["issues"][number] | undefined): string {
+  if (!issue) return "";
+  if (issue.code === "unrecognized_keys") return issue.keys?.[0] ?? "";
+  return issue.path.map(String).join(".");
 }
 
 /**
@@ -65,18 +71,19 @@ export function serializeError(
   }
 
   if (err instanceof ZodError) {
-    const details = err.errors.map((e) => ({
+    const details = err.issues.map((e) => ({
       field: zodIssueField(e),
+      path: zodIssuePath(e),
       message: e.message,
       code: e.code,
     }));
-    const issues = err.errors.map((e) => ({
-      path: e.path,
+    const issues = err.issues.map((e) => ({
+      path: e.path.map(String),
       message: e.message,
       code: e.code,
     }));
-    const first = err.errors[0];
-    const field = zodIssueField(first);
+    const first = err.issues[0];
+    const field = zodIssuePath(first);
     const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
     return formatErrorResponse("VALIDATION_ERROR", message, requestId, details, issues);
   }
@@ -131,18 +138,19 @@ export const errorHandlerPlugin = fp(async function errorHandlerPlugin(app: Fast
     }
 
     if (err instanceof ZodError) {
-      const details = err.errors.map((e) => ({
+      const details = err.issues.map((e) => ({
         field: zodIssueField(e),
+        path: zodIssuePath(e),
         message: e.message,
         code: e.code,
       }));
-      const issues = err.errors.map((e) => ({
-        path: e.path,
+      const issues = err.issues.map((e) => ({
+        path: e.path.map(String),
         message: e.message,
         code: e.code,
       }));
-      const first = err.errors[0];
-      const field = zodIssueField(first);
+      const first = err.issues[0];
+      const field = zodIssuePath(first);
       const message = field ? `${field}: ${first.message}` : first?.message ?? "Validation failed";
 
       return reply.code(400).send(
@@ -175,7 +183,11 @@ export const errorHandlerPlugin = fp(async function errorHandlerPlugin(app: Fast
         (err as any).validation
       )
         ? (err as any).validation.map((v: any) => {
-            const field = String(v?.instancePath ?? "").replace(/^\//, "");
+            const rawPath = String(v?.instancePath ?? "").replace(/^\//, "");
+            const field = rawPath
+              .split("/")
+              .filter(Boolean)
+              .join(".");
             return {
               path: field ? field.split(".") : [],
               field: field || undefined,
@@ -184,7 +196,12 @@ export const errorHandlerPlugin = fp(async function errorHandlerPlugin(app: Fast
             };
           })
         : [];
-      const details = issues.map((issue) => ({ field: issue.field, message: issue.message }));
+      const details = issues.map((issue) => ({
+        field: issue.field,
+        path: issue.field ?? "",
+        message: issue.message,
+        code: issue.code,
+      }));
       const first = issues[0];
       const message = first
         ? first.field

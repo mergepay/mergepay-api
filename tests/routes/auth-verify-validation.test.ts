@@ -274,7 +274,12 @@ describe("POST /auth/verify — invalid payloads are rejected before verificatio
     const body = res.json();
     expect(body.code).toBe("VALIDATION_ERROR");
     expect(body.error.details).toEqual([
-      { field: "transaction", message: expect.stringMatching(/string/i) },
+      {
+        field: "transaction",
+        path: "transaction",
+        message: expect.stringMatching(/string/i),
+        code: "type",
+      },
     ]);
     expect(body.error.message).toMatch(/^transaction: /);
     expect(body.error.issues).toEqual([

@@ -178,6 +178,7 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
       const proposal = await prisma.treasuryProposal.findUnique({
         where: { id: proposalId },
       });
+      if (!proposal) throw Errors.notFound("Treasury proposal not found");
       return {
         proposal: serializeTreasuryProposal(proposal),
         signatureCount: result.signatureCount,

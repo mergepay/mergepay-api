@@ -1,4 +1,5 @@
 import { prisma } from "../db";
+import { serializeAuditDetails } from "../schemas/json-metadata";
 
 export async function log(
   action: string,
@@ -12,7 +13,7 @@ export async function log(
         action,
         userId: userId ?? null,
         groupId: groupId ?? null,
-        details: details ? (details as any) : undefined,
+        details: details ? serializeAuditDetails(details) : undefined,
       },
     });
   } catch (error) {

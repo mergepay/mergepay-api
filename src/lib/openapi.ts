@@ -140,7 +140,19 @@ export function openApiIdParams(): Record<string, unknown> {
  * error, and so the response descriptions below cannot drift out of sync with
  * the statuses actually rendered.
  */
-export type OpenApiErrorStatus = 400 | 401 | 403 | 404 | 409 | 429;
+export type OpenApiErrorStatus =
+  | 400
+  | 401
+  | 403
+  | 404
+  | 409
+  | 413
+  | 415
+  | 422
+  | 429
+  | 502
+  | 503
+  | 504;
 
 const ERROR_RESPONSE_DESCRIPTIONS: Record<OpenApiErrorStatus, string> = {
   400: "Bad Request — the request body, path, or query failed validation.",
@@ -148,7 +160,13 @@ const ERROR_RESPONSE_DESCRIPTIONS: Record<OpenApiErrorStatus, string> = {
   403: "Forbidden — the caller is not allowed to perform this action.",
   404: "Not Found — the addressed resource does not exist or is not visible to the caller.",
   409: "Conflict — the request conflicts with the resource's current state.",
+  413: "Payload Too Large — the request body or an uploaded file exceeded a configured limit.",
+  415: "Unsupported Media Type — the request used an unsupported content type.",
+  422: "Unprocessable Entity — a provider rejected the submitted transaction or payload.",
   429: "Too Many Requests — the caller exceeded a rate limit.",
+  502: "Bad Gateway — an upstream provider could not fulfill the request.",
+  503: "Service Unavailable — a required dependency is unavailable or rate limiting requests.",
+  504: "Gateway Timeout — an upstream provider did not answer in time.",
 };
 
 /**
@@ -199,7 +217,7 @@ export function openApiErrorResponses(
   for (const status of statuses) {
     responses[status] = {
       description: ERROR_RESPONSE_DESCRIPTIONS[status],
-      ...openApiErrorSchema({ includeRetryAfter: status === 429 }),
+      ...openApiErrorSchema({ includeRetryAfter: status === 429 || status === 503 }),
     };
   }
   return responses;

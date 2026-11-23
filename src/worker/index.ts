@@ -93,6 +93,7 @@ import {
   loggerWithContext,
 } from "../lib/correlation";
 import { createLogger } from "../lib/logger";
+import { createGracefulShutdown, type ShutdownController } from "../lib/graceful-shutdown";
 import { jobLogger, type JobLogger } from "../lib/worker-logger";
 import {
   CYCLE_TASK_RETRY_POLICY,
@@ -120,6 +121,7 @@ initWorkerHealth(WORKER_ID);
 export const SETTLEMENT_MAX_RETRIES = SETTLEMENT_RETRY_POLICY.maxAttempts;
 
 let isShuttingDown = false;
+let activeWorkerShutdown: ShutdownController | undefined;
 
 /**
  * Sleep between in-cycle retries. Injectable so tests can drive the backoff
@@ -1847,13 +1849,11 @@ export async function runWorkerCycle(): Promise<void> {
 }
 
 export async function startWorker(): Promise<() => Promise<void>> {
+  activeWorkerShutdown?.dispose();
   const stopReconciliation = startReconciliation();
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  // The cycle currently running, if any. Shutdown waits on this before it
-  // touches leases: a job that is mid-submission still owns its lease, and
-  // clearing it early is what would let a second worker resubmit the payment.
   let inFlight: Promise<void> | undefined;
 
   log.info({ workerId: WORKER_ID, intervalMs: config.WORKER_INTERVAL_MS }, "listening");
@@ -1877,11 +1877,9 @@ export async function startWorker(): Promise<() => Promise<void>> {
 
   void loop();
 
-  const shutdown = async (signal: NodeJS.Signals = "SIGINT"): Promise<void> => {
+  const close = async (signal: NodeJS.Signals): Promise<void> => {
     if (stopped) return;
     stopped = true;
-    // Set before draining: in-flight jobs finish the transition they started,
-    // but no new job is claimed while we wind down.
     isShuttingDown = true;
     if (timer) clearTimeout(timer);
     stopReconciliation();
@@ -1890,16 +1888,10 @@ export async function startWorker(): Promise<() => Promise<void>> {
 
     try {
       log.info(
-        { jobType: "worker_cycle", signal, timeoutMs, outcome: "shutdown_started" },
-        "shutdown started"
-      );
-      log.info(
         { jobType: "worker_cycle", signal, outcome: "accepting_jobs_stopped" },
         "stopped accepting new jobs"
       );
 
-      // Wait for the running cycle, but not forever — a hung upstream must not
-      // hold the process open past the deployment's grace period.
       let drained = true;
       if (inFlight) {
         let drainTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1912,8 +1904,6 @@ export async function startWorker(): Promise<() => Promise<void>> {
 
       if (drained) {
         log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_drained" }, "in-flight work drained");
-        // Nothing of ours is running now, so releasing is safe: the next worker
-        // picks these up immediately instead of waiting for them to lapse.
         await Promise.allSettled([
           prisma.settlement.updateMany({
             where: { claimedBy: WORKER_ID },
@@ -1925,9 +1915,6 @@ export async function startWorker(): Promise<() => Promise<void>> {
           }),
         ]);
       } else {
-        // A job is still running and still holds its lease. Releasing it now
-        // would invite a duplicate submission, so leave every lease in place and
-        // let it expire; the next worker recovers it through the normal path.
         log.warn(
           { jobType: "worker_cycle", signal, timeoutMs, outcome: "shutdown_drain_timeout" },
           "in-flight job outran the drain budget, leaving leases to expire"
@@ -1936,8 +1923,6 @@ export async function startWorker(): Promise<() => Promise<void>> {
     } catch (error) {
       log.error({ jobType: "worker_cycle", signal, reason: safeFailureMessage(error) }, "worker shutdown failed");
     } finally {
-      // The pool must be released on every path — including a drain timeout and
-      // a failed lease release — so a restart never inherits dangling connections.
       try {
         await prisma.$disconnect();
         log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
@@ -1947,18 +1932,21 @@ export async function startWorker(): Promise<() => Promise<void>> {
           "failed to disconnect the database cleanly"
         );
       }
-      log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "shutdown complete");
-      if (!config.isTest) {
-        process.exit(0);
-      }
     }
-
   };
 
-  process.once("SIGINT", () => void shutdown("SIGINT"));
-  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+  const controller = createGracefulShutdown({
+    logger: log,
+    timeoutMs: config.WORKER_SHUTDOWN_DRAIN_MS + config.SHUTDOWN_TIMEOUT_MS,
+    close,
+    exit: (code) => {
+      if (!config.isTest) process.exit(code);
+    },
+    logFields: { jobType: "worker_cycle" },
+  });
+  activeWorkerShutdown = controller;
 
-  return () => shutdown("SIGINT");
+  return () => controller.shutdown("SIGINT");
 }
 
 if (env.NODE_ENV !== "test") {

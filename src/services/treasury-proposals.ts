@@ -57,6 +57,11 @@ import {
   proposalExpiryDate,
   treasuryProposalExpiryDaysSchema,
 } from "./treasury-proposal-expiry";
+import {
+  parseTreasurySignatures,
+  serializeTreasurySignatures,
+  type StoredTreasurySignature,
+} from "../schemas/json-metadata";
 
 export interface CreateProposalParams {
   groupId: string;
@@ -98,12 +103,6 @@ function classifyProposalBuildError(error: unknown): Error {
     );
   }
   return Errors.upstream("The treasury proposal could not be built");
-}
-
-interface StoredSignature {
-  publicKey: string;
-  signature: string;
-  signedAt: string;
 }
 
 const STATUS = {
@@ -204,7 +203,7 @@ export const treasuryProposalsService = {
           xdr,
           txHash,
           threshold,
-          signatures: [] as any,
+          signatures: serializeTreasurySignatures([]),
           status: initialStatus,
           expiresAt,
         },
@@ -393,9 +392,11 @@ export const treasuryProposalsService = {
         }
 
         // Verify each signature corresponds to a group member's public key.
-        const stored: StoredSignature[] = (proposal.signatures as any) ?? [];
+        const stored: StoredTreasurySignature[] = parseTreasurySignatures(
+          proposal.signatures
+        );
         const existingKeys = new Set(stored.map((s) => s.publicKey));
-        const verified: StoredSignature[] = [...stored];
+        const verified: StoredTreasurySignature[] = [...stored];
         const now = new Date().toISOString();
 
         const memberList = [...memberSet];
@@ -410,7 +411,7 @@ export const treasuryProposalsService = {
           .filter((v): v is { pk: string; kp: Keypair } => v !== null);
         const memberByPk = new Map(memberKeypairs.map((v) => [v.pk, v.kp]));
 
-        for (const decorated of submitted.signatures as any[]) {
+        for (const decorated of submitted.signatures) {
           const hint: Buffer = decorated.hint();
           const signature: Buffer = decorated.signature();
           const signatureBase64 = signature.toString("base64");
@@ -500,7 +501,7 @@ export const treasuryProposalsService = {
         await tx.treasuryProposal.update({
           where: { id: proposal.id },
           data: {
-            signatures: verified as any,
+            signatures: serializeTreasurySignatures(verified),
             status: meetsThreshold ? STATUS.submitted : STATUS.awaitingSignatures,
           },
         });
@@ -570,7 +571,7 @@ export const treasuryProposalsService = {
   async mergeAndSubmit(
     tx: Prisma.TransactionClient,
     proposalId: string,
-    storedSignatures: StoredSignature[],
+    storedSignatures: StoredTreasurySignature[],
     actorPublicKey: string | null,
     actorUserId: string | null
   ): Promise<{
@@ -589,7 +590,9 @@ export const treasuryProposalsService = {
     const baseTx = new Transaction(proposal.xdr, config.networkPassphrase);
     for (const s of storedSignatures) {
       try {
-        baseTx.addSignature(s.publicKey, s.signature);
+        // Legacy rows may record only `{ publicKey, signedAt }` — without the
+        // base64 signature there is nothing to attach to the envelope.
+        if (s.signature) baseTx.addSignature(s.publicKey, s.signature);
       } catch {
         // signature may already exist on baseTx — fall back to a manual append
       }

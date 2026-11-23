@@ -33,8 +33,8 @@ function env(overrides: Partial<CorsEnvironment> = {}): CorsEnvironment {
     WEB_URL: "",
     CORS_ALLOW_CREDENTIALS: false,
     CORS_ALLOW_METHODS: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
-    CORS_ALLOW_HEADERS: "Content-Type,Authorization,X-Requested-With,Idempotency-Key",
-    CORS_EXPOSE_HEADERS: "X-Request-ID,X-Correlation-ID",
+    CORS_ALLOW_HEADERS: "Content-Type,Authorization,X-Requested-With,Idempotency-Key,X-Idempotency-Key",
+    CORS_EXPOSE_HEADERS: "X-Request-ID,X-Correlation-ID,Idempotent-Replay",
     CORS_MAX_AGE: 86400,
     ...overrides,
   };
@@ -94,6 +94,12 @@ describe("buildCorsOptions — environment-driven policy", () => {
       "Authorization",
       "X-Requested-With",
       "Idempotency-Key",
+      "X-Idempotency-Key",
+    ]);
+    expect(options.exposedHeaders).toEqual([
+      "X-Request-ID",
+      "X-Correlation-ID",
+      "Idempotent-Replay",
     ]);
   });
 

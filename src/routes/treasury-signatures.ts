@@ -25,7 +25,11 @@ import { requireUser } from "../plugins/auth";
 import { rateLimited } from "../lib/rate-limit";
 import { requireAdmin, requireMembership } from "../services/access";
 import { treasurySignaturesService } from "../services/treasury-signatures";
-import { treasuryTxProposalCreateSchema } from "../validations/treasury";
+import {
+  type TreasuryTxProposalCreateInput,
+  treasuryTxProposalCreateSchema,
+  validateTreasuryTxProposalCreateRequest,
+} from "../validations/treasury";
 import { serializeTreasuryTxProposal } from "../serializers";
 import { openApiBody, openApiIdParams, openApiEnvelope, openApiErrorResponses } from "../lib/openapi";
 
@@ -46,6 +50,7 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
     "/treasury/proposals",
     {
       ...rateLimited("treasuryPropose"),
+      preHandler: validateTreasuryTxProposalCreateRequest,
       schema: {
         tags: ["Treasury"],
         summary: "Submit external treasury proposal with rate limiting",
@@ -60,7 +65,7 @@ export default async function treasurySignatureRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const body = treasuryTxProposalCreateSchema.parse(req.body);
+      const body = req.body as TreasuryTxProposalCreateInput;
       await requireAdmin(body.treasuryId, auth.id);
 
       const { proposal, networkPassphrase } =

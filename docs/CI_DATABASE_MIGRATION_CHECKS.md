@@ -26,13 +26,24 @@ Applies all pending migrations in order against the test database.
 ```bash
 npm run prisma:status
 ```
-Verifies that all migrations in `prisma/migrations` are applied and up-to-date.
+Verifies that all migrations in `prisma/migrations` are applied and up-to-date. This runs `scripts/check-migration-health.ts`, which also performs the automated drift check below and emits one structured report.
 
 ### 4. Schema Drift Detection
 ```bash
 npm run prisma:check-drift
 ```
 Ensures that the deployed database matches `prisma/schema.prisma` with zero uncommitted schema drift.
+
+## Migration Health CLI (#1078)
+
+```bash
+npm run db:migration-health
+npm run db:migration-health -- --json
+```
+
+`scripts/check-migration-health.ts` validates the schema, parses `prisma migrate status` for pending and failed migrations, and compares the database to `prisma/schema.prisma` with `prisma migrate diff --exit-code`. It prints a human-readable report by default, supports `--json` for CI consumers, and exits non-zero for a missing `DATABASE_URL`, invalid schema, connection failure, failed/pending migration, or drift.
+
+The Prisma CLI resolves the datasource URL from `DATABASE_URL` in the child process environment; the connection string is never interpolated into a shell command or printed in diagnostics.
 
 ## Required Environment Variables
 

@@ -73,6 +73,7 @@ Content-Type: application/json
 POST {{baseUrl}}/api/v1/groups/{{groupId}}/expenses
 Authorization: Bearer {{token}}
 Content-Type: application/json
+X-Idempotency-Key: {{$guid}}
 
 {
   "title": "Pizza",

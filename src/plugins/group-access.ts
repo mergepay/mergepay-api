@@ -74,6 +74,8 @@ const groupIdSchema = z.string().min(1).max(64);
 /** Marks a preHandler produced by group/expense guards, so the plugin can order it. */
 export const GROUP_GUARD = Symbol.for("mergepay.groupGuard");
 
+export const GROUP_AFTER_GUARD = Symbol.for("mergepay.afterGroupGuard");
+
 type MarkedGuard = preHandlerAsyncHookHandler & { [GROUP_GUARD]?: true };
 
 export function isGroupGuard(fn: unknown): boolean {
@@ -83,6 +85,10 @@ export function isGroupGuard(fn: unknown): boolean {
     fn.name === "groupRoleGuard" ||
     fn.name === "expensePayerOrAdminGuard"
   );
+}
+
+export function isAfterGroupGuard(fn: unknown): boolean {
+  return typeof fn === "function" && (fn as any)[GROUP_AFTER_GUARD] === true;
 }
 
 /**
@@ -159,9 +165,15 @@ export default fp(async function groupAccessPlugin(app: FastifyInstance) {
     const chain = routeOptions.preHandler;
     if (!Array.isArray(chain) || !chain.some(isGroupGuard)) return;
     routeOptions.preHandler = [
-      ...chain.filter((fn) => !isGroupGuard(fn) && !isRequestValidationHook(fn)),
+      ...chain.filter(
+        (fn) =>
+          !isGroupGuard(fn) &&
+          !isAfterGroupGuard(fn) &&
+          !isRequestValidationHook(fn)
+      ),
       ...chain.filter(isGroupGuard),
       ...chain.filter(isRequestValidationHook),
+      ...chain.filter(isAfterGroupGuard),
     ];
   });
 });

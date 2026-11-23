@@ -19,6 +19,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService } from "../services/anchor";
 import { auditTx } from "../services/audit";
+import { sep24StartAction } from "../services/sep24-audit";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 import { getStatusHistory } from "../services/status-history";
@@ -178,10 +179,17 @@ export default async function sep24Routes(app: FastifyInstance) {
       await auditTx(tx, {
         correlationId: req.id,
         userId: auth.id,
-        action: "anchor_session.start",
+        action: sep24StartAction(kind),
         entityType: "anchor_session",
         entityId: created.id,
-        metadata: { kind, assetCode: validatedBody.assetCode },
+        actorPublicKey: auth.stellarPublicKey,
+        metadata: {
+          kind,
+          assetCode: validatedBody.assetCode,
+          ...("amount" in validatedBody && validatedBody.amount
+            ? { amount: validatedBody.amount }
+            : {}),
+        },
       });
       return created;
     });

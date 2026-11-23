@@ -180,7 +180,7 @@ describe("AC6: audit logging consistency", () => {
       const res = await app.inject({
         method: "POST",
         url: "/groups/group_1/expenses",
-        headers: authHeader(),
+        headers: { ...authHeader(), "x-idempotency-key": "expense-patched" },
         payload: {
           title: "Dinner",
           amount: "50.0000000",
@@ -331,7 +331,7 @@ describe("AC6: audit logging consistency", () => {
       const res = await app.inject({
         method: "POST",
         url: "/groups/group_1/expenses",
-        headers: authHeader(outsider),
+        headers: { ...authHeader(outsider), "x-idempotency-key": "expense-patched" },
         payload: {
           title: "Hack",
           amount: "100.0000000",
@@ -443,7 +443,7 @@ describe("AC6: audit logging consistency", () => {
       await app.inject({
         method: "POST",
         url: "/groups/group_1/expenses",
-        headers: authHeader(),
+        headers: { ...authHeader(), "x-idempotency-key": "expense-patched" },
         payload: {
           title: "Lunch",
           amount: "20.0000000",

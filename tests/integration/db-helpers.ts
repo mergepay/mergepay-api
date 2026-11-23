@@ -161,7 +161,10 @@ export async function createExpenseViaApi(
   const response = await app.inject({
     method: "POST",
     url: `/groups/${groupId}/expenses`,
-    headers: authHeaders(actor),
+    headers: {
+      ...authHeaders(actor),
+      "x-idempotency-key": `integration-expense-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    },
     payload,
   });
 

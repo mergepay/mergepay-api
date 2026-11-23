@@ -152,4 +152,20 @@ describe("treasuryTxProposalCreateSchema", () => {
       ).success
     ).toBe(true);
   });
+
+  it("rejects unexpected fields instead of silently stripping key material", () => {
+    const result = treasuryTxProposalCreateSchema.safeParse(
+      validPayload({ secret: "SSECRETKEY", seed: "SSEED" })
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const unrecognized = result.error.issues.filter(
+        (issue) => issue.code === "unrecognized_keys"
+      );
+      expect(unrecognized).toHaveLength(1);
+      if (unrecognized[0]?.code === "unrecognized_keys") {
+        expect(unrecognized[0].keys).toEqual(expect.arrayContaining(["secret", "seed"]));
+      }
+    }
+  });
 });

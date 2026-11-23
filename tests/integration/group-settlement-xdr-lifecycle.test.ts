@@ -88,7 +88,10 @@ describe("Group Expense Settlement XDR Lifecycle Integration (#900)", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${groupId}/expenses`,
-      headers: authHeaders(creditor),
+      headers: {
+        ...authHeaders(creditor),
+        "x-idempotency-key": "expense-xdr-lifecycle-1",
+      },
       payload: {
         title: "Team Lunch in USDC",
         amount: "90.0000000",

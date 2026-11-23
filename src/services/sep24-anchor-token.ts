@@ -44,6 +44,12 @@ import { sep24CallbackSchema, type Sep24Callback } from "../schemas/sep24";
 import { anchorService, mapAnchorStatus } from "./anchor";
 import { applyAnchorSessionTransition } from "./anchor-status";
 import { audit } from "./audit";
+import { AuditAction } from "./audit-actions";
+import {
+  accountPublicKeys,
+  sep24CallbackAuditMetadata,
+  sep24LifecycleAction,
+} from "./sep24-audit";
 import { sanitizeStatusReason } from "./sep24-status";
 import { isRecognisedSep24Status } from "./sep24-types";
 
@@ -195,20 +201,23 @@ export async function applySep24Callback(
 
   const sessions = await prisma.anchorSession.findMany({
     where: { externalTransactionId: callback.externalTransactionId },
-    select: { id: true, status: true },
+    select: { id: true, status: true, kind: true, userId: true },
   });
 
   if (sessions.length === 0) {
     await audit({
       correlationId: `job_sep24_callback_${callback.externalTransactionId}`,
-      action: "sep24.callback.unmatched",
+      action: AuditAction.SEP24_CALLBACK_UNMATCHED,
       entityType: "anchor_session",
       entityId: callback.externalTransactionId,
       outcome: "failure",
-      metadata: { rawStatus: callback.rawStatus, status },
+      metadata: sep24CallbackAuditMetadata(callback),
     });
     return { matched: 0, updated: 0, status };
   }
+
+  const publicKeys = await accountPublicKeys(sessions.map((session) => session.userId));
+  const callbackMetadata = sep24CallbackAuditMetadata(callback);
 
   let updated = 0;
   for (const session of sessions) {
@@ -216,19 +225,23 @@ export async function applySep24Callback(
       sessionId: session.id,
       nextStatus: status,
       source: "webhook",
+      rawStatus: callback.rawStatus,
       extraData: buildExtraData(callback),
       reason: sanitizeStatusReason(callback.message),
+      auditAction: sep24LifecycleAction(session.kind, status),
+      auditMetadata: callbackMetadata,
+      actorPublicKey: publicKeys.get(session.userId),
     });
     if (result.changed) updated += 1;
   }
 
   await audit({
     correlationId: `job_sep24_callback_${callback.externalTransactionId}`,
-    action: "sep24.callback.applied",
+    action: AuditAction.SEP24_CALLBACK_APPLIED,
     entityType: "anchor_session",
     entityId: callback.externalTransactionId,
     metadata: {
-      rawStatus: callback.rawStatus,
+      ...callbackMetadata,
       status,
       matched: sessions.length,
       updated,
@@ -241,9 +254,9 @@ export async function applySep24Callback(
 /**
  * Callback fields worth persisting alongside the transition.
  *
- * The Stellar transaction hash is recorded on completion so a settled deposit
- * can be traced to its on-chain payment. The anchor's JWT and the raw payload
- * are never persisted.
+ * Only sanitized text is persisted on the session row. The Stellar transaction
+ * hash and amounts travel to the audit record instead (see sep24-audit.ts);
+ * the anchor's JWT and the raw payload are never persisted.
  */
 function buildExtraData(callback: Sep24Callback) {
   const extra: Record<string, unknown> = {};

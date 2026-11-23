@@ -48,20 +48,26 @@ Wave task:
 ## Quickstart
 
 For a local API setup against Stellar testnet, follow the step-by-step guide in
-[docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md). The project defaults to testnet and should
-not be pointed at mainnet — `STELLAR_NETWORK` and `HORIZON_URL` must match.
+[docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md) (or the
+[Local quickstart](README.md#local-quickstart-testnet) in the README).
+**`.env.example` ships with public-network defaults** (`STELLAR_NETWORK=public`,
+`HORIZON_URL=https://horizon.stellar.org`); for local development override both
+to `STELLAR_NETWORK=testnet` and `HORIZON_URL=https://horizon-testnet.stellar.org`.
+Do not point local development at mainnet — `STELLAR_NETWORK` and `HORIZON_URL`
+must match, and `src/config.ts` rejects a mismatched pair at startup.
 
 ```bash
 git clone https://github.com/mergepay/mergepay-api.git
 cd mergepay-api
 npm install
 cp .env.example .env
-npm run gen:sep10key
+createdb mergepay             # once; then edit .env (testnet overrides, JWT_SECRET, DATABASE_URL)
+npm run gen:sep10key          # paste SEP10_SIGNING_SECRET into .env
 npm run prisma:generate
 npm run prisma:migrate
 npm run db:seed
-npm run dev
-npm run worker
+npm run dev                   # API on :4000
+npm run worker                # in a second terminal
 ```
 
 Then verify the local API is healthy:
@@ -187,8 +193,8 @@ The following environment variables can be used to configure integration tests:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HORIZON_URL` | Stellar Horizon endpoint | `https://horizon-testnet.stellar.org` |
-| `API_BASE_URL` | Base URL of the running API | `http://localhost:3000` |
+| `HORIZON_URL` | Stellar Horizon endpoint | `https://horizon-testnet.stellar.org` (test helper fallback) |
+| `API_BASE_URL` | Base URL of the running API | `http://localhost:3000` (test helper fallback) — the API itself listens on **:4000**, so set `API_BASE_URL=http://localhost:4000` when running against a local server |
 | `DATABASE_URL_TEST` | Test database connection string | Uses `DATABASE_URL` |
 
 ### Integration Test Details

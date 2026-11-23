@@ -206,7 +206,7 @@ describe("Expense mutation RBAC — POST /groups/:id/expenses", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${GROUP_ID}/expenses`,
-      headers: { authorization: bearer(NON_MEMBER) },
+      headers: { "x-idempotency-key": "expense-patched", authorization: bearer(NON_MEMBER) },
       payload: {
         title: "Unauthorized Expense",
         amount: "100",
@@ -224,7 +224,7 @@ describe("Expense mutation RBAC — POST /groups/:id/expenses", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${GROUP_ID}/expenses`,
-      headers: { authorization: bearer(MEMBER_USER) },
+      headers: { "x-idempotency-key": "expense-patched", authorization: bearer(MEMBER_USER) },
       payload: {
         title: "Team Lunch",
         amount: "100",
@@ -242,7 +242,7 @@ describe("Expense mutation RBAC — POST /groups/:id/expenses", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${GROUP_ID}/expenses`,
-      headers: { authorization: bearer(ADMIN_USER) },
+      headers: { "x-idempotency-key": "expense-patched", authorization: bearer(ADMIN_USER) },
       payload: {
         title: "Office Supplies",
         amount: "200",
@@ -614,7 +614,7 @@ describe("Non-existent group — expense mutations return 404", () => {
     const res = await app.inject({
       method: "POST",
       url: "/groups/nonexistent_group/expenses",
-      headers: { authorization: bearer(MEMBER_USER) },
+      headers: { "x-idempotency-key": "expense-patched", authorization: bearer(MEMBER_USER) },
       payload: {
         title: "Ghost Expense",
         amount: "100",
@@ -643,7 +643,10 @@ describe("Archived group — expense mutations return 403 (#648)", () => {
     const res = await app.inject({
       method: "POST",
       url: `/groups/${GROUP_ID}/expenses`,
-      headers: { authorization: bearer(MEMBER_USER) },
+      headers: {
+        authorization: bearer(MEMBER_USER),
+        "x-idempotency-key": "expense-rbac-archived",
+      },
       payload: {
         title: "Too Late",
         amount: "100",

@@ -501,6 +501,12 @@ describe("expense creation rate limiting (#518)", () => {
     };
   }
 
+  let keySeq = 0;
+  function expenseHeaders(userId: string) {
+    keySeq += 1;
+    return { ...tokenFor(userId), "x-idempotency-key": `expense-rate-${keySeq}` };
+  }
+
   it("carries its own budget rather than the global allowance", () => {
     const policy = policies.expenseCreate;
     // A dedicated policy, not a copy of the global numbers: a distinct
@@ -518,7 +524,7 @@ describe("expense creation rate limiting (#518)", () => {
   it("POST /groups/:id/expenses — per-route budget, headers, and 429 envelope", async () => {
     const max = policies.expenseCreate.max;
     const userId = "user_518_primary";
-    const headers = tokenFor(userId);
+    const headers = expenseHeaders(userId);
     const blocked = await exhaustAndAssert({
       method: "POST",
       url: groupUrl,
@@ -536,8 +542,8 @@ describe("expense creation rate limiting (#518)", () => {
   it("keys the bucket by the SEP-10 identity, not the client address", async () => {
     const max = policies.expenseCreate.max;
     const noisyId = "user_518_noisy";
-    const noisy = tokenFor(noisyId);
-    const neighbour = tokenFor("user_518_neighbour");
+    const noisy = expenseHeaders(noisyId);
+    const neighbour = expenseHeaders("user_518_neighbour");
 
     // Same client address, same route, same instant — only the token differs.
     for (let i = 0; i < max; i++) {
@@ -587,7 +593,7 @@ describe("expense creation rate limiting (#518)", () => {
     }
 
     const victimId = "user_518_victim";
-    const victim = tokenFor(victimId);
+    const victim = expenseHeaders(victimId);
     const first = await app.inject({
       method: "POST",
       url: groupUrl,
@@ -601,7 +607,7 @@ describe("expense creation rate limiting (#518)", () => {
   it("does not spend the settlement budget, and is not spent by it", async () => {
     const max = policies.expenseCreate.max;
     const userId = "user_518_cross_policy";
-    const headers = tokenFor(userId);
+    const headers = expenseHeaders(userId);
 
     // Exhaust expense creation for this identity.
     for (let i = 0; i < max; i++) {
@@ -673,6 +679,12 @@ describe("rate limiting and request throttling on high-frequency API routes (#50
     };
   }
 
+  let expenseKeySeq = 0;
+  function expenseHeaders(userId: string) {
+    expenseKeySeq += 1;
+    return { ...tokenFor(userId), "x-idempotency-key": `expense-509-${expenseKeySeq}` };
+  }
+
   it("ensures legitimate requests within rate limits pass without disruption", async () => {
     const max = policies.authChallenge.max;
     const client = Keypair.random();
@@ -730,7 +742,7 @@ describe("rate limiting and request throttling on high-frequency API routes (#50
   it("throttles sequential requests exceeding threshold on expense submission routes", async () => {
     const max = policies.expenseCreate.max;
     const userId = "user_509_expense_submitter";
-    const headers = tokenFor(userId);
+    const headers = expenseHeaders(userId);
     const groupUrl = "/groups/00000000-0000-0000-0000-000000000000/expenses";
 
     for (let i = 0; i < max; i++) {
@@ -785,6 +797,12 @@ describe("rate limiting and request throttling on high-frequency API routes (#50
     expect(blocked.json().code).toBe("RATE_LIMITED");
   });
 
+  let isolatedKeySeq = 0;
+  function isolatedExpenseHeaders(userId: string) {
+    isolatedKeySeq += 1;
+    return { ...tokenFor(userId), "x-idempotency-key": `expense-isolated-${isolatedKeySeq}` };
+  }
+
   it("guarantees independent throttling budgets between auth, mutations, and read routes", async () => {
     const authMax = policies.authChallenge.max;
     const client = Keypair.random();
@@ -814,7 +832,7 @@ describe("rate limiting and request throttling on high-frequency API routes (#50
       method: "POST",
       url: groupUrl,
       remoteAddress,
-      headers: tokenFor(userId),
+      headers: isolatedExpenseHeaders(userId),
       payload: validExpense(userId),
     });
     expect(expenseRes.statusCode).not.toBe(429);
@@ -1356,6 +1374,10 @@ describe("sensitive routes left on the global bucket (#682, #693)", () => {
     // Separate key prefixes: a client correcting typos must not exhaust the
     // allowance that guards opening new obligations.
     const headers = authHeader();
+    const createHeaders = {
+      ...headers,
+      "x-idempotency-key": "expense-independent-create",
+    };
     for (let i = 0; i < policies.expenseMutate.max + 1; i++) {
       await app.inject({
         method: "PATCH",
@@ -1367,7 +1389,7 @@ describe("sensitive routes left on the global bucket (#682, #693)", () => {
     const create = await app.inject({
       method: "POST",
       url: "/groups/00000000-0000-0000-0000-000000000000/expenses",
-      headers,
+      headers: createHeaders,
       payload: {
         title: "Dinner",
         amount: "10.0000000",

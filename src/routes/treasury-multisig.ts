@@ -33,8 +33,10 @@ import { rateLimited } from "../lib/rate-limit";
 import { requireAdmin } from "../services/access";
 import { treasurySignaturesService } from "../services/treasury-signatures";
 import {
+  type TreasuryTxProposalCreateInput,
   treasurySignatureSubmitSchema,
   treasuryTxProposalCreateSchema,
+  validateTreasuryTxProposalCreateRequest,
 } from "../validations/treasury";
 import { serializeTreasuryTxProposal } from "../serializers";
 import {
@@ -58,6 +60,7 @@ export default async function treasuryMultisigRoutes(app: FastifyInstance) {
     "/treasury/propose",
     {
       ...rateLimited("treasuryPropose"),
+      preHandler: validateTreasuryTxProposalCreateRequest,
       schema: {
         tags: ["Treasury"],
         summary: "Propose a treasury multisig transaction",
@@ -72,11 +75,11 @@ export default async function treasuryMultisigRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      // The shared schema is the whole request contract: `treasuryId` (or its
-      // legacy `groupId` alias), a parseable `xdr`, an optional bounded
-      // `description`. Unknown fields are stripped, so nothing outside this
-      // shape can reach the stored row.
-      const body = treasuryTxProposalCreateSchema.parse(req.body);
+      // The shared strict schema is the whole request contract: `treasuryId`
+      // (or its legacy `groupId` alias), a parseable `xdr`, and an optional
+      // bounded `description`. The preHandler already validated and normalised
+      // it; an unexpected key is rejected with the structured 400 envelope.
+      const body = req.body as TreasuryTxProposalCreateInput;
       await requireAdmin(body.treasuryId, auth.id);
 
       const { proposal, networkPassphrase } =

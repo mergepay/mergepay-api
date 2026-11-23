@@ -135,7 +135,7 @@ describe("POST /anchors/webhook — status transitions", () => {
       data: { status: "completed" },
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+      data: expect.objectContaining({ action: "anchor.deposit.completed" }),
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ action: "sep24.webhook.applied" }),
@@ -153,7 +153,7 @@ describe("POST /anchors/webhook — status transitions", () => {
     expect(res.statusCode).toBe(200);
     expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
-      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+      data: expect.objectContaining({ action: "anchor.deposit.completed" }),
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ action: "sep24.webhook.applied" }),
@@ -173,7 +173,7 @@ describe("POST /anchors/webhook — status transitions", () => {
     expect(res.statusCode).toBe(200);
     expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
-      data: expect.objectContaining({ action: "anchor_session.status_changed" }),
+      data: expect.objectContaining({ action: "anchor.deposit.completed" }),
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ action: "sep24.webhook.applied" }),
@@ -210,16 +210,16 @@ describe("POST /anchors/webhook — status transitions", () => {
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
-        action: "withdrawal.status_changed",
+        action: "anchor.withdrawal.completed",
         entityType: "withdrawal",
         entityId: "wth_1",
-        metadata: {
+        metadata: expect.objectContaining({
           from: "processing",
           to: "completed",
           source: "webhook",
           // The anchor pushed this, not the withdrawal's owner.
           actorType: "system",
-        },
+        }),
       }),
     });
   });
@@ -285,12 +285,12 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         action: "anchor_session.status_changed",
-        metadata: {
+        metadata: expect.objectContaining({
           from: "incomplete",
           to: "pending_user_transfer_start",
           source: "user",
           actorType: "user",
-        },
+        }),
       }),
     });
     // The anchor JWT must never appear in the audit trail.

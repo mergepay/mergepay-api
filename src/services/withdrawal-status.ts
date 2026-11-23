@@ -37,6 +37,7 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 import { auditTx } from "./audit";
+import { AuditAction } from "./audit-actions";
 import { Errors } from "../errors";
 
 export type WithdrawalStatus =
@@ -148,8 +149,23 @@ export async function applyWithdrawalTransition(params: {
   extraData?: Prisma.WithdrawalUncheckedUpdateInput;
   /** When set, the caller must own this withdrawal (throws 403/404 otherwise). */
   ownerUserId?: string;
+  /** Specific SEP-24 lifecycle action; defaults to the generic transition action. */
+  auditAction?: string;
+  /** Additional safe metadata (hash, amounts, asset code) written with the audit row. */
+  auditMetadata?: Record<string, unknown>;
+  /** Public Stellar key of the account whose transfer is transitioning. */
+  actorPublicKey?: string | null;
 }): Promise<WithdrawalTransitionResult<{ id: string; status: string }>> {
-  const { withdrawalId, nextStatus, source, extraData, ownerUserId } = params;
+  const {
+    withdrawalId,
+    nextStatus,
+    source,
+    extraData,
+    ownerUserId,
+    auditAction,
+    auditMetadata,
+    actorPublicKey,
+  } = params;
 
   return prisma.$transaction(async (tx) => {
     const withdrawal = await tx.withdrawal.findUnique({ where: { id: withdrawalId } });
@@ -212,10 +228,19 @@ export async function applyWithdrawalTransition(params: {
       // Same rule as anchor sessions: only "user" was performed by the owner —
       // "poll" is the worker, "webhook" is the anchor reporting back.
       actorType: source === "user" ? "user" : source === "poll" ? "worker" : "system",
-      action: "withdrawal.status_changed",
+      action: auditAction ?? AuditAction.WITHDRAWAL_STATUS_CHANGED,
       entityType: "withdrawal",
       entityId: withdrawalId,
-      metadata: { from: current, to: target, source },
+      ...(actorPublicKey ? { actorPublicKey } : {}),
+      metadata: {
+        from: current,
+        to: target,
+        source,
+        ...(withdrawal.assetCode ? { assetCode: withdrawal.assetCode } : {}),
+        ...(withdrawal.amount != null ? { amount: String(withdrawal.amount) } : {}),
+        ...(withdrawal.anchorTxId ? { stellarTransactionId: withdrawal.anchorTxId } : {}),
+        ...(auditMetadata ?? {}),
+      },
     });
 
     return { withdrawal: updated ?? withdrawal, changed: true };

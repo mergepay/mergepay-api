@@ -71,6 +71,25 @@ export const AuditAction = {
   SETTLEMENT_FAILED: "settlement.failed",
   SETTLEMENT_RETRIED: "settlement.retried",
 
+  // ── SEP-24 anchor deposits / withdrawals (#1079) ─────────────────────
+  // Values of the legacy action names are kept intact so existing alert
+  // queries and audit rows remain compatible; new lifecycle events use the
+  // `<domain>.<resource>.<verb>` convention.
+  ANCHOR_SESSION_START: "anchor_session.start",
+  ANCHOR_SESSION_STATUS_CHANGED: "anchor_session.status_changed",
+  ANCHOR_DEPOSIT_STARTED: "anchor.deposit.started",
+  ANCHOR_DEPOSIT_COMPLETED: "anchor.deposit.completed",
+  ANCHOR_DEPOSIT_FAILED: "anchor.deposit.failed",
+  ANCHOR_WITHDRAWAL_STARTED: "anchor.withdrawal.started",
+  ANCHOR_WITHDRAWAL_COMPLETED: "anchor.withdrawal.completed",
+  ANCHOR_WITHDRAWAL_FAILED: "anchor.withdrawal.failed",
+  WITHDRAWAL_START: "withdrawal.start",
+  WITHDRAWAL_STATUS_CHANGED: "withdrawal.status_changed",
+  SEP24_WEBHOOK_APPLIED: "sep24.webhook.applied",
+  SEP24_WEBHOOK_UNMATCHED: "sep24.webhook.unmatched",
+  SEP24_CALLBACK_APPLIED: "sep24.callback.applied",
+  SEP24_CALLBACK_UNMATCHED: "sep24.callback.unmatched",
+
   // ── Worker (background jobs) ────────────────────────────────────────
   // A cycle task that exhausted its in-cycle retry budget. Sweep tasks keep no
   // row of their own to fail, so this record is the durable trace that a job

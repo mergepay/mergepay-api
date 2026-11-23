@@ -41,8 +41,15 @@ import { config } from "../config";
 import { prisma } from "../db";
 import { sep24CallbackSchema, type Sep24Callback } from "../schemas/sep24";
 import { audit } from "./audit";
+import { AuditAction } from "./audit-actions";
 import { mapAnchorStatus } from "./anchor";
 import { applyAnchorSessionTransition } from "./anchor-status";
+import {
+  accountPublicKeys,
+  anchorTransactionAuditMetadata,
+  sep24CallbackAuditMetadata,
+  sep24LifecycleAction,
+} from "./sep24-audit";
 import { sanitizeStatusReason } from "./sep24-status";
 import { parseSep24TransactionResponse } from "./anchor-schemas";
 import { isTerminalSep24Status } from "./sep24-types";
@@ -257,19 +264,22 @@ export async function applySep24Callback(
 
   const sessions = await prisma.anchorSession.findMany({
     where: { externalTransactionId: callback.externalTransactionId },
-    select: { id: true, status: true },
+    select: { id: true, status: true, kind: true, userId: true },
   });
 
   if (sessions.length === 0) {
     await audit({
-      action: "sep24.webhook.unmatched",
+      action: AuditAction.SEP24_WEBHOOK_UNMATCHED,
       entityType: "anchor_session",
       entityId: callback.externalTransactionId,
       outcome: "failure",
-      metadata: { rawStatus: callback.rawStatus, status },
+      metadata: sep24CallbackAuditMetadata(callback),
     });
     return { matched: 0, updated: 0, status };
   }
+
+  const publicKeys = await accountPublicKeys(sessions.map((session) => session.userId));
+  const callbackMetadata = sep24CallbackAuditMetadata(callback);
 
   let updated = 0;
   for (const session of sessions) {
@@ -277,8 +287,12 @@ export async function applySep24Callback(
       sessionId: session.id,
       nextStatus: status,
       source: "webhook",
+      rawStatus: callback.rawStatus,
       extraData: buildExtraData(callback),
       reason: sanitizeStatusReason(callback.message),
+      auditAction: sep24LifecycleAction(session.kind, status),
+      auditMetadata: callbackMetadata,
+      actorPublicKey: publicKeys.get(session.userId),
     });
     if (result.changed) updated += 1;
   }
@@ -288,11 +302,11 @@ export async function applySep24Callback(
   // all, which is the record an operator needs when a status did not move
   // because the transition was disallowed rather than because nothing arrived.
   await audit({
-    action: "sep24.webhook.applied",
+    action: AuditAction.SEP24_WEBHOOK_APPLIED,
     entityType: "anchor_session",
     entityId: callback.externalTransactionId,
     metadata: {
-      rawStatus: callback.rawStatus,
+      ...callbackMetadata,
       status,
       matched: sessions.length,
       updated,
@@ -354,6 +368,8 @@ export async function trackSep24TransactionStatus(
   try {
     let effectiveRawStatus = options.rawStatus;
     let effectiveMessage = options.message;
+    let auditMetadata: Record<string, unknown> | undefined;
+    let anchorKind: string | undefined;
 
     // If an external anchor response payload is supplied, validate it using Zod schema
     if (options.anchorResponse !== undefined) {
@@ -369,6 +385,8 @@ export async function trackSep24TransactionStatus(
         };
       }
       effectiveRawStatus = parsed.transaction.status;
+      anchorKind = parsed.transaction.kind;
+      auditMetadata = anchorTransactionAuditMetadata(parsed.transaction);
       if (parsed.transaction.message) {
         effectiveMessage = parsed.transaction.message;
       }
@@ -392,11 +410,11 @@ export async function trackSep24TransactionStatus(
     const session = options.sessionId
       ? await prisma.anchorSession.findUnique({
           where: { id: options.sessionId },
-          select: { id: true, status: true, externalTransactionId: true },
+          select: { id: true, status: true, externalTransactionId: true, userId: true },
         })
       : await prisma.anchorSession.findFirst({
           where: { externalTransactionId },
-          select: { id: true, status: true, externalTransactionId: true },
+          select: { id: true, status: true, externalTransactionId: true, userId: true },
         });
 
     if (!session) {
@@ -411,12 +429,17 @@ export async function trackSep24TransactionStatus(
     }
 
     const previousStatus = session.status;
+    const publicKeys = await accountPublicKeys([session.userId]);
     const transitionResult = await applyAnchorSessionTransition({
       sessionId: session.id,
       nextStatus: normalizedStatus,
       source,
+      rawStatus: effectiveRawStatus,
       reason: sanitizeStatusReason(effectiveMessage),
       extraData: effectiveMessage ? { failureReason: sanitizeStatusReason(effectiveMessage) } : undefined,
+      auditAction: sep24LifecycleAction(anchorKind, normalizedStatus),
+      auditMetadata,
+      actorPublicKey: publicKeys.get(session.userId),
     });
 
     return {

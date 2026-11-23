@@ -1,6 +1,8 @@
 import { Errors } from "../errors";
 import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
 import { mpMemoSchema } from "../lib/stellar-validation";
+import { validateRequest } from "../middleware/validate-request";
+import { treasuryProposalExpiryDaysSchema } from "../services/treasury-proposal-expiry";
 /**
  * Shared Zod schemas for treasury multisig configuration and weight changes.
  *
@@ -145,6 +147,10 @@ export const treasuryTxProposalCreateSchema = z
       .max(280, "Description must be 280 characters or fewer")
       .optional(),
   })
+  // Strict is deliberate: a proposal carries an externally built envelope, and
+  // an unexpected field such as `secret` or `seed` must be refused outright
+  // rather than silently stripped (issue #1080).
+  .strict()
   .refine((value) => Boolean(value.treasuryId ?? value.groupId), {
     message: "treasuryId is required",
     path: ["treasuryId"],
@@ -222,7 +228,12 @@ export const treasuryMultisigProposalPayloadSchema = z
     threshold: stellarWeightSchema.optional(),
     xdr: treasuryXdrSchema.optional(),
     description: z.string().max(280).optional(),
+    expiresInDays: treasuryProposalExpiryDaysSchema.optional(),
   })
+  // Strict so a client cannot smuggle key material or unrelated fields into a
+  // server-built payment proposal; the route's Zod middleware reports an
+  // unrecognized key with the standard 400 VALIDATION_ERROR envelope (#1080).
+  .strict()
   .refine(
     (data) => {
       if (data.assetCode !== "XLM" && data.assetCode !== "native" && !data.assetIssuer) {
@@ -239,6 +250,26 @@ export const treasuryMultisigProposalPayloadSchema = z
 export type TreasuryMultisigProposalPayload = z.infer<
   typeof treasuryMultisigProposalPayloadSchema
 >;
+
+/**
+ * Request-validation middleware for both externally built transaction proposals
+ * (`/treasury/propose`, `/api/treasury/proposals`) — issue #1080.
+ *
+ * Uses the shared `validateRequest` preHandler so a rejection is rendered by
+ * the central ZodError handler as `400 VALIDATION_ERROR` with `details` and
+ * `issues`, identical to every other validated surface.
+ */
+export const validateTreasuryTxProposalCreateRequest = validateRequest({
+  body: treasuryTxProposalCreateSchema,
+});
+
+/**
+ * Request-validation middleware for server-built payment proposals
+ * (`/groups/:groupId/treasury/proposals`) — issue #1080.
+ */
+export const validateTreasuryMultisigProposalCreateRequest = validateRequest({
+  body: treasuryMultisigProposalPayloadSchema,
+});
 
 /**
  * Fastify preHandler validation hook for treasury multisig proposals (#874).

@@ -338,12 +338,14 @@ describe("POST /withdraw/:id/confirm", () => {
         action: "withdrawal.status_changed",
         entityType: "withdrawal",
         entityId: "wth_1",
-        metadata: {
+        metadata: expect.objectContaining({
           from: "pending",
           to: "processing",
           source: "user",
           actorType: "user",
-        },
+          amount: "5",
+          assetCode: "XLM",
+        }),
       }),
     });
   });

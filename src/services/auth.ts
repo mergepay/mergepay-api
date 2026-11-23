@@ -27,6 +27,10 @@ export {
   validateChallengeTimeBounds,
   jwtClaimsSchema,
 };
+export {
+  assertSep10TransactionEnvelope,
+  validateSep10DomainClaims,
+} from "../validations/sep10";
 export type { VerifiedChallenge, AuthUser, JwtClaims };
 
 type Sep10FailureCode =

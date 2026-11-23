@@ -46,6 +46,22 @@ export interface RequestValidationSchemas {
   body?: ZodTypeAny;
 }
 
+/** Marks validation hooks so authorization guards can stay ahead of them. */
+export const REQUEST_VALIDATION_HOOK = Symbol("requestValidationHook");
+
+type MarkedValidationHook = preHandlerHookHandler & {
+  [REQUEST_VALIDATION_HOOK]?: true;
+};
+
+export function isRequestValidationHook(
+  hook: unknown
+): hook is MarkedValidationHook {
+  return (
+    typeof hook === "function" &&
+    (hook as MarkedValidationHook)[REQUEST_VALIDATION_HOOK] === true
+  );
+}
+
 /**
  * Build a `preHandler` that validates the named request parts with Zod.
  *
@@ -58,7 +74,7 @@ export interface RequestValidationSchemas {
 export function validateRequest(
   schemas: RequestValidationSchemas
 ): preHandlerHookHandler {
-  return async function validateRequestHandler(
+  const handler: MarkedValidationHook = async function validateRequestHandler(
     req: FastifyRequest
   ): Promise<void> {
     if (schemas.params) {
@@ -71,4 +87,6 @@ export function validateRequest(
       req.body = schemas.body.parse(req.body);
     }
   };
+  handler[REQUEST_VALIDATION_HOOK] = true;
+  return handler;
 }

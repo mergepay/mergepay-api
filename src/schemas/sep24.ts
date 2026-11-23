@@ -15,6 +15,7 @@
  * than left as a weaker duplicate.
  */
 export {
+  anchorSessionListQuerySchema,
   sep24AccountSchema,
   sep24AmountSchema,
   sep24AssetCodeSchema,
@@ -39,6 +40,7 @@ export {
   sep24WithdrawalParamsSchema,
   sep24WithdrawalRequestBodySchema,
   sep24WithdrawRequestSchema,
+  type AnchorSessionListQuery,
   type Sep24CallbackQuery,
   type Sep24CompleteRequest,
   type Sep24InitQuery,

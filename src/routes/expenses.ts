@@ -14,11 +14,8 @@ import { requireUser } from "../plugins/auth";
 import { requireActiveMembership, requireMembership } from "../services/access";
 import { requireGroupRole } from "../plugins/group-access";
 import { requireExpensePayerOrAdmin } from "../middleware/group-guard";
-import {
-  computeShares,
-  isSettlementEngineError,
-  type SplitType,
-} from "../services/settlement";
+import { validateRequest } from "../middleware/validate-request";
+import { computeShares, isSettlementEngineError } from "../services/settlement";
 import { shortCode } from "../services/codes";
 import { serializeExpense } from "../serializers";
 import {
@@ -31,9 +28,14 @@ import {
 } from "../lib/pagination";
 import { auditTx, logActionTx } from "../services/audit";
 import { AuditAction } from "../services/audit-actions";
-import { validateAsset, validateAmount } from "../services/assets";
+import { validateAsset } from "../services/assets";
 import { assertParticipantsCanHoldAsset } from "../services/horizon";
-import { createExpenseSchema, updateExpenseSchema } from "../validations/expense";
+import {
+  createExpenseSchema,
+  updateExpenseSchema,
+  type CreateExpenseInput,
+  type UpdateExpenseInput,
+} from "../validations/expense";
 import { expenseListQuerySchema, listGroupExpenses } from "../services/expenses";
 import { rateLimited } from "../lib/rate-limit";
 
@@ -77,14 +79,17 @@ export default async function expenseRoutes(app: FastifyInstance) {
     "/groups/:id/expenses",
     {
       ...createLimit,
-      preHandler: requireGroupRole("member", { param: "id", active: true }),
+      preHandler: [
+        requireGroupRole("member", { param: "id", active: true }),
+        validateRequest({ params: idParamSchema, body: createExpenseSchema }),
+      ],
       schema: {
         tags: ["Expenses"],
         summary: "Create an expense in a group",
         description:
           "Records a group expense and its payment split. The payer's share is settled immediately; every other participant's share is owed.",
         params: openApiIdParams(),
-        body: openApiBody(createExpenseSchema),
+        body: openApiBody(createExpenseSchema, { enforce: false }),
         response: {
           ...openApiEnvelope("expense"),
           ...openApiErrorResponses(400, 401, 403, 404, 429),
@@ -93,10 +98,8 @@ export default async function expenseRoutes(app: FastifyInstance) {
     },
     async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = idParamSchema.parse(req.params);
-
-    const body = createExpenseSchema.parse(req.body);
-    validateAmount(body.amount);
+    const { id: groupId } = req.params as { id: string };
+    const body = req.body as CreateExpenseInput;
     const asset = validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const payerUserId = body.payerUserId ?? auth.id;
@@ -115,7 +118,7 @@ export default async function expenseRoutes(app: FastifyInstance) {
 
     let computed;
     try {
-      computed = computeShares(body.amount, body.splitType as SplitType, body.shares);
+      computed = computeShares(body.amount, body.splitType, body.shares);
     } catch (e) {
       // The engine's errors are all client mistakes carrying a stable code;
       // the route forwards code + message so a client can branch without
@@ -283,14 +286,17 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
     "/expenses/:id",
     {
       ...mutateLimit,
-      preHandler: requireExpensePayerOrAdmin({ param: "id", active: true }),
+      preHandler: [
+        requireExpensePayerOrAdmin({ param: "id", active: true }),
+        validateRequest({ params: idParamSchema, body: updateExpenseSchema }),
+      ],
       schema: {
         tags: ["Expenses"],
         summary: "Update an expense",
         description:
           "Updates expense metadata. Only the payer or a group admin may edit it.",
         params: openApiIdParams(),
-        body: openApiBody(updateExpenseSchema),
+        body: openApiBody(updateExpenseSchema, { enforce: false }),
         response: {
           ...openApiEnvelope("expense"),
           ...openApiErrorResponses(400, 401, 403, 404),
@@ -299,8 +305,8 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
     },
     async (req) => {
     const auth = requireUser(req);
-    const { id } = idParamSchema.parse(req.params);
-    const body = updateExpenseSchema.parse(req.body);
+    const { id } = req.params as { id: string };
+    const body = req.body as UpdateExpenseInput;
 
     // The membership/role check and the update run in one transaction: a
     // concurrent removal or demotion of `auth.id` between the check and the
@@ -344,7 +350,10 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
     "/expenses/:id",
     {
       ...mutateLimit,
-      preHandler: requireExpensePayerOrAdmin({ param: "id", active: true }),
+      preHandler: [
+        requireExpensePayerOrAdmin({ param: "id", active: true }),
+        validateRequest({ params: idParamSchema }),
+      ],
       schema: {
         tags: ["Expenses"],
         summary: "Delete an expense",
@@ -359,7 +368,7 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
     },
     async (req) => {
     const auth = requireUser(req);
-    const { id } = idParamSchema.parse(req.params);
+    const { id } = req.params as { id: string };
 
     // Same atomicity concern as the update route above: check and delete
     // happen in one transaction.

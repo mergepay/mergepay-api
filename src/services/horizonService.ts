@@ -15,6 +15,7 @@ export {
   type HorizonRetryPolicy,
 } from "./horizon-retry";
 import { config } from "../config";
+import { getHorizonClient } from "./stellar";
 import { Errors } from "../errors";
 import { createLogger } from "../lib/logger";
 import { ProviderError } from "../lib/provider-error";
@@ -38,7 +39,7 @@ const log = createLogger({ name: "horizon" });
  * connection reuse is the default and tests only need to mock `HORIZON_URL`.
  */
 function server(): Horizon.Server {
-  if (!_server) _server = new Horizon.Server(config.HORIZON_URL);
+  if (!_server) _server = getHorizonClient(config.HORIZON_URL);
   return _server;
 }
 

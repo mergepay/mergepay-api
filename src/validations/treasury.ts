@@ -1,5 +1,7 @@
 import { Errors } from "../errors";
 import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
+import { dateRangeQueryShape, identifierQuerySchema } from "../schemas/common";
+import { paginationQuerySchema } from "../lib/pagination";
 import { mpMemoSchema } from "../lib/stellar-validation";
 /**
  * Shared Zod schemas for treasury multisig configuration and weight changes.
@@ -255,3 +257,35 @@ export async function validateTreasuryProposalHook(req: any) {
   }
   req.treasuryProposal = parsed.data;
 }
+
+/** Query for `GET /groups/:id/treasury/history`. */
+export const treasuryHistoryQuerySchema = paginationQuerySchema.extend({
+  direction: z.enum(["deposit", "withdrawal"]).optional(),
+  status: z.enum(["pending", "submitting", "confirmed", "failed"]).optional(),
+  assetCode: assetCodeSchema.optional(),
+  userId: identifierQuerySchema.optional(),
+  ...dateRangeQueryShape,
+});
+
+export type TreasuryHistoryQuery = z.infer<typeof treasuryHistoryQuerySchema>;
+
+/** Query for `GET /groups/:groupId/treasury/proposals`. */
+export const treasuryProposalListQuerySchema = paginationQuerySchema.extend({
+  status: z
+    .enum([
+      "pending",
+      "open",
+      "awaiting_signatures",
+      "ready",
+      "submitted",
+      "confirmed",
+      "failed",
+      "rejected",
+      "expired",
+    ])
+    .optional(),
+  creatorId: identifierQuerySchema.optional(),
+  ...dateRangeQueryShape,
+});
+
+export type TreasuryProposalListQuery = z.infer<typeof treasuryProposalListQuerySchema>;

@@ -200,3 +200,38 @@ describe("withHorizonFailover", () => {
     expect(horizonMocks.created).toHaveLength(1);
   });
 });
+
+describe("getHorizonClient", () => {
+  it("constructs one client per URL and reuses it for later callers", async () => {
+    const stellar = await loadStellar(["https://shared.example.com"]);
+
+    expect(horizonMocks.created).toHaveLength(0);
+    const first = stellar.getHorizonClient("https://shared.example.com");
+    const second = stellar.getHorizonClient("https://shared.example.com");
+    const other = stellar.getHorizonClient("https://other.example.com");
+
+    expect(second).toBe(first);
+    expect(other).not.toBe(first);
+    expect(horizonMocks.created.map((entry) => entry.url)).toEqual([
+      "https://shared.example.com",
+      "https://other.example.com",
+    ]);
+  });
+
+  it("shares clients with the failover endpoint pool", async () => {
+    const stellar = await loadStellar([
+      "https://primary.example.com",
+      "https://backup.example.com",
+    ]);
+
+    await stellar.withHorizonFailover(async () => "ok");
+
+    expect(stellar.getHorizonClient("https://primary.example.com")).toBe(
+      horizonMocks.created[0].server
+    );
+    expect(stellar.getHorizonClient("https://backup.example.com")).toBe(
+      horizonMocks.created[1].server
+    );
+    expect(horizonMocks.created).toHaveLength(2);
+  });
+});

@@ -26,6 +26,12 @@ import {
   stellarPublicKeySchema,
 } from "../lib/stellar-validation";
 import { paginationQuerySchema } from "../lib/pagination";
+import {
+  SEP24_TRANSACTION_STATUSES,
+  type Sep24TransactionStatus,
+} from "../services/sep24-types";
+import { assetCodeSchema } from "../schemas/asset";
+import { dateRangeQueryShape } from "../schemas/common";
 import { signedXdrRequestSchema } from "./stellar-transaction";
 
 /** Language tag accepted by SEP-24 start, read, and callback endpoints. */
@@ -114,12 +120,12 @@ export type Sep24TransactionQuery = z.infer<typeof sep24TransactionQuerySchema>;
  * Query parameters for SEP-24 transaction *list* polling
  * (`GET /api/sep24/transactions`).
  *
- * The spec's `/transactions` endpoint takes the transfer direction and a page
- * bound, and nothing else that Mergepay can answer: it has no anchor-side text
- * search, and its sessions carry no asset filter that a client could not read
- * from the returned rows. So the schema is the shared pagination contract —
- * `limit`, `cursor`, `order`, strict about unknown keys exactly as every other
- * list endpoint — extended with the two SEP-24 parameters this API honours.
+ * The spec's `/transactions` endpoint takes the transfer direction, an asset,
+ * and a page bound; it has no anchor-side text search. So the schema is the
+ * shared pagination contract — `limit`, `cursor`, `order`, strict about unknown
+ * keys exactly as every other list endpoint — extended with the SEP-24
+ * parameters this API honours. `status` and the date bounds are additive
+ * Mergepay filters over the stored session rows.
  *
  * `kind` is an enum rather than a free string because it goes straight into a
  * database filter: `?kind=depos` is a client bug, and answering it with an
@@ -129,12 +135,32 @@ export type Sep24TransactionQuery = z.infer<typeof sep24TransactionQuerySchema>;
  * localisation of an anchor `message`, which Mergepay serves from stored
  * history, so it is validated and then ignored rather than rejected.
  */
+const sep24StatusSchema = z.enum(
+  SEP24_TRANSACTION_STATUSES as unknown as [
+    Sep24TransactionStatus,
+    ...Sep24TransactionStatus[],
+  ]
+);
+
 export const sep24TransactionsQuerySchema = paginationQuerySchema.extend({
   kind: z.enum(["deposit", "withdrawal"]).optional(),
+  asset_code: assetCodeSchema.optional(),
+  status: sep24StatusSchema.optional(),
   lang: sep24LangSchema.optional(),
+  ...dateRangeQueryShape,
 });
 
 export type Sep24TransactionsQuery = z.infer<typeof sep24TransactionsQuerySchema>;
+
+/** Query for Mergepay's authenticated `GET /anchors/sessions` list. */
+export const anchorSessionListQuerySchema = paginationQuerySchema.extend({
+  kind: z.enum(["deposit", "withdrawal"]).optional(),
+  status: sep24StatusSchema.optional(),
+  assetCode: assetCodeSchema.optional(),
+  ...dateRangeQueryShape,
+});
+
+export type AnchorSessionListQuery = z.infer<typeof anchorSessionListQuerySchema>;
 
 /**
  * Path parameter for the anchor-session status read and interactive completion

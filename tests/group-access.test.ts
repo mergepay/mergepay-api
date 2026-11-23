@@ -591,7 +591,7 @@ describe("expense routes on the real app", () => {
         method,
         url: "/expenses/expense_1",
         headers: bearer(newUser(null)),
-        payload: method === "GET" ? undefined : {},
+        payload: method === "GET" ? undefined : method === "PATCH" ? { title: "Updated" } : {},
       });
       expect(res.statusCode).toBe(403);
       expect(res.json().error.code).toBe("FORBIDDEN");
@@ -607,7 +607,7 @@ describe("expense routes on the real app", () => {
         method,
         url: "/expenses/expense_missing",
         headers: bearer(newUser(null)),
-        payload: method === "GET" ? undefined : {},
+        payload: method === "GET" ? undefined : method === "PATCH" ? { title: "Updated" } : {},
       });
       expect(res.statusCode).toBe(404);
       expect(res.json().error.code).toBe("NOT_FOUND");
@@ -625,7 +625,7 @@ describe("expense routes on the real app", () => {
         method,
         url: "/expenses/expense_1",
         headers: bearer(newUser(method === "GET" ? "member" : "admin")),
-        payload: method === "GET" ? undefined : {},
+        payload: method === "GET" ? undefined : method === "PATCH" ? { title: "Updated" } : {},
       });
       expect(res.statusCode).toBe(200);
     }

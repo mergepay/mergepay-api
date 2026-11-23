@@ -604,10 +604,10 @@ describe("Expense Update Zod Validation", () => {
     expect(result.success).toBe(true);
   });
 
-  it("accepts empty update object", () => {
+  it("rejects an empty update object", () => {
     const payload = {};
     const result = updateExpenseSchema.safeParse(payload);
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
   });
 
   it("rejects title exceeding 80 characters", () => {
@@ -628,17 +628,15 @@ describe("Expense Update Zod Validation", () => {
     expect(result.success).toBe(false);
   });
 
-  it("accepts any receipt URL value (schema doesn't validate URL format)", () => {
+  it("rejects an invalid receipt URL", () => {
     const payload = { receiptUrl: "not-a-url" };
     const result = updateExpenseSchema.safeParse(payload);
-    // The update schema doesn't use URL validation
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
   });
 
-  it("accepts unknown fields (schema doesn't use strict mode)", () => {
+  it("rejects unknown fields with strict mode", () => {
     const payload = { unknownField: "value" };
     const result = updateExpenseSchema.safeParse(payload);
-    // The update schema doesn't use .strict(), so unknown fields are allowed
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
   });
 });

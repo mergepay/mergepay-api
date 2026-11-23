@@ -43,6 +43,7 @@ import type {
 } from "fastify";
 import fp from "fastify-plugin";
 import { z } from "zod";
+import { isRequestValidationHook } from "../middleware/validate-request";
 import { prisma } from "../db";
 import { Errors } from "../errors";
 import { requireUser } from "./auth";
@@ -158,8 +159,9 @@ export default fp(async function groupAccessPlugin(app: FastifyInstance) {
     const chain = routeOptions.preHandler;
     if (!Array.isArray(chain) || !chain.some(isGroupGuard)) return;
     routeOptions.preHandler = [
-      ...chain.filter((fn) => !isGroupGuard(fn)),
+      ...chain.filter((fn) => !isGroupGuard(fn) && !isRequestValidationHook(fn)),
       ...chain.filter(isGroupGuard),
+      ...chain.filter(isRequestValidationHook),
     ];
   });
 });

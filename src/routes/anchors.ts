@@ -14,17 +14,18 @@ import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
 import { applySep24Callback } from "../services/sep24";
 import {
-  paginationQuerySchema,
   buildPage,
   cursorFilter,
   cursorOrderBy,
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
+import { composeWhere, dateRangeWhere } from "../schemas/common";
 import { serializeAnchorSession } from "../serializers";
 import { getStatusHistory } from "../services/status-history";
 import { validateAsset } from "../services/assets";
 import {
+  anchorSessionListQuerySchema,
   sep24CallbackQuerySchema,
   sep24CompleteRequestSchema,
   sep24DepositRequestSchema,
@@ -325,7 +326,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         tags: ["SEP-24"],
         summary: "List user anchor sessions",
         description:
-          "Returns a paginated list of SEP-24 interactive sessions for the authenticated user.",
+          "Returns a paginated list of SEP-24 interactive sessions for the authenticated user. Accepts the shared pagination parameters plus optional kind, status, assetCode, startDate, and endDate filters.",
         response: {
           200: {
             type: "object",
@@ -341,14 +342,30 @@ export default async function anchorRoutes(app: FastifyInstance) {
     async (req) => {
       const auth = requireUser(req);
       sep24NoParamsSchema.parse(req.params ?? {});
-      const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+      const {
+        cursor,
+        limit,
+        order,
+        kind,
+        status,
+        assetCode,
+        startDate,
+        endDate,
+      } = anchorSessionListQuerySchema.parse(req.query ?? {});
       const position = requireCursor(cursor);
+      const createdAt = dateRangeWhere({ startDate, endDate });
+      const cursorScope = cursorFilter(position, order);
+      const filters = [
+        { userId: auth.id },
+        ...(kind ? [{ kind }] : []),
+        ...(status ? [{ status }] : []),
+        ...(assetCode ? [{ assetCode }] : []),
+        ...(createdAt ? [{ createdAt }] : []),
+      ];
+      const where = composeWhere(filters, cursorScope, ["createdAt"]);
 
       const sessions = await prisma.anchorSession.findMany({
-        where: {
-          userId: auth.id,
-          ...cursorFilter(position, order),
-        },
+        where,
         orderBy: cursorOrderBy(order),
         take: takeForPage(limit),
       });

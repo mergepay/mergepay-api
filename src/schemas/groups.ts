@@ -37,6 +37,7 @@ import {
   GROUP_LIST_MAX_PAGE_SIZE,
   paginationQuerySchema,
 } from "../lib/pagination";
+import { booleanQuerySchema, identifierQuerySchema } from "./common";
 
 // ---------------------------------------------------------------------------
 // Field primitives
@@ -86,6 +87,17 @@ export const groupMemberParamsSchema = z.object({
 });
 
 /**
+ * Query for `GET /groups`: the shared cursor plus filters on the membership
+ * row and its group. Keyset paging is always applied inside the filtered set.
+ */
+export const groupListQuerySchema = paginationQuerySchema.extend({
+  role: groupRoleSchema.optional(),
+  archived: booleanQuerySchema.optional(),
+  treasuryEnabled: booleanQuerySchema.optional(),
+  createdByUserId: identifierQuerySchema.optional(),
+});
+
+/**
  * Query for the paginated member list on `GET /groups/:id`.
  *
  * Members sort alphabetically by display name, so the shared `(createdAt, id)`
@@ -101,6 +113,9 @@ export const groupMemberListQuerySchema = paginationQuerySchema.extend({
     .max(GROUP_LIST_MAX_PAGE_SIZE)
     .default(DEFAULT_PAGE_SIZE),
   order: z.enum(["asc", "desc"]).default("asc"),
+  role: groupRoleSchema.optional(),
+  userId: identifierQuerySchema.optional(),
+  search: z.string().trim().min(1).max(100).optional(),
 });
 
 // ---------------------------------------------------------------------------

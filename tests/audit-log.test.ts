@@ -55,6 +55,7 @@ vi.mock("../src/services/stellar", async (importActual) => {
 });
 
 import { buildApp } from "../src/app";
+import { encodeCursor } from "../src/lib/pagination";
 import { signToken } from "../src/plugins/auth";
 
 const prisma = h.prisma;
@@ -153,7 +154,7 @@ describe("GET /groups/:id/audit-log", () => {
       actorDisplayName: "Tester",
     });
     expect(body.events[0].metadata).toEqual({ amount: "10" });
-    expect(body.nextCursor).toBeNull();
+    expect(body.meta).toEqual({ nextCursor: null, hasMore: false, limit: 50, order: "desc" });
   });
 
   it("requests one extra row to compute nextCursor and returns it when there are more pages", async () => {
@@ -177,14 +178,21 @@ describe("GET /groups/:id/audit-log", () => {
     const body = res.json();
     expect(body.events).toHaveLength(1);
     expect(body.events[0].id).toBe("a1");
-    expect(body.nextCursor).toBe("a1");
+    expect(body.meta.nextCursor).toBe(
+      encodeCursor(new Date("2026-02-01T00:00:00.000Z"), "a1")
+    );
+    expect(body.meta).toMatchObject({ hasMore: true, limit: 1, order: "desc" });
 
     expect(prisma.auditLog.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ take: 2, where: expect.objectContaining({ groupId: "group_1" }) })
+      expect.objectContaining({
+        take: 2,
+        where: expect.objectContaining({ groupId: "group_1" }),
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      })
     );
   });
 
-  it("passes the cursor through to the query and scopes by group", async () => {
+  it("applies the shared cursor filter and scopes by group", async () => {
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId: "group_1",
       userId: "user_1",
@@ -192,9 +200,11 @@ describe("GET /groups/:id/audit-log", () => {
     });
     prisma.auditLog.findMany.mockResolvedValueOnce([]);
 
+    const createdAt = new Date("2026-02-01T00:00:00.000Z");
+    const cursor = encodeCursor(createdAt, "a1");
     const res = await app.inject({
       method: "GET",
-      url: "/groups/group_1/audit-log?cursor=a1&action=expense.create&actorUserId=user_1",
+      url: `/groups/group_1/audit-log?cursor=${cursor}&action=expense.create&actorUserId=user_1`,
       headers: authHeader(),
     });
 
@@ -205,11 +215,103 @@ describe("GET /groups/:id/audit-log", () => {
           groupId: "group_1",
           action: "expense.create",
           userId: "user_1",
+          OR: [{ createdAt: { lt: createdAt } }, { createdAt, id: { lt: "a1" } }],
         }),
-        cursor: { id: "a1" },
-        skip: 1,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: 51,
       })
     );
+    expect(prisma.auditLog.findMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ cursor: expect.anything(), skip: 1 })
+    );
+  });
+
+  it("returns 400 for an action outside the audit action vocabulary", async () => {
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: "user_1",
+      role: "admin",
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/groups/group_1/audit-log?action=not.a.real.action",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    expect(prisma.auditLog.findMany).not.toHaveBeenCalled();
+  });
+
+  it("accepts an action from the audit action vocabulary", async () => {
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: "user_1",
+      role: "admin",
+    });
+    prisma.auditLog.findMany.mockResolvedValueOnce([]);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/groups/group_1/audit-log?action=treasury.proposal.created",
+      headers: authHeader(),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.auditLog.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          groupId: "group_1",
+          action: "treasury.proposal.created",
+        }),
+      })
+    );
+  });
+
+  it("pages through more entries than the limit without overlap", async () => {
+    prisma.groupMember.findUnique
+      .mockResolvedValueOnce({ groupId: "group_1", userId: "user_1", role: "admin" })
+      .mockResolvedValueOnce({ groupId: "group_1", userId: "user_1", role: "admin" });
+
+    const rows = ["a1", "a2", "a3", "a4", "a5"].map((id, index) =>
+      fakeEvent({ id, createdAt: new Date(Date.UTC(2026, 1, 1, 0, 0, 5 - index)) })
+    );
+    prisma.auditLog.findMany
+      .mockImplementationOnce(async () => rows.slice(0, 3))
+      .mockImplementationOnce(async (args: any) => {
+        const boundary = args.where.OR[0].createdAt.lt as Date;
+        return rows.filter((row) => row.createdAt < boundary).slice(0, 3);
+      });
+
+    const firstRes = await app.inject({
+      method: "GET",
+      url: "/groups/group_1/audit-log?limit=2",
+      headers: authHeader(),
+    });
+    expect(firstRes.statusCode).toBe(200);
+    const first = firstRes.json();
+    expect(first.events.map((event: any) => event.id)).toEqual(["a1", "a2"]);
+    expect(first.meta).toMatchObject({
+      hasMore: true,
+      limit: 2,
+      nextCursor: encodeCursor(rows[1].createdAt, "a2"),
+    });
+
+    const secondRes = await app.inject({
+      method: "GET",
+      url: `/groups/group_1/audit-log?limit=2&cursor=${first.meta.nextCursor}`,
+      headers: authHeader(),
+    });
+    expect(secondRes.statusCode).toBe(200);
+    const second = secondRes.json();
+    expect(second.events.map((event: any) => event.id)).toEqual(["a3", "a4"]);
+    expect(
+      second.events.some((event: any) =>
+        first.events.some((prior: any) => prior.id === event.id)
+      )
+    ).toBe(false);
+    expect(second.meta.nextCursor).toBe(encodeCursor(rows[3].createdAt, "a4"));
   });
 
   it("returns 400 for an invalid date range", async () => {
@@ -259,7 +361,10 @@ describe("GET /groups/:id/audit-log", () => {
     });
 
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ events: [], nextCursor: null });
+    expect(res.json()).toEqual({
+      events: [],
+      meta: { nextCursor: null, hasMore: false, limit: 50, order: "desc" },
+    });
   });
 
   it("allows an active member to use the new filtered paginated endpoint", async () => {

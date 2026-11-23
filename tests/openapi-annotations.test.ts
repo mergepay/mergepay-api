@@ -222,3 +222,33 @@ describe("OpenAPI: SEP-24 withdrawal routes (#663)", () => {
     ).toContain("signedXdr");
   });
 });
+
+describe("OpenAPI: group audit log", () => {
+  it("documents the admin-only response shape and error statuses", () => {
+    const op = operation("/api/v1/groups/{groupId}/audit-log", "get");
+    expect(op.tags).toContain("Groups");
+    expect(op.summary).toBeTruthy();
+    expect(op.description).toContain("Group admin only");
+    expect(op.parameters?.map((p: any) => p.name)).toContain("groupId");
+
+    const ok = op.responses["200"];
+    expect(ok).toBeTruthy();
+    const schema = ok.content?.["application/json"]?.schema ?? ok.schema ?? ok;
+    expect(Object.keys(schema.properties)).toEqual(
+      expect.arrayContaining(["events", "meta"])
+    );
+    expect(schema.properties.events.type).toBe("array");
+    expect(schema.properties.meta.properties).toEqual(
+      expect.objectContaining({
+        nextCursor: expect.anything(),
+        hasMore: expect.anything(),
+        limit: expect.anything(),
+        order: expect.anything(),
+      })
+    );
+
+    for (const status of ["400", "401", "403", "404"]) {
+      expect(op.responses[status], `missing ${status} on audit-log read`).toBeTruthy();
+    }
+  });
+});

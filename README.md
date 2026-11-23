@@ -674,7 +674,8 @@ Covers `GET /groups`, `/groups/:id`, `/groups/:id/expenses`,
 `/groups/:id/settlements`, `/groups/:id/ledger`,
 `/groups/:id/treasury/history`, `/groups/:groupId/treasury/proposals`,
 `/groups/:groupId/webhooks`, `/groups/:groupId/webhooks/:webhookId/deliveries`,
-`/anchors/sessions`, `/api/v1/sep24/transactions`, and `/history` (which
+`/groups/:groupId/audit-log`, `/anchors/sessions`, `/api/v1/sep24/transactions`,
+and `/history` (which
 paginates its expense and settlement streams independently, via `cursor` and
 `settlementCursor`).
 
@@ -691,7 +692,8 @@ requested `limit` and make `hasMore` describe the unfiltered scan.
 | `GET /groups/:id/settlements` | `status` (`awaiting_signature`\|`submitted`\|`confirmed`\|`failed`\|`expired`), `asset`, `startDate`, `endDate`, `includeTotal` |
 | `GET /groups/:id/ledger` | `type` (one or more of `expense`,`settlement`,`treasury`), `startDate`, `endDate` |
 | `GET /groups/:groupId/webhooks/:webhookId/deliveries` | `status` (`pending`\|`delivered`\|`failed`), `event` |
-| `GET /groups/:groupId/audit-logs` | `action`, `actorUserId`, `startDate`, `endDate` |
+| `GET /groups/:groupId/audit-logs` | `action`, `actorUserId`, `startDate`, `endDate` (member-access feed) |
+| `GET /groups/:groupId/audit-log` | `action` (valid `AuditAction` only), `actorUserId`, `startDate`, `endDate`, plus the shared `cursor`, `limit`, `order` (admin only; returns `{ events, meta }`) |
 
 Notes that matter when integrating:
 

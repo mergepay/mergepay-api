@@ -155,10 +155,21 @@ const rateLimitPlugin: FastifyPluginAsync<RateLimitPluginOptions> = async (app, 
     },
     ...rateLimitStoreOptions(config.RATE_LIMIT_STORE),
     // Must be a real Error (AppError), not a bare payload object — see the
-    // module comment above. (The builder's request argument is intentionally
-    // unused: the error handler owns the requestId.)
-    errorResponseBuilder: () =>
-      new AppError(429, ErrorCode.RATE_LIMITED, "Too many requests. Please retry later."),
+    // module comment above. The builder exposes the retry window so the 429
+    // body carries the same wait hint as the Retry-After header.
+    errorResponseBuilder: (_req, context) => {
+      const afterMs = Number((context as { ttl?: unknown }).ttl);
+      const retryAfterSeconds = Number.isFinite(afterMs) && afterMs > 0
+        ? Math.max(1, Math.ceil(afterMs / 1000))
+        : 1;
+      return new AppError(
+        429,
+        ErrorCode.RATE_LIMITED,
+        "Too many requests. Please retry later.",
+        { retryAfter: retryAfterSeconds },
+        retryAfterSeconds
+      );
+    },
   });
 };
 

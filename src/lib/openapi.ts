@@ -157,7 +157,9 @@ const ERROR_RESPONSE_DESCRIPTIONS: Record<OpenApiErrorStatus, string> = {
  * field the handler actually sent. Mirrors `formatErrorResponse` in
  * src/utils/error-response.ts.
  */
-export function openApiErrorSchema(): Record<string, unknown> {
+export function openApiErrorSchema(
+  options: { includeRetryAfter?: boolean } = {}
+): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: true,
@@ -170,8 +172,10 @@ export function openApiErrorSchema(): Record<string, unknown> {
           message: { type: "string" },
           timestamp: { type: "string", format: "date-time" },
           requestId: { type: "string" },
+          ...(options.includeRetryAfter ? { retryAfter: { type: "integer" } } : {}),
         },
       },
+      ...(options.includeRetryAfter ? { retryAfter: { type: "integer" } } : {}),
     },
   };
 }
@@ -195,7 +199,7 @@ export function openApiErrorResponses(
   for (const status of statuses) {
     responses[status] = {
       description: ERROR_RESPONSE_DESCRIPTIONS[status],
-      ...openApiErrorSchema(),
+      ...openApiErrorSchema({ includeRetryAfter: status === 429 }),
     };
   }
   return responses;

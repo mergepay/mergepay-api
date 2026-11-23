@@ -185,6 +185,7 @@ export interface RemoveGroupMemberOptions {
   actorUserId: string;
   groupId: string;
   targetUserId: string;
+  correlationId?: string | null;
   tx?: any;
 }
 
@@ -203,7 +204,7 @@ export interface RemoveGroupMemberResult {
 export async function removeGroupMember(
   options: RemoveGroupMemberOptions
 ): Promise<RemoveGroupMemberResult> {
-  const { actorUserId, groupId, targetUserId } = options;
+  const { actorUserId, groupId, targetUserId, correlationId } = options;
 
   if (targetUserId === actorUserId) {
     throw Errors.badRequest(
@@ -239,6 +240,7 @@ export async function removeGroupMember(
     });
 
     await auditGroupMemberActionTx(tx, {
+      correlationId: correlationId ?? null,
       userId: actorUserId,
       groupId,
       memberId: targetUserId,

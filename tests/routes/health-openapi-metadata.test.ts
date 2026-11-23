@@ -47,6 +47,15 @@ describe("OpenAPI metadata for health routes (#378)", () => {
     expect(op.responses["503"]).toBeDefined();
   });
 
+  it("documents /health/ready with readiness probe schema", () => {
+    const op = spec.paths["/health/ready"]?.get;
+    expect(op).toBeDefined();
+    expect(op.tags).toContain("System");
+    expect(op.summary).toBe("Readiness probe");
+    expect(op.responses["200"]).toBeDefined();
+    expect(op.responses["503"]).toBeDefined();
+  });
+
   it("documents /health/live with System tag, summary, and description", () => {
     const op = spec.paths["/health/live"]?.get;
     expect(op).toBeDefined();

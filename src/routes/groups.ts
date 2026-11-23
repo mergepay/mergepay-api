@@ -102,9 +102,16 @@ export default async function groupRoutes(app: FastifyInstance) {
         summary: "Create a group",
         description:
           "Creates a group owned by the caller, who is added to it as its first admin. 409 if a unique constraint rejects the write (e.g. a duplicate first membership).",
-        body: openApiBody(createGroupSchema),
+        body: {
+          ...openApiBody(createGroupSchema),
+        },
         response: {
-          ...openApiEnvelope("group"),
+          200: {
+            description: "Group created",
+            type: "object",
+            additionalProperties: true,
+            properties: { group: { type: "object", additionalProperties: true, example: { id: "grp_123", name: "Weekend Trip", description: "Split travel expenses", archived: false } } },
+          },
           ...openApiErrorResponses(400, 401, 409),
         },
       },
@@ -124,6 +131,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       });
 req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "Audit: group created");
       await logActionTx(tx, {
+        correlationId: req.id,
         actorId: auth.id,
         groupId: created.id,
         actorType: "user",
@@ -379,9 +387,16 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         description:
           "Admin-only. Updates the group's name and/or description. Treasury configuration is managed on its own endpoint and cannot be changed here.",
         params: openApiIdParams(),
-        body: openApiBody(updateGroupDocSchema),
+        body: {
+          ...openApiBody(updateGroupDocSchema),
+        },
         response: {
-          ...openApiEnvelope("group"),
+          200: {
+            description: "Group updated",
+            type: "object",
+            additionalProperties: true,
+            properties: { group: { type: "object", additionalProperties: true } },
+          },
           ...openApiErrorResponses(400, 401, 403, 404),
         },
       },
@@ -402,6 +417,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         action: "group.update",
@@ -431,20 +447,21 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         description:
           "Admin-only. With `publicKey`, creates a direct invitation for that Stellar account (201). Otherwise mints a legacy invite code (200).",
         params: openApiIdParams(),
-        body: openApiBody(inviteBodyDocSchema),
+        body: {
+          ...openApiBody(inviteBodyDocSchema),
+        },
         response: {
-          ...openApiResponse(
-            {
-              invitation: { type: "object", additionalProperties: true },
-              invite: { type: "object", additionalProperties: true },
-            }
-          ),
-          201: {
+          200: {
+            description: "Invite code created",
             type: "object",
             additionalProperties: true,
-            properties: {
-              invitation: { type: "object", additionalProperties: true },
-            },
+            properties: { invite: { type: "object", additionalProperties: true, example: { code: "ABCD2345", maxUses: 10 } } },
+          },
+          201: {
+            description: "Direct invitation created",
+            type: "object",
+            additionalProperties: true,
+            properties: { invitation: { type: "object", additionalProperties: true, example: { id: "inv_123", status: "PENDING", inviteePublicKey: "GABC...XYZ" } } },
           },
           ...openApiErrorResponses(400, 401, 403, 404, 409),
         },
@@ -511,6 +528,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         });
 
         await auditTx(tx, {
+        correlationId: req.id,
           userId: auth.id,
           groupId: id,
           action: "group.invite",
@@ -544,6 +562,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         action: "group.invite_code_create",
@@ -565,9 +584,16 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         summary: "Join a group with an invite code",
         description:
           "Adds the caller to the group the invite code belongs to. Re-using a code the caller has already redeemed is a no-op.",
-        body: openApiBody(joinGroupSchema),
+        body: {
+          ...openApiBody(joinGroupSchema),
+        },
         response: {
-          ...openApiEnvelope("group"),
+          200: {
+            description: "Joined group",
+            type: "object",
+            additionalProperties: true,
+            properties: { group: { type: "object", additionalProperties: true } },
+          },
           ...openApiErrorResponses(400, 401, 404),
         },
       },
@@ -601,6 +627,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
           data: { uses: { increment: 1 } },
         });
         await logActionTx(tx, {
+        correlationId: req.id,
           actorId: auth.id,
           groupId: invite.groupId,
           actorType: "user",
@@ -665,6 +692,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         where: { groupId_userId: { groupId: id, userId: auth.id } },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         action: "group.leave",
@@ -693,9 +721,16 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
           },
           required: ["id", "memberId"],
         },
-        body: openApiBody(memberRoleSchema),
+        body: {
+          ...openApiBody(memberRoleSchema),
+        },
         response: {
-          ...openApiEnvelope("member"),
+          200: {
+            description: "Member updated",
+            type: "object",
+            additionalProperties: true,
+            properties: { member: { type: "object", additionalProperties: true, example: { userId: "usr_123", role: "admin" } } },
+          },
           ...openApiErrorResponses(400, 401, 403, 404, 409),
         },
       },
@@ -715,6 +750,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
       });
       req.log.info({ userId: auth.id, groupId: id, memberId, action: "group.member.update" }, "Audit: group member updated");
       await auditGroupMemberActionTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         memberId,
@@ -761,6 +797,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
       actorUserId: auth.id,
       groupId: id,
       targetUserId: memberId,
+      correlationId: req.id,
     });
 
     return { ok: true };
@@ -786,12 +823,16 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         description:
           "Admin-only. Promotes or demotes a member; demoting the last admin is rejected.",
         params: openApiIdParams(),
-        body: openApiBody(changeMemberRoleSchema),
+        body: {
+          ...openApiBody(changeMemberRoleSchema),
+        },
         response: {
-          ...openApiResponse(
-            { member: { type: "object", additionalProperties: true } },
-            ["member"]
-          ),
+          200: {
+            description: "Role changed",
+            type: "object",
+            additionalProperties: true,
+            properties: { member: { type: "object", additionalProperties: true, example: { userId: "usr_123", role: "member" } } },
+          },
           ...openApiErrorResponses(400, 401, 403, 404, 409),
         },
       },
@@ -839,6 +880,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
       });
 
       await auditGroupMemberActionTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         memberId: body.userId,
@@ -885,6 +927,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         data: { archived: true },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         action: "group.archive",

@@ -176,6 +176,7 @@ export default async function sep24Routes(app: FastifyInstance) {
         },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         action: sep24StartAction(kind),
         entityType: "anchor_session",

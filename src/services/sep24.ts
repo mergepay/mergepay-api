@@ -269,6 +269,7 @@ export async function applySep24Callback(
 
   if (sessions.length === 0) {
     await audit({
+      correlationId: `job_sep24_webhook_${callback.externalTransactionId}`,
       action: AuditAction.SEP24_WEBHOOK_UNMATCHED,
       entityType: "anchor_session",
       entityId: callback.externalTransactionId,
@@ -302,6 +303,7 @@ export async function applySep24Callback(
   // all, which is the record an operator needs when a status did not move
   // because the transition was disallowed rather than because nothing arrived.
   await audit({
+    correlationId: `job_sep24_webhook_${callback.externalTransactionId}`,
     action: AuditAction.SEP24_WEBHOOK_APPLIED,
     entityType: "anchor_session",
     entityId: callback.externalTransactionId,

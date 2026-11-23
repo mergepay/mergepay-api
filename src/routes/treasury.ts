@@ -116,6 +116,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         actorPublicKey: auth.stellarPublicKey,
@@ -205,6 +206,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     const validation = validateProposedSignerConfig(proposedConfig, snapshot);
     
     await audit({
+        correlationId: req.id,
       userId: auth.id,
       groupId: id,
       actorPublicKey: auth.stellarPublicKey,
@@ -310,6 +312,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         // change (issue #367): a best-effort write here would survive a
         // rollback and orphan an entry for a deposit that never happened.
         await auditTx(tx, {
+        correlationId: req.id,
           userId: auth.id,
           groupId: id,
           actorPublicKey: auth.stellarPublicKey,
@@ -428,6 +431,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         // change (issue #367): a best-effort write here would survive a
         // rollback and orphan an entry for a withdrawal that never happened.
         await auditTx(tx, {
+        correlationId: req.id,
           userId: auth.id,
           groupId: id,
           actorPublicKey: auth.stellarPublicKey,
@@ -568,6 +572,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             data: { status: "failed" },
           });
           await auditTx(tx, {
+        correlationId: req.id,
             userId: auth.id,
             groupId: fresh.groupId,
             actorPublicKey: auth.stellarPublicKey,
@@ -590,6 +595,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           include: { user: true },
         });
         await auditTx(tx, {
+        correlationId: req.id,
           userId: auth.id,
           groupId: fresh.groupId,
           actorPublicKey: auth.stellarPublicKey,

@@ -145,6 +145,7 @@ export async function applyWithdrawalTransition(params: {
   withdrawalId: string;
   nextStatus: string;
   source: WithdrawalTransitionSource;
+  correlationId?: string | null;
   /** Fields to persist alongside a successful transition (e.g. anchorTxId). */
   extraData?: Prisma.WithdrawalUncheckedUpdateInput;
   /** When set, the caller must own this withdrawal (throws 403/404 otherwise). */
@@ -165,6 +166,7 @@ export async function applyWithdrawalTransition(params: {
     auditAction,
     auditMetadata,
     actorPublicKey,
+    correlationId,
   } = params;
 
   return prisma.$transaction(async (tx) => {
@@ -232,6 +234,7 @@ export async function applyWithdrawalTransition(params: {
       entityType: "withdrawal",
       entityId: withdrawalId,
       ...(actorPublicKey ? { actorPublicKey } : {}),
+      correlationId: correlationId ?? (source === "poll" ? `job_withdrawal_${withdrawalId}` : null),
       metadata: {
         from: current,
         to: target,

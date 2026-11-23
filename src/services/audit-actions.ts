@@ -70,6 +70,7 @@ export const AuditAction = {
   SETTLEMENT_FINALIZED: "settlement.confirmed",
   SETTLEMENT_FAILED: "settlement.failed",
   SETTLEMENT_RETRIED: "settlement.retried",
+  SETTLEMENT_IDEMPOTENT_REPLAY: "settlement.idempotent_replay",
 
   // ── SEP-24 anchor deposits / withdrawals (#1079) ─────────────────────
   // Values of the legacy action names are kept intact so existing alert

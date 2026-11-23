@@ -59,12 +59,19 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Request SEP-10 challenge",
         description:
           "Builds an unsigned SEP-10 challenge transaction for the specified account, to be signed by the client wallet.",
-        body: openApiBody(sep10ChallengeRequestSchema, { enforce: false }),
+        body: {
+          ...openApiBody(sep10ChallengeRequestSchema, { enforce: false }),
+        },
         response: {
-          ...openApiResponse({
-            transaction: { type: "string" },
-            networkPassphrase: { type: "string" },
-          }),
+          200: {
+            description: "Challenge issued",
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              transaction: { type: "string", example: "AAAAAgAAAAB..." },
+              networkPassphrase: { type: "string", example: "Test SDF Network ; September 2015" },
+            },
+          },
           ...openApiErrorResponses(400, 429),
         },
       },
@@ -85,14 +92,21 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Verify SEP-10 challenge transaction",
         description:
           "Verifies the client signature on a SEP-10 challenge transaction and issues JWT access and refresh tokens. The optional `home_domain` must name the domain this server authenticates; `client_domain` is not supported here and is rejected rather than ignored.",
-        body: openApiBody(sep10VerifyRequestSchema, { enforce: false }),
+        body: {
+          ...openApiBody(sep10VerifyRequestSchema, { enforce: false }),
+        },
         response: {
-          ...openApiResponse({
-            token: { type: "string" },
-            refreshToken: { type: "string" },
-            refreshTokenExpiresAt: { type: "string" },
-            user: { type: "object", additionalProperties: true },
-          }),
+          200: {
+            description: "Authenticated",
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              token: { type: "string", example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." },
+              refreshToken: { type: "string", example: "rt_3f9d2f1c8b..." },
+              refreshTokenExpiresAt: { type: "string", format: "date-time", example: "2026-12-23T13:00:00.000Z" },
+              user: { type: "object", additionalProperties: true, example: { id: "usr_123", stellarPublicKey: "GABC...XYZ", displayName: "GABC…WXYZ" } },
+            },
+          },
           ...openApiErrorResponses(400, 401, 429),
         },
       },
@@ -174,6 +188,7 @@ export default async function authRoutes(app: FastifyInstance) {
       // not sign the user out of their other devices.
       const refresh = await issueRefreshToken(user.id);
       await audit({
+        correlationId: req.id,
         userId: user.id,
         action: "auth.verify",
         entityType: "user",
@@ -208,16 +223,21 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Exchange refresh token for access token",
         description:
           "Exchanges a valid refresh token for a new access token and rotated refresh token.",
-        body: openApiBody(z.object({ refreshToken: z.string().min(1).max(512) }), {
-          enforce: false,
-        }),
+        body: {
+          ...openApiBody(z.object({ refreshToken: z.string().min(1).max(512) }), { enforce: false }),
+        },
         response: {
-          ...openApiResponse({
-            token: { type: "string" },
-            refreshToken: { type: "string" },
-            refreshTokenExpiresAt: { type: "string" },
-            user: { type: "object", additionalProperties: true },
-          }),
+          200: {
+            description: "Tokens refreshed",
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              token: { type: "string", example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." },
+              refreshToken: { type: "string", example: "rt_new_abc123..." },
+              refreshTokenExpiresAt: { type: "string", format: "date-time", example: "2026-12-23T13:00:00.000Z" },
+              user: { type: "object", additionalProperties: true },
+            },
+          },
           ...openApiErrorResponses(400, 401, 429),
         },
       },
@@ -236,6 +256,7 @@ export default async function authRoutes(app: FastifyInstance) {
           // two parties, and the whole family has just been revoked.
           if (err.reason === "reused") {
             await audit({
+        correlationId: req.id,
               action: "auth.refresh.reuse_detected",
               entityType: "refresh_token",
               entityId: "redacted",
@@ -256,6 +277,7 @@ export default async function authRoutes(app: FastifyInstance) {
       });
 
       await audit({
+        correlationId: req.id,
         userId: user.id,
         action: "auth.refresh",
         entityType: "user",
@@ -308,6 +330,7 @@ export default async function authRoutes(app: FastifyInstance) {
         const auth = requireUser(req);
         await revokeAllForUser(auth.id);
         await audit({
+        correlationId: req.id,
           userId: auth.id,
           action: "auth.logout",
           entityType: "user",
@@ -366,13 +389,15 @@ export default async function authRoutes(app: FastifyInstance) {
         tags: ["Auth"],
         summary: "Update current user profile",
         description: "Updates user profile fields such as display name and avatar URL.",
-        body: openApiBody(
-          z.object({
-            displayName: z.string().min(1).max(40).optional(),
-            avatarUrl: z.string().url().nullable().optional(),
-          }),
-          { enforce: false }
-        ),
+        body: {
+          ...openApiBody(
+            z.object({
+              displayName: z.string().min(1).max(40).optional(),
+              avatarUrl: z.string().url().nullable().optional(),
+            }),
+            { enforce: false }
+          ),
+        },
         response: {
           ...openApiEnvelope("user"),
           ...openApiErrorResponses(400, 401, 404),

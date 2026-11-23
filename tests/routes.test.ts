@@ -589,10 +589,12 @@ describe("group routes", () => {
           action: "group.member_remove",
           entityType: "group_member",
           entityId: targetUser.id,
+          correlationId: expect.any(String),
           metadata: {
             targetUserId: targetUser.id,
             removedRole: "member",
             outcome: "success",
+            correlationId: expect.any(String),
           },
         },
       });

@@ -171,6 +171,7 @@ export const treasuryProposalsService = {
     } catch (error) {
       const classified = classifyProposalBuildError(error);
       await audit({
+        correlationId: null,
         userId: params.creatorId,
         groupId: params.groupId,
         // The attempt is still the creator's, even though no proposal row
@@ -232,6 +233,7 @@ export const treasuryProposalsService = {
     } catch (error) {
       const classified = classifyProposalBuildError(error);
       await audit({
+        correlationId: null,
         userId: params.creatorId,
         groupId: params.groupId,
         actorPublicKey: params.creatorPublicKey,

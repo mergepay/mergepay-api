@@ -1,5 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { getReadiness } from "../services/health";
+import { prisma } from "../db";
 
 let lastLoggedDegradedReadiness: string | null = null;
 
@@ -78,6 +79,57 @@ export default async function healthRoutes(app: FastifyInstance) {
       }
 
       return reply.code(statusCode).send(readiness);
+    }
+  );
+
+  app.get(
+    "/health/ready",
+    {
+      schema: {
+        tags: ["System"],
+        summary: "Readiness probe",
+        description:
+          "Readiness probe that verifies the database connection before reporting healthy.",
+        response: {
+          200: {
+            description: "Service is ready to accept traffic",
+            type: "object",
+            properties: {
+              status: { type: "string", example: "ok" },
+            },
+          },
+          503: {
+            description: "Service is not ready because a dependency is unavailable",
+            type: "object",
+            properties: {
+              status: { type: "string", example: "unavailable" },
+              dependency: { type: "string", example: "database" },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const timeoutMs = 2000;
+        const dbCheck = Promise.resolve(
+          typeof (prisma as any).$queryRawUnsafe === "function"
+            ? (prisma as any).$queryRawUnsafe("SELECT 1")
+            : (prisma as any).$queryRaw`SELECT 1`
+        ).then(() => true, () => false);
+        const connected = await Promise.race<boolean>([
+          dbCheck,
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+        ]);
+        if (connected) {
+          return reply.code(200).send({ status: "ok" });
+        }
+        request.log.warn({ dependency: "database" }, "Readiness probe failed");
+        return reply.code(503).send({ status: "unavailable", dependency: "database" });
+      } catch (err) {
+        request.log.warn({ err, dependency: "database" }, "Readiness probe failed");
+        return reply.code(503).send({ status: "unavailable", dependency: "database" });
+      }
     }
   );
 }

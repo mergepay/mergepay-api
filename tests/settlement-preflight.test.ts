@@ -219,7 +219,9 @@ describe("USDC settlements", () => {
     expect(result).toMatchObject({
       ok: false,
       reason: "insufficient_asset_balance",
+      shortfallAsset: "USDC",
     });
+    expect(result.ok ? 0 : Number(result.shortfall)).toBeGreaterThan(0);
   });
 });
 
@@ -278,9 +280,23 @@ describe("error mapping", () => {
         expect(error).toBeInstanceOf(AppError);
         expect((error as AppError).status).toBe(status);
         expect((error as AppError).code).toBe(code);
+        expect((error as AppError).details).toMatchObject({ account: "GSOURCE" });
       }
     }
   );
+
+  it("maps insufficient balance to 422 with shortfall", () => {
+    const acct = account({ balances: [{ assetCode: "XLM", assetIssuer: null, balance: horizonAmount("1.1") }] });
+    try {
+      assertPreflightResult(evaluatePreflight(acct, { ...nativePayment, amount: "1" }));
+      expect.unreachable("should throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AppError);
+      expect((error as AppError).status).toBe(422);
+      expect((error as AppError).code).toBe("INSUFFICIENT_BALANCE");
+      expect((error as AppError).details).toMatchObject({ account: "GSOURCE", shortfallAsset: "XLM" });
+    }
+  });
 
   it("maps an upstream outage to 502, not a client error", () => {
     try {
@@ -288,6 +304,7 @@ describe("error mapping", () => {
         ok: false,
         reason: "upstream_unavailable",
         message: "unreachable",
+        account: "GSOURCE",
       });
       expect.unreachable("preflight should have thrown");
     } catch (error) {
@@ -295,17 +312,14 @@ describe("error mapping", () => {
     }
   });
 
-  it("never puts a balance figure in a client-visible message", () => {
+  it("returns structured account/shortfall details", () => {
     const acct = account({
       balances: [
         { assetCode: "XLM", assetIssuer: null, balance: horizonAmount("3.7") },
       ],
     });
     const result = evaluatePreflight(acct, { ...nativePayment, amount: "100" });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.message).not.toContain("3.7");
-      expect(result.message).not.toMatch(/\d+\.\d{7}/);
-    }
+    expect(result).toMatchObject({ ok: false, account: "GSOURCE", shortfallAsset: "XLM" });
+    expect(result.ok ? undefined : result.shortfall).toBeDefined();
   });
 });

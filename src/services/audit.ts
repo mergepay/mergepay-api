@@ -47,6 +47,8 @@ export interface AuditParams {
   action: string;
   entityType: string;
   entityId: string;
+  /** Per-request Fastify request id, or a job_-prefixed worker correlation id. */
+  correlationId?: string | null;
   outcome?: AuditOutcome;
   actorType?: AuditActorType;
   /** Public Stellar key of the actor; private key material is never accepted. */
@@ -63,11 +65,13 @@ export function auditData(params: AuditParams) {
     action: params.action,
     entityType: params.entityType,
     entityId: params.entityId,
+    correlationId: params.correlationId ?? null,
     metadata: {
       ...(sanitizeAuditMetadata(params.metadata ?? {}) as Record<string, unknown>),
       ...(params.outcome ? { outcome: params.outcome } : {}),
       ...(params.actorType ? { actorType: params.actorType } : {}),
       ...(params.actorPublicKey ? { actorPublicKey: params.actorPublicKey } : {}),
+      ...(params.correlationId ? { correlationId: params.correlationId } : {}),
     } as any,
   };
 }
@@ -144,6 +148,8 @@ export interface LogActionParams {
   actorType?: AuditActorType;
   /** Group the action belongs to, when the action is group-scoped. */
   groupId?: string | null;
+  /** Per-request Fastify request id, or a job_-prefixed worker correlation id. */
+  correlationId?: string | null;
   /** Action type from the structured vocabulary (src/services/audit-actions.ts). */
   action: string;
   /** Target resource type, e.g. "group", "group_member", "expense", "settlement". */
@@ -163,6 +169,7 @@ function toAuditParams(params: LogActionParams): AuditParams {
     action: params.action,
     entityType: params.resourceType,
     entityId: params.resourceId,
+    correlationId: params.correlationId ?? null,
     outcome: params.outcome,
     actorType: params.actorType,
     actorPublicKey: params.actorPublicKey ?? null,
@@ -235,7 +242,7 @@ export interface GroupMemberAuditParams {
 /** Write a canonical actor/group/member audit record within the mutation transaction. */
 export function auditGroupMemberActionTx(
   tx: Prisma.TransactionClient,
-  params: GroupMemberAuditParams
+  params: GroupMemberAuditParams & { correlationId?: string | null }
 ): Promise<void> {
   return auditTx(tx, {
     userId: params.userId,
@@ -243,6 +250,7 @@ export function auditGroupMemberActionTx(
     action: params.action,
     entityType: "group_member",
     entityId: params.memberId,
+    correlationId: params.correlationId ?? null,
     outcome: "success",
     metadata: params.metadata,
   });
@@ -271,6 +279,7 @@ export interface MultisigAuditParams {
    */
   entityType?: "treasury_proposal" | "treasury_tx_proposal" | string;
   actorPublicKey?: string | null;
+  correlationId?: string | null;
   outcome?: AuditOutcome;
   metadata?: Record<string, unknown>;
 }
@@ -299,6 +308,7 @@ export async function auditMultisigActionTx(
     action: params.action,
     entityType: params.entityType ?? "treasury_proposal",
     entityId: params.proposalId,
+    correlationId: params.correlationId ?? null,
     outcome: params.outcome ?? "success",
     metadata: params.metadata,
   });
@@ -311,6 +321,7 @@ export interface GroupExpenseMutationAuditParams {
   action: string;
   entityType: "group" | "expense" | "settlement" | "group_member";
   entityId: string;
+  correlationId?: string | null;
   outcome?: AuditOutcome;
   metadata?: Record<string, unknown>;
 }
@@ -329,6 +340,7 @@ export async function auditGroupExpenseMutation(
     action: params.action,
     entityType: params.entityType,
     entityId: params.entityId,
+    correlationId: params.correlationId ?? null,
     outcome: params.outcome ?? "success",
     actorType: params.userId ? "user" : "system",
     metadata: {
@@ -347,6 +359,7 @@ export interface SettlementAuditParams {
   amount: string;
   assetCode: string;
   toUserId?: string | null;
+  correlationId?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -365,6 +378,7 @@ export async function auditSettlementInitiated(
     action: AuditAction.SETTLEMENT_CREATED,
     entityType: "settlement",
     entityId: params.settlementId,
+    correlationId: params.correlationId ?? null,
     outcome: "success",
     actorType: "user",
     metadata: {
@@ -388,6 +402,7 @@ export interface SettlementFinalizeAuditParams {
   settlementId: string;
   status: "confirmed" | "completed" | "submitted" | "failed";
   stellarTxHash?: string | null;
+  correlationId?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -407,6 +422,7 @@ export async function auditSettlementFinalized(
     action: isFailed ? AuditAction.SETTLEMENT_FAILED : AuditAction.SETTLEMENT_CONFIRMED,
     entityType: "settlement",
     entityId: params.settlementId,
+    correlationId: params.correlationId ?? null,
     outcome: isFailed ? "failure" : "success",
     actorType: "user",
     metadata: {
@@ -430,6 +446,7 @@ export interface TreasurySignerChangeAuditParams {
   requiredSigners: number;
   previousRequiredSigners?: number | null;
   signers?: Array<{ publicKey: string; weight: number }>;
+  correlationId?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -448,6 +465,7 @@ export async function auditTreasurySignerChange(
     action: AuditAction.TREASURY_SIGNER_UPDATE,
     entityType: "group",
     entityId: params.groupId,
+    correlationId: params.correlationId ?? null,
     outcome: "success",
     actorType: "user",
     metadata: {
@@ -472,6 +490,7 @@ export interface GroupAdminAuditParams {
   targetResourceId: string;
   targetResourceType?: string;
   actorPublicKey?: string | null;
+  correlationId?: string | null;
   metadata?: Record<string, unknown>;
   outcome?: AuditOutcome;
 }
@@ -492,6 +511,7 @@ export async function auditGroupAdminAction(
     action: params.action,
     entityType: params.targetResourceType ?? "group",
     entityId: params.targetResourceId,
+    correlationId: params.correlationId ?? null,
     outcome: params.outcome ?? "success",
     actorType: "user",
     metadata: {

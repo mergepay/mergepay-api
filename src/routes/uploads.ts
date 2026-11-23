@@ -154,6 +154,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       // a database round trip. Only the content type is recorded: this file
       // never logs filenames or contents.
       logAuditTrail({
+        correlationId: req.id,
         actorId: auth.id,
         actorType: "user",
         action: "receipt.upload",

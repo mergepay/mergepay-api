@@ -458,6 +458,7 @@ async function confirmSubmission(params: {
     action: "settlement.submitted_to_stellar",
     entityType: "settlement",
     entityId: job.id,
+    correlationId: `job_settlement_${job.id}`,
     outcome: "success",
     metadata: { stellarTxHash: hash, attempt },
   });
@@ -1287,6 +1288,7 @@ async function reconcileSingleAnchor(
       action: `anchor.session.${result.status}`,
       entityType: "anchor_session",
       entityId: job.id,
+      correlationId: `job_anchor_${job.id}`,
       outcome: result.status === "error" ? "failure" : "success",
       metadata: {
         previousStatus: job.status,
@@ -1751,6 +1753,7 @@ async function runCycleTask<T>(
       action: AuditAction.WORKER_TASK_DEAD_LETTER,
       entityType: "worker_task",
       entityId: taskName,
+      correlationId: `job_worker_${taskName}_${Date.now()}`,
       outcome: "failure",
       metadata: {
         jobType: "worker_cycle",

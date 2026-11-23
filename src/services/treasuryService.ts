@@ -194,6 +194,7 @@ async function compareAndUpdate(
   });
 
   await audit({
+    correlationId: `job_treasury_balance_${treasuryId}`,
     groupId: treasuryId,
     actorType: "worker",
     action: "treasury.balance_variance",

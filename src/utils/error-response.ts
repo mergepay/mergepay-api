@@ -5,6 +5,7 @@ export interface ErrorPayload {
   requestId?: string;
   details?: unknown;
   issues?: unknown;
+  retryAfter?: number;
 }
 
 export interface FormattedErrorResponse {
@@ -12,6 +13,7 @@ export interface FormattedErrorResponse {
   code: string;
   message: string;
   requestId?: string;
+  retryAfter?: number;
 }
 
 export function formatErrorResponse(
@@ -19,7 +21,8 @@ export function formatErrorResponse(
   message: string,
   requestId?: string,
   details?: unknown,
-  issues?: unknown
+  issues?: unknown,
+  retryAfter?: number
 ): FormattedErrorResponse {
   const payload: ErrorPayload = {
     code,
@@ -29,9 +32,16 @@ export function formatErrorResponse(
   if (requestId) payload.requestId = requestId;
   if (details !== undefined) payload.details = details;
   if (issues !== undefined) payload.issues = issues;
+  if (retryAfter !== undefined) payload.retryAfter = retryAfter;
 
   // Backwards-compatible top-level fields (`code`, `message`, `requestId`) are
   // included to avoid breaking existing clients/tests while introducing the
   // canonical `error` envelope.
-  return { error: payload, code: payload.code, message: payload.message, requestId: payload.requestId };
+  return {
+    error: payload,
+    code: payload.code,
+    message: payload.message,
+    requestId: payload.requestId,
+    ...(payload.retryAfter !== undefined ? { retryAfter: payload.retryAfter } : {}),
+  };
 }

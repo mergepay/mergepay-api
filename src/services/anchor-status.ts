@@ -159,6 +159,7 @@ export async function applyAnchorSessionTransition(params: {
   sessionId: string;
   nextStatus: string;
   source: AnchorTransitionSource;
+  correlationId?: string | null;
   /** Fields to persist alongside a successful transition (e.g. interactiveUrl). */
   extraData?: Prisma.AnchorSessionUncheckedUpdateInput;
   /** When set, the caller must own this session (throws 403/404 otherwise). */
@@ -188,6 +189,7 @@ export async function applyAnchorSessionTransition(params: {
     auditAction,
     auditMetadata,
     actorPublicKey,
+    correlationId,
   } = params;
 
   return prisma.$transaction(async (tx) => {
@@ -266,6 +268,7 @@ export async function applyAnchorSessionTransition(params: {
       entityType: "anchor_session",
       entityId: sessionId,
       ...(actorPublicKey ? { actorPublicKey } : {}),
+      correlationId: correlationId ?? (source === "poll" ? `job_anchor_${sessionId}` : null),
       metadata: {
         from: current,
         to: target,

@@ -88,6 +88,7 @@ import groupAccessPlugin, {
 const GROUP_ID = "group_1";
 const OTHER_GROUP_ID = "group_2";
 const PUBLIC_KEY = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const TREASURY_DESTINATION = "GDKYN3O7ZVZLDTGOG6H242WA2TEZHVQNCHKJXZZLEWVS5WM3CKKO2WV6";
 
 let userSeq = 0;
 /** A fresh user id per scenario, so per-user rate-limit buckets never collide. */
@@ -456,6 +457,17 @@ function concreteUrl(routePath: string, groupId = GROUP_ID): string {
     .replace(":webhookId", "wh_1");
 }
 
+function mutationPayload(
+  route: (typeof GROUP_ROUTES)[number],
+  fallback: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  if (route.method === "GET") return undefined;
+  if (route.path === "/groups/:groupId/treasury/proposals") {
+    return { destination: TREASURY_DESTINATION, amount: "1", assetCode: "XLM" };
+  }
+  return fallback;
+}
+
 /** Mutations that must never happen when the guard rejects a request. */
 function writes() {
   const p = h.prisma;
@@ -479,7 +491,7 @@ describe("group routes on the real app", () => {
       method: route.method,
       url: concreteUrl(route.path),
       headers: bearer(newUser(null)),
-      payload: route.method === "GET" ? undefined : { role: "admin" },
+      payload: mutationPayload(route, { role: "admin" }),
     });
     expect(res.statusCode).toBe(403);
     expect(res.json().error.code).toBe("FORBIDDEN");
@@ -493,7 +505,7 @@ describe("group routes on the real app", () => {
         method: route.method,
         url: concreteUrl(route.path),
         headers: bearer(newUser("member")),
-        payload: route.method === "GET" ? undefined : { role: "admin", userId: "user_target" },
+        payload: mutationPayload(route, { role: "admin", userId: "user_target" }),
       });
       expect(res.statusCode).toBe(403);
       expect(res.json().error.message).toBe("Only a group admin can perform this action");
@@ -519,7 +531,7 @@ describe("group routes on the real app", () => {
       method: route.method,
       url: concreteUrl(route.path, "group_missing"),
       headers: bearer(newUser(null)),
-      payload: route.method === "GET" ? undefined : {},
+      payload: mutationPayload(route, {}),
     });
     expect(res.statusCode).toBe(404);
     expect(writes()).toBe(0);

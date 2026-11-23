@@ -62,7 +62,7 @@ const schema = z.object({
   // database concurrency across Fastify workers on a single instance.
   DATABASE_CONNECTION_LIMIT: z.coerce.number().int().positive().default(5),
   PORT: z.coerce.number().int().positive().default(4000),
-  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   // How long (ms) a request may occupy a connection before the server answers
   // it with 408 Request Timeout. Bounds stalled handlers — a slow-loris client,
   // a runaway Horizon call, or a database query the pool never resolves — so a

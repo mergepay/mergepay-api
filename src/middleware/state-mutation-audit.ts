@@ -10,6 +10,7 @@ import {
   emitAuditEvent,
   sanitizeAuditMetadata,
 } from "../lib/audit-logger";
+import { isRecord, serializeAuditMetadata } from "../schemas/json-metadata";
 
 export const MUTATING_HTTP_METHODS: ReadonlySet<string> = new Set([
   "POST",
@@ -47,10 +48,11 @@ export function stateMutationAudit(
       const action = `${actionPrefix}.${req.method.toLowerCase()}`;
       const outcome = reply.statusCode >= 200 && reply.statusCode < 400 ? "success" : "failure";
 
-      const scrubbedBody =
+      const sanitizedBody =
         recordBody && req.body && typeof req.body === "object"
-          ? (sanitizeAuditMetadata(req.body) as Record<string, unknown>)
+          ? sanitizeAuditMetadata(req.body)
           : undefined;
+      const scrubbedBody = isRecord(sanitizedBody) ? sanitizedBody : undefined;
 
       const metadata: Record<string, unknown> = {
         method: req.method,
@@ -68,7 +70,7 @@ export function stateMutationAudit(
             action,
             entityType: "api_route",
             entityId: routeUrl,
-            metadata: metadata as any,
+            metadata: serializeAuditMetadata(metadata),
           },
         })
         .catch(() => {

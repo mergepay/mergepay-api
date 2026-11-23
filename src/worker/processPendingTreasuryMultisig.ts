@@ -13,6 +13,7 @@ import { AuditAction } from "../services/audit-actions";
 import { stellar } from "../services/stellar";
 import { type RetryPolicy } from "../services/job-retry";
 import { isProposalExpired } from "../services/treasury-proposal-expiry";
+import { parseTreasurySignatures } from "../schemas/json-metadata";
 import { executeWorkerJobWithRetry } from "./job-retry-handler";
 
 export interface ProcessPendingMultisigResult {
@@ -58,7 +59,7 @@ export async function processPendingTreasuryMultisig(params: {
   for (const proposal of proposals) {
     if (isProposalExpired(proposal, now)) continue;
 
-    const rawSignatures = (proposal.signatures as unknown as Array<{ publicKey: string; signature: string }>) || [];
+    const rawSignatures = parseTreasurySignatures(proposal.signatures);
     const signatureCount = rawSignatures.length;
 
     // Only process proposals that meet or exceed required threshold

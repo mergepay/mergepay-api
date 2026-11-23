@@ -342,8 +342,8 @@ browser never sends an `Authorization` header on an `OPTIONS` probe.
 | `WEB_URL` | `""` (deny cross-origin) | Origin allow-list, comma-separated; `*` reflects any origin and is for local development only (the shipped `.env.example` sets `*`) |
 | `CORS_ALLOW_CREDENTIALS` | `false` | Whether cross-origin requests may carry credentials; never enable alongside `WEB_URL=*` outside local development |
 | `CORS_ALLOW_METHODS` | `GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS` | Methods advertised on a preflight — restricted to this list, never echoed from the request |
-| `CORS_ALLOW_HEADERS` | `Content-Type,Authorization,X-Requested-With,Idempotency-Key` | Request headers a cross-origin request may send |
-| `CORS_EXPOSE_HEADERS` | `X-Request-ID,X-Correlation-ID,X-RateLimit-*`,`Retry-After` | Response headers made readable to the caller |
+| `CORS_ALLOW_HEADERS` | `Content-Type,Authorization,X-Requested-With,Idempotency-Key,X-Idempotency-Key` | Request headers a cross-origin request may send |
+| `CORS_EXPOSE_HEADERS` | `X-Request-ID,X-Correlation-ID,X-RateLimit-*`,`Retry-After`,`Idempotent-Replay` | Response headers made readable to the caller |
 | `CORS_MAX_AGE` | `86400` | Preflight cache lifetime in seconds |
 
 An empty `WEB_URL` denies every cross-origin request while leaving same-origin

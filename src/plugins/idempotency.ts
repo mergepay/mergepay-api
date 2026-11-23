@@ -1,5 +1,5 @@
 /**
- * HTTP-level idempotency for settlement execution.
+ * HTTP-level idempotency for unsafe API requests.
  *
  * `src/services/idempotency.ts` makes an *operation* run once: the caller
  * wraps a database transaction and gets its return value replayed. That is the
@@ -50,6 +50,7 @@ import { z } from "zod";
 import { config } from "../config";
 import { prisma } from "../db";
 import { Errors } from "../errors";
+import { GROUP_AFTER_GUARD } from "./group-access";
 import {
   IDEMPOTENCY_KEY_MAX_LENGTH,
   IDEMPOTENCY_KEY_MIN_LENGTH,
@@ -107,6 +108,16 @@ function isUniqueConstraintViolation(error: unknown): boolean {
 /** Deterministic hash of the request body, order-insensitive for objects. */
 export function hashRequestBody(scope: string, body: unknown): string {
   const serialized = JSON.stringify(canonicalize({ scope, body })) ?? "";
+  return crypto.createHash("sha256").update(serialized).digest("hex");
+}
+
+export function hashRequestBodyWithResource(
+  scope: string,
+  resourceId: string,
+  body: unknown
+): string {
+  const serialized =
+    JSON.stringify(canonicalize({ scope, resourceId, body })) ?? "";
   return crypto.createHash("sha256").update(serialized).digest("hex");
 }
 
@@ -321,6 +332,8 @@ export interface IdempotentRouteOptions {
   scope: string;
   /** Whether a request without the header is rejected. */
   required?: boolean;
+  resourceId?: (req: FastifyRequest) => string;
+  afterGuards?: boolean;
 }
 
 /**
@@ -335,9 +348,9 @@ async function idempotencyPlugin(app: FastifyInstance) {
   app.decorate(
     "idempotent",
     function idempotent(options: IdempotentRouteOptions) {
-      const { scope, required = false } = options;
+      const { scope, required = false, resourceId, afterGuards = false } = options;
 
-      return async function idempotencyPreHandler(
+      const preHandler = async function idempotencyPreHandler(
         req: FastifyRequest,
         reply: FastifyReply
       ) {
@@ -361,7 +374,11 @@ async function idempotencyPlugin(app: FastifyInstance) {
           throw Errors.unauthorized("Authentication required");
         }
 
-        const requestHash = hashRequestBody(scope, req.body ?? null);
+        const resource = resourceId?.(req);
+        const requestHash =
+          resource === undefined
+            ? hashRequestBody(scope, req.body ?? null)
+            : hashRequestBodyWithResource(scope, resource, req.body ?? null);
         const context = await reserve({
           userId,
           scope,
@@ -376,6 +393,12 @@ async function idempotencyPlugin(app: FastifyInstance) {
 
         req.idempotency = context;
       };
+
+      if (afterGuards) {
+        (preHandler as any)[GROUP_AFTER_GUARD] = true;
+      }
+
+      return preHandler;
     }
   );
 

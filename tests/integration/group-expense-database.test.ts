@@ -93,13 +93,14 @@ async function call(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   url: string,
   actor: Actor | null,
-  payload?: Record<string, unknown>
+  payload?: Record<string, unknown>,
+  headers: Record<string, string> = {}
 ) {
   return app.inject({
     method,
     url,
     remoteAddress: remoteAddress(),
-    headers: actor ? { authorization: `Bearer ${actor.token}` } : {},
+    headers: { ...(actor ? { authorization: `Bearer ${actor.token}` } : {}), ...headers },
     payload,
   });
 }
@@ -189,7 +190,7 @@ describe("integration suite on a real Postgres (#646)", () => {
       assetCode: "XLM",
       splitType: "equal",
       shares: [{ userId: outsider.id }],
-    });
+    }, { "x-idempotency-key": "expense-int-22594" });
     expect(res.statusCode).toBe(403);
     expect(await prisma.expense.count({ where: { groupId } })).toBe(0);
   });
@@ -201,7 +202,7 @@ describe("integration suite on a real Postgres (#646)", () => {
       assetCode: "XLM",
       splitType: "equal",
       shares: [{ userId: owner.id }, { userId: member.id }],
-    });
+    }, { "x-idempotency-key": "expense-int-95202" });
     expect(res.statusCode).toBe(200);
     expenseId = res.json().expense.id;
 
@@ -235,7 +236,7 @@ describe("integration suite on a real Postgres (#646)", () => {
       assetCode: "XLM",
       splitType: "equal",
       shares: [{ userId: owner.id }, { userId: outsider.id }],
-    });
+    }, { "x-idempotency-key": "expense-int-1880" });
     expect(res.statusCode).toBe(400);
     // `Errors.badRequest` upper-cases every code (src/lib/errors.ts:227), so a
     // route that throws `invalid_split` answers `INVALID_SPLIT`.
@@ -539,7 +540,7 @@ describe("archived-group mutation lockout on a real Postgres (#648)", () => {
       assetCode: "XLM",
       splitType: "equal",
       shares: [{ userId: owner.id }, { userId: member.id }],
-    });
+    }, { "x-idempotency-key": "expense-int-93975" });
     expect(e.statusCode).toBe(200);
     closedExpenseId = e.json().expense.id;
 
@@ -560,7 +561,7 @@ describe("archived-group mutation lockout on a real Postgres (#648)", () => {
       assetCode: "XLM",
       splitType: "equal",
       shares: [{ userId: owner.id }, { userId: member.id }],
-    });
+    }, { "x-idempotency-key": "expense-int-89936" });
     expect(res.statusCode).toBe(403);
     expect(res.json().error.message).toMatch(/archived/i);
     // Only the pre-archive expense survives.

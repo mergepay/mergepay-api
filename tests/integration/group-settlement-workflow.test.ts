@@ -66,6 +66,7 @@ let groupId: string;
 let firstExpenseId: string;
 let secondExpenseId: string;
 let requestNumber = 0;
+let expenseKeyNumber = 0;
 
 /**
  * A distinct source address per request: rate-limit buckets key on it, so the
@@ -89,13 +90,14 @@ async function call(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   url: string,
   actor: Actor | null,
-  payload?: Record<string, unknown>
+  payload?: Record<string, unknown>,
+  headers: Record<string, string> = {}
 ) {
   return app.inject({
     method,
     url,
     remoteAddress: remoteAddress(),
-    headers: actor ? { authorization: `Bearer ${actor.token}` } : {},
+    headers: { ...(actor ? { authorization: `Bearer ${actor.token}` } : {}), ...headers },
     payload,
   });
 }
@@ -108,13 +110,20 @@ async function netBalances(actor: Actor): Promise<Record<string, string>> {
 }
 
 async function createExpense(actor: Actor, title: string, amount: string) {
-  return call("POST", `/groups/${groupId}/expenses`, actor, {
-    title,
-    amount,
-    assetCode: "XLM",
-    splitType: "equal",
-    shares: [{ userId: owner.id }, { userId: member.id }, { userId: debtor.id }],
-  });
+  expenseKeyNumber += 1;
+  return call(
+    "POST",
+    `/groups/${groupId}/expenses`,
+    actor,
+    {
+      title,
+      amount,
+      assetCode: "XLM",
+      splitType: "equal",
+      shares: [{ userId: owner.id }, { userId: member.id }, { userId: debtor.id }],
+    },
+    { "x-idempotency-key": `expense-workflow-${expenseKeyNumber}` }
+  );
 }
 
 beforeAll(async () => {

@@ -49,6 +49,22 @@ describe("GET /health/live", () => {
   });
 });
 
+describe("GET /health/ready", () => {
+  it("returns 200 when the DB query succeeds", async () => {
+    const response = await app.inject({ method: "GET", url: "/health/ready" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ status: "ok" });
+  });
+
+  it("returns 503 with dependency when the DB is unreachable", async () => {
+    h.queryRawUnsafe.mockRejectedValueOnce(new Error("db down"));
+    h.queryRaw.mockRejectedValueOnce(new Error("db down"));
+    const response = await app.inject({ method: "GET", url: "/health/ready" });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({ status: "unavailable", dependency: "database" });
+  });
+});
+
 describe("GET /health", () => {
   it("returns dependency status", async () => {
     const response = await app.inject({ method: "GET", url: "/health" });

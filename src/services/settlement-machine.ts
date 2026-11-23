@@ -73,6 +73,7 @@ export interface ApplySettlementTransitionParams {
   settlementId: string;
   nextStatus: SettlementStatus;
   source: SettlementTransitionSource;
+  correlationId?: string | null;
   extraData?: Prisma.SettlementUncheckedUpdateInput;
   ownerUserId?: string;
   tx?: Prisma.TransactionClient;
@@ -91,6 +92,7 @@ export async function applySettlementTransition(params: ApplySettlementTransitio
     ownerUserId,
     tx,
     settleExpenseShare = false,
+    correlationId,
   } = params;
 
   async function execute(client: Prisma.TransactionClient) {
@@ -172,6 +174,7 @@ export async function applySettlementTransition(params: ApplySettlementTransitio
       action: "settlement.status_changed",
       resourceType: "settlement",
       resourceId: settlementId,
+      correlationId: correlationId ?? (source === "worker" ? `job_settlement_${settlementId}` : null),
       metadata: {
         from: current,
         to: nextStatus,

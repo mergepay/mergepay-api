@@ -108,6 +108,7 @@ export async function processPendingTreasuryMultisig(params: {
               action: AuditAction.TREASURY_PROPOSAL_FAILED,
               entityType: "treasury_proposal",
               entityId: proposal.id,
+              correlationId: `job_treasury_multisig_${proposal.id}`,
               outcome: "failure",
               metadata: {
                 reason,

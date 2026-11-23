@@ -508,15 +508,16 @@ model IdempotencyKey {
 /// Structured audit log records for state-changing operations including
 /// treasury multisig proposals, signature collections, and submissions.
 model AuditLog {
-  id         String   @id @default(cuid())
-  userId     String?  @map("user_id")
-  groupId    String?  @map("group_id")
-  action     String
-  details    Json?
-  entityType String?  @map("entity_type")
-  entityId   String?  @map("entity_id")
-  metadata   Json?
-  createdAt  DateTime @default(now()) @map("created_at")
+  id            String   @id @default(cuid())
+  userId        String?  @map("user_id")
+  groupId       String?  @map("group_id")
+  action        String
+  details       Json?
+  entityType    String?  @map("entity_type")
+  entityId      String?  @map("entity_id")
+  correlationId String?  @map("correlation_id")
+  metadata      Json?
+  createdAt     DateTime @default(now()) @map("created_at")
 
   user  User?  @relation(fields: [userId], references: [id])
   group Group? @relation(fields: [groupId], references: [id], onDelete: SetNull)
@@ -524,6 +525,7 @@ model AuditLog {
   @@index([userId])
   @@index([groupId])
   @@index([entityType, entityId])
+  @@index([correlationId])
   // Audit feeds filter by action type and read newest-first; this keeps a
   // large trail's most common query from scanning the whole table.
   @@index([action, createdAt])

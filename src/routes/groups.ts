@@ -124,6 +124,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       });
 req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "Audit: group created");
       await logActionTx(tx, {
+        correlationId: req.id,
         actorId: auth.id,
         groupId: created.id,
         actorType: "user",
@@ -402,6 +403,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         action: "group.update",
@@ -511,6 +513,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         });
 
         await auditTx(tx, {
+        correlationId: req.id,
           userId: auth.id,
           groupId: id,
           action: "group.invite",
@@ -544,6 +547,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         action: "group.invite_code_create",
@@ -601,6 +605,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
           data: { uses: { increment: 1 } },
         });
         await logActionTx(tx, {
+        correlationId: req.id,
           actorId: auth.id,
           groupId: invite.groupId,
           actorType: "user",
@@ -665,6 +670,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         where: { groupId_userId: { groupId: id, userId: auth.id } },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         action: "group.leave",
@@ -715,6 +721,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
       });
       req.log.info({ userId: auth.id, groupId: id, memberId, action: "group.member.update" }, "Audit: group member updated");
       await auditGroupMemberActionTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         memberId,
@@ -839,6 +846,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
       });
 
       await auditGroupMemberActionTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         memberId: body.userId,
@@ -885,6 +893,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         data: { archived: true },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         groupId: id,
         action: "group.archive",

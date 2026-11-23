@@ -200,6 +200,7 @@ export async function applySep24Callback(
 
   if (sessions.length === 0) {
     await audit({
+      correlationId: `job_sep24_callback_${callback.externalTransactionId}`,
       action: "sep24.callback.unmatched",
       entityType: "anchor_session",
       entityId: callback.externalTransactionId,
@@ -222,6 +223,7 @@ export async function applySep24Callback(
   }
 
   await audit({
+    correlationId: `job_sep24_callback_${callback.externalTransactionId}`,
     action: "sep24.callback.applied",
     entityType: "anchor_session",
     entityId: callback.externalTransactionId,

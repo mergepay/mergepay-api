@@ -17,9 +17,9 @@
 import { FastifyInstance } from "fastify";
 import { Prisma } from "@prisma/client";
 import {
-  treasuryMultisigProposalPayloadSchema,
+  type TreasuryMultisigProposalPayload,
   treasuryProposalListQuerySchema,
-  validateTreasuryProposalHook,
+  validateTreasuryMultisigProposalCreateRequest,
 } from "../validations/treasury";
 import { z } from "zod";
 import { prisma } from "../db";
@@ -63,12 +63,15 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
     "/groups/:groupId/treasury/proposals",
     {
       ...rateLimited("treasuryPropose"),
-      preHandler: requireGroupRole("admin", { param: "groupId" }),
+      preHandler: [
+        requireGroupRole("admin", { param: "groupId" }),
+        validateTreasuryMultisigProposalCreateRequest,
+      ],
     },
     async (req) => {
     const auth = requireUser(req);
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
-    const body = treasuryMultisigProposalPayloadSchema.parse(req.body);
+    const body = req.body as TreasuryMultisigProposalPayload;
     const { expiresInDays } = z
       .object({ expiresInDays: treasuryProposalExpiryDaysSchema.optional() })
       .parse(req.body ?? {});

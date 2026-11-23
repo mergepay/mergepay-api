@@ -241,5 +241,54 @@ describe("Treasury Multisig Proposal Payload Validation (#874)", () => {
       expect(res.json().error.code).toBe("VALIDATION_ERROR");
       expect(h.createProposal).not.toHaveBeenCalled();
     });
+
+    it("rejects unexpected fields with structured validation details", async () => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/v1/groups/${GROUP_ID}/treasury/proposals`,
+        headers: authHeader(),
+        payload: {
+          destination: VALID_DESTINATION,
+          amount: "75.00",
+          assetCode: "XLM",
+          secret: Keypair.random().secret(),
+        },
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe("VALIDATION_ERROR");
+      expect(res.json().error.details).toEqual(
+        expect.arrayContaining([expect.objectContaining({ field: "secret", path: "secret" })])
+      );
+      expect(res.json().error.issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: "unrecognized_keys",
+            message: expect.stringContaining("secret"),
+          }),
+        ])
+      );
+      expect(h.createProposal).not.toHaveBeenCalled();
+    });
+
+    it("accepts expiresInDays as part of the strict body contract", async () => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/v1/groups/${GROUP_ID}/treasury/proposals`,
+        headers: authHeader(),
+        payload: {
+          destination: VALID_DESTINATION,
+          amount: "75.00",
+          assetCode: "XLM",
+          expiresInDays: 14,
+        },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(h.createProposal).toHaveBeenCalledWith(
+        expect.objectContaining({ expiresInDays: 14 }),
+        2
+      );
+    });
   });
 });

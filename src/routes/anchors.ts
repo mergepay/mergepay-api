@@ -11,6 +11,12 @@ import {
   mapAnchorStatusToWithdrawalStatus,
 } from "../services/withdrawal-status";
 import { auditTx } from "../services/audit";
+import {
+  accountPublicKeys,
+  sep24CallbackAuditMetadata,
+  sep24LifecycleAction,
+  sep24StartAction,
+} from "../services/sep24-audit";
 import { rateLimited } from "../lib/rate-limit";
 import { applySep24Callback } from "../services/sep24";
 import {
@@ -155,10 +161,15 @@ export default async function anchorRoutes(app: FastifyInstance) {
       await auditTx(tx, {
         correlationId: req.id,
         userId: auth.id,
-        action: "anchor_session.start",
+        action: sep24StartAction(kind),
         entityType: "anchor_session",
         entityId: created.id,
-        metadata: { kind, assetCode: body.assetCode },
+        actorPublicKey: auth.stellarPublicKey,
+        metadata: {
+          kind,
+          assetCode: body.assetCode,
+          ...("amount" in body && body.amount ? { amount: body.amount } : {}),
+        },
       });
       return created;
     });
@@ -452,12 +463,16 @@ export default async function anchorRoutes(app: FastifyInstance) {
         where: { anchorTxId: callback.externalTransactionId },
       });
       if (withdrawal) {
+        const publicKeys = await accountPublicKeys([withdrawal.userId]);
         await applyWithdrawalTransition({
           withdrawalId: withdrawal.id,
           nextStatus: mapAnchorStatusToWithdrawalStatus(
             mapAnchorStatus(callback.rawStatus)
           ),
           source: "webhook",
+          auditAction: sep24LifecycleAction("withdrawal", callback.rawStatus),
+          auditMetadata: sep24CallbackAuditMetadata(callback),
+          actorPublicKey: publicKeys.get(withdrawal.userId),
         });
       }
 

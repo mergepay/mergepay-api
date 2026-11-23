@@ -26,13 +26,12 @@ let app: Awaited<ReturnType<typeof buildApp>>;
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  // The readiness probe is cached for a few seconds; reset it so each test
-  // observes the dependency mocks it just configured.
+  // Reset implementations and once-queues so tests don't leak into each other.
+  h.queryRaw.mockReset().mockResolvedValue([{ 1: 1 }]);
+  h.queryRawUnsafe.mockReset().mockResolvedValue([{ 1: 1 }]);
+  h.feeStats.mockReset().mockResolvedValue({ minAcceptedFee: 100 });
+  h.fetch.mockReset().mockResolvedValue({ ok: true, status: 200, text: async () => "ok" });
   clearReadinessCache();
-  h.queryRaw.mockResolvedValue([{ 1: 1 }]);
-  h.queryRawUnsafe.mockResolvedValue([{ 1: 1 }]);
-  h.feeStats.mockResolvedValue({ minAcceptedFee: 100 });
-  h.fetch.mockResolvedValue({ ok: true, status: 200, text: async () => "ok" });
   if (!app) app = await buildApp();
   global.fetch = h.fetch as typeof fetch;
 });

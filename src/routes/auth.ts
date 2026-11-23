@@ -188,6 +188,7 @@ export default async function authRoutes(app: FastifyInstance) {
       // not sign the user out of their other devices.
       const refresh = await issueRefreshToken(user.id);
       await audit({
+        correlationId: req.id,
         userId: user.id,
         action: "auth.verify",
         entityType: "user",
@@ -255,6 +256,7 @@ export default async function authRoutes(app: FastifyInstance) {
           // two parties, and the whole family has just been revoked.
           if (err.reason === "reused") {
             await audit({
+        correlationId: req.id,
               action: "auth.refresh.reuse_detected",
               entityType: "refresh_token",
               entityId: "redacted",
@@ -275,6 +277,7 @@ export default async function authRoutes(app: FastifyInstance) {
       });
 
       await audit({
+        correlationId: req.id,
         userId: user.id,
         action: "auth.refresh",
         entityType: "user",
@@ -327,6 +330,7 @@ export default async function authRoutes(app: FastifyInstance) {
         const auth = requireUser(req);
         await revokeAllForUser(auth.id);
         await audit({
+        correlationId: req.id,
           userId: auth.id,
           action: "auth.logout",
           entityType: "user",

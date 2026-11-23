@@ -106,6 +106,7 @@ export function auditTrail(
 
       const actorId = req.user?.id ?? null;
       logAuditTrail({
+        correlationId: req.id,
         actorId,
         actorType: options.actorType ?? (actorId ? "user" : "system"),
         groupId: options.groupId?.(req) ?? null,

@@ -144,12 +144,13 @@ export async function applyWithdrawalTransition(params: {
   withdrawalId: string;
   nextStatus: string;
   source: WithdrawalTransitionSource;
+  correlationId?: string | null;
   /** Fields to persist alongside a successful transition (e.g. anchorTxId). */
   extraData?: Prisma.WithdrawalUncheckedUpdateInput;
   /** When set, the caller must own this withdrawal (throws 403/404 otherwise). */
   ownerUserId?: string;
 }): Promise<WithdrawalTransitionResult<{ id: string; status: string }>> {
-  const { withdrawalId, nextStatus, source, extraData, ownerUserId } = params;
+  const { withdrawalId, nextStatus, source, extraData, ownerUserId, correlationId } = params;
 
   return prisma.$transaction(async (tx) => {
     const withdrawal = await tx.withdrawal.findUnique({ where: { id: withdrawalId } });
@@ -215,6 +216,7 @@ export async function applyWithdrawalTransition(params: {
       action: "withdrawal.status_changed",
       entityType: "withdrawal",
       entityId: withdrawalId,
+      correlationId: correlationId ?? (source === "poll" ? `job_withdrawal_${withdrawalId}` : null),
       metadata: { from: current, to: target, source },
     });
 

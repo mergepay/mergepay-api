@@ -153,6 +153,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         },
       });
       await auditTx(tx, {
+        correlationId: req.id,
         userId: auth.id,
         action: "anchor_session.start",
         entityType: "anchor_session",

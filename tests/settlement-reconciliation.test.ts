@@ -350,10 +350,13 @@ describe("reconcileSingleSettlement", () => {
     );
     expect(h.audit).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: "settlement.reconciliation.exhausted",
+        action: "settlement.failed",
+        correlationId: "job_recon_settlement_settle_1",
+        outcome: "failure",
         metadata: expect.objectContaining({
           attempts: 11,
           maxRetries: 10,
+          reason: "reconciliation_exhausted",
         }),
       })
     );

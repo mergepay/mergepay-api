@@ -257,6 +257,7 @@ export async function calculateAndAuditGroupBalances(
 
   if (actor) {
     await audit({
+      correlationId: actor?.type === "worker" ? `job_balance_${groupId}` : null,
       action: "group.balances_calculated",
       actorType: actor.type,
       userId: actor.id ?? null,

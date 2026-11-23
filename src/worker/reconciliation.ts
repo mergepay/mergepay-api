@@ -185,6 +185,7 @@ async function writeStatus(
   }
 
   await audit({
+    correlationId: `job_recon_${table}_${record.id}`,
     userId: null,
     groupId: record.groupId,
     actorType: "worker",
@@ -198,8 +199,9 @@ async function writeStatus(
       previousStatus: record.status,
       status,
       ledger: details.ledger,
-      reason: details.reason,
-      retryCount: details.retryCount,
+      ...((details as any).pagingToken ? { pagingToken: (details as any).pagingToken } : {}),
+      ...((details as any).resultCode ? { resultCode: (details as any).resultCode } : {}),
+      ...(details.reason ? { reason: details.reason } : {}),
     },
   });
 

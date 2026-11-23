@@ -92,7 +92,8 @@ name go to the log instead.
 Applies to `GET /groups`, `/groups/:id`, `/groups/:id/expenses`, `/groups/:id/settlements`,
 `/groups/:id/ledger`, `/groups/:id/treasury/history`, `/groups/:groupId/treasury/proposals`,
 `/groups/:groupId/webhooks`, `/groups/:groupId/webhooks/:webhookId/deliveries`,
-`/anchors/sessions`, `/api/v1/sep24/transactions`, and `/history`.
+`/groups/:groupId/audit-log`, `/anchors/sessions`, `/api/v1/sep24/transactions`,
+and `/history`.
 Defined in [../src/lib/pagination.ts](../src/lib/pagination.ts).
 
 ### Query parameters
@@ -211,6 +212,40 @@ own data re-served through a different authorization path, and the response body
 is third-party text. The list returns `id`, `webhookId`, `eventType`, `status`,
 `attempts`, `responseStatusCode`, `nextAttemptAt`, `lastAttemptAt`, `createdAt`,
 and `updatedAt`.
+
+### Audit log (`GET /groups/:groupId/audit-log`)
+
+Admin-only and read-only. A non-admin member receives `FORBIDDEN` (403). Every
+row is scoped by the path's `groupId` before any filter or cursor is applied.
+The response is newest first and uses the shared pagination metadata:
+
+```json
+{
+  "events": [
+    {
+      "id": "audit_1",
+      "actorUserId": "user_1",
+      "actorDisplayName": "Tester",
+      "action": "treasury.proposal.created",
+      "entityType": "treasuryProposal",
+      "entityId": "proposal_1",
+      "metadata": {},
+      "createdAt": "2026-02-01T00:00:00.000Z"
+    }
+  ],
+  "meta": { "nextCursor": null, "hasMore": false, "limit": 50, "order": "desc" }
+}
+```
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `action` | one value from [`AuditAction`](../src/services/audit-actions.ts) | Unknown values are `VALIDATION_ERROR` (400) |
+| `actorUserId` | string | Filter to one actor |
+| `startDate` / `endDate` | ISO 8601 datetime | Inclusive `createdAt` bounds. `from` / `to` are accepted aliases |
+| `cursor`, `limit`, `order` | shared pagination parameters | See the Pagination section above |
+
+`metadata` is passed through the same redaction as the rest of the API, so
+sensitive keys such as `signedXdr`, `token`, and `secret` are never returned.
 
 ---
 

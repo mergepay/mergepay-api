@@ -83,12 +83,13 @@ its own SEP-10 signing key.
 ## Prerequisites
 
 - Node.js 20+
-- PostgreSQL 14+
-- A Stellar SEP-10 signing keypair (generate one below)
+- PostgreSQL 14+ running locally (default `localhost:5432`)
+- A Stellar SEP-10 signing keypair — generated locally with `npm run gen:sep10key` (below); no funded account is needed to boot the API
 
 ## Setup
 
-For the quickest local dev path against Stellar testnet, see [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
+For the step-by-step local dev path against Stellar testnet (including
+troubleshooting), see [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
 
 ```bash
 git clone https://github.com/mergepay/mergepay-api.git
@@ -107,9 +108,107 @@ npm run prisma:migrate        # creates tables (needs DATABASE_URL)
 npm run db:seed
 
 # Run it
-npm run dev                   # API on :4000
+npm run dev                   # API on :4000 (tsx watch src/index.ts)
 npm run worker                # background reconciliation worker (separate shell)
 ```
+
+### Local quickstart (testnet)
+
+A fresh clone can run the API and worker with only the steps below.
+
+> **⚠️ Network defaults.** [.env.example](.env.example) ships with the *safe
+> public-network* defaults `STELLAR_NETWORK=public` and
+> `HORIZON_URL=https://horizon.stellar.org`. For local development you should
+> override **both** to testnet values. [src/config.ts](src/config.ts) validates
+> the pair at startup and exits if they disagree (a testnet URL with a `public`
+> network, or vice versa) — changing only one will not boot. Never develop
+> against mainnet with real funds.
+
+1. **Install and create the env file** (commands in [Setup](#setup) above),
+   then create the database once:
+
+   ```bash
+   createdb mergepay
+   ```
+
+2. **Edit `.env`.** `src/config.ts` requires `DATABASE_URL`, `API_PUBLIC_URL`,
+   `JWT_SECRET`, `STELLAR_NETWORK`, `HORIZON_URL`, `ANCHOR_HOME_DOMAIN`,
+   `ANCHOR_NAME`, `ANCHOR_WEBHOOK_SECRET`, `STABLE_ASSET_CODE`, and
+   `STABLE_ASSET_ISSUER` — the worker needs the same Horizon/anchor values.
+   Everything else has a working default. A minimal local testnet block:
+
+   ```env
+   DATABASE_URL=postgresql://postgres:***@localhost:5432/mergepay
+   API_PUBLIC_URL=http://localhost:4000
+   JWT_SECRET=replace-with-a-long-random-secret   # at least 16 characters
+
+   # Override the shipped public defaults — both must match (see warning above)
+   STELLAR_NETWORK=testnet
+   HORIZON_URL=https://horizon-testnet.stellar.org
+
+   # Paste the secret printed by `npm run gen:sep10key`. Optional in config
+   # (a random key is generated per process when unset) but recommended so
+   # issued challenges survive restarts.
+   SEP10_SIGNING_SECRET=S...
+
+   # Safe testnet placeholders shipped in .env.example
+   ANCHOR_HOME_DOMAIN=testanchor.stellar.org
+   ANCHOR_NAME=Stellar Test Anchor
+   ANCHOR_WEBHOOK_SECRET=change-me-local-webhook-secret
+   STABLE_ASSET_CODE=USDC
+   STABLE_ASSET_ISSUER=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+   ```
+
+3. **Generate the SEP-10 key and set up Prisma:**
+
+   ```bash
+   npm run gen:sep10key          # paste SEP10_SIGNING_SECRET into .env
+   npm run prisma:generate
+   npm run prisma:migrate
+   npm run db:seed               # optional, idempotent demo data
+   ```
+
+4. **Start the API and worker** in two terminals:
+
+   ```bash
+   npm run dev                   # terminal 1 — API on http://localhost:4000
+   npm run worker                # terminal 2 — settlement + anchor worker
+   ```
+
+5. **Health check:**
+
+   ```bash
+   curl -sS http://localhost:4000/health
+   ```
+
+   Expect `{"status":"ok","database":{"connected":true},"stellar":{"reachable":true,"network":"testnet"},…}`.
+   Other probes: `/health/live` (process liveness, contacts nothing external),
+   `/health/ready` (cached readiness), and `/health/deep` (uncached dependency
+   checks with latency). See [HEALTH.md](HEALTH.md).
+
+#### Verify build/tests
+
+```bash
+npm run build          # tsc, must pass with zero errors (strict mode)
+npm test               # unit/route tests — no database or network needed
+npm run test:coverage  # with coverage
+npm run lint           # eslint over src/
+```
+
+Integration tests need a local PostgreSQL — see
+[docs/INTEGRATION_TESTING_GUIDE.md](docs/INTEGRATION_TESTING_GUIDE.md) and
+[Integration tests](#integration-tests-postgresql) below (`npm run test:integration`).
+
+#### Explore the API
+
+- [docs/api.http](docs/api.http) — a ready-to-run REST Client collection that
+  walks SEP-10 auth → group → expense → settlement (see
+  [Local API exploration](#local-api-exploration-rest-client)).
+- `http://localhost:4000/docs` — interactive OpenAPI reference (Swagger UI).
+- [docs/api-contract.md](docs/api-contract.md) — error envelope and codes,
+  pagination, intent expiration, settlement status contract.
+- [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md) — troubleshooting for local setup.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — coding standards and the PR checklist.
 
 ### Local database setup
 
@@ -196,6 +295,17 @@ See [.env.example](.env.example). Key ones:
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
 | `REQUEST_TIMEOUT_MS` | Per-request wall-clock budget in milliseconds (default 10000, must be positive) |
+| `SHUTDOWN_TIMEOUT_MS` | API graceful-shutdown hard timeout in milliseconds (default 30000; see [Graceful shutdown](#graceful-shutdown)) |
+| `WORKER_SHUTDOWN_DRAIN_MS` | Worker shutdown drain budget in milliseconds (default 30000; see [Graceful shutdown](#graceful-shutdown)) |
+
+#### Graceful shutdown
+
+On `SIGINT`/`SIGTERM` both processes shut down gracefully (issue #1038):
+
+| Variable | Default | Applies to | Behavior |
+| --- | --- | --- | --- |
+| `SHUTDOWN_TIMEOUT_MS` | 30000 | API | Hard budget for `app.close()` to finish in-flight requests before the process force-exits; Prisma is disconnected afterwards. |
+| `WORKER_SHUTDOWN_DRAIN_MS` | 30000 | Worker | How long shutdown waits for the in-flight worker cycle to finish. If it drains in time, the worker releases its job leases; if the budget is exceeded, leases are left to expire on their own — a job recovered late is safe, a job submitted twice is not. The worker's overall hard timeout is `WORKER_SHUTDOWN_DRAIN_MS + SHUTDOWN_TIMEOUT_MS`. |
 
 #### Database connection & query timeouts
 
@@ -389,15 +499,21 @@ memory exhaustion and DoS attacks:
 
 | Type | Variable | Default | Description |
 | --- | --- | --- | --- |
-| JSON body | `JSON_BODY_LIMIT_BYTES` | 256 KB | All JSON request bodies (auth, settlements, anchors) |
+| JSON body (global) | `JSON_BODY_LIMIT_BYTES` | 1 MB | Default limit for JSON request bodies |
+| JSON body (auth/settlement/treasury/anchor routes) | `AUTH_BODY_LIMIT_BYTES` | 256 KB | Tighter per-route limit for sensitive JSON surfaces |
 | Multipart file | `MULTIPART_FILE_SIZE_BYTES` | 5 MB | Max file size in multipart uploads (e.g. receipts) |
 | Multipart files | `MULTIPART_MAX_FILES` | 1 | Maximum number of files per multipart request |
-| Multipart fields | `MULTIPART_MAX_FIELDS` | 10 | Maximum number of form fields per multipart request |
+| Multipart parts | `MULTIPART_MAX_FIELDS` | 20 | Maximum total multipart parts (fields + files) per request |
+| Single form field | `MULTIPART_FIELD_SIZE_BYTES` | 64 KB | Largest single non-file form field |
 
-Oversized requests are rejected with a `413 Payload Too Large` or `400 Bad Request`
-response before expensive business logic or external Stellar calls run. Request
+Oversized requests are rejected with a `413` and a stable code
+(`REQUEST_TOO_LARGE`, `FILE_TOO_LARGE`, `TOO_MANY_FILES`, `FIELD_TOO_LARGE`,
+`TOO_MANY_PARTS`) before expensive business logic or external Stellar calls
+run; a body that is not multipart where multipart is required is a `415`. A
+malformed multipart body is a `400 BAD_REQUEST` with a fixed message. Request
 bodies are fully validated with Zod before use; the size limits ensure the
-validator runs efficiently.
+validator runs efficiently. See
+[docs/api-contract.md](docs/api-contract.md#request-size-limits).
 
 ### Worker job tracking and recovery
 
@@ -614,7 +730,7 @@ canonical versioned routes before routing, preserving the query string. The
 rewrite is a compatibility layer, not a second surface — both spellings reach
 the same handler, validators, and audit entries — and new integrations should
 use `/api/v1`. The operational endpoints (`/health`, `/health/live`,
-`/health/ready`, `/docs`, and the static `/uploads/…` receipt files) stay at
+`/health/ready`, `/health/deep`, `/docs`, and the static `/uploads/…` receipt files) stay at
 the root: they are outside the versioned API contract and probes must not have
 to track an API version.
 
@@ -638,7 +754,7 @@ All paths below are relative to `/api/v1` (see
 | POST/GET | `/withdraw` · `/withdraw/:id` · `/withdraw/:id/confirm` | SEP-24 withdrawals |
 | GET | `/history` | Cross-group history |
 | POST/GET | `/uploads/receipt` · `/uploads/:file` | Receipts |
-| GET | `/health` · `/health/live` · `/health/ready` | Liveness & readiness probes (see [HEALTH.md](HEALTH.md)) |
+| GET | `/health` · `/health/live` · `/health/ready` · `/health/deep` | Liveness, readiness & deep dependency probes (see [HEALTH.md](HEALTH.md)) |
 
 All request bodies are validated with Zod; every group action checks membership
 (and admin rights where required). The full contract — error envelope and codes,
@@ -794,24 +910,55 @@ Subsequent requests use `{{token}}` automatically. Response variables
 
 ## Architecture notes
 
-### Error handling standardization (#654)
+### Error handling standardization (#654, finalized in #1040)
 
-All errors flow through a single Fastify plugin (`src/plugins/error-handler.ts`)
-that maps framework, validation, database, and upstream failures to a canonical
-envelope while keeping operator-visible details server-side only. The mapping is
-deterministic and tested end-to-end:
+All errors flow through a single Fastify plugin (`src/plugins/error-handler.ts`).
+Its canonical `resolveError()` is shared by the error handler and
+`serializeError()`, so a failure is mapped identically no matter which path
+reports it. Every error uses one envelope — **no `statusCode` in the body**; the
+HTTP status is the response status:
 
-| Source | HTTP status | Error code | Details |
+```json
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "Settlement not found",
+    "timestamp": "2026-01-01T00:00:00.000Z",
+    "requestId": "req-…",
+    "details": { "…": "optional, structured" },
+    "issues": [ { "path": ["field"], "message": "…", "code": "…" } ]
+  },
+  "code": "NOT_FOUND",
+  "message": "Settlement not found",
+  "requestId": "req-…"
+}
+```
+
+`details` and `issues` appear only when relevant (e.g. validation); the
+top-level `code`/`message`/`requestId` mirror `error.*` for backwards
+compatibility. The finalized mapping:
+
+| Source | HTTP status | Error code | Notes |
 | --- | --- | --- | --- |
-| Zod validation failure | 400 | `VALIDATION_ERROR` | Field-level issues with message and code |
-| Prisma P2002 (unique constraint) | 409 | `DUPLICATE_RECORD` | Conflicting fields, model name |
-| Prisma P2025/P2001 (record not found) | 404 | `NOT_FOUND` | — |
-| Prisma P2003 (foreign key) | 400 | `VALIDATION_ERROR` | Referenced field name |
-| Prisma lifecycle codes (P1000-P1017) | 503 | `SERVICE_UNAVAILABLE` | Retryable, driver text logged only |
-| Horizon upstream failure | 502 | `UPSTREAM_ERROR` | Provider error category |
-| Timeout / transport error | 502 | `UPSTREAM_ERROR` | Transient network issue |
-| Rate limit exceeded | 429 | `RATE_LIMIT_EXCEEDED` | Retry-After header |
-| Generic unhandled error | 500 | `INTERNAL_ERROR` | Sanitized message only |
+| Zod / ajv (`FST_ERR_VALIDATION`) / malformed or empty JSON body | 400 | `VALIDATION_ERROR` | Field-level `details` + `issues` |
+| `AppError` (route/domain errors) | its own status | its own code | e.g. `INTENT_EXPIRED` 400, `TOKEN_EXPIRED` 401, `FORBIDDEN` 403, `IDEMPOTENCY_CONFLICT` 409 |
+| Request size/type limits | 413 / 415 | `REQUEST_TOO_LARGE`, `FILE_TOO_LARGE`, `TOO_MANY_FILES`, `FIELD_TOO_LARGE`, `TOO_MANY_PARTS` (413); `BAD_REQUEST` (415) | Stable codes, fixed messages |
+| Prisma constraint/validation (P2000, P2003, P2004, …) | 400 | `VALIDATION_ERROR` | Sanitized; driver text logged only |
+| Prisma record not found (P2001/P2025) | 404 | `NOT_FOUND` | — |
+| Prisma unique constraint (P2002) / write conflict (P2034) | 409 | `DUPLICATE_RECORD` / `CONFLICT` | `details.fields` names the columns |
+| Prisma lifecycle/unreachable (P1xxx) | 503 | `SERVICE_UNAVAILABLE` | Retryable |
+| Horizon ledger result codes | 409 / 422 / 502 | `STELLAR_SEQUENCE_CONFLICT` (409), `STELLAR_*` rejections e.g. `STELLAR_INSUFFICIENT_FUNDS`, `STELLAR_MISSING_TRUSTLINE` (422), `STELLAR_INTERNAL_ERROR` (502) | `details` carries a hint + validated result codes |
+| Horizon network timeout (no HTTP response) | 504 | `UPSTREAM_TIMEOUT` | Retryable |
+| Horizon HTTP 429 | 503 | `SERVICE_UNAVAILABLE` | Dependency throttling, not the caller's budget; `Retry-After` when known |
+| Anchor/provider 5xx or timeout/transport error | 502 | `UPSTREAM_ERROR` | Transient upstream issue |
+| Rate limit exceeded (this API's limiter, or generic 429) | 429 | `RATE_LIMITED` | `Retry-After` + `X-RateLimit-*` headers |
+| Generic 4xx with a status but no known type | status | `BAD_REQUEST` / `UNAUTHORIZED` / `FORBIDDEN` / `NOT_FOUND` / `CONFLICT` | Status-derived code with fixed safe text |
+| Unknown/unhandled error | 500 | `INTERNAL_ERROR` | Sanitized message only |
+
+The OpenAPI document (`src/lib/openapi.ts`) annotates routes with the same
+error surface: 400, 401, 403, 404, 409, 413, 415, 422, 429, 502, 503, 504.
+The full code list lives in
+[docs/api-contract.md](docs/api-contract.md#error-envelope).
 
 Tests: [`tests/prisma-error.test.ts`](tests/prisma-error.test.ts),
 [`tests/plugins/error-handler.test.ts`](tests/plugins/error-handler.test.ts).
@@ -860,13 +1007,13 @@ Tests: [`tests/worker.test.ts`](tests/worker.test.ts),
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `WORKER_SETTLEMENT_MAX_ATTEMPTS` | 5 | Total submission attempts per settlement |
+| `WORKER_SETTLEMENT_MAX_ATTEMPTS` | 3 | Total submission attempts per settlement |
 | `WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS` | 1000 | Initial backoff delay |
 | `WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS` | 30000 | Maximum backoff cap |
 | `WORKER_SETTLEMENT_RETRY_JITTER_RATIO` | 0.25 | Jitter fraction (0–1) |
 | `WORKER_ANCHOR_MAX_ATTEMPTS` | 5 | Total poll attempts per anchor session |
-| `WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS` | 2000 | Anchor poll backoff start |
-| `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` | 60000 | Anchor poll backoff cap |
+| `WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS` | 5000 | Anchor poll backoff start |
+| `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` | 120000 | Anchor poll backoff cap |
 | `WORKER_ANCHOR_RETRY_JITTER_RATIO` | 0.25 | Anchor jitter fraction |
 
 ### Horizon SDK isolation (#650)

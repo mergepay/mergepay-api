@@ -5,6 +5,7 @@ import {
   emitAuditEvent,
   sanitizeAuditMetadata,
 } from "../lib/audit-logger";
+import { isRecord, serializeAuditMetadata } from "../schemas/json-metadata";
 
 /**
  * Console/file telemetry for the durable audit trail — Issues #367 and #131,
@@ -18,15 +19,21 @@ import {
  * operation the audit record documents.
  */
 function emitTelemetry(data: ReturnType<typeof auditData>): void {
+  const { actorType, actorPublicKey, outcome } = data.metadata;
   emitAuditEvent({
     action: data.action,
-    actorType: data.metadata?.actorType,
+    actorType:
+      actorType === "user" || actorType === "worker" || actorType === "system"
+        ? actorType
+        : undefined,
     userId: data.userId,
-    actorPublicKey: data.metadata?.actorPublicKey,
+    actorPublicKey:
+      typeof actorPublicKey === "string" ? actorPublicKey : undefined,
     groupId: data.groupId,
     entityType: data.entityType ?? "unknown",
     entityId: data.entityId ?? "unknown",
-    outcome: data.metadata?.outcome,
+    outcome:
+      outcome === "success" || outcome === "failure" ? outcome : undefined,
     metadata: data.metadata,
   });
 }
@@ -59,6 +66,7 @@ export interface AuditParams {
 
 /** Build the Prisma `data` payload for an audit record. */
 export function auditData(params: AuditParams) {
+  const sanitized = sanitizeAuditMetadata(params.metadata ?? {});
   return {
     userId: params.userId ?? null,
     groupId: params.groupId ?? null,
@@ -66,13 +74,13 @@ export function auditData(params: AuditParams) {
     entityType: params.entityType,
     entityId: params.entityId,
     correlationId: params.correlationId ?? null,
-    metadata: {
-      ...(sanitizeAuditMetadata(params.metadata ?? {}) as Record<string, unknown>),
+    metadata: serializeAuditMetadata({
+      ...(isRecord(sanitized) ? sanitized : {}),
       ...(params.outcome ? { outcome: params.outcome } : {}),
       ...(params.actorType ? { actorType: params.actorType } : {}),
       ...(params.actorPublicKey ? { actorPublicKey: params.actorPublicKey } : {}),
       ...(params.correlationId ? { correlationId: params.correlationId } : {}),
-    } as any,
+    }),
   };
 }
 
@@ -504,6 +512,7 @@ export async function auditGroupAdminAction(
   params: GroupAdminAuditParams,
   tx?: Prisma.TransactionClient
 ): Promise<void> {
+  const sanitized = sanitizeAuditMetadata(params.metadata ?? {});
   const auditPayload: AuditParams = {
     userId: params.actorId,
     actorPublicKey: params.actorPublicKey ?? null,
@@ -517,7 +526,7 @@ export async function auditGroupAdminAction(
     metadata: {
       adminAction: true,
       timestamp: new Date().toISOString(),
-      ...(sanitizeAuditMetadata(params.metadata ?? {}) as Record<string, unknown>),
+      ...(isRecord(sanitized) ? sanitized : {}),
     },
   };
 

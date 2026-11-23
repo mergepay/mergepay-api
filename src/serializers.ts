@@ -18,6 +18,10 @@ import type {
   StatusHistory,
 } from "./types/contract";
 import { isProposalExpired } from "./services/treasury-proposal-expiry";
+import {
+  parseAuditMetadata,
+  parseTreasurySignatures,
+} from "./schemas/json-metadata";
 
 function dec(v: Prisma.Decimal | string | number): string {
   return v.toString();
@@ -149,15 +153,32 @@ export function serializeTreasuryTx(t: any): TreasuryTransaction {
   };
 }
 
-export function serializeTreasuryProposal(p: any): TreasuryProposal {
+/** Minimal structural view of a `TreasuryProposal` row for serialization. */
+interface TreasuryProposalPayload {
+  id: string;
+  groupId: string;
+  creatorId: string;
+  xdr: string;
+  threshold: number;
+  signatures?: Prisma.JsonValue | null;
+  status: string;
+  stellarTxHash?: string | null;
+  failureReason?: string | null;
+  expiresAt?: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export function serializeTreasuryProposal(p: TreasuryProposalPayload): TreasuryProposal {
+  const signatures = parseTreasurySignatures(p.signatures);
   return {
     id: p.id,
     groupId: p.groupId,
     creatorId: p.creatorId,
     xdr: p.xdr,
     threshold: p.threshold,
-    signatures: p.signatures ?? [],
-    signatureCount: Array.isArray(p.signatures) ? p.signatures.length : 0,
+    signatures,
+    signatureCount: signatures.length,
     status: p.status,
     stellarTxHash: p.stellarTxHash ?? null,
     failureReason: p.failureReason ?? null,
@@ -271,17 +292,32 @@ const SENSITIVE_AUDIT_METADATA_KEYS = new Set([
   "authorization",
 ]);
 
-function redactAuditMetadata(metadata: unknown): Record<string, unknown> | null {
-  if (!metadata || typeof metadata !== "object") return null;
+function redactAuditMetadata(
+  metadata: Prisma.JsonValue | null | undefined
+): Record<string, unknown> | null {
+  if (metadata === null || metadata === undefined) return null;
+  const parsed = parseAuditMetadata(metadata);
   const redacted: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(metadata as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(parsed)) {
     if (SENSITIVE_AUDIT_METADATA_KEYS.has(key.toLowerCase())) continue;
     redacted[key] = value;
   }
   return redacted;
 }
 
-export function serializeAuditLogEntry(e: any): AuditLogEntry {
+/** Minimal structural view of an `AuditLog` row (with optional actor) for serialization. */
+interface AuditLogEntryPayload {
+  id: string;
+  createdAt: Date;
+  userId?: string | null;
+  action: string;
+  entityType?: string | null;
+  entityId?: string | null;
+  metadata?: Prisma.JsonValue | null;
+  user?: { displayName?: string | null } | null;
+}
+
+export function serializeAuditLogEntry(e: AuditLogEntryPayload): AuditLogEntry {
   return {
     id: e.id,
     createdAt: iso(e.createdAt),

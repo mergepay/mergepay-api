@@ -1,5 +1,5 @@
 /**
- * Automated Database Migration Health Check Script (#806).
+ * Automated Database Migration Health Check Script (#806, #1078).
  *
  * Verifies database migration status and Prisma client schema alignment before
  * API server or worker process deployment.
@@ -7,9 +7,12 @@
  * Diagnostic checks:
  * 1. Checks DATABASE_URL configuration and connection health.
  * 2. Validates Prisma schema syntax and model integrity (`prisma validate`).
- * 3. Inspects migration history against target database (`prisma migrate status`).
+ * 3. Inspects migration history against target database (`prisma migrate status`),
+ *    reporting unapplied and failed migrations with an actionable count/status.
  * 4. Gracefully catches and describes connection errors (P1001, timeouts, auth failures).
- * 5. Detects failed migrations and schema drift (`prisma migrate diff --exit-code`) (#1081).
+ * 5. Detects schema drift with `prisma migrate diff --exit-code` (#1081), reading
+ *    the datasource URL from the environment rather than the process argv so the
+ *    database password never leaks into shell command lines or logs (#1078).
  * 6. Exits 0 on clean synced migrations; exits 1 on unapplied migrations, drift or errors.
  *    Pass `--json` for a machine-readable report (used by CI).
  */
@@ -101,13 +104,15 @@ export function checkMigrationHealth(options?: {
       stdio: "pipe",
     });
     diagnostics.push("✅ Prisma schema syntax and model relations verified");
-  } catch (err: unknown) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
+  } catch {
+    // The raw Prisma error may carry connection details (including parts of
+    // DATABASE_URL). Keep it out of the report: `prisma validate` prints the
+    // precise syntax diagnostics when the operator runs it locally.
     diagnostics.push("❌ Prisma schema validation failed: Syntax or model error detected");
     return {
       healthy: false,
       statusCode: "schema_invalid",
-      message: `Schema validation error: ${errorMsg.slice(0, 200)}`,
+      message: "Schema validation error: prisma/schema.prisma is not valid; run `npx prisma validate` for details",
       diagnostics,
     };
   }
@@ -122,11 +127,15 @@ export function checkMigrationHealth(options?: {
     // Check if unapplied migrations exist
     if (
       /following migration.*have not yet been applied/i.test(statusOutput) ||
+      /\d+\s+migrations?\s+have not yet been applied/i.test(statusOutput) ||
       /unapplied migration/i.test(statusOutput)
     ) {
       const match = statusOutput.match(/(\d+)\s+migration.*have not yet been applied/i);
       const pendingCount = match ? parseInt(match[1], 10) : undefined;
       diagnostics.push("⚠️ Database has pending unapplied migrations");
+      if (pendingCount !== undefined) {
+        diagnostics.push(`ℹ️ ${pendingCount} migration(s) awaiting application`);
+      }
       return {
         healthy: false,
         statusCode: "pending_migrations",
@@ -139,9 +148,13 @@ export function checkMigrationHealth(options?: {
     diagnostics.push("✅ Database schema is up to date: All migrations successfully applied");
 
     // 3. Confirm the migrated database matches schema.prisma (exit 2 = drift).
+    // `--from-schema-datasource` makes the Prisma CLI resolve the datasource
+    // URL from the DATABASE_URL we pass in `env`. Interpolating the URL into
+    // the shell command would expose the password in argv, process listings,
+    // and CI logs (#1078).
     try {
       runner(
-        'npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code',
+        "npx prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --exit-code",
         { env: { ...process.env, DATABASE_URL: dbUrl }, stdio: "pipe" }
       );
       diagnostics.push("✅ No drift between the database and prisma/schema.prisma");
@@ -180,13 +193,17 @@ export function checkMigrationHealth(options?: {
     }
     if (/have not yet been applied|unapplied migration/i.test(errorText)) {
       const match = errorText.match(/(\d+)\s+migrations?.*have not yet been applied/i);
+      const pendingCount = match ? parseInt(match[1], 10) : undefined;
       diagnostics.push("⚠️ Database has pending unapplied migrations");
+      if (pendingCount !== undefined) {
+        diagnostics.push(`ℹ️ ${pendingCount} migration(s) awaiting application`);
+      }
       return {
         healthy: false,
         statusCode: "pending_migrations",
         message: "Target database is behind: Pending migrations require execution",
         diagnostics,
-        pendingMigrationsCount: match ? parseInt(match[1], 10) : undefined,
+        pendingMigrationsCount: pendingCount,
       };
     }
     const connectionReason = parseConnectionError(errorText);
@@ -228,14 +245,30 @@ export function formatHealthReport(status: MigrationHealthStatus): string {
   return lines.join("\n");
 }
 
-if (typeof require !== "undefined" && require.main === module) {
-  const result = checkMigrationHealth();
-  console.log(
-    process.argv.includes("--json")
+/**
+ * CLI entry point, extracted so the report/exit-code contract is unit-testable
+ * without spawning a process or requiring a live database. Returns the code a
+ * CI runner should see: 0 for a synced schema, 1 for every unhealthy status.
+ */
+export function runMigrationHealthCli(
+  args: readonly string[],
+  log: (message: string) => void = (message) => console.log(message),
+  exit: (code: number) => void = (code) => process.exit(code),
+  options?: Parameters<typeof checkMigrationHealth>[0]
+): number {
+  const result = checkMigrationHealth(options);
+  log(
+    args.includes("--json")
       ? JSON.stringify(result, null, 2)
       : formatHealthReport(result)
   );
-  if (!result.healthy) {
-    process.exit(1);
+  const exitCode = result.healthy ? 0 : 1;
+  if (exitCode !== 0) {
+    exit(exitCode);
   }
+  return exitCode;
+}
+
+if (typeof require !== "undefined" && require.main === module) {
+  runMigrationHealthCli(process.argv);
 }

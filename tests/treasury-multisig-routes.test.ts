@@ -304,7 +304,7 @@ describe("POST /treasury/propose", () => {
     });
   });
 
-  it("accepts the legacy groupId alias and never persists key material sent with it", async () => {
+  it("rejects key material sent alongside the legacy groupId alias", async () => {
     seedTreasuryGroup();
     seedAdminMembership();
     const leakedSecret = treasury.secret();
@@ -320,15 +320,38 @@ describe("POST /treasury/propose", () => {
       },
     });
 
-    expect(res.statusCode).toBe(200);
-    const stored = h.prisma.treasuryTxProposal.create.mock.calls[0][0].data;
-    expect(stored.groupId).toBe("group_1");
-    // Unknown fields are stripped by the schema, so a stray secret cannot reach
-    // the row — and the stored envelope is the caller's unsigned XDR only.
-    expect(JSON.stringify(stored)).not.toContain(leakedSecret);
-    expect(Object.keys(stored).sort()).toEqual(
-      ["creatorId", "description", "groupId", "requiredWeight", "sourceAccount", "status", "txHash", "xdr"].sort()
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    expect(res.json().error.details).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: "secret" })])
     );
+    // Strict validation rejects the whole request before any storage side
+    // effect, so the secret cannot be persisted anywhere.
+    expect(h.prisma.treasuryTxProposal.create).not.toHaveBeenCalled();
+    expect(JSON.stringify(res.body)).not.toContain(leakedSecret);
+  });
+
+  it("applies the same strict validation to the collection-style proposal route", async () => {
+    seedTreasuryGroup();
+    seedAdminMembership();
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/treasury/proposals",
+      headers: authHeader(admin),
+      payload: {
+        groupId: "group_1",
+        xdr: unsignedXdr(),
+        seed: treasury.secret(),
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    expect(res.json().error.details).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: "seed" })])
+    );
+    expect(h.prisma.treasuryTxProposal.create).not.toHaveBeenCalled();
   });
 
   it("rejects a proposal from a group member who is not an admin", async () => {

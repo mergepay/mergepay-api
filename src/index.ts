@@ -2,6 +2,7 @@ import { buildApp } from "./app";
 import { config, env } from "./config";
 import { prisma } from "./db";
 import { connectWithRetry } from "./lib/db-connect";
+import { createGracefulShutdown } from "./lib/graceful-shutdown";
 
 async function main() {
   // Config validation already happened at module load time in config.ts
@@ -22,41 +23,18 @@ async function main() {
     process.exit(1);
   }
 
-  let shutdownStarted = false;
-  const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
-    if (shutdownStarted) {
-      return;
-    }
-    shutdownStarted = true;
-
-    const timeoutMs = config.SHUTDOWN_TIMEOUT_MS;
-    const timeoutHandle = setTimeout(() => {
-      app.log.error({ signal, timeoutMs }, "shutdown timed out, forcing exit");
-      process.exit(1);
-    }, timeoutMs);
-
-    try {
-      app.log.info({ signal, timeoutMs }, "shutting down");
+  createGracefulShutdown({
+    logger: app.log,
+    timeoutMs: config.SHUTDOWN_TIMEOUT_MS,
+    close: async (signal) => {
       try {
         await app.close();
       } finally {
-        // The pool is released even when the HTTP server fails to close: a
-        // leaked connection pool is exactly what this teardown exists to
-        // prevent, and it must not hinge on the previous step succeeding.
         await prisma.$disconnect();
         app.log.info({ signal }, "database disconnected");
       }
-      app.log.info({ signal }, "shutdown complete");
-    } catch (error) {
-      app.log.error({ err: error, signal }, "shutdown failed");
-      throw error;
-    } finally {
-      clearTimeout(timeoutHandle);
-      process.exit(0);
-    }
-  };
-  process.once("SIGINT", () => void shutdown("SIGINT"));
-  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+    },
+  });
 
   try {
     await app.listen({ port: config.PORT, host: "0.0.0.0" });

@@ -13,6 +13,7 @@ import {
 import { anchorService } from "../services/anchor";
 import { stellar } from "../services/stellar";
 import { auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import { applyWithdrawalTransition } from "../services/withdrawal-status";
 import { isPositive } from "../services/money";
 import { validateRequest } from "../middleware/validate-request";
@@ -165,9 +166,10 @@ export default async function withdrawalRoutes(app: FastifyInstance) {
       await auditTx(tx, {
         correlationId: req.id,
         userId: auth.id,
-        action: "withdrawal.start",
+        action: AuditAction.WITHDRAWAL_START,
         entityType: "withdrawal",
         entityId: created.id,
+        actorPublicKey: auth.stellarPublicKey,
         metadata: { amount: body.amount, assetCode: body.assetCode },
       });
       return created;

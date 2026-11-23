@@ -99,12 +99,13 @@ describe("applyAnchorSessionTransition", () => {
         // `source: "webhook"` is the anchor reporting back, so the actor is
         // automation even though the session belongs to `user_1`.
         userId: "user_1",
-        metadata: {
+        metadata: expect.objectContaining({
           from: "pending_anchor",
           to: "completed",
           source: "webhook",
           actorType: "system",
-        },
+          assetCode: "USDC",
+        }),
       }),
     });
   });

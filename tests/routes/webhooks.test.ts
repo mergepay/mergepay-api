@@ -303,7 +303,7 @@ describe("POST /api/webhooks/sep24 — state updates", () => {
     const actions = prisma.auditLog.create.mock.calls.map(
       ([args]: any[]) => args.data.action
     );
-    expect(actions).toContain("anchor_session.status_changed");
+    expect(actions).toContain("anchor.deposit.completed");
     expect(actions).toContain("sep24.webhook.applied");
   });
 

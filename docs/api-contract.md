@@ -16,19 +16,33 @@ or query convention changes.
 
 ## Error envelope
 
-Every error — validation, authorization, rate limiting, upstream — uses one shape:
+Every error — validation, authorization, rate limiting, upstream — uses one
+canonical envelope, produced by `resolveError()` / `serializeError()` in
+[../src/plugins/error-handler.ts](../src/plugins/error-handler.ts) (finalized in
+issue #1040):
 
 ```json
 {
-  "error": "NOT_FOUND",
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "Settlement not found",
+    "timestamp": "2026-01-01T00:00:00.000Z",
+    "requestId": "req-…",
+    "details": { "…": "optional, structured" },
+    "issues": [ { "path": ["field"], "message": "…", "code": "…" } ]
+  },
+  "code": "NOT_FOUND",
   "message": "Settlement not found",
-  "statusCode": 404,
-  "details": { "…": "optional, structured" },
-  "requestId": "01J…"
+  "requestId": "req-…"
 }
 ```
 
-`error` is a stable machine-readable code from `ErrorCode` in
+The HTTP status is the response status — **the body carries no `statusCode`
+field**. `details` and `issues` are present only when relevant (e.g.
+validation); `retryAfter` may accompany a 429/503. The top-level `code`,
+`message`, and `requestId` mirror `error.*` for backwards compatibility.
+
+`error.code` is a stable machine-readable code from `ErrorCode` in
 [../src/lib/errors.ts](../src/lib/errors.ts). Codes worth calling out:
 
 | Code | Status | Meaning |
@@ -54,10 +68,18 @@ Every error — validation, authorization, rate limiting, upstream — uses one 
 | `INVALID_SIGNATURE` | 401 | `POST /auth/verify`: the challenge's client signatures do not verify — re-sign it |
 | `FORBIDDEN` | 403 | Authenticated, but not permitted on this resource |
 | `NOT_FOUND` | 404 | The resource does not exist |
+| `BAD_REQUEST` | 400 / 415 | Generic malformed request (fixed safe text), or a body that is not multipart where multipart is required (415) |
+| `CONFLICT` | 409 | Write conflict/deadlock, or a generic 409 with no more specific code |
+| `REQUEST_TOO_LARGE` / `FILE_TOO_LARGE` / `TOO_MANY_FILES` / `FIELD_TOO_LARGE` / `TOO_MANY_PARTS` | 413 | A request size limit tripped — see [Request size limits](#request-size-limits) |
+| `STELLAR_SEQUENCE_CONFLICT` | 409 | Horizon rejected the transaction's sequence number (e.g. `tx_bad_seq`) — rebuild and re-sign |
+| `STELLAR_INSUFFICIENT_FUNDS`, `STELLAR_MISSING_TRUSTLINE`, `STELLAR_FEE_TOO_LOW`, `STELLAR_AUTH_FAILED`, `STELLAR_TRANSACTION_EXPIRED`, … | 422 | The ledger rejected the submitted transaction; `details` carries a hint and validated `resultCodes` |
 | `RATE_LIMITED` | 429 | Per-route budget exhausted; the wait is in the `Retry-After` header |
 | `DUPLICATE_RECORD` | 409 | A unique constraint rejected the write; `details.fields` names the columns |
-| `UPSTREAM_ERROR` | 502 | Horizon or an anchor failed |
-| `SERVICE_UNAVAILABLE` | 503 | The database is unreachable, so the request could not be attempted |
+| `UPSTREAM_ERROR` | 502 | Horizon or an anchor failed (provider 5xx, timeout, or transport error) |
+| `STELLAR_INTERNAL_ERROR` | 502 | Horizon itself reported an internal error |
+| `SERVICE_UNAVAILABLE` | 503 | The database is unreachable, or Horizon is rate limiting this server (upstream 429) — retry later |
+| `UPSTREAM_TIMEOUT` | 504 | A Horizon call timed out with no HTTP response — retryable |
+| `INTERNAL_ERROR` | 500 | Unknown/unhandled failure; sanitized message only |
 
 `404` versus `403` is deliberate and consistent: a resource that does not exist
 is `404`; one that exists but is not the caller's is `403`. Clients need to
@@ -608,6 +630,7 @@ monitoring probe must work without a session. See also
 | --- | --- | --- |
 | `GET /health` · `GET /health/live` | Liveness | `200` with `{ "status": "ok", "timestamp": "…" }` while the process can accept requests. Contacts nothing external. |
 | `GET /health/ready` | Readiness | `200` with `{ "status": "ok", "checks": {…} }` when every required dependency is available; `503` with `{ "status": "not_ready", "checks": {…} }` otherwise. |
+| `GET /health/deep` | Deep dependency check | Uncached: measures database and Horizon independently and reports `checks.{database,stellar}.{status,latencyMs}` plus `uptime` and `environment`. `200` (`status: "ok"`) when both answer, `503` (`status: "degraded"`) otherwise. |
 
 ### Readiness checks
 

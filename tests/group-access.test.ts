@@ -92,6 +92,7 @@ import groupAccessPlugin, {
 const GROUP_ID = "group_1";
 const OTHER_GROUP_ID = "group_2";
 const PUBLIC_KEY = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const TREASURY_DESTINATION = "GDKYN3O7ZVZLDTGOG6H242WA2TEZHVQNCHKJXZZLEWVS5WM3CKKO2WV6";
 
 let userSeq = 0;
 /** A fresh user id per scenario, so per-user rate-limit buckets never collide. */
@@ -514,8 +515,14 @@ function concreteUrl(routePath: string, groupId = GROUP_ID): string {
     .replace(":webhookId", "wh_1");
 }
 
-function payloadFor(route: GroupRoute): Record<string, unknown> | undefined {
+function payloadFor(
+  route: GroupRoute,
+  fallback: Record<string, unknown> = { role: "admin", userId: "user_target" }
+): Record<string, unknown> | undefined {
   if (route.method === "GET") return undefined;
+  if (route.path === "/groups/:groupId/treasury/proposals") {
+    return { destination: TREASURY_DESTINATION, amount: "1", assetCode: "XLM" };
+  }
   if (route.path.endsWith("/expenses")) {
     return {
       title: "Dinner",
@@ -525,7 +532,7 @@ function payloadFor(route: GroupRoute): Record<string, unknown> | undefined {
       shares: [{ userId: "user_target" }],
     };
   }
-  return { role: "admin", userId: "user_target" };
+  return fallback;
 }
 
 function headersFor(route: GroupRoute, userId: string): Record<string, string> {
@@ -574,7 +581,7 @@ describe("group routes on the real app", () => {
         method: route.method,
         url: concreteUrl(route.path),
         headers: headersFor(route, newUser("member")),
-        payload: payloadFor(route),
+        payload: payloadFor(route, { role: "admin", userId: "user_target" }),
       });
       expect(res.statusCode).toBe(403);
       expect(res.json().error.message).toBe("Only a group admin can perform this action");
@@ -600,7 +607,7 @@ describe("group routes on the real app", () => {
       method: route.method,
       url: concreteUrl(route.path, "group_missing"),
       headers: headersFor(route, newUser(null)),
-      payload: payloadFor(route),
+      payload: payloadFor(route, {}),
     });
     expect(res.statusCode).toBe(404);
     expect(writes()).toBe(0);

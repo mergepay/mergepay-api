@@ -31,6 +31,7 @@
  */
 
 import { z } from "zod";
+import { sanitizedTextField } from "../lib/sanitize-text";
 import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import {
   DEFAULT_PAGE_SIZE,
@@ -186,8 +187,8 @@ export const groupMetadataSchema = z.record(z.unknown());
 export const createGroupSchema = z
   .object({
     /** 1–60 visible characters; whitespace-only names are rejected. */
-    name: z.string().trim().min(1, "name is required").max(60),
-    description: z.string().max(280).nullable().optional(),
+    name: sanitizedTextField({ min: 1, max: 60, minMessage: "name is required" }),
+    description: sanitizedTextField({ max: 280 }).nullable().optional(),
     currency: groupCurrencySchema.optional(),
     currencyType: groupCurrencySchema.optional(),
     defaultCurrency: groupCurrencySchema.optional(),
@@ -214,8 +215,8 @@ export const createGroupSchema = z
  */
 export const updateGroupSchema = z
   .object({
-    name: z.string().trim().min(1, "name is required").max(60).optional(),
-    description: z.string().max(280).nullable().optional(),
+    name: sanitizedTextField({ min: 1, max: 60, minMessage: "name is required" }).optional(),
+    description: sanitizedTextField({ max: 280 }).nullable().optional(),
     currency: groupCurrencySchema.optional(),
     currencyType: groupCurrencySchema.optional(),
     defaultCurrency: groupCurrencySchema.optional(),

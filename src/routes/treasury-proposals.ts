@@ -133,15 +133,8 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
     async (req) => {
     const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
 
-    const {
-      cursor,
-      limit,
-      order,
-      status,
-      creatorId,
-      startDate,
-      endDate,
-    } = treasuryProposalListQuerySchema.parse(req.query ?? {});
+    const { cursor, limit, order, status, creatorId, startDate, endDate } =
+      treasuryProposalListQuerySchema.parse(req.query ?? {});
     const position = requireCursor(cursor);
     const createdAt = dateRangeWhere({ startDate, endDate });
     const cursorScope = cursorFilter(position, order);

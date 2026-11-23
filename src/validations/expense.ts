@@ -5,6 +5,7 @@ import {
   refineValidatedAsset,
   validateAmount,
 } from "../lib/money";
+import { sanitizedTextField } from "../lib/sanitize-text";
 
 export const SplitType = z.enum(["equal", "custom", "percentage"]);
 
@@ -54,8 +55,8 @@ const shareInput = z
 
 export const createExpenseSchema = z
   .object({
-    title: z.string().min(1).max(80),
-    description: z.string().max(500).optional(),
+    title: sanitizedTextField({ min: 1, max: 80 }),
+    description: sanitizedTextField({ max: 500 }).optional(),
     amount: canonicalAmountSchema,
     assetCode: z.string().min(1).max(12),
     assetIssuer: z.string().nullable().optional(),
@@ -137,8 +138,8 @@ export type CreateExpenseInput = z.infer<typeof createExpenseSchema>;
 
 export const updateExpenseSchema = z
   .object({
-    title: z.string().min(1).max(80).optional(),
-    description: z.string().max(500).nullable().optional(),
+    title: sanitizedTextField({ min: 1, max: 80 }).optional(),
+    description: sanitizedTextField({ max: 500 }).nullable().optional(),
     memo: memoSchema,
     receiptUrl: z.string().url("Receipt URL must be a valid URL").nullable().optional(),
   })

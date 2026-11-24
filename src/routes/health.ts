@@ -1,5 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { getReadiness } from "../services/health";
+import { getAuthHealth } from "../services/auth-health";
 import { prisma } from "../db";
 
 let lastLoggedDegradedReadiness: string | null = null;
@@ -79,6 +80,62 @@ export default async function healthRoutes(app: FastifyInstance) {
       }
 
       return reply.code(statusCode).send(readiness);
+    }
+  );
+
+  app.get(
+    "/health/auth",
+    {
+      schema: {
+        tags: ["System"],
+        summary: "SEP-10 authentication dependency health",
+        description:
+          "Reports whether the dependencies SEP-10 authentication needs are usable: the server signing key loads and Stellar Horizon (the signer lookup used during verification) answers. Returns 200 when both are healthy and 503 when either is not, so an orchestrator can drain an instance whose logins would fail closed. The payload contains booleans only — never key material, signatures, or upstream error text.",
+        response: {
+          200: {
+            description: "Every authentication dependency is healthy",
+            type: "object",
+            required: ["status", "checks"],
+            properties: {
+              status: { type: "string", example: "ok" },
+              checks: {
+                type: "object",
+                required: ["signingKey", "horizon"],
+                properties: {
+                  signingKey: { type: "boolean", example: true },
+                  horizon: { type: "boolean", example: true },
+                },
+              },
+            },
+          },
+          503: {
+            description: "At least one authentication dependency is unavailable",
+            type: "object",
+            required: ["status", "checks"],
+            properties: {
+              status: { type: "string", example: "degraded" },
+              checks: {
+                type: "object",
+                required: ["signingKey", "horizon"],
+                properties: {
+                  signingKey: { type: "boolean", example: false },
+                  horizon: { type: "boolean", example: false },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const health = await getAuthHealth();
+      const statusCode = health.status === "ok" ? 200 : 503;
+
+      if (statusCode === 503) {
+        request.log.warn({ checks: health.checks }, "Auth dependency health check is degraded");
+      }
+
+      return reply.code(statusCode).send(health);
     }
   );
 

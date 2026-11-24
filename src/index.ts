@@ -3,6 +3,7 @@ import { config, env } from "./config";
 import { prisma } from "./db";
 import { connectWithRetry } from "./lib/db-connect";
 import { createGracefulShutdown } from "./lib/graceful-shutdown";
+import { preloadSep10SigningKey } from "./services/auth-health";
 
 async function main() {
   // Config validation already happened at module load time in config.ts
@@ -12,7 +13,14 @@ async function main() {
     process.exit(1);
   }
 
+  // Derive the SEP-10 signing key once, before the app accepts traffic: a
+  // malformed SEP10_SIGNING_SECRET fails the boot instead of the first login,
+  // and every challenge/verification reuses the memoized keypair (issue #1033).
+  // The public key is not secret — it is published in stellar.toml.
+  const sep10ServerPublicKey = preloadSep10SigningKey();
+
   const app = await buildApp();
+  app.log.info({ sep10ServerPublicKey }, "SEP-10 signing key loaded");
 
   // Wait for the database before accepting traffic, so a container that
   // starts ahead of PostgreSQL doesn't serve failing requests or crash-loop.

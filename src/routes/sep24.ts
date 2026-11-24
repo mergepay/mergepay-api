@@ -12,16 +12,12 @@
  * two exist side by side because anchors differ in which scheme they support;
  * each verifies its own credential and both converge on session state.
  */
-import type { FastifyInstance, FastifyRequest } from "fastify";
-import { config } from "../config";
+import type { FastifyInstance } from "fastify";
 import { prisma } from "../db";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { anchorService } from "../services/anchor";
-import { auditTx } from "../services/audit";
-import { sep24StartAction } from "../services/sep24-audit";
+import { initiateSep24Deposit, initiateSep24Withdrawal } from "../services/sep24";
 import { serializeAnchorSession } from "../serializers";
-import { validateAsset } from "../services/assets";
 import { getStatusHistory } from "../services/status-history";
 import { toSep24TransactionView } from "../services/sep24-status";
 import {
@@ -51,8 +47,6 @@ import {
 import {
   sep24DepositValidationMiddleware,
   sep24WithdrawValidationMiddleware,
-  validateSep24DepositRequest,
-  validateSep24WithdrawalRequest,
 } from "../schemas/sep24";
 
 /**
@@ -146,60 +140,6 @@ export default async function sep24Routes(app: FastifyInstance) {
   const initLimit = rateLimited("anchorInit");
   const pollLimit = rateLimited("anchorPoll");
 
-  async function handleStartInteractive(
-    kind: "deposit" | "withdrawal",
-    req: FastifyRequest
-  ) {
-    const auth = requireUser(req);
-
-    // Validate payload with dedicated Zod schemas before touching anchor or database
-    const validatedBody =
-      kind === "deposit"
-        ? validateSep24DepositRequest(req.body)
-        : validateSep24WithdrawalRequest(req.body);
-
-    validateAsset(validatedBody.assetCode, validatedBody.assetIssuer);
-
-    const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
-    const challenge = await anchorService.getChallenge(
-      t.webAuthEndpoint,
-      auth.stellarPublicKey
-    );
-
-    const session = await prisma.$transaction(async (tx) => {
-      const created = await tx.anchorSession.create({
-        data: {
-          userId: auth.id,
-          anchorName: validatedBody.anchorName ?? config.ANCHOR_NAME,
-          kind,
-          assetCode: validatedBody.assetCode,
-          status: "incomplete",
-        },
-      });
-      await auditTx(tx, {
-        correlationId: req.id,
-        userId: auth.id,
-        action: sep24StartAction(kind),
-        entityType: "anchor_session",
-        entityId: created.id,
-        actorPublicKey: auth.stellarPublicKey,
-        metadata: {
-          kind,
-          assetCode: validatedBody.assetCode,
-          ...("amount" in validatedBody && validatedBody.amount
-            ? { amount: validatedBody.amount }
-            : {}),
-        },
-      });
-      return created;
-    });
-
-    return {
-      session: serializeAnchorSession(session),
-      challenge,
-    };
-  }
-
   app.post(
     "/sep24/deposit",
     {
@@ -228,9 +168,17 @@ export default async function sep24Routes(app: FastifyInstance) {
       },
     },
     async (req) => {
+      const auth = requireUser(req);
       sep24NoParamsSchema.parse(req.params ?? {});
       sep24InitQuerySchema.parse(req.query ?? {});
-      return handleStartInteractive("deposit", req);
+
+      const { session, challenge } = await initiateSep24Deposit({
+        body: req.body,
+        actor: auth,
+        correlationId: req.id,
+      });
+
+      return { session: serializeAnchorSession(session), challenge };
     }
   );
 
@@ -259,9 +207,17 @@ export default async function sep24Routes(app: FastifyInstance) {
       },
     },
     async (req) => {
+      const auth = requireUser(req);
       sep24NoParamsSchema.parse(req.params ?? {});
       sep24InitQuerySchema.parse(req.query ?? {});
-      return handleStartInteractive("withdrawal", req);
+
+      const { session, challenge } = await initiateSep24Withdrawal({
+        body: req.body,
+        actor: auth,
+        correlationId: req.id,
+      });
+
+      return { session: serializeAnchorSession(session), challenge };
     }
   );
 

@@ -697,12 +697,16 @@ describe("treasury multisig read-back and failure handling (#653)", () => {
     // #653 rather than fixed here, because the fix belongs in the service and
     // this issue is the test suite.
     const row = await proposalRow(proposalId);
-    expect(row.status).toBe("PENDING_SIGNATURES");
-    expect(row.failureReason).toBeNull();
+    // #1051 re-persists the terminal failure outside the rolled-back
+    // transaction: the rejection is recorded as FAILED with its reason, while
+    // the in-transaction READY row and admin B's signature disappear with the
+    // rollback. Admin A's earlier signature committed in its own request.
+    expect(row.status).toBe("FAILED");
+    expect(row.failureReason).toContain("tx_failed");
     expect((await signatureRows(proposalId)).map((s) => s.signerUserId)).toEqual([adminA.id]);
 
     const actions = await auditActions(proposalId);
-    expect(actions).not.toContain("treasury.tx_proposal.failed");
+    expect(actions).toContain("treasury.tx_proposal.failed");
     expect(actions).not.toContain("treasury.tx_proposal.ready");
     expect(actions.filter((a) => a === "treasury.tx_proposal.signature_added")).toHaveLength(1);
   });

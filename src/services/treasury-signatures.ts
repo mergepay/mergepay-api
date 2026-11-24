@@ -66,6 +66,7 @@ import {
 } from "./treasury-stellar";
 import { auditMultisigActionTx } from "./audit";
 import { verifyTreasuryProposalSignature } from "./treasury-signature-verification";
+import { verifyMultisigSignatures } from "./treasury-multisig-verification";
 import { AuditAction } from "./audit-actions";
 
 export const STATUS = {
@@ -522,6 +523,30 @@ export const treasurySignaturesService = {
           }
         }
         const mergedXdr = base.toXDR();
+
+        // Re-verify the exact bytes about to be broadcast before Horizon sees
+        // them. Signatures were verified when each was first submitted, but
+        // the rows that are merged here are read back from the database: a
+        // tampered or corrupted signature row would otherwise be submitted
+        // without any cryptographic check, leaving Horizon as the only
+        // backstop. The live weights read above are reused so this costs no
+        // extra Horizon round trip, and only signatures that verify count
+        // toward the threshold.
+        const verification = await verifyMultisigSignatures({
+          xdr: mergedXdr,
+          treasuryAccountPublicKey: proposal.sourceAccount,
+          authorizedSigners: new Set(
+            allSignatures.map((signature) => signature.signerPublicKey)
+          ),
+          signerWeights: onChainWeight,
+          requiredWeight,
+        });
+        if (!verification.meetsThreshold) {
+          throw Errors.badRequest(
+            "signature_verification_failed",
+            "Merged envelope does not carry enough verified signature weight to meet the treasury threshold"
+          );
+        }
 
         try {
           const hash = await stellar.submitSigned(mergedXdr);

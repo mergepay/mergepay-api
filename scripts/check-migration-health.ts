@@ -55,6 +55,39 @@ function errorOutput(err: unknown): string {
 }
 
 /**
+ * Reduce `prisma migrate diff` output to the change lines an operator can act
+ * on, with every connection string scrubbed.
+ *
+ * The diff body describes schema objects, not credentials, but a Prisma error
+ * can echo the datasource URL, so the URL and any userinfo left in it are
+ * redacted before the lines enter diagnostics or CI logs (#1078).
+ */
+export function summarizeDriftDiagnostics(
+  rawOutput: string,
+  databaseUrl: string | undefined,
+  maxLines = 10
+): string[] {
+  const redact = (value: string): string => {
+    let redacted = databaseUrl ? value.split(databaseUrl).join("<DATABASE_URL>") : value;
+    redacted = redacted.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "<DATABASE_URL>");
+    redacted = redacted.replace(/(\/\/[^:/@\s]+:)[^@\s]+@/g, "$1<REDACTED>@");
+    return redacted.trim();
+  };
+
+  const lines: string[] = [];
+  for (const rawLine of rawOutput.split(/\r?\n/)) {
+    const line = redact(rawLine);
+    // Change lines only: the `+++`/`---` file headers and context lines add
+    // noise without saying what drifted.
+    if (!/^[+-]/.test(line) || /^(\+\+\+|---)/.test(line)) continue;
+    if (!line || lines.includes(line)) continue;
+    lines.push(line);
+    if (lines.length >= maxLines) break;
+  }
+  return lines;
+}
+
+/**
  * Parses connection error details from Prisma error messages.
  */
 export function parseConnectionError(rawError: string): string {
@@ -159,10 +192,16 @@ export function checkMigrationHealth(options?: {
       );
       diagnostics.push("✅ No drift between the database and prisma/schema.prisma");
     } catch (driftErr: unknown) {
-      if (/P100[0-3]|P1017|authentication failed/i.test(errorOutput(driftErr))) {
+      const driftOutput = errorOutput(driftErr);
+      if (/P100[0-3]|P1017|authentication failed/i.test(driftOutput)) {
         throw driftErr;
       }
       diagnostics.push("❌ Schema drift detected between the database and prisma/schema.prisma");
+      const driftLines = summarizeDriftDiagnostics(driftOutput, dbUrl);
+      if (driftLines.length > 0) {
+        diagnostics.push("ℹ️ Differing schema statements (redacted):");
+        for (const line of driftLines) diagnostics.push(`   ${line}`);
+      }
       return {
         healthy: false,
         statusCode: "schema_drift",

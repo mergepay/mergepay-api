@@ -394,6 +394,8 @@ describe("worker audit writes name their actor (#667/#676)", () => {
     "worker/expireSettlementIntents.ts": 1,
     "worker/processPendingTreasuryMultisig.ts": 1,
     "worker/index.ts": 3,
+    // Opt-in durable dead-letter row written by executeWorkerJobWithRetry.
+    "worker/job-retry-handler.ts": 1,
     "worker/reconciliation.ts": 1,
     "worker/tasks/tx-status-sync.ts": 1,
     "services/settlement-machine.ts": 1,

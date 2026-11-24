@@ -798,6 +798,13 @@ export async function authenticateChallenge(signedXdr: string): Promise<Verified
     invalidSignature(clientAccountId);
   }
 
+  // Signature verification may have waited on a Horizon round trip, so the
+  // window is checked against the clock once more immediately before the
+  // challenge is burned. Without this, an envelope whose maxTime elapsed while
+  // Horizon was answering would still be redeemed — exactly the stale window
+  // the expiry contract exists to close.
+  validateChallengeTimeBounds(bounds, new Date(), clientAccountId);
+
   // Consumed last, so a challenge is only burned by an otherwise valid
   // exchange — a wrong signature can never be used to invalidate someone
   // else's pending challenge.

@@ -526,6 +526,39 @@ describe("POST /treasury/:id/sign", () => {
     );
   });
 
+  it("refuses to broadcast when a persisted signature no longer verifies", async () => {
+    seedTreasuryGroup();
+    seedAdminMembership();
+    // Four units required: the stored (tampered) row and the valid submission
+    // together clear the threshold on paper, so only cryptographic
+    // re-verification of the merged envelope can stop the broadcast.
+    state.account.thresholds = { low: 1, med: 1, high: 4 };
+    const tx = buildTx(treasury.publicKey());
+    seedPendingProposal(tx);
+    const otherTx = buildTx(treasury.publicKey(), "9");
+    state.signatures = [
+      {
+        id: "sig_tampered",
+        proposalId: "ttp_1",
+        signerUserId: secondAdmin.id,
+        signerPublicKey: secondAdminKp.publicKey(),
+        signature: secondAdminKp.sign(otherTx.hash()).toString("base64"),
+        weight: 2,
+      },
+    ];
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/treasury/ttp_1/sign",
+      headers: authHeader(admin),
+      payload: { signedXdr: signedXdrFor(tx, [adminKp]) },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("SIGNATURE_VERIFICATION_FAILED");
+    expect(state.submittedXdrs).toHaveLength(0);
+  });
+
   it("leaves the proposal pending while collected weight is below the threshold", async () => {
     seedTreasuryGroup();
     seedAdminMembership();

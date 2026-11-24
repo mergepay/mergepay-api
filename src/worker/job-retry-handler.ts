@@ -9,6 +9,8 @@
  */
 import { createLogger } from "../lib/logger";
 import { jobLogger } from "../lib/worker-logger";
+import { audit } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
 import {
   asJobError,
   retryDelayMs,
@@ -110,6 +112,30 @@ export async function executeWorkerJobWithRetry<T>(
           reason,
           outcome: "dead_letter",
         });
+
+        // Opt-in durable dead-letter record. The structured log above is
+        // streamed and gone after rotation; this row is what an operator can
+        // query later to see which job the worker gave up on and why.
+        if (options.auditDeadLetter) {
+          await audit({
+            userId: options.userId ?? null,
+            groupId: options.groupId ?? null,
+            actorType: "worker",
+            action: AuditAction.WORKER_TASK_DEAD_LETTER,
+            entityType: "worker_task",
+            entityId: jobId,
+            correlationId: `job_${jobType}_${jobId}_${Date.now()}`,
+            outcome: "failure",
+            metadata: {
+              jobType,
+              task: taskName,
+              attempts: attempt,
+              maxAttempts: policy.maxAttempts,
+              category,
+              reason,
+            },
+          });
+        }
 
         if (options.onDeadLetter) {
           await options.onDeadLetter({

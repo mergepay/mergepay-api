@@ -69,3 +69,95 @@ describe("treasury XDR helpers", () => {
     ).toThrowError(/match|does not match/i);
   });
 });
+
+describe("buildTreasuryPaymentXdr edge cases", () => {
+  it("rejects an invalid source public key", () => {
+    expect(() =>
+      buildTreasuryPaymentXdr({
+        sourcePublicKey: "not-a-valid-key",
+        sourceSequence: "1",
+        destination,
+        asset: { code: "XLM", issuer: null },
+        amount: "10.0000000",
+        memoCode: "TEST",
+        validitySeconds: 120,
+      })
+    ).toThrow();
+  });
+
+  it("rejects an invalid destination public key", () => {
+    expect(() =>
+      buildTreasuryPaymentXdr({
+        sourcePublicKey: source.publicKey(),
+        sourceSequence: "1",
+        destination: "bad-destination-key",
+        asset: { code: "XLM", issuer: null },
+        amount: "10.0000000",
+        memoCode: "TEST",
+        validitySeconds: 120,
+      })
+    ).toThrow();
+  });
+
+  it("rejects an unsupported asset code", () => {
+    expect(() =>
+      buildTreasuryPaymentXdr({
+        sourcePublicKey: source.publicKey(),
+        sourceSequence: "1",
+        destination,
+        asset: { code: "FAKECOIN", issuer: Keypair.random().publicKey() },
+        amount: "10.0000000",
+        memoCode: "TEST",
+        validitySeconds: 120,
+      })
+    ).toThrow();
+  });
+
+  it("rejects a non-numeric source sequence", () => {
+    expect(() =>
+      buildTreasuryPaymentXdr({
+        sourcePublicKey: source.publicKey(),
+        sourceSequence: "not-a-number",
+        destination,
+        asset: { code: "XLM", issuer: null },
+        amount: "10.0000000",
+        memoCode: "TEST",
+        validitySeconds: 120,
+      })
+    ).toThrow();
+  });
+
+  it("builds the correct payment operation: destination, asset, and payment type", () => {
+    const xdr = buildTreasuryPaymentXdr({
+      sourcePublicKey: source.publicKey(),
+      sourceSequence: "1",
+      destination,
+      asset: { code: "XLM", issuer: null },
+      amount: "50.0000000",
+      memoCode: "PAY1",
+      validitySeconds: 120,
+    });
+
+    const tx = new Transaction(xdr, config.networkPassphrase);
+    expect(tx.operations).toHaveLength(1);
+    expect(tx.operations[0].type).toBe("payment");
+    const op = tx.operations[0] as { destination: string; amount: string };
+    expect(op.destination).toBe(destination);
+    expect(op.amount).toBe("50.0000000");
+  });
+
+  it("produces an unsigned envelope with no signatures", () => {
+    const xdr = buildTreasuryPaymentXdr({
+      sourcePublicKey: source.publicKey(),
+      sourceSequence: "1",
+      destination,
+      asset: { code: "XLM", issuer: null },
+      amount: "1.0000000",
+      memoCode: "NOSIG",
+      validitySeconds: 60,
+    });
+
+    const tx = new Transaction(xdr, config.networkPassphrase);
+    expect(tx.signatures).toHaveLength(0);
+  });
+});

@@ -123,6 +123,27 @@ export const createExpenseSchema = z
     }
 
     if (val.splitType === "percentage") {
+      // Every participant must state their allocation. A share without a
+      // percent, or with 0%, would otherwise pass whenever the remaining
+      // shares sum to 100 and reach the settlement engine as a zero-value
+      // obligation — malformed allocation data the schema is meant to stop.
+      for (let i = 0; i < val.shares.length; i++) {
+        const percent = val.shares[i]!.percent;
+        if (percent === undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Missing percent for "${val.shares[i]!.userId}" in a percentage split`,
+            path: ["shares", i, "percent"],
+          });
+        } else if (percent <= 0) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Share percent for "${val.shares[i]!.userId}" must be greater than zero`,
+            path: ["shares", i, "percent"],
+          });
+        }
+      }
+
       const total = val.shares.reduce((sum, s) => sum + (s.percent ?? 0), 0);
       if (Math.abs(total - 100) >= 0.01) {
         ctx.addIssue({

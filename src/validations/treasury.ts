@@ -19,7 +19,13 @@
  * bounds.
  */
 import { z } from "zod";
-import { stellarPublicKeySchema } from "../lib/stellar-validation";
+import {
+  mpMemoSchema,
+  refineStellarAsset,
+  stellarAccountIdSchema,
+  stellarPublicKeySchema,
+} from "../lib/stellar-validation";
+import { canonicalAmountSchema } from "../lib/money";
 
 /** A Stellar weight/threshold: integer in [0, 255]. */
 const stellarWeightSchema = z
@@ -93,3 +99,67 @@ export const treasuryThresholdUpdateSchema = z.object({
 });
 
 export type TreasuryThresholdUpdateInput = z.infer<typeof treasuryThresholdUpdateSchema>;
+
+// ─── Treasury proposal mutation payloads ────────────────────────────────────
+
+/**
+ * Path parameters for a group-scoped treasury proposal collection.
+ * Bounded so an oversized identifier is rejected at the door rather than
+ * reaching a database lookup.
+ */
+export const treasuryProposalGroupParamsSchema = z.object({
+  groupId: z.string().min(1, "Group ID is required").max(64),
+});
+
+/** Path parameters for a single treasury proposal resource. */
+export const treasuryProposalParamsSchema = z.object({
+  groupId: z.string().min(1, "Group ID is required").max(64),
+  proposalId: z.string().min(1, "Proposal ID is required").max(64),
+});
+
+/**
+ * Payload for creating a treasury payment proposal. The destination is a
+ * checksum-validated Stellar account, the amount is a positive, precision-safe
+ * decimal within Stellar's Int64 range, and the asset pair must be a supported
+ * asset (native XLM without an issuer, or the configured stablecoin).
+ */
+export const treasuryProposalCreateSchema = z
+  .object({
+    destination: stellarAccountIdSchema,
+    // Reports the specific reason (zero, excess precision, out of range)
+    // instead of a generic "invalid amount" message.
+    amount: canonicalAmountSchema,
+    assetCode: z.string().min(1, "Asset code is required").max(12),
+    assetIssuer: z.string().nullable().optional(),
+    memo: mpMemoSchema.optional(),
+  })
+  .superRefine((val, ctx) => {
+    refineStellarAsset(ctx, val.assetCode, val.assetIssuer);
+  });
+
+export type TreasuryProposalCreateInput = z.infer<
+  typeof treasuryProposalCreateSchema
+>;
+
+/**
+ * Payload for a member signing (and, once the threshold is met, submitting) a
+ * treasury proposal. The signed envelope must be a non-empty base64 XDR; the
+ * service verifies it hashes to the persisted proposal before accepting it.
+ * The upper bound keeps an oversized envelope out of the request pipeline.
+ */
+export const treasuryProposalSignSchema = z.object({
+  signedXdr: z
+    .string()
+    .min(1, "Signed XDR is required")
+    .max(100_000, "Signed XDR is too large"),
+});
+
+export type TreasuryProposalSignInput = z.infer<
+  typeof treasuryProposalSignSchema
+>;
+
+/**
+ * Final submission shares the sign payload shape: submission is the signature
+ * that reaches the threshold, so the same envelope rules apply.
+ */
+export const treasuryProposalSubmitSchema = treasuryProposalSignSchema;

@@ -124,6 +124,24 @@ describe("SEP-10 challenge / verify", () => {
     await expect(verifyChallenge(signedXdr)).rejects.toBeTruthy();
   });
 
+  it("rejects a challenge whose validity window has not opened yet", async () => {
+    const client = Keypair.random();
+    const { transaction, networkPassphrase } = buildChallenge(client.publicKey());
+    const tx = new Transaction(transaction, networkPassphrase);
+    tx.sign(client);
+    const signedXdr = tx.toXDR();
+
+    // Move the server clock ten minutes *behind* the window the challenge was
+    // built for, so the envelope is correctly signed but not yet usable.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(Date.now() - 10 * 60 * 1000));
+
+    await expect(verifyChallenge(signedXdr)).rejects.toMatchObject({
+      code: "CHALLENGE_NOT_YET_VALID",
+      status: 401,
+    });
+  });
+
   it("rejects a challenge signed for the wrong network", async () => {
     const client = Keypair.random();
     const { transaction } = buildChallenge(client.publicKey());

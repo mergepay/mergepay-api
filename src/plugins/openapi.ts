@@ -52,7 +52,22 @@ export const EXPENSE_OPENAPI_SCHEMA = {
     memo: { type: ["string", "null"] },
     receiptUrl: { type: ["string", "null"] },
     createdAt: { type: "string", format: "date-time" },
-    shares: { type: "array", items: { type: "object" } },
+    shares: {
+      type: "array",
+      items: {
+        type: "object",
+        // The serializer walks these properties: an item schema with none
+        // strips every field, which is what the contract tests caught.
+        additionalProperties: true,
+        properties: {
+          id: { type: "string" },
+          expenseId: { type: "string" },
+          userId: { type: "string" },
+          shareAmount: { type: "string" },
+          status: { type: "string" },
+        },
+      },
+    },
   },
 } as const;
 

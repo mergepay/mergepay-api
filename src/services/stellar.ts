@@ -23,8 +23,9 @@ import {
   TransactionBuilder,
 } from "@stellar/stellar-sdk";
 import { config } from "../config";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { ProviderError } from "../lib/provider-error";
+import { extractHorizonResultCodes } from "./horizon-errors";
 import { createLogger } from "../lib/logger";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
 import { withTimeout, toProviderError } from "./timeout";
@@ -146,6 +147,42 @@ function logHorizonFailure(
     { provider: "horizon", operation, category, resultCodes },
     "Horizon call failed"
   );
+}
+
+/**
+ * Translate anything a Horizon *submission* threw into the API's typed error
+ * and write one safe log line for it (#1057).
+ *
+ * This is the single mapping point for every on-chain submission in this
+ * module — plain payments, multisig payments, and the treasury signature
+ * collector all pass their failure through here, so `stellar` result codes
+ * (`tx_bad_seq`, `op_underfunded`, …) reach the client with the same stable
+ * code, status and hint regardless of which flow submitted the envelope, and
+ * an operational log entry exists for every failed attempt.
+ *
+ * Only the operation label, the normalized category, and allow-listed result
+ * codes are logged; the raw provider error and envelope bytes never are.
+ *
+ * @param error - Whatever the SDK rejected with (or a `TimeoutError` /
+ *   `TransportError` from `withTimeout`).
+ * @param operation - Horizon operation label used in the error and log.
+ * @returns The `AppError` the caller should throw.
+ */
+function submissionFailure(error: unknown, operation: string): AppError {
+  const converted = toProviderError(error, {
+    provider: "horizon",
+    operation,
+    fallbackMessage: "Stellar rejected the transaction",
+  });
+  const category =
+    converted instanceof ProviderError ? converted.category : "rejected";
+  const resultCodes = extractHorizonResultCodes(error);
+  logHorizonFailure(
+    operation,
+    category,
+    resultCodes.length > 0 ? resultCodes.join(",") : null
+  );
+  return converted;
 }
 
 /**
@@ -519,15 +556,7 @@ export const stellar = {
       // Normalize everything into a categorized ProviderError: timeouts stay
       // indeterminate, transports transient, and Horizon result codes a
       // permanent rejection — the worker's retry decision reads the category.
-      const converted = toProviderError(e, {
-        provider: "horizon",
-        operation: "Horizon.submitTransaction",
-        fallbackMessage: "Stellar rejected the transaction",
-      });
-      if (converted instanceof ProviderError) {
-        logHorizonFailure(converted.operation, converted.category, converted.detail?.join(",") ?? null);
-      }
-      throw converted;
+      throw submissionFailure(e, "Horizon.submitTransaction");
     }
   },
 
@@ -554,15 +583,7 @@ export const stellar = {
       // Normalize into a categorized ProviderError exactly like the worker's
       // submission path: Horizon result codes become a permanent rejection
       // carrying only the safe code identifiers.
-      const converted = toProviderError(e, {
-        provider: "horizon",
-        operation: "Horizon.submitTransaction",
-        fallbackMessage: "Stellar rejected the transaction",
-      });
-      if (converted instanceof ProviderError) {
-        logHorizonFailure(converted.operation, converted.category, converted.detail?.join(",") ?? null);
-      }
-      throw converted;
+      throw submissionFailure(e, "Horizon.submitTransaction");
     }
   },
 
@@ -662,23 +683,11 @@ async function submitToHorizon(tx: Transaction): Promise<string> {
     );
     return res.hash;
   } catch (e: unknown) {
-    // Route every Horizon rejection through the shared mapping (#810) so the
-    // failure carries a stable API code, a ledger-appropriate status, and an
-    // actionable hint. Only validated result-code tokens survive; the raw
-    // SDK error and its response payload never reach the client.
-    const converted = toProviderError(e, {
-      provider: "horizon",
-      operation: "Horizon.submitTransaction",
-      fallbackMessage: "Stellar rejected the transaction",
-    });
-    if (converted instanceof ProviderError) {
-      logHorizonFailure(
-        converted.operation,
-        converted.category,
-        converted.detail?.join(",") ?? null
-      );
-    }
-    throw converted;
+    // Route every Horizon rejection through the shared mapping (#810/#1057) so
+    // the failure carries a stable API code, a ledger-appropriate status, an
+    // actionable hint, and one log entry. Only validated result-code tokens
+    // survive; the raw SDK error and its response payload never reach the client.
+    throw submissionFailure(e, "Horizon.submitTransaction");
   }
 }
 

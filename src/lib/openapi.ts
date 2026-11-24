@@ -125,6 +125,41 @@ export function openApiEnvelope(envelope: string): Record<string, unknown> {
   };
 }
 
+/**
+ * Reference a declared component schema from a response, while keeping the
+ * response permissive.
+ *
+ * Route responses are serialized by Fastify against their documented schema,
+ * so a strict `$ref` would strip fields the handler legitimately adds (a group
+ * summary's `memberCount`, an expense's `payer`). Wrapping the reference in an
+ * `allOf` with `additionalProperties: true` documents the component's fields in
+ * Swagger without allowing the serializer to drop anything (#1047).
+ */
+export function openApiSchemaRef(name: string): Record<string, unknown> {
+  // `name` is the shared schema's `$id` (see src/plugins/openapi.ts), which
+  // both the OpenAPI generator and Fastify's response serializer resolve.
+  return { $ref: name };
+}
+
+/**
+ * Documentation-only query-string schema.
+ *
+ * The handler's Zod schema remains the single validator (as it is for request
+ * bodies — see `openApiBody`), so values are documented as strings without
+ * constraints Fastify's validator would enforce before Zod runs. Query string
+ * values always arrive as text, so typing them loosely keeps coercion out of
+ * the documentation layer.
+ */
+export function openApiQuery(
+  properties: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: true,
+    properties,
+  };
+}
+
 /** OpenAPI params schema for a route carrying a single `id` path parameter. */
 export function openApiIdParams(): Record<string, unknown> {
   return {

@@ -47,11 +47,12 @@ import {
 } from "../lib/pagination";
 import {
   openApiBody,
-  openApiEnvelope,
   openApiErrorResponses,
   openApiIdParams,
   openApiOkResponse,
+  openApiQuery,
   openApiResponse,
+  openApiSchemaRef,
 } from "../lib/openapi";
 
 const GROUP_BALANCE_CACHE_TTL_MS = 30_000;
@@ -107,12 +108,7 @@ export default async function groupRoutes(app: FastifyInstance) {
           ...openApiBody(createGroupSchema),
         },
         response: {
-          200: {
-            description: "Group created",
-            type: "object",
-            additionalProperties: true,
-            properties: { group: { type: "object", additionalProperties: true, example: { id: "grp_123", name: "Weekend Trip", description: "Split travel expenses", archived: false } } },
-          },
+          ...openApiResponse({ group: openApiSchemaRef("Group") }, ["group"]),
           ...openApiErrorResponses(400, 401, 409),
         },
       },
@@ -161,12 +157,20 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         summary: "List the caller's groups",
         description:
           "Returns the groups the caller belongs to, each with a member count and the caller's net balance. Keyset-paginated.",
+        querystring: openApiQuery({
+          limit: { type: "string", description: "Page size." },
+          cursor: {
+            type: "string",
+            description: "Opaque continuation token from `meta.nextCursor`.",
+          },
+          order: { type: "string", description: "`asc` or `desc` (default)." },
+        }),
         response: {
           ...openApiResponse(
             {
               groups: {
                 type: "array",
-                items: { type: "object", additionalProperties: true },
+                items: openApiSchemaRef("Group"),
               },
               meta: { type: "object", additionalProperties: true },
             },
@@ -324,10 +328,18 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         description:
           "Returns the group, a page of its members, the caller's role, and pagination metadata.",
         params: openApiIdParams(),
+        querystring: openApiQuery({
+          limit: { type: "string", description: "Member page size." },
+          cursor: {
+            type: "string",
+            description: "Opaque member continuation token from `meta.nextCursor`.",
+          },
+          order: { type: "string", description: "`asc` or `desc` (default)." },
+        }),
         response: {
           ...openApiResponse(
             {
-              group: { type: "object", additionalProperties: true },
+              group: openApiSchemaRef("Group"),
               members: {
                 type: "array",
                 items: { type: "object", additionalProperties: true },
@@ -421,12 +433,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
           ...openApiBody(updateGroupDocSchema),
         },
         response: {
-          200: {
-            description: "Group updated",
-            type: "object",
-            additionalProperties: true,
-            properties: { group: { type: "object", additionalProperties: true } },
-          },
+          ...openApiResponse({ group: openApiSchemaRef("Group") }, ["group"]),
           ...openApiErrorResponses(400, 401, 403, 404),
         },
       },
@@ -941,7 +948,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         description: "Admin-only. Marks the group archived; historical data is retained.",
         params: openApiIdParams(),
         response: {
-          ...openApiEnvelope("group"),
+          ...openApiResponse({ group: openApiSchemaRef("Group") }, ["group"]),
           ...openApiErrorResponses(401, 403, 404),
         },
       },

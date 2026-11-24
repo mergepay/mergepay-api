@@ -4,7 +4,66 @@ import fastifySwaggerUi from "@fastify/swagger-ui";
 import fp from "fastify-plugin";
 import { config } from "../config";
 
+/**
+ * Shared entity schemas for the documented API (#1047).
+ *
+ * Declared once here and registered with Fastify as shared schemas so route
+ * responses can `$ref` them: the OpenAPI document gets a real `Group` /
+ * `Expense` component, and Fastify's response serializer can resolve the same
+ * reference. `additionalProperties: true` keeps the schemas documentation-only
+ * — a response may carry fields the schema does not name (a group summary's
+ * `memberCount`, an expense's `payer`) without the serializer stripping them.
+ *
+ * `@fastify/swagger`'s option types reject the widened literal types these
+ * constants infer, so they are cast at their two use sites. The objects are
+ * fixed documentation shapes, not user input.
+ */
+export const GROUP_OPENAPI_SCHEMA = {
+  $id: "Group",
+  type: "object",
+  additionalProperties: true,
+  properties: {
+    id: { type: "string" },
+    name: { type: "string" },
+    description: { type: ["string", "null"] },
+    createdByUserId: { type: "string" },
+    treasuryEnabled: { type: "boolean" },
+    treasuryAccountPublicKey: { type: ["string", "null"] },
+    treasuryRequiredSigners: { type: ["integer", "null"] },
+    archived: { type: "boolean" },
+    createdAt: { type: "string", format: "date-time" },
+  },
+} as const;
+
+export const EXPENSE_OPENAPI_SCHEMA = {
+  $id: "Expense",
+  type: "object",
+  additionalProperties: true,
+  properties: {
+    id: { type: "string" },
+    groupId: { type: "string" },
+    payerUserId: { type: "string" },
+    title: { type: "string" },
+    description: { type: ["string", "null"] },
+    amount: { type: "string" },
+    assetCode: { type: "string" },
+    assetIssuer: { type: ["string", "null"] },
+    splitType: { type: "string" },
+    memo: { type: ["string", "null"] },
+    receiptUrl: { type: ["string", "null"] },
+    createdAt: { type: "string", format: "date-time" },
+    shares: { type: "array", items: { type: "object" } },
+  },
+} as const;
+
 export default fp(async function openAPIPlugin(app: FastifyInstance) {
+  // Register the entity schemas before any route is added so both the OpenAPI
+  // document and the response serializer can resolve `$ref: "Group"` /
+  // `$ref: "Expense"`.
+
+  app.addSchema(GROUP_OPENAPI_SCHEMA as any);
+  app.addSchema(EXPENSE_OPENAPI_SCHEMA as any);
+
   await app.register(fastifySwagger, {
     openapi: {
       openapi: "3.0.0",
@@ -104,38 +163,8 @@ export default fp(async function openAPIPlugin(app: FastifyInstance) {
               createdAt: { type: "string", format: "date-time" },
             },
           },
-          Group: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              name: { type: "string" },
-              description: { type: ["string", "null"] },
-              createdByUserId: { type: "string" },
-              treasuryEnabled: { type: "boolean" },
-              treasuryAccountPublicKey: { type: ["string", "null"] },
-              treasuryRequiredSigners: { type: ["integer", "null"] },
-              archived: { type: "boolean" },
-              createdAt: { type: "string", format: "date-time" },
-            },
-          },
-          Expense: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              groupId: { type: "string" },
-              payerUserId: { type: "string" },
-              title: { type: "string" },
-              description: { type: ["string", "null"] },
-              amount: { type: "string" },
-              assetCode: { type: "string" },
-              assetIssuer: { type: ["string", "null"] },
-              splitType: { type: "string" },
-              memo: { type: ["string", "null"] },
-              receiptUrl: { type: ["string", "null"] },
-              createdAt: { type: "string", format: "date-time" },
-              shares: { type: "array", items: { type: "object" } },
-            },
-          },
+          Group: GROUP_OPENAPI_SCHEMA as any,
+          Expense: EXPENSE_OPENAPI_SCHEMA as any,
           Settlement: {
             type: "object",
             properties: {

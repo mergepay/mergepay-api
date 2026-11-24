@@ -9,6 +9,10 @@
  */
 
 import { TimeoutError, TransportError } from "../services/timeout";
+import {
+  extractHorizonResultCodes,
+  isPermanentHorizonResultCode,
+} from "../services/horizon-errors";
 
 /**
  * Options for configuring retry with exponential backoff.
@@ -127,28 +131,6 @@ export function calculateBackoffDelay(
 }
 
 /**
- * Horizon transaction and operation result codes that indicate permanent rejection.
- * Retrying with the same envelope or parameters will never succeed.
- */
-const PERMANENT_HORIZON_CODES = new Set([
-  "tx_bad_auth",
-  "tx_bad_seq",
-  "tx_insufficient_fee",
-  "tx_too_late",
-  "tx_too_early",
-  "tx_malformed",
-  "tx_not_supported",
-  "tx_failed",
-  "op_no_destination",
-  "op_no_trust",
-  "op_not_authorized",
-  "op_line_full",
-  "op_underfunded",
-  "op_src_no_trust",
-  "op_src_not_authorized",
-]);
-
-/**
  * Inspect an error to extract HTTP status code if present.
  */
 function extractHttpStatus(error: unknown): number | null {
@@ -169,34 +151,6 @@ function extractHttpStatus(error: unknown): number | null {
     return extractHttpStatus(e.cause);
   }
   return null;
-}
-
-/**
- * Extract Horizon result codes from response data if available.
- */
-function extractHorizonCodes(error: unknown): string[] {
-  if (!error || typeof error !== "object") return [];
-  const e = error as any;
-  const data = e.response?.data ?? e.data;
-  const extras = data?.extras?.result_codes ?? data?.result_codes;
-  if (!extras) return [];
-
-  const codes: string[] = [];
-  if (typeof extras.transaction === "string") codes.push(extras.transaction);
-  if (typeof extras.transaction_result_code === "string") {
-    codes.push(extras.transaction_result_code);
-  }
-  if (Array.isArray(extras.operations)) {
-    for (const op of extras.operations) {
-      if (typeof op === "string") codes.push(op);
-    }
-  }
-  if (Array.isArray(extras.operation_results)) {
-    for (const op of extras.operation_results) {
-      if (typeof op === "string") codes.push(op);
-    }
-  }
-  return codes;
 }
 
 /**
@@ -233,8 +187,8 @@ export function isTransientHorizonError(error: unknown): boolean {
   }
 
   // Horizon result codes check: permanent transaction/operation errors should not be retried
-  const horizonCodes = extractHorizonCodes(error);
-  if (horizonCodes.some((code) => PERMANENT_HORIZON_CODES.has(code))) {
+  const horizonCodes = extractHorizonResultCodes(error);
+  if (horizonCodes.some(isPermanentHorizonResultCode)) {
     return false;
   }
 

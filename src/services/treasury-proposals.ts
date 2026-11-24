@@ -46,7 +46,7 @@
 import { Keypair, Transaction } from "@stellar/stellar-sdk";
 import { Prisma } from "@prisma/client";
 import { config } from "../config";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
 import { buildTreasuryPaymentXdr } from "./treasury-stellar";
@@ -113,6 +113,101 @@ const STATUS = {
   confirmed: "confirmed",
   failed: "failed",
 } as const;
+
+/**
+ * Whether a failure came from the on-chain submission step rather than from
+ * request validation or a proposal-state check.
+ *
+ * Only submission failures need the post-rollback persistence below: a
+ * validation rejection changed nothing and must leave no "proposal failed"
+ * trail, while a rejection from Stellar (or an indeterminate timeout) does
+ * change the proposal's fate and must be recorded.
+ */
+function isSubmissionRejection(error: unknown): error is AppError {
+  if (!(error instanceof AppError)) return false;
+  return (
+    error.statusCode >= 500 ||
+    error.code.startsWith("STELLAR_") ||
+    error.code === "PROVIDER_REJECTED" ||
+    error.code === "UPSTREAM_TIMEOUT" ||
+    error.code === "SERVICE_UNAVAILABLE"
+  );
+}
+
+/**
+ * Record a submission failure durably (#1051).
+ *
+ * The failure state and its audit row are written *inside* the signature
+ * transaction so that a successful commit is atomic. But the submission
+ * rejection then rolls that whole transaction back — taking the `failed`
+ * status and the audit row with it. Re-persisting them here, in a fresh
+ * transaction after the rollback, is what makes the failure visible to
+ * operators and gives the proposal a terminal state its signers can see.
+ *
+ * A failure to record the failure never masks the original rejection: the
+ * caller still receives the mapped Stellar error.
+ */
+async function persistSubmissionFailure(
+  args: {
+    proposalId: string;
+    groupId: string;
+    userId: string;
+    actorPublicKey?: string | null;
+  },
+  error: AppError
+): Promise<void> {
+  try {
+    await prisma.$transaction(async (tx) => {
+      const proposal = await tx.treasuryProposal.findUnique({
+        where: { id: args.proposalId },
+      });
+      if (!proposal) return;
+
+      const signatureCount = Array.isArray(proposal.signatures)
+        ? proposal.signatures.length
+        : 0;
+      await tx.treasuryProposal.update({
+        where: { id: proposal.id },
+        data: { status: STATUS.failed, failureReason: error.message },
+      });
+      await auditMultisigActionTx(tx, {
+        userId: args.userId,
+        groupId: proposal.groupId,
+        actorPublicKey: args.actorPublicKey ?? null,
+        action: AuditAction.TREASURY_PROPOSAL_FAILED,
+        proposalId: proposal.id,
+        outcome: "failure",
+        metadata: {
+          txHash: proposal.txHash,
+          signatureCount,
+          threshold: proposal.threshold,
+          reason: error.message,
+        },
+      });
+    });
+  } catch {
+    // The submission rejection is the response; an audit write failure must
+    // not replace it with a different error.
+  }
+}
+
+/**
+ * Run a signature submission transaction, re-persisting its terminal failure
+ * after a rollback (#1051).
+ */
+async function runSignatureTransaction<T>(
+  args: Parameters<typeof persistSubmissionFailure>[0],
+  work: () => Promise<T>
+): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (isSubmissionRejection(error)) {
+      await persistSubmissionFailure(args, error);
+    }
+    throw error;
+  }
+}
 
 export const treasuryProposalsService = {
   /**
@@ -313,8 +408,9 @@ export const treasuryProposalsService = {
     stellarTxHash: string | null;
   }> {
     const events: MergepayEvent[] = [];
-    const result = await prisma.$transaction(
-      async (tx) => {
+    const result = await runSignatureTransaction(args, () =>
+      prisma.$transaction(
+        async (tx) => {
         // Lock the proposal row for the duration of this transaction.
         // `findUnique` with `SELECT ... FOR UPDATE` prevents concurrent
         // signers from reading stale data.
@@ -600,8 +696,9 @@ export const treasuryProposalsService = {
           },
         });
         return submitResult;
-      },
-      { timeout: 15_000 }
+        },
+        { timeout: 15_000 }
+      )
     );
 
     // Announce only after the transaction commits: a rolled-back mutation
@@ -712,7 +809,14 @@ export const treasuryProposalsService = {
           reason: msg,
         },
       });
-      throw Errors.upstream(`Stellar rejected the multisig transaction: ${msg}`);
+      // `stellar.submitSigned` already ran the centralized Stellar error
+      // mapper (#1057): a rejected envelope arrives as an `AppError` carrying
+      // the stable STELLAR_* code, ledger-appropriate status, and hint. Re-wrap
+      // only failures that the mapper could not classify — wrapping a mapped
+      // rejection in a generic upstream error would throw that information away.
+      throw e instanceof AppError
+        ? e
+        : Errors.upstream(`Stellar rejected the multisig transaction: ${msg}`);
     }
   },
 

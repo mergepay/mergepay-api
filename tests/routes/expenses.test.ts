@@ -416,3 +416,59 @@ describe("expense filter helpers", () => {
     expect(parsed.order).toBe("desc");
   });
 });
+
+describe("GET /groups/:id/expenses — status filter contract (#1048)", () => {
+  it("accepts a lower-case status and normalizes it", () => {
+    expect(expenseListQuerySchema.parse({ status: "pending" }).status).toBe("PENDING");
+    expect(expenseListQuerySchema.parse({ status: "Settled" }).status).toBe("SETTLED");
+  });
+
+  it("rejects an unrecognized status rather than returning an empty page", async () => {
+    const res = await list("?status=disputed");
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    expect(prisma.expense.findMany).not.toHaveBeenCalled();
+  });
+
+  it("narrows the query with the normalized status", async () => {
+    const res = await list("?status=settled");
+
+    expect(res.statusCode).toBe(200);
+    expect(conditions(lastWhere())).toContainEqual(
+      expect.objectContaining({
+        shares: expect.objectContaining({
+          some: {},
+          every: { status: "settled" },
+        }),
+      })
+    );
+  });
+
+  it("mirrors nextCursor at the top level of the response envelope", async () => {
+    const rows = Array.from({ length: 3 }, (_, i) =>
+      fakeExpense({
+        id: `exp_${i}`,
+        createdAt: new Date(Date.UTC(2026, 1, 1, 0, 0, i)),
+      })
+    );
+    prisma.expense.findMany.mockResolvedValue(rows);
+
+    const body = (await list("?limit=2")).json();
+
+    expect(body.expenses).toHaveLength(2);
+    expect(body.nextCursor).toBeTruthy();
+    expect(body.nextCursor).toBe(body.meta.nextCursor);
+  });
+
+  it("returns a null nextCursor on the last page", async () => {
+    prisma.expense.findMany.mockResolvedValue([
+      fakeExpense({ id: "exp_last" }),
+    ]);
+
+    const body = (await list("?limit=10")).json();
+
+    expect(body.nextCursor).toBeNull();
+    expect(body.meta.nextCursor).toBeNull();
+  });
+});

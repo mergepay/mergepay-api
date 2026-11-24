@@ -12,8 +12,12 @@ import { describe, expect, it } from "vitest";
 import { xdr } from "@stellar/stellar-sdk";
 import {
   enumNameToResultCode,
+  extractHorizonResultCodes,
+  isPermanentHorizonResultCode,
   mapHorizonError,
 } from "../src/services/horizon-errors";
+import { classifyHorizonError } from "../src/services/horizon-retry";
+import { isTransientHorizonError } from "../src/utils/retry";
 import { TransportError, toProviderError } from "../src/services/timeout";
 import { ProviderError } from "../src/lib/provider-error";
 
@@ -190,6 +194,115 @@ describe("mapHorizonError", () => {
     }
   });
 });
+
+/**
+ * Issue #1057 — one result-code vocabulary for the whole codebase.
+ *
+ * The API error mapping, the Horizon retry policy, and the generic retry
+ * utility all classify ledger rejections through `horizon-errors`. These tests
+ * pin that agreement so the three can never drift into different verdicts for
+ * the same code.
+ */
+describe("centralized Horizon result-code classification (#1057)", () => {
+  it("extracts codes from the SDK response body", () => {
+    expect(
+      extractHorizonResultCodes(
+        sdkError({
+          extras: {
+            result_codes: { transaction: "tx_failed", operations: ["op_no_trust"] },
+          },
+        })
+      )
+    ).toEqual(["tx_failed", "op_no_trust"]);
+  });
+
+  it("extracts codes from a direct `data` shape and from result_xdr", () => {
+    expect(
+      extractHorizonResultCodes({
+        data: { extras: { result_codes: { transaction: "tx_too_early" } } },
+      })
+    ).toEqual(["tx_too_early"]);
+
+    expect(
+      extractHorizonResultCodes(
+        sdkError({
+          extras: { result_xdr: resultXdr(xdr.TransactionResultResult.txBadSeq()) },
+        })
+      )
+    ).toEqual(["tx_bad_seq"]);
+  });
+
+  it("returns an empty list for errors without ledger result codes", () => {
+    expect(extractHorizonResultCodes(new Error("socket hang up"))).toEqual([]);
+    expect(extractHorizonResultCodes({ response: { status: 503 } })).toEqual([]);
+    expect(extractHorizonResultCodes(null)).toEqual([]);
+    expect(extractHorizonResultCodes(sdkError({ extras: {} }))).toEqual([]);
+  });
+
+  it("classifies codes that cannot be fixed by resubmitting the same envelope", () => {
+    for (const code of [
+      "tx_bad_auth",
+      "tx_bad_seq",
+      "tx_insufficient_fee",
+      "tx_too_late",
+      "tx_too_early",
+      "tx_malformed",
+      "tx_not_supported",
+      "tx_failed",
+      "op_no_destination",
+      "op_underfunded",
+      "op_no_trust",
+      "op_src_not_authorized",
+      "op_line_full",
+    ]) {
+      expect(isPermanentHorizonResultCode(code), code).toBe(true);
+    }
+
+    for (const code of [
+      "tx_success",
+      "tx_insufficient_balance",
+      "op_low_reserve",
+      "op_spam",
+      "not_a_code",
+    ]) {
+      expect(isPermanentHorizonResultCode(code), code).toBe(false);
+    }
+  });
+
+  it("makes every retry classifier agree with the shared classification", () => {
+    const permanent = sdkError({
+      extras: { result_codes: { transaction: "tx_bad_seq" } },
+    });
+    const transient = sdkError({
+      extras: { result_codes: { transaction: "tx_failed", operations: ["op_underfunded"] } },
+    });
+    // No HTTP status: only the code itself can classify this one.
+    const unknownCode = {
+      data: { extras: { result_codes: { operations: ["op_spam"] } } },
+    };
+
+    expect(classifyHorizonError(permanent)).toBe("permanent");
+    expect(isTransientHorizonError(permanent)).toBe(false);
+
+    expect(classifyHorizonError(transient)).toBe("permanent");
+    expect(isTransientHorizonError(transient)).toBe(false);
+
+    // An unrecognized code is not a permanent verdict in either classifier.
+    expect(classifyHorizonError(unknownCode)).toBe("transient");
+    expect(isTransientHorizonError(unknownCode)).toBe(true);
+  });
+
+  it("still treats transport failures as retryable in both classifiers", () => {
+    const transport = new TransportError("Horizon.submitTransaction", connectionError());
+
+    expect(classifyHorizonError(transport)).toBe("transient");
+    expect(isTransientHorizonError(transport)).toBe(true);
+  });
+});
+
+function connectionError(): Error {
+  return new Error("ECONNRESET");
+}
 
 describe("enumNameToResultCode", () => {
   it("converts XDR enum member names to Horizon result codes", () => {

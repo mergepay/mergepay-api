@@ -38,6 +38,18 @@ import {
 export const EXPENSE_STATUSES = ["PENDING", "SETTLED"] as const;
 export type ExpenseStatus = (typeof EXPENSE_STATUSES)[number];
 
+/**
+ * A status filter that accepts the canonical upper-case value or any casing the
+ * caller sends (`?status=pending`). The API documents upper case, but a filter
+ * that silently rejected `pending` while `PENDING` worked would be a trap — and
+ * an unrecognized value still fails validation with a 400 rather than returning
+ * an empty page.
+ */
+const expenseStatusFilterSchema = z
+  .string()
+  .transform((value) => value.toUpperCase())
+  .pipe(z.enum(EXPENSE_STATUSES));
+
 /** The per-share value stored in the database for a settled share. */
 const SHARE_SETTLED = "settled";
 
@@ -65,7 +77,7 @@ export const expenseListQuerySchema = paginationQuerySchema.extend({
     .max(GROUP_LIST_MAX_PAGE_SIZE)
     .default(DEFAULT_PAGE_SIZE),
   asset: z.enum(FILTERABLE_ASSETS).optional(),
-  status: z.enum(EXPENSE_STATUSES).optional(),
+  status: expenseStatusFilterSchema.optional(),
   startDate: z.string().datetime({ offset: true }).optional(),
   endDate: z.string().datetime({ offset: true }).optional(),
   page: z.coerce.number().int().min(1).optional(),
@@ -269,7 +281,7 @@ export async function listGroupExpenses<T extends { createdAt: Date; id: string 
 export const groupExpenseHistorySchema = paginationQuerySchema.extend({
   asset: z.enum(FILTERABLE_ASSETS).optional(),
   assetCode: z.string().optional(),
-  status: z.enum(EXPENSE_STATUSES).optional(),
+  status: expenseStatusFilterSchema.optional(),
   startDate: z.string().datetime({ offset: true }).optional(),
   endDate: z.string().datetime({ offset: true }).optional(),
   fromDate: z.string().datetime().optional(),

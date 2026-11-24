@@ -3,6 +3,7 @@ import { config, env } from "./config";
 import { prisma } from "./db";
 import { connectWithRetry } from "./lib/db-connect";
 import { createGracefulShutdown } from "./lib/graceful-shutdown";
+import { runStartupMigrationCheck } from "./lib/startup-migration-check";
 import { preloadSep10SigningKey } from "./services/auth-health";
 
 async function main() {
@@ -27,6 +28,17 @@ async function main() {
   try {
     await connectWithRetry(prisma, { logger: app.log });
   } catch {
+    await app.close();
+    process.exit(1);
+  }
+
+  // Verify migration health after the connection is live but before the port
+  // opens. A pending or drifted schema causes process.exit(1) so a bad deploy
+  // is caught here rather than during the first request (#1140).
+  try {
+    await runStartupMigrationCheck({ databaseUrl: env.DATABASE_URL, logger: app.log });
+  } catch (err) {
+    app.log.error({ err }, "startup migration check failed; exiting");
     await app.close();
     process.exit(1);
   }

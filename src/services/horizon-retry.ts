@@ -18,6 +18,10 @@
  */
 
 import { TimeoutError, TransportError } from "./timeout";
+import {
+  extractHorizonResultCodes,
+  isPermanentHorizonResultCode,
+} from "./horizon-errors";
 
 // ─── Retry policy ───────────────────────────────────────────────────────────
 
@@ -98,70 +102,25 @@ export function classifyHorizonError(error: unknown): HorizonErrorCategory {
     }
   }
 
-  // Horizon SDK error shapes — the response body may carry result_codes.
+  // Ledger result codes, extracted through the same allow-listing helper the
+  // client-facing error mapping uses, so the retry decision and the API
+  // response can never disagree about a code's meaning (#1057).
+  const resultCodes = extractHorizonResultCodes(error);
+  if (resultCodes.some(isPermanentHorizonResultCode)) {
+    return "permanent";
+  }
+
+  // HTTP status on the Horizon response itself.
   const response = extractResponse(error);
-  if (response) {
-    const resultCodes = normalizeResultCodes(response.extras?.result_codes ?? response.result_codes);
-    if (resultCodes.length > 0) {
-      const txCode = resultCodes.find((code) => code.startsWith("tx_"));
-      // These Stellar transaction codes are permanent — the transaction
-      // itself is invalid and retrying with the same envelope won't help.
-      const permanentTxCodes = [
-        "tx_bad_auth",
-        "tx_bad_seq",
-        "tx_insufficient_fee",
-        "tx_too_late",
-        "tx_too_early",
-        "tx_malformed",
-        "tx_not_supported",
-        "tx_failed",
-      ];
-      if (txCode && permanentTxCodes.includes(txCode)) return "permanent";
-
-      // Operation-level errors may be transient (e.g. underfunded can happen
-      // when a concurrent payment consumed the balance).
-      const opCodes = resultCodes.filter((code) => code.startsWith("op_"));
-      const permanentOpCodes = [
-        "op_no_destination",
-        "op_no_trust",
-        "op_not_authorized",
-        "op_line_full",
-        "op_underfunded",
-        "op_src_no_trust",
-        "op_src_not_authorized",
-      ];
-      if (opCodes.some((code: string) => permanentOpCodes.includes(code))) {
-        return "permanent";
-      }
-    }
-
-    // HTTP status on the Horizon response itself.
-    if (typeof response.status === "number") {
-      if (response.status === 429) return "transient";
-      if (response.status >= 500) return "transient";
-      if (response.status >= 400) return "permanent";
-    }
+  if (response && typeof response.status === "number") {
+    if (response.status === 429) return "transient";
+    if (response.status >= 500) return "transient";
+    if (response.status >= 400) return "permanent";
   }
 
   // Fallback: treat as transient to allow one more attempt, but the bounded
   // retry count ensures this never spins indefinitely.
   return "transient";
-}
-
-function normalizeResultCodes(resultCodes: unknown): string[] {
-  if (Array.isArray(resultCodes)) {
-    return resultCodes.filter((code): code is string => typeof code === "string");
-  }
-  if (resultCodes && typeof resultCodes === "object") {
-    const codes = resultCodes as { [key: string]: unknown };
-    const values = [
-      codes.transaction_result_code,
-      ...(Array.isArray(codes.operations) ? codes.operations : []),
-      ...(Array.isArray(codes.operation_results) ? codes.operation_results : []),
-    ];
-    return values.filter((code): code is string => typeof code === "string");
-  }
-  return [];
 }
 
 function extractResponse(

@@ -21,6 +21,11 @@
 
 import { config } from "../config";
 import { ProviderError } from "../lib/provider-error";
+import {
+  extractHorizonResultCodes,
+  extractResultCodeTokens,
+  isPermanentHorizonResultCode,
+} from "./horizon-errors";
 
 export type JobFailureCategory = "transient" | "indeterminate" | "permanent";
 
@@ -99,16 +104,6 @@ const PERMANENT_MARKERS = [
   "not authorized",
   "rejected the transaction",
   "signature",
-  "tx_bad_auth",
-  "tx_bad_seq",
-  "tx_too_late",
-  "tx_too_early",
-  "tx_insufficient_fee",
-  "op_no_destination",
-  "op_underfunded",
-  "op_no_trust",
-  "op_not_authorized",
-  "op_line_full",
   "underfunded",
   "trustline",
 ];
@@ -171,7 +166,22 @@ export function classifyJobFailure(error: unknown): JobFailureCategory {
     if (status >= 400) return "permanent";
   }
 
-  const message = errorMessage(error).toLowerCase();
+  // A ledger result code is a definitive verdict, so it is checked before any
+  // prose. The shared classifier (#1057) is the same one the API's error
+  // mapping and the Horizon retry policy use, so all three agree on what is
+  // permanent rather than each maintaining its own code list. When the error
+  // carries no structured fields, the same classification is applied to any
+  // result-code tokens in its message — still one vocabulary, not a
+  // per-module substring list.
+  const rawMessage = errorMessage(error);
+  if (
+    extractHorizonResultCodes(error).some(isPermanentHorizonResultCode) ||
+    extractResultCodeTokens(rawMessage).some(isPermanentHorizonResultCode)
+  ) {
+    return "permanent";
+  }
+
+  const message = rawMessage.toLowerCase();
   if (PERMANENT_MARKERS.some((marker) => message.includes(marker))) return "permanent";
   if (INDETERMINATE_MARKERS.some((marker) => message.includes(marker))) {
     return "indeterminate";

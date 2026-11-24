@@ -185,6 +185,68 @@ const RESULT_MAPPINGS: Record<string, KnownMapping> = {
   },
 };
 
+/**
+ * Horizon / Stellar Core result codes that describe the envelope itself as
+ * invalid. Retrying the same envelope can never succeed, so every retry
+ * classifier in the codebase must agree on this set.
+ *
+ * Kept here — beside the client-facing mappings above — so the API response
+ * category, the read-retry policy (`src/services/horizon-retry.ts`), and the
+ * generic retry utility (`src/utils/retry.ts`) cannot drift apart.
+ */
+export const PERMANENT_HORIZON_RESULT_CODES: ReadonlySet<string> = new Set([
+  // Transaction-level rejections
+  "tx_bad_auth",
+  "tx_bad_auth_extra",
+  "tx_bad_seq",
+  "tx_bad_min_seq_age_or_gap",
+  "tx_insufficient_fee",
+  "tx_too_late",
+  "tx_too_early",
+  "tx_no_account",
+  "tx_missing_operation",
+  "tx_malformed",
+  "tx_not_supported",
+  "tx_failed",
+  // Operation-level rejections
+  "op_underfunded",
+  "op_no_destination",
+  "op_no_trust",
+  "op_src_no_trust",
+  "op_not_authorized",
+  "op_src_not_authorized",
+  "op_line_full",
+  "op_no_issuer",
+  "op_malformed",
+]);
+
+/**
+ * Result-code-shaped tokens embedded in free-form error text.
+ *
+ * Some failures reach a retry classifier as a plain `Error` whose message
+ * carries the ledger verdict (`"tx_bad_seq"`) but none of the structured
+ * response fields. Extracting the tokens here — with the same grammar and
+ * permanent-code classification as the structured path — keeps message-based
+ * fallbacks on the same vocabulary instead of each caller maintaining its own
+ * substring list.
+ */
+export function extractResultCodeTokens(text: string): string[] {
+  const matches = text.match(/\b(?:tx|op)_[a-z0-9_]+\b/g) ?? [];
+  return [...new Set(matches.filter((code) => safeCode(code) !== null))];
+}
+
+/**
+ * Whether a result code is a permanent rejection (retrying cannot help).
+ *
+ * Codes outside the set are treated as transient by callers: a concurrent
+ * payment may free up the balance (`tx_insufficient_balance`,
+ * `op_low_reserve`), and an unrecognized code is more safely retried under a
+ * bounded budget than failed outright.
+ */
+export function isPermanentHorizonResultCode(code: string): boolean {
+  return PERMANENT_HORIZON_RESULT_CODES.has(code);
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object"
     ? (value as Record<string, unknown>)
@@ -248,19 +310,23 @@ function codeFromResultXdr(value: unknown): string | null {
 }
 
 /**
- * Inspect a Stellar SDK / Horizon error and map it onto a client-safe
- * response, or return `null` when the error does not describe a ledger
- * rejection (transport failure, timeout, anchor error, …).
+ * Extract every validated result-code token from a Stellar SDK / Horizon
+ * error, in the order the ledger reported them.
  *
- * Non-null results always carry at least one validated result-code token, so
- * the caller can treat their presence as "the provider definitively rejected
- * this transaction".
+ * This is the single extraction path for the API's error mapping, the Horizon
+ * retry classifier, and the generic retry utility. It reads both the
+ * structured `extras.result_codes` object and the authoritative `result_xdr`,
+ * and only keeps allow-listed tokens — raw payloads never escape.
+ *
+ * @returns The transaction-level verdict first, then the failed operations;
+ *   `[]` when the error carries no ledger result codes (transport, timeout, or
+ *   an unrelated SDK failure).
  */
-export function mapHorizonError(error: unknown): HorizonResultMapping | null {
+export function extractHorizonResultCodes(error: unknown): string[] {
   const root = record(error);
   const response = record(root?.response);
-  const data = record(response?.data);
-  if (!data) return null;
+  const data = record(response?.data) ?? record(root?.data);
+  if (!data) return [];
 
   const extras = record(data.extras);
   const resultCodes = codesFromResultCodes(
@@ -271,6 +337,21 @@ export function mapHorizonError(error: unknown): HorizonResultMapping | null {
   // it so it wins over an operation code when both describe the same failure.
   const xdrCode = codeFromResultXdr(extras?.result_xdr ?? data.result_xdr);
   if (xdrCode && !resultCodes.includes(xdrCode)) resultCodes.unshift(xdrCode);
+
+  return resultCodes;
+}
+
+/**
+ * Inspect a Stellar SDK / Horizon error and map it onto a client-safe
+ * response, or return `null` when the error does not describe a ledger
+ * rejection (transport failure, timeout, anchor error, …).
+ *
+ * Non-null results always carry at least one validated result-code token, so
+ * the caller can treat their presence as "the provider definitively rejected
+ * this transaction".
+ */
+export function mapHorizonError(error: unknown): HorizonResultMapping | null {
+  const resultCodes = extractHorizonResultCodes(error);
 
   for (const resultCode of resultCodes) {
     const mapping = RESULT_MAPPINGS[resultCode];

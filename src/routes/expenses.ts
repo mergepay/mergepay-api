@@ -3,11 +3,12 @@ import { z } from "zod";
 import { prisma } from "../db";
 import {
   openApiBody,
-  openApiEnvelope,
   openApiErrorResponses,
   openApiIdParams,
   openApiOkResponse,
+  openApiQuery,
   openApiResponse,
+  openApiSchemaRef,
 } from "../lib/openapi";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
@@ -25,6 +26,7 @@ import {
   buildPage,
   cursorFilter,
   cursorOrderBy,
+  GROUP_LIST_MAX_PAGE_SIZE,
   paginationQuerySchema,
   requireCursor,
   takeForPage,
@@ -86,7 +88,10 @@ export default async function expenseRoutes(app: FastifyInstance) {
         params: openApiIdParams(),
         body: openApiBody(createExpenseSchema),
         response: {
-          ...openApiEnvelope("expense"),
+          ...openApiResponse(
+            { expense: openApiSchemaRef("Expense") },
+            ["expense"]
+          ),
           ...openApiErrorResponses(400, 401, 403, 404, 429),
         },
       },
@@ -220,18 +225,41 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
         tags: ["Expenses"],
         summary: "List a group's expenses",
         description:
-          "Returns a paginated, filterable list of the group's expenses. Requires membership.",
+          "Returns a paginated, filterable list of the group's expenses. Requires membership. Cursor pagination is keyset-based on (createdAt, id); `nextCursor` is null on the last page.",
         params: openApiIdParams(),
+        querystring: openApiQuery({
+          limit: {
+            type: "string",
+            description: `Page size, capped at ${GROUP_LIST_MAX_PAGE_SIZE}.`,
+          },
+          cursor: {
+            type: "string",
+            description: "Opaque continuation token from `meta.nextCursor`.",
+          },
+          order: { type: "string", description: "`asc` or `desc` (default)." },
+          status: {
+            type: "string",
+            description:
+              "Settlement state filter: `pending` (any share outstanding) or `settled` (every share settled). Case-insensitive.",
+          },
+          asset: { type: "string", description: "Asset code filter (`XLM` or `USDC`)." },
+          startDate: { type: "string", description: "Inclusive ISO-8601 lower bound on `createdAt`." },
+          endDate: { type: "string", description: "Inclusive ISO-8601 upper bound on `createdAt`." },
+          categoryId: { type: "string", description: "Matches a description substring or an exact memo." },
+          page: { type: "string", description: "Opt into offset pagination instead of the cursor." },
+          includeTotal: { type: "string", description: "`true` to include a filtered total count." },
+        }),
         response: {
           ...openApiResponse(
             {
               expenses: {
                 type: "array",
-                items: { type: "object", additionalProperties: true },
+                items: openApiSchemaRef("Expense"),
               },
               meta: { type: "object", additionalProperties: true },
+              nextCursor: { type: ["string", "null"] },
             },
-            ["expenses", "meta"]
+            ["expenses", "meta", "nextCursor"]
           ),
           ...openApiErrorResponses(400, 401, 403),
         },
@@ -246,7 +274,11 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
 
     const { items, meta } = await listGroupExpenses(groupId, query, expenseInclude);
 
-    return { expenses: items.map(serializeExpense), meta };
+    // `meta.nextCursor` is the shared pagination contract; it is also mirrored
+    // at the top level so clients written against the expense-list contract
+    // (#1048) can read it without destructuring `meta`. Additive, never a
+    // replacement for the existing envelope.
+    return { expenses: items.map(serializeExpense), meta, nextCursor: meta.nextCursor };
   });
 
   // -- get one ----------------------------------------------------------------
@@ -261,7 +293,10 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
           "Returns a single expense with its payer and shares. Requires membership of the expense's group.",
         params: openApiIdParams(),
         response: {
-          ...openApiEnvelope("expense"),
+          ...openApiResponse(
+            { expense: openApiSchemaRef("Expense") },
+            ["expense"]
+          ),
           ...openApiErrorResponses(401, 403, 404),
         },
       },
@@ -292,7 +327,10 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
         params: openApiIdParams(),
         body: openApiBody(updateExpenseSchema),
         response: {
-          ...openApiEnvelope("expense"),
+          ...openApiResponse(
+            { expense: openApiSchemaRef("Expense") },
+            ["expense"]
+          ),
           ...openApiErrorResponses(400, 401, 403, 404),
         },
       },

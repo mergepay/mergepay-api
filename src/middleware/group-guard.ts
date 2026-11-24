@@ -144,6 +144,31 @@ export const requireAdminGuard = requireGroupAdmin;
 export const requireExpenseMutationRole = requireExpensePayerOrAdmin;
 export const requireExpenseModificationGuard = requireExpensePayerOrAdmin;
 
+/**
+ * Role-based authorization guard for group management operations (#1137).
+ *
+ * Enforces that the caller is an admin of an *active* (non-archived) group
+ * before they can perform write operations against group membership: removing a
+ * member, promoting or demoting a member's role. Wraps `requireGroupAdmin` with
+ * `active: true` so a single import conveys the full contract — "this route
+ * mutates group membership and therefore requires both an admin role and a live
+ * group".
+ *
+ * Usage:
+ *   preHandler: requireGroupManagementGuard()
+ *   preHandler: requireGroupManagementGuard({ param: "groupId" })
+ */
+export function requireGroupManagementGuard(
+  options: Omit<GroupGuardOptions, "active"> = {}
+): ReturnType<typeof requireGroupAdmin> {
+  return requireGroupAdmin({ ...options, active: true });
+}
+
+/** Explicit alias: signals this is for member removal specifically. */
+export const requireMemberRemovalGuard = requireGroupManagementGuard;
+/** Explicit alias: signals this is for role modification specifically. */
+export const requireRoleModificationGuard = requireGroupManagementGuard;
+
 export {
   requireGroupRole,
   groupMembership,

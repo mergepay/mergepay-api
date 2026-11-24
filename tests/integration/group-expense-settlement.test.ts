@@ -201,7 +201,10 @@ describe("group creation and membership", () => {
     const response = await app.inject({
       method: "POST",
       url: `/groups/${group.id}/expenses`,
-      headers: authHeaders(admin),
+      headers: {
+        ...authHeaders(admin),
+        "x-idempotency-key": "expense-invalid-participants",
+      },
       payload: {
         title: "Non-member dinner",
         amount: "10",
@@ -320,7 +323,10 @@ describe("expense creation and split rules", () => {
     const badCustom = await app.inject({
       method: "POST",
       url: `/groups/${group.id}/expenses`,
-      headers: authHeaders(admin),
+      headers: {
+        ...authHeaders(admin),
+        "x-idempotency-key": "expense-unbalanced-custom",
+      },
       payload: {
         title: "Unbalanced custom split",
         amount: "20",
@@ -341,7 +347,10 @@ describe("expense creation and split rules", () => {
     const badPercentage = await app.inject({
       method: "POST",
       url: `/groups/${group.id}/expenses`,
-      headers: authHeaders(admin),
+      headers: {
+        ...authHeaders(admin),
+        "x-idempotency-key": "expense-unbalanced-percentage",
+      },
       payload: {
         title: "Unbalanced percentage split",
         amount: "20",

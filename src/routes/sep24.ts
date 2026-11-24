@@ -19,6 +19,7 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService } from "../services/anchor";
 import { auditTx } from "../services/audit";
+import { sep24StartAction } from "../services/sep24-audit";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 import { getStatusHistory } from "../services/status-history";
@@ -30,6 +31,7 @@ import {
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
+import { composeWhere, dateRangeWhere } from "../schemas/common";
 import { rateLimited } from "../lib/rate-limit";
 import { openApiBody } from "../lib/openapi";
 import {
@@ -177,10 +179,17 @@ export default async function sep24Routes(app: FastifyInstance) {
       await auditTx(tx, {
         correlationId: req.id,
         userId: auth.id,
-        action: "anchor_session.start",
+        action: sep24StartAction(kind),
         entityType: "anchor_session",
         entityId: created.id,
-        metadata: { kind, assetCode: validatedBody.assetCode },
+        actorPublicKey: auth.stellarPublicKey,
+        metadata: {
+          kind,
+          assetCode: validatedBody.assetCode,
+          ...("amount" in validatedBody && validatedBody.amount
+            ? { amount: validatedBody.amount }
+            : {}),
+        },
       });
       return created;
     });
@@ -334,8 +343,8 @@ export default async function sep24Routes(app: FastifyInstance) {
         tags: ["SEP-24"],
         summary: "List SEP-24 transactions for status polling",
         description:
-          "Returns the caller's SEP-24 transaction objects, newest first, optionally filtered by transfer direction. " +
-          "Accepts the shared pagination parameters — `limit` (1-100, default 50), `cursor`, `order` (asc|desc) — plus SEP-24's `kind` (deposit|withdrawal) and `lang`. Keyset-paginated.",
+          "Returns the caller's SEP-24 transaction objects, newest first. " +
+          "Accepts the shared pagination parameters — `limit` (1-100, default 50), `cursor`, `order` (asc|desc) — plus SEP-24's `kind` (deposit|withdrawal), `asset_code`, `lang`, and the additive `status`, `startDate`, `endDate` filters. Keyset-paginated.",
         // No `querystring` schema, unlike this file's other routes: ajv runs
         // with coercion off (src/app.ts), so a documented `limit` of
         // `type: "integer"` would judge the string `"2"` a query string
@@ -372,9 +381,16 @@ export default async function sep24Routes(app: FastifyInstance) {
     async (req) => {
       const auth = requireUser(req);
       sep24NoParamsSchema.parse(req.params ?? {});
-      const { cursor, limit, order, kind } = sep24TransactionsQuerySchema.parse(
-        req.query ?? {}
-      );
+      const {
+        cursor,
+        limit,
+        order,
+        kind,
+        asset_code,
+        status,
+        startDate,
+        endDate,
+      } = sep24TransactionsQuerySchema.parse(req.query ?? {});
       const position = requireCursor(cursor);
 
       // The `kind` filter is the view's normalisation written as a query, not
@@ -384,16 +400,25 @@ export default async function sep24Routes(app: FastifyInstance) {
       // instead would let a row the view renders as a deposit disappear from the
       // filtered list — a transaction that vanishes between the two routes is
       // worse than a corrupt value is worth.
+      const kindFilter =
+        kind === undefined
+          ? {}
+          : kind === "withdrawal"
+            ? { kind: "withdrawal" }
+            : { kind: { not: "withdrawal" } };
+      const createdAt = dateRangeWhere({ startDate, endDate });
+      const cursorScope = cursorFilter(position, order);
+      const filters = [
+        { userId: auth.id },
+        ...(Object.keys(kindFilter).length ? [kindFilter] : []),
+        ...(asset_code ? [{ assetCode: asset_code }] : []),
+        ...(status ? [{ status }] : []),
+        ...(createdAt ? [{ createdAt }] : []),
+      ];
+      const where = composeWhere(filters, cursorScope, ["createdAt"]);
+
       const sessions = await prisma.anchorSession.findMany({
-        where: {
-          userId: auth.id,
-          ...(kind === undefined
-            ? {}
-            : kind === "withdrawal"
-              ? { kind: "withdrawal" }
-              : { kind: { not: "withdrawal" } }),
-          ...cursorFilter(position, order),
-        },
+        where,
         orderBy: cursorOrderBy(order),
         take: takeForPage(limit),
       });

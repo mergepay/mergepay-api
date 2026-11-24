@@ -185,6 +185,7 @@ export async function createExpense(
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
+      "X-Idempotency-Key": `expense-helper-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     },
     body: JSON.stringify(data),
   });

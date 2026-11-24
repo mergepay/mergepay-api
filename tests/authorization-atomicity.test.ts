@@ -161,7 +161,7 @@ describe("POST /groups/:id/expenses authorization", () => {
     const res = await app.inject({
       method: "POST",
       url: "/groups/group_1/expenses",
-      headers: authHeader(),
+      headers: { ...authHeader(), "x-idempotency-key": "expense-patched" },
       payload: {
         title: "Hotel",
         amount: "120.00",
@@ -198,7 +198,7 @@ describe("POST /groups/:id/expenses authorization", () => {
     const res = await app.inject({
       method: "POST",
       url: "/groups/group_1/expenses",
-      headers: authHeader(),
+      headers: { ...authHeader(), "x-idempotency-key": "expense-patched" },
       payload: {
         title: "Hotel",
         amount: "120.00",
@@ -240,7 +240,7 @@ describe("POST /groups/:id/expenses authorization", () => {
     const res = await app.inject({
       method: "POST",
       url: "/groups/group_1/expenses",
-      headers: authHeader(),
+      headers: { ...authHeader(), "x-idempotency-key": "expense-patched" },
       payload: {
         title: "Hotel",
         amount: "120.00",

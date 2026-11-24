@@ -16,6 +16,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import Fastify from "fastify";
+import jwt from "jsonwebtoken";
+import { config } from "../src/config";
 
 const h = vi.hoisted(() => {
   const model = () => ({
@@ -81,6 +83,8 @@ import { signToken } from "../src/plugins/auth";
 import authPlugin from "../src/plugins/auth";
 import errorHandlerPlugin from "../src/plugins/error-handler";
 import groupAccessPlugin, {
+  GROUP_AFTER_GUARD,
+  GROUP_GUARD,
   groupMembership,
   requireGroupRole,
 } from "../src/plugins/group-access";
@@ -88,6 +92,7 @@ import groupAccessPlugin, {
 const GROUP_ID = "group_1";
 const OTHER_GROUP_ID = "group_2";
 const PUBLIC_KEY = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const TREASURY_DESTINATION = "GDKYN3O7ZVZLDTGOG6H242WA2TEZHVQNCHKJXZZLEWVS5WM3CKKO2WV6";
 
 let userSeq = 0;
 /** A fresh user id per scenario, so per-user rate-limit buckets never collide. */
@@ -390,6 +395,60 @@ describe("groupAccessPlugin — guard ordering", () => {
     // The real (marked) guard is moved behind the limiter.
     expect(order).toEqual(["limiter", "guard-lookup"]);
   });
+
+  it("orders after-guard preHandlers behind group guards", async () => {
+    const order: string[] = [];
+    const app = Fastify();
+    await app.register(authPlugin);
+    await app.register(errorHandlerPlugin);
+    app.addHook("onRoute", (route) => {
+      if ((route.config as any)?.limited) {
+        route.preHandler = [
+          ...(Array.isArray(route.preHandler)
+            ? route.preHandler
+            : route.preHandler
+              ? [route.preHandler]
+              : []),
+          async () => {
+            order.push("limiter");
+          },
+        ];
+      }
+    });
+    await app.register(groupAccessPlugin);
+    const guard = async () => {
+      order.push("guard");
+    };
+    (guard as any)[GROUP_GUARD] = true;
+    const after = async () => {
+      order.push("after");
+    };
+    (after as any)[GROUP_AFTER_GUARD] = true;
+    app.post(
+      "/z/:id",
+      {
+        config: { limited: true } as any,
+        preHandler: [
+          after,
+          guard,
+          async () => {
+            order.push("before");
+          },
+        ],
+      },
+      async () => {
+        order.push("handler");
+        return { ok: true };
+      }
+    );
+    await app.ready();
+    await app.inject({
+      method: "POST",
+      url: `/z/${GROUP_ID}`,
+      headers: bearer(newUser("member")),
+    });
+    expect(order).toEqual(["before", "limiter", "guard", "after", "handler"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -456,6 +515,34 @@ function concreteUrl(routePath: string, groupId = GROUP_ID): string {
     .replace(":webhookId", "wh_1");
 }
 
+function payloadFor(
+  route: GroupRoute,
+  fallback: Record<string, unknown> = { role: "admin", userId: "user_target" }
+): Record<string, unknown> | undefined {
+  if (route.method === "GET") return undefined;
+  if (route.path === "/groups/:groupId/treasury/proposals") {
+    return { destination: TREASURY_DESTINATION, amount: "1", assetCode: "XLM" };
+  }
+  if (route.path.endsWith("/expenses")) {
+    return {
+      title: "Dinner",
+      amount: "10.0000000",
+      assetCode: "XLM",
+      splitType: "equal",
+      shares: [{ userId: "user_target" }],
+    };
+  }
+  return fallback;
+}
+
+function headersFor(route: GroupRoute, userId: string): Record<string, string> {
+  const headers = bearer(userId);
+  if (route.method === "POST" && route.path.endsWith("/expenses")) {
+    headers["x-idempotency-key"] = `group-access-${userId}-${route.method}`;
+  }
+  return headers;
+}
+
 /** Mutations that must never happen when the guard rejects a request. */
 function writes() {
   const p = h.prisma;
@@ -464,6 +551,7 @@ function writes() {
     p.groupMember.delete, p.invitation.create, p.invite.create, p.expense.create,
     p.settlement.create, p.treasuryTransaction.create, p.treasuryProposal.create,
     p.webhook.create, p.webhook.delete, p.auditLog.create, p.$transaction,
+    p.idempotencyKey.create, p.idempotencyKey.update, p.idempotencyKey.updateMany,
   ].reduce((n, fn) => n + fn.mock.calls.length, 0);
 }
 
@@ -478,8 +566,8 @@ describe("group routes on the real app", () => {
     const res = await (await app()).inject({
       method: route.method,
       url: concreteUrl(route.path),
-      headers: bearer(newUser(null)),
-      payload: route.method === "GET" ? undefined : { role: "admin" },
+      headers: headersFor(route, newUser(null)),
+      payload: payloadFor(route),
     });
     expect(res.statusCode).toBe(403);
     expect(res.json().error.code).toBe("FORBIDDEN");
@@ -492,8 +580,8 @@ describe("group routes on the real app", () => {
       const res = await (await app()).inject({
         method: route.method,
         url: concreteUrl(route.path),
-        headers: bearer(newUser("member")),
-        payload: route.method === "GET" ? undefined : { role: "admin", userId: "user_target" },
+        headers: headersFor(route, newUser("member")),
+        payload: payloadFor(route, { role: "admin", userId: "user_target" }),
       });
       expect(res.statusCode).toBe(403);
       expect(res.json().error.message).toBe("Only a group admin can perform this action");
@@ -505,8 +593,8 @@ describe("group routes on the real app", () => {
     const res = await (await app()).inject({
       method: route.method,
       url: concreteUrl(route.path),
-      headers: bearer(newUser(route.role)),
-      payload: route.method === "GET" ? undefined : {},
+      headers: headersFor(route, newUser(route.role)),
+      payload: payloadFor(route),
     });
     // Handlers may fail downstream on mocked data (400/404/409/500), but the
     // guard itself must not refuse the required role.
@@ -518,8 +606,8 @@ describe("group routes on the real app", () => {
     const res = await (await app()).inject({
       method: route.method,
       url: concreteUrl(route.path, "group_missing"),
-      headers: bearer(newUser(null)),
-      payload: route.method === "GET" ? undefined : {},
+      headers: headersFor(route, newUser(null)),
+      payload: payloadFor(route, {}),
     });
     expect(res.statusCode).toBe(404);
     expect(writes()).toBe(0);
@@ -542,6 +630,56 @@ describe("group routes on the real app", () => {
     await a.inject({ method: "POST", url, headers: bearer(outsider), payload: {} });
     expect(h.prisma.groupMember.findUnique.mock.calls.length).toBe(lookupsAtLimit);
   });
+
+  it.each(GROUP_ROUTES)(
+    "$method $path — missing token returns 401 with MISSING_TOKEN and no DB lookup",
+    async (route) => {
+      const res = await (await app()).inject({
+        method: route.method,
+        url: concreteUrl(route.path),
+        payload: payloadFor(route),
+      });
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error.code).toBe("MISSING_TOKEN");
+      expect(res.headers["www-authenticate"]).toBe('Bearer realm="mergepay-api"');
+      expect(h.prisma.groupMember.findUnique).not.toHaveBeenCalled();
+      expect(h.prisma.expense.findUnique).not.toHaveBeenCalled();
+      expect(writes()).toBe(0);
+    }
+  );
+
+  it.each(GROUP_ROUTES)(
+    "$method $path — expired token returns 401 with TOKEN_EXPIRED and no DB lookup",
+    async (route) => {
+      const userId = newUser(route.role);
+      const token = jwt.sign(
+        { sub: userId, pk: PUBLIC_KEY },
+        config.JWT_SECRET,
+        {
+          algorithm: "HS256",
+          issuer: config.JWT_ISSUER,
+          audience: config.JWT_AUDIENCE,
+          expiresIn: -60,
+        }
+      );
+      const res = await (await app()).inject({
+        method: route.method,
+        url: concreteUrl(route.path),
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(route.method === "POST" && route.path.endsWith("/expenses")
+            ? { "x-idempotency-key": `expired-${userId}` }
+            : {}),
+        },
+        payload: payloadFor(route),
+      });
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error.code).toBe("TOKEN_EXPIRED");
+      expect(String(res.headers["www-authenticate"])).toContain('error="invalid_token"');
+      expect(h.prisma.groupMember.findUnique).not.toHaveBeenCalled();
+      expect(writes()).toBe(0);
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -591,7 +729,7 @@ describe("expense routes on the real app", () => {
         method,
         url: "/expenses/expense_1",
         headers: bearer(newUser(null)),
-        payload: method === "GET" ? undefined : {},
+        payload: method === "GET" ? undefined : method === "PATCH" ? { title: "Updated" } : {},
       });
       expect(res.statusCode).toBe(403);
       expect(res.json().error.code).toBe("FORBIDDEN");
@@ -607,7 +745,7 @@ describe("expense routes on the real app", () => {
         method,
         url: "/expenses/expense_missing",
         headers: bearer(newUser(null)),
-        payload: method === "GET" ? undefined : {},
+        payload: method === "GET" ? undefined : method === "PATCH" ? { title: "Updated" } : {},
       });
       expect(res.statusCode).toBe(404);
       expect(res.json().error.code).toBe("NOT_FOUND");
@@ -625,7 +763,7 @@ describe("expense routes on the real app", () => {
         method,
         url: "/expenses/expense_1",
         headers: bearer(newUser(method === "GET" ? "member" : "admin")),
-        payload: method === "GET" ? undefined : {},
+        payload: method === "GET" ? undefined : method === "PATCH" ? { title: "Updated" } : {},
       });
       expect(res.statusCode).toBe(200);
     }

@@ -18,10 +18,11 @@
  *     issues: server-sourced, sequence 0, no memo, real time bounds (checked
  *     explicitly against server time with clock-skew tolerance — expired,
  *     not-yet-valid, and over-long windows each get their own code), one
- *     client-sourced `<home domain> auth` operation carrying a large enough
- *     nonce for a G... account, and exactly one server-sourced
- *     `web_auth_domain` entry — nothing else (`client_domain` is not
- *     supported). An unrelated transaction envelope has no way through this.
+  *     client-sourced `<home domain> auth` operation carrying a canonical
+  *     48-byte base64 nonce for a G... account, and exactly one server-sourced
+  *     `web_auth_domain` entry — nothing else (`client_domain` is not
+  *     supported). The fee must equal the base fee for both operations. An
+  *     unrelated transaction envelope has no way through this.
  *  3. Signatures are verified against the client account: the master key for an
  *     unfunded account, the account's signers and medium threshold otherwise.
  *     The server's own signature is required by both SDK checks.
@@ -59,6 +60,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import {
+  BASE_FEE,
   Horizon,
   Keypair,
   MemoNone,
@@ -93,8 +95,28 @@ import { stellar } from "./stellar";
 export const CHALLENGE_VALIDITY_SECONDS =
   config.SEP10_CHALLENGE_VALIDITY_SECONDS;
 
-/** SEP-10 requires at least 32 bytes of server-chosen randomness in the nonce. */
-const MIN_NONCE_BYTES = 32;
+/** The SDK encodes exactly 48 random bytes as a 64-character base64 nonce. */
+const CHALLENGE_NONCE_BYTES = 48;
+const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+function hasCanonicalNonce(value: Uint8Array | undefined): boolean {
+  if (!value) return false;
+  const encoded = Buffer.from(value).toString("utf8");
+  if (encoded.length !== (CHALLENGE_NONCE_BYTES / 3) * 4) return false;
+  if (!BASE64_PATTERN.test(encoded)) return false;
+  const decoded = Buffer.from(encoded, "base64");
+  return decoded.length === CHALLENGE_NONCE_BYTES && decoded.toString("base64") === encoded;
+}
+
+/** The SDK decodes XDR timestamps as canonical decimal strings, not numbers. */
+function safeEpochSeconds(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  }
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && String(parsed) === value ? parsed : null;
+}
 
 /**
  * Replay state for deployments with no reachable database — tests, and only
@@ -274,21 +296,23 @@ export function validateChallengeTimeBounds(
   // No usable bounds, or an inverted window (minTime after maxTime): an
   // envelope that never expires, or whose bounds contradict each other, is
   // not one this server built — structural, so the generic 401.
-  if (!bounds || bounds.maxTime <= 0 || bounds.minTime > bounds.maxTime) {
+  const minTime = safeEpochSeconds(bounds?.minTime);
+  const maxTime = safeEpochSeconds(bounds?.maxTime);
+  if (minTime === null || maxTime === null || maxTime <= 0 || minTime > maxTime) {
     invalidChallenge();
   }
 
   const currentSeconds = nowSeconds(now);
 
-  if (bounds.maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= currentSeconds) {
+  if (maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= currentSeconds) {
     expiredChallenge(account);
   }
-  if (bounds.minTime > currentSeconds + CLOCK_SKEW_TOLERANCE_SECONDS) {
+  if (minTime > currentSeconds + CLOCK_SKEW_TOLERANCE_SECONDS) {
     invalidChallengeWindow("not_yet_valid");
   }
   if (
-    bounds.maxTime >
-    bounds.minTime + CHALLENGE_VALIDITY_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS
+    maxTime >
+    minTime + CHALLENGE_VALIDITY_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS
   ) {
     invalidChallengeWindow("window_too_long");
   }
@@ -371,8 +395,15 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): Ti
   if (!isValidAccount(clientAccountId)) invalidChallenge();
   if (tx.memo.type !== MemoNone) invalidChallenge();
 
+  const operations = tx.operations as ChallengeOperation[];
+  // This server always issues exactly two manageData operations and pays the
+  // SDK's base fee for each. Any other fee is a different envelope shape.
+  if (operations.length !== 2 || Number(tx.fee) !== Number(BASE_FEE) * operations.length) {
+    invalidChallenge();
+  }
+
   const homeDomain = extractHomeDomain(tx);
-  if (!homeDomain || homeDomain.toLowerCase() !== config.SEP10_HOME_DOMAIN.toLowerCase()) {
+  if (!homeDomain || homeDomain !== config.SEP10_HOME_DOMAIN) {
     invalidChallenge();
   }
 
@@ -392,9 +423,6 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): Ti
   // testable statement of the challenge-expiration contract.
   validateChallengeTimeBounds(bounds, undefined, clientAccountId);
 
-  const operations = tx.operations as ChallengeOperation[];
-  if (operations.length === 0) invalidChallenge();
-
   // The first operation carries the nonce and must be sourced by the account
   // being authenticated — this is what ties the challenge to one client.
   const authOperation = operations[0];
@@ -402,8 +430,7 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): Ti
     authOperation.type !== "manageData" ||
     authOperation.name !== `${config.SEP10_HOME_DOMAIN} auth` ||
     authOperation.source !== clientAccountId ||
-    !authOperation.value ||
-    authOperation.value.length < MIN_NONCE_BYTES
+    !hasCanonicalNonce(authOperation.value)
   ) {
     invalidChallenge();
   }
@@ -495,7 +522,7 @@ export function validateChallengeHomeDomain(
   expectedDomain: string = config.SEP10_HOME_DOMAIN
 ): string {
   const homeDomain = extractHomeDomain(tx);
-  if (!homeDomain || homeDomain.toLowerCase() !== expectedDomain.toLowerCase()) {
+  if (!homeDomain || homeDomain !== expectedDomain) {
     homeDomainMismatch();
   }
   return homeDomain;

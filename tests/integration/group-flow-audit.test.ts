@@ -62,13 +62,14 @@ async function call(
   method: "GET" | "POST",
   url: string,
   actor: Actor | null,
-  payload?: Record<string, unknown>
+  payload?: Record<string, unknown>,
+  headers: Record<string, string> = {}
 ) {
   return app.inject({
     method,
     url,
     remoteAddress: `10.102.${Math.floor(requestNumber / 250) % 250}.${(requestNumber++ % 250) + 1}`,
-    headers: actor ? { authorization: `Bearer ${actor.token}` } : {},
+    headers: { ...(actor ? { authorization: `Bearer ${actor.token}` } : {}), ...headers },
     payload,
   });
 }
@@ -142,7 +143,7 @@ describe("full group → expense → settlement intent flow on real Postgres (#1
       assetCode: "XLM",
       splitType: "equal",
       shares: [{ userId: outsider.id }],
-    });
+    }, { "x-idempotency-key": "expense-int-47937" });
     expect(denied.statusCode).toBe(403);
 
     const created = await call("POST", `/groups/${groupId}/expenses`, owner, {
@@ -151,7 +152,7 @@ describe("full group → expense → settlement intent flow on real Postgres (#1
       assetCode: "XLM",
       splitType: "equal",
       shares: [{ userId: owner.id }, { userId: member.id }],
-    });
+    }, { "x-idempotency-key": "expense-int-78818" });
     expect(created.statusCode).toBe(200);
     expenseId = created.json().expense.id as string;
 

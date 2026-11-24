@@ -31,12 +31,14 @@
  */
 
 import { z } from "zod";
+import { sanitizedTextField } from "../lib/sanitize-text";
 import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import {
   DEFAULT_PAGE_SIZE,
   GROUP_LIST_MAX_PAGE_SIZE,
   paginationQuerySchema,
 } from "../lib/pagination";
+import { booleanQuerySchema, identifierQuerySchema } from "./common";
 
 // ---------------------------------------------------------------------------
 // Field primitives
@@ -86,6 +88,17 @@ export const groupMemberParamsSchema = z.object({
 });
 
 /**
+ * Query for `GET /groups`: the shared cursor plus filters on the membership
+ * row and its group. Keyset paging is always applied inside the filtered set.
+ */
+export const groupListQuerySchema = paginationQuerySchema.extend({
+  role: groupRoleSchema.optional(),
+  archived: booleanQuerySchema.optional(),
+  treasuryEnabled: booleanQuerySchema.optional(),
+  createdByUserId: identifierQuerySchema.optional(),
+});
+
+/**
  * Query for the paginated member list on `GET /groups/:id`.
  *
  * Members sort alphabetically by display name, so the shared `(createdAt, id)`
@@ -101,6 +114,9 @@ export const groupMemberListQuerySchema = paginationQuerySchema.extend({
     .max(GROUP_LIST_MAX_PAGE_SIZE)
     .default(DEFAULT_PAGE_SIZE),
   order: z.enum(["asc", "desc"]).default("asc"),
+  role: groupRoleSchema.optional(),
+  userId: identifierQuerySchema.optional(),
+  search: z.string().trim().min(1).max(100).optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -171,8 +187,8 @@ export const groupMetadataSchema = z.record(z.unknown());
 export const createGroupSchema = z
   .object({
     /** 1–60 visible characters; whitespace-only names are rejected. */
-    name: z.string().trim().min(1, "name is required").max(60),
-    description: z.string().max(280).nullable().optional(),
+    name: sanitizedTextField({ min: 1, max: 60, minMessage: "name is required" }),
+    description: sanitizedTextField({ max: 280 }).nullable().optional(),
     currency: groupCurrencySchema.optional(),
     currencyType: groupCurrencySchema.optional(),
     defaultCurrency: groupCurrencySchema.optional(),
@@ -199,8 +215,8 @@ export const createGroupSchema = z
  */
 export const updateGroupSchema = z
   .object({
-    name: z.string().trim().min(1, "name is required").max(60).optional(),
-    description: z.string().max(280).nullable().optional(),
+    name: sanitizedTextField({ min: 1, max: 60, minMessage: "name is required" }).optional(),
+    description: sanitizedTextField({ max: 280 }).nullable().optional(),
     currency: groupCurrencySchema.optional(),
     currencyType: groupCurrencySchema.optional(),
     defaultCurrency: groupCurrencySchema.optional(),

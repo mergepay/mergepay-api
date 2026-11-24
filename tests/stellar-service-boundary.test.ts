@@ -84,6 +84,14 @@ describe("Stellar service boundary (#845)", () => {
     expect(offenders.map(relativeToSrc)).toEqual([]);
   });
 
+  it("constructs Horizon clients only through the shared service helper", () => {
+    const offenders = sourceFiles
+      .filter((path) => relativeToSrc(path) !== "services/stellar.ts")
+      .filter((path) => /new\s+Horizon\.Server\s*\(/.test(readFileSync(path, "utf8")));
+
+    expect(offenders.map(relativeToSrc)).toEqual([]);
+  });
+
   it("exposes the account and envelope checks other layers validate through", async () => {
     // Routes must be able to validate a G... address and parse a submitted
     // envelope without importing the SDK themselves: these are the seam.

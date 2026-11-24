@@ -62,7 +62,7 @@ const schema = z.object({
   // database concurrency across Fastify workers on a single instance.
   DATABASE_CONNECTION_LIMIT: z.coerce.number().int().positive().default(5),
   PORT: z.coerce.number().int().positive().default(4000),
-  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   // How long (ms) a request may occupy a connection before the server answers
   // it with 408 Request Timeout. Bounds stalled handlers — a slow-loris client,
   // a runaway Horizon call, or a database query the pool never resolves — so a
@@ -86,10 +86,10 @@ const schema = z.object({
   CORS_ALLOW_METHODS: z.string().default("GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS"),
   // Comma-separated list of allowed headers for CORS.
   // Defaults to common headers needed for API clients.
-  CORS_ALLOW_HEADERS: z.string().default("Content-Type,Authorization,X-Requested-With,Idempotency-Key"),
+  CORS_ALLOW_HEADERS: z.string().default("Content-Type,Authorization,X-Requested-With,Idempotency-Key,X-Idempotency-Key"),
   // Comma-separated list of headers exposed to the client.
   // Defaults to headers useful for debugging and pagination.
-  CORS_EXPOSE_HEADERS: z.string().default("X-Request-ID,X-Correlation-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,Retry-After"),
+  CORS_EXPOSE_HEADERS: z.string().default("X-Request-ID,X-Correlation-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,Retry-After,Idempotent-Replay"),
   // Max age (seconds) for CORS preflight cache.
   // Defaults to 24 hours to reduce preflight requests.
   CORS_MAX_AGE: z.coerce.number().int().positive().default(86400),

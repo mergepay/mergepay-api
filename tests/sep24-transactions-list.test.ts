@@ -377,6 +377,45 @@ describe("GET /api/sep24/transactions — kind filter", () => {
   });
 });
 
+describe("GET /api/sep24/transactions — additive filters", () => {
+  it("passes asset_code and status through to the stored-session query", async () => {
+    prisma.anchorSession.findMany.mockResolvedValue([]);
+
+    const res = await list("asset_code=USDC&status=completed");
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.anchorSession.findMany.mock.calls[0][0].where).toMatchObject({
+      userId: "user_1",
+      assetCode: "USDC",
+      status: "completed",
+    });
+  });
+
+  it("composes date bounds with the cursor without losing either condition", async () => {
+    const cursor = Buffer.from(`${T1.getTime()}_s2`).toString("base64url");
+    prisma.anchorSession.findMany.mockResolvedValue([]);
+
+    const res = await list(
+      `startDate=2026-01-01T00:00:00.000Z&cursor=${cursor}`
+    );
+
+    expect(res.statusCode).toBe(200);
+    const { where } = prisma.anchorSession.findMany.mock.calls[0][0];
+    expect(where).toMatchObject({
+      userId: "user_1",
+      createdAt: { gte: new Date("2026-01-01T00:00:00.000Z") },
+      OR: expect.any(Array),
+    });
+  });
+
+  it("400s on an unsupported status", async () => {
+    const res = await list("status=unknown");
+
+    expect(res.statusCode).toBe(400);
+    expect(prisma.anchorSession.findMany).not.toHaveBeenCalled();
+  });
+});
+
 describe("GET /api/sep24/transactions — authentication and scope", () => {
   it("rejects an unauthenticated poll before touching the database", async () => {
     const res = await app.inject({ method: "GET", url: "/api/sep24/transactions" });

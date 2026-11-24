@@ -35,21 +35,26 @@ vi.mock("../src/config", () => ({
   },
 }));
 
-vi.mock("@stellar/stellar-sdk", () => ({
-  Horizon: {
-    Server: vi.fn().mockImplementation(() => ({
-      transactions: () => ({
-        transaction: () => ({ call: h.transactionCall }),
-      }),
-      operations: () => ({
-        forTransaction: () => ({
-          limit: () => ({ call: h.paymentsCall }),
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
+  return {
+    ...actual,
+    Horizon: {
+      ...actual.Horizon,
+      Server: vi.fn().mockImplementation(() => ({
+        transactions: () => ({
+          transaction: () => ({ call: h.transactionCall }),
         }),
-      }),
-    })),
-  },
-  Memo: {},
-}));
+        operations: () => ({
+          forTransaction: () => ({
+            limit: () => ({ call: h.paymentsCall }),
+          }),
+        }),
+      })),
+    },
+    Memo: {},
+  };
+});
 
 vi.mock("../src/services/timeout", async (importOriginal) => {
   // Real TimeoutError/TransportError classes, but withTimeout runs the

@@ -1,6 +1,10 @@
 import { Errors } from "../errors";
 import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
+import { dateRangeQueryShape, identifierQuerySchema } from "../schemas/common";
+import { paginationQuerySchema } from "../lib/pagination";
 import { mpMemoSchema } from "../lib/stellar-validation";
+import { validateRequest } from "../middleware/validate-request";
+import { treasuryProposalExpiryDaysSchema } from "../services/treasury-proposal-expiry";
 /**
  * Shared Zod schemas for treasury multisig configuration and weight changes.
  *
@@ -23,6 +27,7 @@ import { mpMemoSchema } from "../lib/stellar-validation";
  */
 import { z } from "zod";
 import { stellarPublicKeySchema } from "../lib/stellar-validation";
+import { sanitizedTextField } from "../lib/sanitize-text";
 import { isValidXdr } from "../utils/stellar-xdr";
 
 /** A Stellar weight/threshold: integer in [0, 255]. */
@@ -139,12 +144,17 @@ export const treasuryTxProposalCreateSchema = z
     /** Legacy alias for `treasuryId`, retained for backward compatibility. */
     groupId: z.string().min(1).optional(),
     xdr: treasuryXdrSchema,
-    description: z
-      .string()
-      .min(1, "Description cannot be empty")
-      .max(280, "Description must be 280 characters or fewer")
-      .optional(),
+    description: sanitizedTextField({
+      min: 1,
+      max: 280,
+      minMessage: "Description cannot be empty",
+      maxMessage: "Description must be 280 characters or fewer",
+    }).optional(),
   })
+  // Strict is deliberate: a proposal carries an externally built envelope, and
+  // an unexpected field such as `secret` or `seed` must be refused outright
+  // rather than silently stripped (issue #1080).
+  .strict()
   .refine((value) => Boolean(value.treasuryId ?? value.groupId), {
     message: "treasuryId is required",
     path: ["treasuryId"],
@@ -221,8 +231,16 @@ export const treasuryMultisigProposalPayloadSchema = z
     signers: treasurySignersSchema.optional(),
     threshold: stellarWeightSchema.optional(),
     xdr: treasuryXdrSchema.optional(),
-    description: z.string().max(280).optional(),
+    description: sanitizedTextField({
+      max: 280,
+      maxMessage: "Description must be 280 characters or fewer",
+    }).optional(),
+    expiresInDays: treasuryProposalExpiryDaysSchema.optional(),
   })
+  // Strict so a client cannot smuggle key material or unrelated fields into a
+  // server-built payment proposal; the route's Zod middleware reports an
+  // unrecognized key with the standard 400 VALIDATION_ERROR envelope (#1080).
+  .strict()
   .refine(
     (data) => {
       if (data.assetCode !== "XLM" && data.assetCode !== "native" && !data.assetIssuer) {
@@ -240,6 +258,68 @@ export type TreasuryMultisigProposalPayload = z.infer<
   typeof treasuryMultisigProposalPayloadSchema
 >;
 
+/** Every persisted lifecycle state of a server-built treasury proposal. */
+export const TREASURY_PROPOSAL_STATUSES = [
+  "pending",
+  "awaiting_signatures",
+  "submitted",
+  "confirmed",
+  "failed",
+  "expired",
+] as const;
+
+export type TreasuryProposalStatus = (typeof TREASURY_PROPOSAL_STATUSES)[number];
+
+/**
+ * Query contract for `GET /groups/:groupId/treasury/proposals` (issue #1053).
+ *
+ * Extends the shared cursor-pagination schema with closed-enum status,
+ * creator, and creation-date filters. Unknown keys stay a 400 (`.strict()`
+ * is preserved by `.extend()`), and an inverted date range is rejected rather
+ * than silently returning an empty page.
+ */
+export const treasuryProposalListQuerySchema = paginationQuerySchema
+  .extend({
+    status: z.enum(TREASURY_PROPOSAL_STATUSES).optional(),
+    creatorId: z.string().min(1).max(64).optional(),
+    startDate: z.string().datetime({ offset: true }).optional(),
+    endDate: z.string().datetime({ offset: true }).optional(),
+  })
+  .refine(
+    (query) =>
+      !query.startDate ||
+      !query.endDate ||
+      new Date(query.startDate).getTime() <= new Date(query.endDate).getTime(),
+    {
+      message: "startDate must be before or equal to endDate",
+      path: ["startDate"],
+    }
+  );
+
+export type TreasuryProposalListQuery = z.infer<
+  typeof treasuryProposalListQuerySchema
+>;
+
+/**
+ * Request-validation middleware for both externally built transaction proposals
+ * (`/treasury/propose`, `/api/treasury/proposals`) — issue #1080.
+ *
+ * Uses the shared `validateRequest` preHandler so a rejection is rendered by
+ * the central ZodError handler as `400 VALIDATION_ERROR` with `details` and
+ * `issues`, identical to every other validated surface.
+ */
+export const validateTreasuryTxProposalCreateRequest = validateRequest({
+  body: treasuryTxProposalCreateSchema,
+});
+
+/**
+ * Request-validation middleware for server-built payment proposals
+ * (`/groups/:groupId/treasury/proposals`) — issue #1080.
+ */
+export const validateTreasuryMultisigProposalCreateRequest = validateRequest({
+  body: treasuryMultisigProposalPayloadSchema,
+});
+
 /**
  * Fastify preHandler validation hook for treasury multisig proposals (#874).
  */
@@ -255,3 +335,14 @@ export async function validateTreasuryProposalHook(req: any) {
   }
   req.treasuryProposal = parsed.data;
 }
+
+/** Query for `GET /groups/:id/treasury/history`. */
+export const treasuryHistoryQuerySchema = paginationQuerySchema.extend({
+  direction: z.enum(["deposit", "withdrawal"]).optional(),
+  status: z.enum(["pending", "submitting", "confirmed", "failed"]).optional(),
+  assetCode: assetCodeSchema.optional(),
+  userId: identifierQuerySchema.optional(),
+  ...dateRangeQueryShape,
+});
+
+export type TreasuryHistoryQuery = z.infer<typeof treasuryHistoryQuerySchema>;

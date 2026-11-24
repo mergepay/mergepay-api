@@ -424,7 +424,10 @@ describe("Group Settlement End-to-End Integration Flow", () => {
 
       const res = await fetch(`${API_BASE_URL}/groups/${invalidGroupId}/expenses`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${adminToken}` },
+        headers: {
+          Authorization: `Bearer ${adminToken}`,
+          "X-Idempotency-Key": `expense-invalid-split-${Date.now()}`,
+        },
         body: JSON.stringify(expenseData),
       });
 

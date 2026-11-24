@@ -99,6 +99,7 @@ model Expense {
   shares ExpenseShare[]
 
   @@index([groupId, createdAt, id])
+  @@index([groupId, assetCode, createdAt, id])
   @@index([payerUserId])
   @@index([groupId, payerUserId])
   @@index([groupId, assetCode])
@@ -121,6 +122,7 @@ model ExpenseShare {
   @@index([expenseId, userId])
   @@index([status, expenseId])
   @@index([userId, status])
+  @@index([expenseId, status])
   @@map("expense_shares")
 }
 

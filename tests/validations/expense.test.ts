@@ -458,9 +458,9 @@ describe("updateExpenseSchema", () => {
     expect(result.success).toBe(true);
   });
 
-  it("accepts empty object", () => {
+  it("rejects empty object", () => {
     const result = updateExpenseSchema.safeParse({});
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
   });
 
   it("rejects empty title", () => {

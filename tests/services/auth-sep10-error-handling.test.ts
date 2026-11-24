@@ -265,6 +265,17 @@ describe("Auth Service & SEP-10 Verification Error Handling (#885)", () => {
       expect(json.error.message).toContain("expired");
       expect(res.body).not.toContain(serverKeypair().secret());
     });
+
+    it("returns 401 INVALID_CHALLENGE for a malformed SEP10 authorization envelope", async () => {
+      const res = await app.inject({
+        method: "GET",
+        url: "/test-protected",
+        headers: { authorization: "SEP10 not@valid!base64==" },
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error.code).toBe(ErrorCode.INVALID_CHALLENGE);
+    });
   });
 
   describe("Fastify authenticateSep10 hook", () => {
@@ -282,6 +293,17 @@ describe("Auth Service & SEP-10 Verification Error Handling (#885)", () => {
       const json = res.json();
       expect(json.ok).toBe(true);
       expect(json.sep10Account).toBe(client.publicKey());
+    });
+
+    it("returns 401 INVALID_CHALLENGE for a malformed X-SEP10-Challenge header", async () => {
+      const res = await app.inject({
+        method: "POST",
+        url: "/test-sep10-hook",
+        headers: { "x-sep10-challenge": "not@valid!base64==" },
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error.code).toBe(ErrorCode.INVALID_CHALLENGE);
     });
 
     it("authenticates via request body transaction field", async () => {

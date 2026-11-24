@@ -12,6 +12,7 @@ import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
 import openAPIPlugin from "./plugins/openapi";
 import rateLimitPlugin, { type RateLimitRegistration } from "./plugins/rate-limit";
+import requestIdPlugin, { resolveIncomingRequestId } from "./plugins/request-id";
 import requestTimeoutPlugin from "./plugins/request-timeout";
 import { validateAssetConfig } from "./services/assets";
 import authRoutes from "./routes/auth";
@@ -38,7 +39,6 @@ import { buildLoggerOptions, nullLogDestination } from "./lib/logger";
 import { buildCorsOptions } from "./lib/cors";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
-import { nanoid } from "nanoid";
 
 /**
  * Build-time overrides.
@@ -199,18 +199,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     // before routing, so the route table itself contains only versioned paths
     // while old clients keep reaching them.
     rewriteUrl: (request) => toVersionedUrl(request.url ?? "/"),
-    genReqId: (request) => {
-      const incomingRequestId = request.headers["x-request-id"];
-      const incomingCorrelationId = request.headers["x-correlation-id"];
-      const preferred =
-        typeof incomingRequestId === "string" && incomingRequestId.trim()
-          ? incomingRequestId
-          : typeof incomingCorrelationId === "string" && incomingCorrelationId.trim()
-            ? incomingCorrelationId
-            : `req-${nanoid(16)}`;
-
-      return getCorrelationId(preferred);
-    },
+    genReqId: (request) => resolveIncomingRequestId(request.headers),
     logger:
       options.logger ??
       (config.isTest
@@ -256,32 +245,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     timeoutMs: options.requestTimeoutMs ?? config.REQUEST_TIMEOUT_MS,
   });
 
-  app.addHook("onRequest", async (request, reply) => {
-    const requestId = request.id;
-    const correlationId = getCorrelationId(requestId);
-    reply.header("x-request-id", requestId);
-    reply.header("x-correlation-id", correlationId);
-    request.log = request.log.child({ reqId: requestId, correlationId });
-    request.log.info({ requestId, correlationId }, "request received");
-  });
-
-  app.addHook("onResponse", async (request, reply) => {
-    const requestId = request.id;
-    const correlationId = getCorrelationId(requestId);
-    reply.header("x-request-id", requestId);
-    reply.header("x-correlation-id", correlationId);
-    request.log = request.log.child({ reqId: requestId, correlationId });
-    request.log.info(
-      {
-        requestId,
-        correlationId,
-        statusCode: reply.statusCode,
-        method: request.method,
-        route: request.routeOptions.url,
-      },
-      "request completed"
-    );
-  });
+  // Correlation IDs live in their own plugin (issue #1077): generation,
+  // response headers, and request-logger binding must not drift apart across
+  // the API, the 404 handler, and the timeout path.
+  await app.register(requestIdPlugin);
 
   app.addHook("onError", async (request, _reply, error) => {
     // A handler is not obliged to throw an `Error`: `throw null` and a promise

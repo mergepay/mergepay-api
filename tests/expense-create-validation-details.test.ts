@@ -3,12 +3,20 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const h = vi.hoisted(() => ({
   groupFindUnique: vi.fn(),
   memberFindUnique: vi.fn(),
+  idempotencyFindUnique: vi.fn(),
+  idempotencyCreate: vi.fn(),
+  idempotencyUpdate: vi.fn(),
 }));
 
 vi.mock("../src/db", () => ({
   prisma: {
     group: { findUnique: h.groupFindUnique },
     groupMember: { findUnique: h.memberFindUnique },
+    idempotencyKey: {
+      findUnique: h.idempotencyFindUnique,
+      create: h.idempotencyCreate,
+      update: h.idempotencyUpdate,
+    },
     $transaction: vi.fn(async (arg: any) => (typeof arg === "function" ? arg({}) : Promise.all(arg))),
   },
 }));
@@ -22,6 +30,8 @@ describe("expense create validation details (#1031)", () => {
     vi.clearAllMocks();
     h.groupFindUnique.mockResolvedValue({ id: "g1", currency: "USD", status: "active" });
     h.memberFindUnique.mockResolvedValue({ groupId: "g1", userId: "u1", role: "member" });
+    h.idempotencyFindUnique.mockResolvedValue(null);
+    h.idempotencyCreate.mockResolvedValue({});
     app = await buildApp();
   });
 
@@ -30,7 +40,10 @@ describe("expense create validation details (#1031)", () => {
     const res = await app.inject({
       method: "POST",
       url: "/groups/g1/expenses",
-      headers: { authorization: `Bearer ${token}` },
+      headers: {
+        authorization: `Bearer ${token}`,
+        "x-idempotency-key": "expense-validation-details",
+      },
       payload: { description: "", total: "-1", currency: "usd" },
     });
     expect(res.statusCode).toBe(400);

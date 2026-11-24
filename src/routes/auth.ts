@@ -1,6 +1,5 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { config } from "../config";
 import { prisma } from "../db";
 import { Errors } from "../errors";
 import { authenticateChallenge, buildChallenge } from "../services/sep10";
@@ -20,6 +19,7 @@ import {
   sep10ChallengeRequestSchema,
   sep10QuerySchema,
   sep10VerifyRequestSchema,
+  validateSep10DomainClaims,
 } from "../validations/sep10";
 import { openApiBody, openApiEnvelope, openApiErrorResponses, openApiOkResponse, openApiResponse } from "../lib/openapi";
 
@@ -115,41 +115,7 @@ export default async function authRoutes(app: FastifyInstance) {
       sep10QuerySchema.parse(req.query);
       const body = sep10VerifyRequestSchema.parse(req.body);
 
-      // SEP-10 lets a client name the domains it authenticated against, and
-      // this schema has always accepted `home_domain` / `client_domain` as
-      // well-formed values — then dropped them. A client that sends them is
-      // making a claim about the flow, so the claim is now answered here,
-      // before any envelope is parsed, any signature checked, and above all
-      // before this server's challenge is consumed:
-      //
-      //   - `client_domain`: this server does not do client-domain
-      //     verification at all (src/services/sep10.ts rejects an envelope
-      //     carrying the operation). Accepting the field while never performing
-      //     the check is how a wallet integration ends up *believing* it has
-      //     one. Rejected outright, so the answer is explicit.
-      //   - `home_domain`: challenges are issued for exactly one domain,
-      //     `config.SEP10_HOME_DOMAIN`. A request naming another is a client
-      //     mistake — the envelope check would reject it anyway, as an opaque
-      //     401 — so it is named here instead, as a 400 that says what to fix.
-      //
-      // These are 400s about the *request*, raised before any credential is
-      // evaluated, so they add no probe into how the signature itself failed.
-      const clientDomain = body.client_domain ?? body.clientDomain;
-      if (clientDomain !== undefined) {
-        throw Errors.badRequest(
-          "client_domain_unsupported",
-          "This server does not support SEP-10 client_domain authentication"
-        );
-      }
-      if (
-        body.home_domain !== undefined &&
-        body.home_domain.toLowerCase() !== config.SEP10_HOME_DOMAIN.toLowerCase()
-      ) {
-        throw Errors.badRequest(
-          "home_domain_mismatch",
-          `home_domain must match the domain this server issues challenges for (${config.SEP10_HOME_DOMAIN})`
-        );
-      }
+      validateSep10DomainClaims(body);
 
       let verifiedChallenge: { account: string; challengeHash: string };
       try {

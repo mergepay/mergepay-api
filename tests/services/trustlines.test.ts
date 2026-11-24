@@ -2,7 +2,14 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 const h = vi.hoisted(() => {
   const loadAccount = vi.fn();
+  const idempotencyKey = {
+    findUnique: vi.fn(async () => null),
+    create: vi.fn(async () => ({})),
+    update: vi.fn(async () => ({})),
+    updateMany: vi.fn(async () => ({ count: 0 })),
+  };
   const prisma: any = {
+    idempotencyKey,
     groupMember: {
       findMany: vi.fn(async () => []),
       // requireMembership reads this before the route body runs.
@@ -277,7 +284,7 @@ describe("POST /groups/:id/expenses — trustline validation", () => {
     return app.inject({
       method: "POST",
       url: `/groups/${GROUP_ID}/expenses`,
-      headers: authHeader(),
+      headers: { ...authHeader(), "x-idempotency-key": "expense-auto" },
       payload: {
         title: "Dinner",
         amount: "20.0000000",

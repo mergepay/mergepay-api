@@ -48,6 +48,11 @@ import {
   takeForPage,
   type PageMeta,
 } from "../lib/pagination";
+import {
+  booleanQuerySchema,
+  dateRangeQueryShape,
+  dateRangeWhere,
+} from "../schemas/common";
 import { WEBHOOK_EVENT_TYPES } from "./event";
 
 /** Delivery states the worker records, as clients may filter by them. */
@@ -65,12 +70,18 @@ export type DeliveryStatus = (typeof DELIVERY_STATUSES)[number];
 export const deliveryListQuerySchema = paginationQuerySchema.extend({
   status: z.enum(DELIVERY_STATUSES).optional(),
   event: z.enum(WEBHOOK_EVENT_TYPES).optional(),
+  ...dateRangeQueryShape,
 });
 
 export type DeliveryListQuery = z.infer<typeof deliveryListQuerySchema>;
 
-/** Query parameters for the endpoint list: pagination only, no filters. */
-export const webhookListQuerySchema = paginationQuerySchema;
+/** Query parameters for the endpoint list, including the stored endpoint filters. */
+export const webhookListQuerySchema = paginationQuerySchema.extend({
+  enabled: booleanQuerySchema.optional(),
+  event: z.enum(WEBHOOK_EVENT_TYPES).optional(),
+});
+
+export type WebhookListQuery = z.infer<typeof webhookListQuerySchema>;
 
 export interface ListPage<T> {
   items: T[];
@@ -128,12 +139,14 @@ export function deliverySummary(row: {
  */
 export function deliveryFilters(
   webhookId: string,
-  query: Pick<DeliveryListQuery, "status" | "event">
+  query: Pick<DeliveryListQuery, "status" | "event" | "startDate" | "endDate">
 ): Prisma.WebhookDeliveryWhereInput[] {
+  const createdAt = dateRangeWhere(query);
   return [
     { webhookId },
     ...(query.status ? [{ status: query.status }] : []),
     ...(query.event ? [{ eventType: query.event }] : []),
+    ...(createdAt ? [{ createdAt }] : []),
   ];
 }
 
@@ -151,10 +164,6 @@ export async function listWebhookDeliveries(
   const filters = deliveryFilters(webhookId, query);
   const cursorCondition = cursorFilter(position, query.order);
 
-  // With no filters beyond the endpoint scope the query keeps its flat shape;
-  // only a filtered request pays for the `AND` wrapper. Either way the cursor
-  // condition stays separate from the filters, so paging never widens the
-  // result set.
   const where: Prisma.WebhookDeliveryWhereInput =
     filters.length === 1
       ? { webhookId, ...cursorCondition }
@@ -170,6 +179,18 @@ export async function listWebhookDeliveries(
   return { items: items.map(deliverySummary), meta };
 }
 
+/** Filter conditions for a webhook endpoint query, excluding pagination. */
+export function webhookFilters(
+  groupId: string,
+  query: Pick<WebhookListQuery, "enabled" | "event">
+): Prisma.WebhookWhereInput[] {
+  return [
+    { groupId },
+    ...(query.enabled === undefined ? [] : [{ enabled: query.enabled }]),
+    ...(query.event ? [{ events: { has: query.event } }] : []),
+  ];
+}
+
 /**
  * List one page of a group's webhook endpoints.
  *
@@ -178,12 +199,18 @@ export async function listWebhookDeliveries(
  */
 export async function listGroupWebhooks(
   groupId: string,
-  query: z.infer<typeof webhookListQuerySchema>
+  query: WebhookListQuery
 ): Promise<ListPage<{ id: string; createdAt: Date }>> {
   const position = requireCursor(query.cursor);
+  const filters = webhookFilters(groupId, query);
+  const cursorCondition = cursorFilter(position, query.order);
+  const where: Prisma.WebhookWhereInput =
+    filters.length === 1
+      ? { groupId, ...cursorCondition }
+      : { AND: [...filters, cursorCondition] };
 
   const rows = await prisma.webhook.findMany({
-    where: { groupId, ...cursorFilter(position, query.order) },
+    where,
     orderBy: cursorOrderBy(query.order),
     take: takeForPage(query.limit),
   });

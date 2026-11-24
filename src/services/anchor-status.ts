@@ -30,6 +30,7 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 import { auditTx } from "./audit";
+import { AuditAction } from "./audit-actions";
 import { Errors } from "../errors";
 import {
   SEP24_TRANSACTION_STATUSES,
@@ -169,6 +170,12 @@ export async function applyAnchorSessionTransition(params: {
   rawStatus?: string;
   /** Safe, displayable reason stored on the history row (e.g. a failure message). */
   reason?: string;
+  /** Specific SEP-24 lifecycle action; defaults to the generic transition action. */
+  auditAction?: string;
+  /** Additional safe metadata (hash, amounts, asset code) written with the audit row. */
+  auditMetadata?: Record<string, unknown>;
+  /** Public Stellar key of the account whose transfer is transitioning. */
+  actorPublicKey?: string | null;
 }): Promise<AnchorSessionUpdateResult<{ id: string; status: string }>> {
   const {
     sessionId,
@@ -179,6 +186,9 @@ export async function applyAnchorSessionTransition(params: {
     expectedCurrentStatus,
     rawStatus,
     reason,
+    auditAction,
+    auditMetadata,
+    actorPublicKey,
     correlationId,
   } = params;
 
@@ -254,15 +264,18 @@ export async function applyAnchorSessionTransition(params: {
       // worker asking the anchor, and a `webhook` is the anchor reporting back;
       // in both cases the owner is who the session belongs to, not the actor.
       actorType: source === "user" ? "user" : source === "poll" ? "worker" : "system",
-      action: "anchor_session.status_changed",
+      action: auditAction ?? AuditAction.ANCHOR_SESSION_STATUS_CHANGED,
       entityType: "anchor_session",
       entityId: sessionId,
+      ...(actorPublicKey ? { actorPublicKey } : {}),
       correlationId: correlationId ?? (source === "poll" ? `job_anchor_${sessionId}` : null),
       metadata: {
         from: current,
         to: target,
         source,
         ...(rawStatus !== undefined ? { rawStatus } : {}),
+        ...(session.assetCode ? { assetCode: session.assetCode } : {}),
+        ...(auditMetadata ?? {}),
       },
     });
 

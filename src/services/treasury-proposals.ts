@@ -52,11 +52,17 @@ import { stellar } from "./stellar";
 import { buildTreasuryPaymentXdr } from "./treasury-stellar";
 import { audit, auditMultisigActionTx } from "./audit";
 import { AuditAction } from "./audit-actions";
+import { emitEvent, type MergepayEvent } from "./event";
 import {
   assertProposalActionable,
   proposalExpiryDate,
   treasuryProposalExpiryDaysSchema,
 } from "./treasury-proposal-expiry";
+import {
+  parseTreasurySignatures,
+  serializeTreasurySignatures,
+  type StoredTreasurySignature,
+} from "../schemas/json-metadata";
 
 export interface CreateProposalParams {
   groupId: string;
@@ -98,12 +104,6 @@ function classifyProposalBuildError(error: unknown): Error {
     );
   }
   return Errors.upstream("The treasury proposal could not be built");
-}
-
-interface StoredSignature {
-  publicKey: string;
-  signature: string;
-  signedAt: string;
 }
 
 const STATUS = {
@@ -299,7 +299,7 @@ export const treasuryProposalsService = {
           xdr,
           txHash,
           threshold,
-          signatures: [] as any,
+          signatures: serializeTreasurySignatures([]),
           status: initialStatus,
           expiresAt,
         },
@@ -340,6 +340,28 @@ export const treasuryProposalsService = {
       });
       throw classified;
     }
+
+    announceTreasuryProposalEvent({
+      eventType: "treasury.proposal.created",
+      groupId: params.groupId,
+      userId: params.creatorId,
+      payload: {
+        proposalId: proposal.id,
+        groupId: params.groupId,
+        creatorId: params.creatorId,
+        status: proposal.status,
+        txHash: proposal.txHash,
+        threshold: proposal.threshold,
+        signatureCount: 0,
+        destination: params.destination,
+        amount: params.amount,
+        assetCode: params.assetCode,
+        assetIssuer: params.assetIssuer,
+        expiresAt: proposal.expiresAt
+          ? new Date(proposal.expiresAt).toISOString()
+          : null,
+      },
+    });
 
     return { proposal, xdr, networkPassphrase: config.networkPassphrase };
   },
@@ -385,7 +407,8 @@ export const treasuryProposalsService = {
     threshold: number;
     stellarTxHash: string | null;
   }> {
-    return runSignatureTransaction(args, () =>
+    const events: MergepayEvent[] = [];
+    const result = await runSignatureTransaction(args, () =>
       prisma.$transaction(
         async (tx) => {
         // Lock the proposal row for the duration of this transaction.
@@ -489,9 +512,11 @@ export const treasuryProposalsService = {
         }
 
         // Verify each signature corresponds to a group member's public key.
-        const stored: StoredSignature[] = (proposal.signatures as any) ?? [];
+        const stored: StoredTreasurySignature[] = parseTreasurySignatures(
+          proposal.signatures
+        );
         const existingKeys = new Set(stored.map((s) => s.publicKey));
-        const verified: StoredSignature[] = [...stored];
+        const verified: StoredTreasurySignature[] = [...stored];
         const now = new Date().toISOString();
 
         const memberList = [...memberSet];
@@ -506,7 +531,7 @@ export const treasuryProposalsService = {
           .filter((v): v is { pk: string; kp: Keypair } => v !== null);
         const memberByPk = new Map(memberKeypairs.map((v) => [v.pk, v.kp]));
 
-        for (const decorated of submitted.signatures as any[]) {
+        for (const decorated of submitted.signatures) {
           const hint: Buffer = decorated.hint();
           const signature: Buffer = decorated.signature();
           const signatureBase64 = signature.toString("base64");
@@ -596,7 +621,7 @@ export const treasuryProposalsService = {
         await tx.treasuryProposal.update({
           where: { id: proposal.id },
           data: {
-            signatures: verified as any,
+            signatures: serializeTreasurySignatures(verified),
             status: meetsThreshold ? STATUS.submitted : STATUS.awaitingSignatures,
           },
         });
@@ -620,6 +645,20 @@ export const treasuryProposalsService = {
               threshold: proposal.threshold,
             },
           });
+          events.push({
+            eventType: "treasury.proposal.signed",
+            groupId: proposal.groupId,
+            userId: signerUserId ?? undefined,
+            payload: {
+              proposalId: proposal.id,
+              groupId: proposal.groupId,
+              signerPublicKey: pk,
+              txHash: proposal.txHash,
+              signatureCount: verified.length,
+              threshold: proposal.threshold,
+              status: meetsThreshold ? STATUS.submitted : STATUS.awaitingSignatures,
+            },
+          });
         }
 
         if (!meetsThreshold) {
@@ -632,7 +671,7 @@ export const treasuryProposalsService = {
         }
 
         // Merge all verified signatures onto the base envelope, then submit.
-        return await this.mergeAndSubmit(
+        const submitResult = await this.mergeAndSubmit(
           tx,
           proposal.id,
           verified,
@@ -642,10 +681,32 @@ export const treasuryProposalsService = {
           args.actorPublicKey ?? verified.at(-1)?.publicKey ?? null,
           args.userId
         );
+        events.push({
+          eventType: "treasury.proposal.submitted",
+          groupId: proposal.groupId,
+          userId: args.userId,
+          payload: {
+            proposalId: proposal.id,
+            groupId: proposal.groupId,
+            status: submitResult.status,
+            txHash: proposal.txHash,
+            stellarTxHash: submitResult.stellarTxHash,
+            signatureCount: submitResult.signatureCount,
+            threshold: submitResult.threshold,
+          },
+        });
+        return submitResult;
         },
         { timeout: 15_000 }
       )
     );
+
+    // Announce only after the transaction commits: a rolled-back mutation
+    // must never reach a subscriber's endpoint.
+    for (const event of events) {
+      announceTreasuryProposalEvent(event);
+    }
+    return result;
   },
 
   /**
@@ -667,7 +728,7 @@ export const treasuryProposalsService = {
   async mergeAndSubmit(
     tx: Prisma.TransactionClient,
     proposalId: string,
-    storedSignatures: StoredSignature[],
+    storedSignatures: StoredTreasurySignature[],
     actorPublicKey: string | null,
     actorUserId: string | null
   ): Promise<{
@@ -686,7 +747,9 @@ export const treasuryProposalsService = {
     const baseTx = new Transaction(proposal.xdr, config.networkPassphrase);
     for (const s of storedSignatures) {
       try {
-        baseTx.addSignature(s.publicKey, s.signature);
+        // Legacy rows may record only `{ publicKey, signedAt }` — without the
+        // base64 signature there is nothing to attach to the envelope.
+        if (s.signature) baseTx.addSignature(s.publicKey, s.signature);
       } catch {
         // signature may already exist on baseTx — fall back to a manual append
       }
@@ -760,6 +823,19 @@ export const treasuryProposalsService = {
   /** Memo-helper exposed for reuse by routes. */
   STATUS,
 };
+
+/**
+ * Publish a committed proposal transition on the event bus, which the webhook
+ * dispatcher (src/services/webhook.ts) turns into queued deliveries. A failed
+ * announcement must never turn an already-committed mutation into an error.
+ */
+function announceTreasuryProposalEvent(event: MergepayEvent): void {
+  try {
+    emitEvent(event);
+  } catch {
+    // Swallow — webhook queueing is best-effort relative to the mutation.
+  }
+}
 
 /** Tiny alphanumeric rune used for default memo text when none provided. */
 function shortCodeRunes(): string {

@@ -95,6 +95,35 @@ describe("migration health CLI (#1078)", () => {
     expect(report).toMatchObject({ healthy: false, statusCode: "missing_database_url" });
   });
 
+  it("returns 1 and reports schema_drift to CI when migrate diff finds differences (#1185)", () => {
+    const log = vi.fn();
+    const exit = vi.fn();
+
+    const code = runMigrationHealthCli(
+      ["node", "check-migration-health.ts", "--json"],
+      log,
+      exit,
+      {
+        databaseUrl: DB_URL,
+        execSyncFn: (cmd) => {
+          if (cmd.includes("prisma migrate diff")) {
+            throw Object.assign(new Error("exit code 2"), {
+              status: 2,
+              stdout: "+model Extra {",
+            });
+          }
+          return "";
+        },
+      }
+    );
+
+    expect(code).toBe(1);
+    expect(exit).toHaveBeenCalledWith(1);
+    const report = JSON.parse(log.mock.calls[0][0] as string);
+    expect(report).toMatchObject({ healthy: false, statusCode: "schema_drift" });
+    expect(report.diagnostics.join("\n")).not.toContain("super-secret");
+  });
+
   it("prints the human-readable report by default", () => {
     const log = vi.fn();
     const exit = vi.fn();

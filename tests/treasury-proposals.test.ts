@@ -863,3 +863,145 @@ describe("GET /groups/:groupId/treasury/status", () => {
     expect(res.json().error.code).toBe("TREASURY_DISABLED");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Request validation for treasury proposal mutations
+// ---------------------------------------------------------------------------
+
+describe("treasury proposal payload validation", () => {
+  it("returns a clean 400 with field details for a zero amount", async () => {
+    const user = fakeUser();
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals",
+      headers: authHeader(user),
+      payload: {
+        destination: Keypair.random().publicKey(),
+        amount: "0",
+        assetCode: "XLM",
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(body.error.details).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          field: "amount",
+          message: expect.stringContaining("greater than zero"),
+        }),
+      ])
+    );
+  });
+
+  it("returns 400 with a field error for an unsupported asset", async () => {
+    const user = fakeUser();
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals",
+      headers: authHeader(user),
+      payload: {
+        destination: Keypair.random().publicKey(),
+        amount: "5",
+        assetCode: "BADCOIN",
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(body.error.details).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: "assetCode" }),
+      ])
+    );
+  });
+
+  it("returns 400 for a memo outside the Mergepay format", async () => {
+    const user = fakeUser();
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals",
+      headers: authHeader(user),
+      payload: {
+        destination: Keypair.random().publicKey(),
+        amount: "5",
+        assetCode: "XLM",
+        memo: "not-a-mergepay-memo",
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(body.error.details).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: "memo" })])
+    );
+  });
+
+  it("returns 400 when signing with an empty signed XDR", async () => {
+    const user = fakeUser();
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "member",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/groups/group_1/treasury/proposals/prop_1/sign",
+      headers: authHeader(user),
+      payload: { signedXdr: "" },
+    });
+
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(body.error.details).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: "signedXdr" }),
+      ])
+    );
+  });
+
+  it("returns 400 for an oversized group id", async () => {
+    const user = fakeUser();
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${"g".repeat(65)}/treasury/proposals`,
+      headers: authHeader(user),
+      payload: {
+        destination: Keypair.random().publicKey(),
+        amount: "5",
+        assetCode: "XLM",
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(body.error.details).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: "groupId" })])
+    );
+  });
+});

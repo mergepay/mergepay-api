@@ -37,18 +37,26 @@
  * matters because anchors retry aggressively and give no ordering guarantee.
  */
 import crypto from "node:crypto";
+import type { AnchorSession } from "@prisma/client";
 import { config } from "../config";
 import { prisma } from "../db";
-import { sep24CallbackSchema, type Sep24Callback } from "../schemas/sep24";
-import { audit } from "./audit";
+import {
+  sep24CallbackSchema,
+  validateSep24DepositRequest,
+  validateSep24WithdrawalRequest,
+  type Sep24Callback,
+} from "../schemas/sep24";
+import { audit, auditTx } from "./audit";
 import { AuditAction } from "./audit-actions";
-import { mapAnchorStatus } from "./anchor";
+import { anchorService, mapAnchorStatus } from "./anchor";
 import { applyAnchorSessionTransition } from "./anchor-status";
+import { validateAsset } from "./assets";
 import {
   accountPublicKeys,
   anchorTransactionAuditMetadata,
   sep24CallbackAuditMetadata,
   sep24LifecycleAction,
+  sep24StartAction,
 } from "./sep24-audit";
 import { sanitizeStatusReason } from "./sep24-status";
 import { parseSep24TransactionResponse } from "./anchor-schemas";
@@ -465,4 +473,110 @@ export async function trackSep24TransactionStatus(
       error: `Unexpected error tracking SEP-24 status: ${errorMsg}`,
     };
   }
+}
+
+// ─── Interactive deposit / withdrawal initialization ───────────────────────
+
+/** The two SEP-24 interactive flows this service starts. */
+export type Sep24InteractiveKind = "deposit" | "withdrawal";
+
+/** The authenticated caller starting a flow. Public key material only. */
+export interface Sep24FlowActor {
+  id: string;
+  stellarPublicKey: string;
+}
+
+export interface StartSep24InteractiveParams {
+  kind: Sep24InteractiveKind;
+  /** The raw, unvalidated request body. Validated here with the shared schemas. */
+  body: unknown;
+  actor: Sep24FlowActor;
+  /** Per-request correlation id recorded on the start audit row. */
+  correlationId?: string | null;
+}
+
+export interface Sep24InteractiveStartResult {
+  /** The created anchor session (not serialized — that is the route's job). */
+  session: AnchorSession;
+  /** The SEP-10 challenge the client signs to obtain an anchor token. */
+  challenge: { transaction: string; networkPassphrase: string };
+}
+
+/**
+ * Start a SEP-24 interactive deposit or withdrawal.
+ *
+ * This is the whole initiation flow, lifted out of the Fastify handlers so it
+ * can be unit tested without an HTTP server:
+ *
+ *  1. Validate the payload with the shared SEP-24 request schema for the kind
+ *     (a withdrawal must name its amount; both reject unknown fields).
+ *  2. Validate the asset against the supported-asset registry *before* any
+ *     anchor I/O, so an unsupported code never reaches the anchor.
+ *  3. Fetch the anchor's stellar.toml and request a SEP-10 challenge for the
+ *     caller's account.
+ *  4. Create the `incomplete` anchor session and its start audit row in one
+ *     transaction — a session without its audit record never commits.
+ *
+ * Anchors are only contacted after the payload and asset are known good; a
+ * validation failure therefore costs no upstream call.
+ */
+export async function startSep24InteractiveFlow(
+  params: StartSep24InteractiveParams
+): Promise<Sep24InteractiveStartResult> {
+  const { kind, actor, correlationId = null } = params;
+
+  const body =
+    kind === "deposit"
+      ? validateSep24DepositRequest(params.body)
+      : validateSep24WithdrawalRequest(params.body);
+
+  validateAsset(body.assetCode, body.assetIssuer);
+
+  const toml = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
+  const challenge = await anchorService.getChallenge(
+    toml.webAuthEndpoint,
+    actor.stellarPublicKey
+  );
+
+  const session = await prisma.$transaction(async (tx) => {
+    const created = await tx.anchorSession.create({
+      data: {
+        userId: actor.id,
+        anchorName: body.anchorName ?? config.ANCHOR_NAME,
+        kind,
+        assetCode: body.assetCode,
+        status: "incomplete",
+      },
+    });
+    await auditTx(tx, {
+      correlationId,
+      userId: actor.id,
+      action: sep24StartAction(kind),
+      entityType: "anchor_session",
+      entityId: created.id,
+      actorPublicKey: actor.stellarPublicKey,
+      metadata: {
+        kind,
+        assetCode: body.assetCode,
+        ...("amount" in body && body.amount ? { amount: body.amount } : {}),
+      },
+    });
+    return created;
+  });
+
+  return { session, challenge };
+}
+
+/** Start a SEP-24 interactive deposit. */
+export function initiateSep24Deposit(
+  params: Omit<StartSep24InteractiveParams, "kind">
+): Promise<Sep24InteractiveStartResult> {
+  return startSep24InteractiveFlow({ ...params, kind: "deposit" });
+}
+
+/** Start a SEP-24 interactive withdrawal (the payload must carry an amount). */
+export function initiateSep24Withdrawal(
+  params: Omit<StartSep24InteractiveParams, "kind">
+): Promise<Sep24InteractiveStartResult> {
+  return startSep24InteractiveFlow({ ...params, kind: "withdrawal" });
 }

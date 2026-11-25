@@ -925,7 +925,7 @@ describe("treasury proposal payload validation", () => {
     expect(body.error.code).toBe("VALIDATION_ERROR");
     expect(body.error.details).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ field: "assetCode" }),
+        expect.objectContaining({ field: "assetIssuer" }),
       ])
     );
   });

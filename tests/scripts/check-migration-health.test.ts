@@ -157,6 +157,39 @@ describe("Database Migration Health Check Script (#806)", () => {
       expect(result.statusCode).toBe("schema_drift");
     });
 
+    it("includes redacted drift statements for CI diagnostics (#1185)", () => {
+      const dbUrl = "postgresql://migration_user:super-secret@db.internal:5432/mergepay";
+      const mockRunner = (cmd: string) => {
+        if (cmd.includes("prisma migrate diff")) {
+          throw Object.assign(new Error(`Command failed for ${dbUrl}`), {
+            status: 2,
+            stdout: [
+              "--- a/prisma/schema.prisma",
+              "+++ b/prisma/schema.prisma",
+              "+model Extra {",
+              "+  id String @id",
+              "+}",
+              `-database: ${dbUrl}`,
+            ].join("\n"),
+          });
+        }
+        return "";
+      };
+
+      const result = checkMigrationHealth({ databaseUrl: dbUrl, execSyncFn: mockRunner });
+
+      expect(result.statusCode).toBe("schema_drift");
+      expect(result.diagnostics).toContain("ℹ️ Differing schema statements (redacted):");
+      expect(result.diagnostics.some((line) => line.includes("+model Extra {"))).toBe(true);
+      // File headers carry no information about what drifted.
+      expect(result.diagnostics.some((line) => line.trim().startsWith("+++"))).toBe(false);
+
+      const joined = result.diagnostics.join("\n");
+      expect(joined).not.toContain("super-secret");
+      expect(joined).not.toContain(dbUrl);
+      expect(joined).not.toContain("db.internal");
+    });
+
     it("stays healthy when migrations are applied and there is no drift (#1081)", () => {
       const result = checkMigrationHealth({
         databaseUrl: "postgresql://localhost:5432/test",

@@ -10,15 +10,13 @@ import {
   applyWithdrawalTransition,
   mapAnchorStatusToWithdrawalStatus,
 } from "../services/withdrawal-status";
-import { auditTx } from "../services/audit";
 import {
   accountPublicKeys,
   sep24CallbackAuditMetadata,
   sep24LifecycleAction,
-  sep24StartAction,
 } from "../services/sep24-audit";
 import { rateLimited } from "../lib/rate-limit";
-import { applySep24Callback } from "../services/sep24";
+import { applySep24Callback, startSep24InteractiveFlow } from "../services/sep24";
 import {
   buildPage,
   cursorFilter,
@@ -29,7 +27,6 @@ import {
 import { composeWhere, dateRangeWhere } from "../schemas/common";
 import { serializeAnchorSession } from "../serializers";
 import { getStatusHistory } from "../services/status-history";
-import { validateAsset } from "../services/assets";
 import {
   anchorSessionListQuerySchema,
   sep24CallbackQuerySchema,
@@ -46,8 +43,6 @@ import {
   sep24CallbackSchema,
   sep24DepositValidationMiddleware,
   sep24WithdrawValidationMiddleware,
-  validateSep24DepositRequest,
-  validateSep24WithdrawalRequest,
 } from "../schemas/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
@@ -130,55 +125,13 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // introducing a second source of truth.
   async function start(kind: "deposit" | "withdrawal", req: FastifyRequest) {
     const auth = requireUser(req);
-
-    const body =
-      kind === "deposit"
-        ? validateSep24DepositRequest(req.body)
-        : validateSep24WithdrawalRequest(req.body);
-
-    // Validate that the requested asset is supported. The issuer is part of
-    // the request contract, so it is validated *with* the code rather than
-    // dropped: a caller naming an issuer Mergepay does not issue that asset
-    // under would otherwise get a session created against a different asset
-    // than the one it asked for.
-    validateAsset(body.assetCode, body.assetIssuer);
-
-    const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
-    const challenge = await anchorService.getChallenge(
-      t.webAuthEndpoint,
-      auth.stellarPublicKey
-    );
-
-    const session = await prisma.$transaction(async (tx) => {
-      const created = await tx.anchorSession.create({
-        data: {
-          userId: auth.id,
-          anchorName: body.anchorName ?? config.ANCHOR_NAME,
-          kind,
-          assetCode: body.assetCode,
-          status: "incomplete",
-        },
-      });
-      await auditTx(tx, {
-        correlationId: req.id,
-        userId: auth.id,
-        action: sep24StartAction(kind),
-        entityType: "anchor_session",
-        entityId: created.id,
-        actorPublicKey: auth.stellarPublicKey,
-        metadata: {
-          kind,
-          assetCode: body.assetCode,
-          ...("amount" in body && body.amount ? { amount: body.amount } : {}),
-        },
-      });
-      return created;
+    const { session, challenge } = await startSep24InteractiveFlow({
+      kind,
+      body: req.body,
+      actor: auth,
+      correlationId: req.id,
     });
-
-    return {
-      session: serializeAnchorSession(session),
-      challenge,
-    };
+    return { session: serializeAnchorSession(session), challenge };
   }
 
   app.post(

@@ -270,6 +270,24 @@ describe("structure and domains", () => {
 // ─── Timebounds ──────────────────────────────────────────────────────────────
 
 describe("timebounds", () => {
+  it("rejects a challenge whose window closes while Horizon is answering", async () => {
+    // Structural and cryptographic checks pass at T0; the slow Horizon round
+    // trip is what pushes the clock past maxTime. The window must be re-checked
+    // immediately before the challenge is consumed, not only on entry.
+    const client = Keypair.random();
+    const tx = challenge({ client });
+    const maxTime = Number(tx.timeBounds!.maxTime);
+    h.loadAccount.mockImplementation(async () => {
+      vi.setSystemTime(new Date((maxTime + 60) * 1000)); // past maxTime + 30s skew
+      return UNFUNDED;
+    });
+
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject({
+      status: 401,
+      code: "CHALLENGE_EXPIRED",
+    });
+  });
+
   it("rejects an expired server-issued challenge with CHALLENGE_EXPIRED", async () => {
     const client = Keypair.random();
     const signed = xdrOf(challenge({ client }));

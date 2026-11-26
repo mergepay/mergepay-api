@@ -45,6 +45,17 @@ export interface MultisigVerificationParams {
   treasuryAccountPublicKey: string;
   /** Set of authorized signer public keys for this treasury */
   authorizedSigners: Set<string>;
+  /**
+   * Live signer weights already read from Horizon, keyed by public key.
+   *
+   * Callers that have just loaded the treasury account (for example the
+   * signature submission path, which needs the same weights for its own
+   * threshold decision) pass them here so verification does not need a second
+   * Horizon round trip. Omit them to have the account loaded and inspected.
+   */
+  signerWeights?: ReadonlyMap<string, number>;
+  /** High threshold already read from Horizon; pairs with `signerWeights`. */
+  requiredWeight?: number;
 }
 
 /**
@@ -78,19 +89,27 @@ export async function verifyMultisigSignatures(
     );
   }
 
-  // Load the treasury account to get current threshold and signer weights
-  const account = await stellar.loadAccount(treasuryAccountPublicKey);
-  if (!account.exists) {
-    throw Errors.badRequest(
-      "treasury_unfunded",
-      "Treasury account is not funded on-chain"
-    );
-  }
+  // Threshold and signer weights come from Horizon unless the caller already
+  // holds a fresh snapshot of them.
+  const snapshot =
+    params.signerWeights !== undefined && params.requiredWeight !== undefined
+      ? { weights: params.signerWeights, threshold: params.requiredWeight }
+      : await (async () => {
+          const account = await stellar.loadAccount(treasuryAccountPublicKey);
+          if (!account.exists) {
+            throw Errors.badRequest(
+              "treasury_unfunded",
+              "Treasury account is not funded on-chain"
+            );
+          }
+          return {
+            weights: new Map(account.signers.map((s) => [s.key, s.weight])),
+            threshold: account.thresholds.high,
+          };
+        })();
 
-  const requiredWeight = account.thresholds.high;
-  const onChainWeight = new Map(
-    account.signers.map((s) => [s.key, s.weight])
-  );
+  const requiredWeight = snapshot.threshold;
+  const onChainWeight = snapshot.weights;
 
   // Verify each signature against authorized signers
   const signatures: MultisigVerificationResult["signatures"] = [];

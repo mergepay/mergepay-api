@@ -349,7 +349,21 @@ describe("POST /api/treasury/proposals/:id/signatures — signing audit records 
       { userId: signer.id, user: { stellarPublicKey: signerKp.publicKey() } },
     ]);
     // Existing signatures, then the merged view the threshold is decided on.
-    const signatureReads: any[] = [[], [{ weight: 1 }]];
+    // The stored row carries the envelope signature the merge step re-applies
+    // and the pre-broadcast verification re-checks.
+    const signatureReads: any[] = [
+      [],
+      [
+        {
+          id: "sig_1",
+          proposalId: "ttp_sign_1",
+          signerUserId: signer.id,
+          signerPublicKey: signerKp.publicKey(),
+          signature: signerKp.sign(signed.hash()).toString("base64"),
+          weight: 1,
+        },
+      ],
+    ];
     prisma.treasurySignature.findMany.mockImplementation(async () =>
       signatureReads.shift() ?? []
     );

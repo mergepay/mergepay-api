@@ -105,6 +105,36 @@ describe("Group Expense Settlement History Pagination & Filtering (#882)", () =>
     it("rejects invalid limit exceeding MAX_PAGE_SIZE", () => {
       expect(() => historyQuerySchema.parse({ limit: 500 })).toThrow();
     });
+
+    it("rejects groupExpenseHistorySchema limit=0 (below minimum)", () => {
+      expect(() => groupExpenseHistorySchema.parse({ limit: 0 })).toThrow();
+    });
+
+    it("rejects groupExpenseHistorySchema limit=-1 (negative)", () => {
+      expect(() => groupExpenseHistorySchema.parse({ limit: -1 })).toThrow();
+    });
+
+    it("accepts groupExpenseHistorySchema limit=100 (at MAX_PAGE_SIZE boundary)", () => {
+      const parsed = groupExpenseHistorySchema.parse({ limit: 100 });
+      expect(parsed.limit).toBe(100);
+    });
+
+    it("rejects groupExpenseHistorySchema limit=101 (exceeds MAX_PAGE_SIZE)", () => {
+      expect(() => groupExpenseHistorySchema.parse({ limit: 101 })).toThrow();
+    });
+
+    it("rejects historyQuerySchema limit=0", () => {
+      expect(() => historyQuerySchema.parse({ limit: 0 })).toThrow();
+    });
+
+    it("rejects historyQuerySchema limit=-5", () => {
+      expect(() => historyQuerySchema.parse({ limit: -5 })).toThrow();
+    });
+
+    it("accepts historyQuerySchema limit=100 (at MAX_PAGE_SIZE boundary)", () => {
+      const parsed = historyQuerySchema.parse({ limit: 100 });
+      expect(parsed.limit).toBe(100);
+    });
   });
 
   describe("listGroupExpenseHistory service", () => {

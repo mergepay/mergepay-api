@@ -18,6 +18,7 @@ import { FastifyInstance } from "fastify";
 import {
   type TreasuryMultisigProposalPayload,
   treasuryProposalListQuerySchema,
+  treasuryProposalSignSchema,
   validateTreasuryMultisigProposalCreateRequest,
 } from "../validations/treasury";
 import { z } from "zod";
@@ -42,18 +43,6 @@ import {
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
-
-const createBodySchema = z.object({
-  destination: stellarAccountIdSchema,
-  amount: z.string().min(1),
-  assetCode: assetCodeSchema,
-  assetIssuer: assetIssuerSchema.nullable().optional(),
-  memo: mpMemoSchema.optional(),
-});
-
-const signBodySchema = z.object({
-  signedXdr: z.string().min(1),
-});
 
 export default async function treasuryProposalRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -175,7 +164,7 @@ export default async function treasuryProposalRoutes(app: FastifyInstance) {
       // authorization based on the authenticated member and requested group,
       // without performing a second resource lookup that changes legacy error
       // behavior for proposal-state validation.
-      const body = signBodySchema.parse(req.body);
+      const body = treasuryProposalSignSchema.parse(req.body ?? {});
 
       // Load group members to constrain which signers are accepted.
       const members = await prisma.groupMember.findMany({

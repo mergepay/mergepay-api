@@ -60,6 +60,17 @@ export function isSettlementEngineError(
   return error instanceof SettlementEngineError;
 }
 
+/**
+ * How far a percentage split's weights may drift from 100 before it is
+ * rejected.
+ *
+ * Shared with the expense request schema (`src/validations/expense.ts`) so a
+ * payload the schema accepts can never be refused by this engine for a
+ * different threshold: the two checks used to differ by an order of magnitude,
+ * which turned a validation-passing request into a late `INVALID_SPLIT_PERCENT`.
+ */
+export const PERCENT_TOTAL_TOLERANCE = 0.001;
+
 export interface ShareInput {
   userId: string;
   amount?: string; // custom
@@ -124,7 +135,7 @@ export function computeShares(
         );
       pctTotal += s.percent;
     }
-    if (Math.abs(pctTotal - 100) > 0.001) {
+    if (Math.abs(pctTotal - 100) > PERCENT_TOTAL_TOLERANCE) {
       throw new SettlementEngineError(
         SETTLEMENT_ENGINE_ERROR_CODES.INVALID_SPLIT_PERCENT,
         `Percentages must sum to 100 (got ${pctTotal})`

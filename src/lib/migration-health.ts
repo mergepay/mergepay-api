@@ -375,3 +375,43 @@ export function checkMigrationHealth(options?: {
     };
   }
 }
+
+/** Formats a migration-health result for deployment logs. */
+export function formatHealthReport(status: MigrationHealthStatus): string {
+  const lines = [
+    "==================================================",
+    "  MERGEPAY DATABASE MIGRATION HEALTH REPORT (#806) ",
+    "==================================================",
+    ...status.diagnostics.map((diagnostic) => `  ${diagnostic}`),
+    "--------------------------------------------------",
+  ];
+
+  if (status.healthy) {
+    lines.push(`  STATUS: HEALTHY (${status.statusCode.toUpperCase()})`);
+    lines.push(`  ${status.message}`);
+  } else {
+    lines.push(`  STATUS: UNHEALTHY (${status.statusCode.toUpperCase()})`);
+    lines.push(`  REASON: ${status.message}`);
+    if (status.remediation && status.remediation.length > 0) {
+      lines.push("  NEXT STEPS:");
+      status.remediation.forEach((step, index) => lines.push(`    ${index + 1}. ${step}`));
+    }
+  }
+
+  lines.push("==================================================");
+  return lines.join("\n");
+}
+
+/** Testable CLI adapter retained for the existing migration-health script. */
+export function runMigrationHealthCli(
+  args: readonly string[],
+  log: (message: string) => void = (message) => console.log(message),
+  exit: (code: number) => void = (code) => process.exit(code),
+  options?: Parameters<typeof checkMigrationHealth>[0]
+): number {
+  const result = checkMigrationHealth(options);
+  log(args.includes("--json") ? JSON.stringify(result, null, 2) : formatHealthReport(result));
+  const exitCode = result.healthy ? 0 : 1;
+  if (exitCode !== 0) exit(exitCode);
+  return exitCode;
+}

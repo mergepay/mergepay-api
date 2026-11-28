@@ -4,6 +4,7 @@ import {
   updateExpenseSchema,
   SplitType,
 } from "../../src/validations/expense";
+import { computeShares } from "../../src/services/settlement";
 
 describe("createExpenseSchema", () => {
   const validBase = {
@@ -155,6 +156,30 @@ describe("createExpenseSchema", () => {
         assetIssuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
       });
       expect(result.success).toBe(true);
+    });
+
+    it("normalizes a lower-case asset code to upper case (#1183)", () => {
+      const result = createExpenseSchema.safeParse({ ...validBase, assetCode: "xlm" });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.assetCode).toBe("XLM");
+      }
+    });
+
+    it("trims surrounding whitespace from the asset code (#1183)", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        assetCode: "  usdc  ",
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.assetCode).toBe("USDC");
+      }
+    });
+
+    it("still rejects an unsupported code after normalization (#1183)", () => {
+      const result = createExpenseSchema.safeParse({ ...validBase, assetCode: "eur" });
+      expect(result.success).toBe(false);
     });
   });
 
@@ -445,6 +470,78 @@ describe("createExpenseSchema", () => {
         ],
       });
       expect(result.success).toBe(true);
+    });
+
+    it("rejects a split where only some shares carry a percent (#1183)", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        splitType: "percentage",
+        shares: [
+          { userId: "user_1", percent: 100 },
+          { userId: "user_2" },
+        ],
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.errors.find(
+          (e) => e.path.join(".") === "shares.1.percent"
+        );
+        expect(issue?.message).toContain("must include a percent");
+      }
+    });
+
+    it("rejects percentages outside the engine's tolerance (#1183)", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        splitType: "percentage",
+        shares: [
+          { userId: "user_1", percent: 50.002 },
+          { userId: "user_2", percent: 50 },
+        ],
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.errors.find((e) => e.path.join(".") === "shares");
+        expect(issue?.message).toContain("must sum to 100%");
+        expect(issue?.message).toContain("100.002");
+      }
+    });
+
+    it("accepts percentages within the engine's tolerance (#1183)", () => {
+      const result = createExpenseSchema.safeParse({
+        ...validBase,
+        splitType: "percentage",
+        shares: [
+          { userId: "user_1", percent: 50.0005 },
+          { userId: "user_2", percent: 50 },
+        ],
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts exactly the percentages the settlement engine accepts (#1183)", () => {
+      // The schema must not be a second, looser gate: anything it approves has
+      // to reach computeShares, and anything it rejects the engine may refuse.
+      for (const sum of [99.998, 99.999, 100, 100.0005, 100.001, 100.002, 100.01]) {
+        const shares = [
+          { userId: "user_1", percent: sum / 2 },
+          { userId: "user_2", percent: sum / 2 },
+        ];
+        const schemaAccepts = createExpenseSchema.safeParse({
+          ...validBase,
+          splitType: "percentage",
+          shares,
+        }).success;
+
+        let engineAccepts = true;
+        try {
+          computeShares("100", "percentage", shares);
+        } catch {
+          engineAccepts = false;
+        }
+
+        expect(schemaAccepts, `sum ${sum}`).toBe(engineAccepts);
+      }
     });
   });
 });

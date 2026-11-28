@@ -10,7 +10,7 @@
  * without spawning a process or touching a live database.
  */
 
-import { checkMigrationHealth } from "./migration-health.js";
+import { checkMigrationHealth } from "./migration-health";
 
 export interface StartupMigrationCheckLogger {
   info(obj: object, msg: string): void;

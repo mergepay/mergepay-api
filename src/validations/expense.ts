@@ -6,6 +6,7 @@ import {
   validateAmount,
 } from "../lib/money";
 import { sanitizedTextField } from "../lib/sanitize-text";
+import { PERCENT_TOTAL_TOLERANCE } from "../services/settlement";
 
 export const SplitType = z.enum(["equal", "custom", "percentage"]);
 
@@ -28,6 +29,20 @@ function stroopsIfValid(amount: string): bigint | undefined {
   const result = validateAmount(amount);
   return result.ok ? result.value.stroops : undefined;
 }
+
+/**
+ * The expense's currency code. Trimmed and upper-cased on parse (#1183): the
+ * supported-asset registry matches codes case-insensitively, so "xlm" and
+ * " XLM " name the same asset as "XLM". `validateRequest` writes the parsed
+ * body back, so normalizing here is what stops a raw spelling from being
+ * persisted and splitting the group's balances across two currency keys.
+ */
+const assetCodeSchema = z
+  .string({ required_error: "assetCode is required" })
+  .trim()
+  .min(1, "assetCode is required")
+  .max(12, "assetCode must be at most 12 characters")
+  .transform((value) => value.toUpperCase());
 
 const identifierSchema = z
   .string()
@@ -58,7 +73,7 @@ export const createExpenseSchema = z
     title: sanitizedTextField({ min: 1, max: 80 }),
     description: sanitizedTextField({ max: 500 }).optional(),
     amount: canonicalAmountSchema,
-    assetCode: z.string().min(1).max(12),
+    assetCode: assetCodeSchema,
     assetIssuer: z.string().nullable().optional(),
     splitType: SplitType,
     shares: z.array(shareInput).min(1).max(100),
@@ -127,12 +142,14 @@ export const createExpenseSchema = z
       // percent, or with 0%, would otherwise pass whenever the remaining
       // shares sum to 100 and reach the settlement engine as a zero-value
       // obligation — malformed allocation data the schema is meant to stop.
+      let missingPercent = false;
       for (let i = 0; i < val.shares.length; i++) {
         const percent = val.shares[i]!.percent;
         if (percent === undefined) {
+          missingPercent = true;
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: `Missing percent for "${val.shares[i]!.userId}" in a percentage split`,
+            message: `Missing percent: share for "${val.shares[i]!.userId}" must include a percent`,
             path: ["shares", i, "percent"],
           });
         } else if (percent <= 0) {
@@ -143,9 +160,12 @@ export const createExpenseSchema = z
           });
         }
       }
+      if (missingPercent) return;
 
       const total = val.shares.reduce((sum, s) => sum + (s.percent ?? 0), 0);
-      if (Math.abs(total - 100) >= 0.01) {
+      // Same tolerance the settlement engine applies, so every payload that
+      // passes here is a payload `computeShares` will accept.
+      if (Math.abs(total - 100) > PERCENT_TOTAL_TOLERANCE) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `Percentage shares must sum to 100%, but got ${total}%`,

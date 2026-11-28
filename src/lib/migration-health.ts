@@ -1,31 +1,14 @@
 /**
- * Automated Database Migration Health Check Script (#806, #1078, #1118).
+ * Shared migration health check core (#1140).
  *
- * Verifies database migration status and Prisma client schema alignment before
- * API server or worker process deployment.
- *
- * Diagnostic checks:
- * 1. Checks DATABASE_URL configuration and connection health.
- * 2. Validates Prisma schema syntax and model integrity (`prisma validate`).
- * 3. Inspects migration history against target database (`prisma migrate status`),
- *    reporting unapplied and failed migrations with an actionable count/status.
- * 4. Gracefully catches and describes connection errors (P1001, timeouts, auth failures).
- * 5. Detects schema drift with `prisma migrate diff --exit-code` (#1081), reading
- *    the datasource URL from the environment rather than the process argv so the
- *    database password never leaks into shell command lines or logs (#1078).
- * 6. Reports schema drift with the SQL that would reconcile it and the exact
- *    commands that resolve it, and separates "drift found" from "drift check
- *    could not run" so a broken `migrate diff` invocation is never mistaken for
- *    a clean schema (#1118).
- * 7. Exits 0 on clean synced migrations; exits 1 on unapplied migrations, drift,
- *    a failed drift check or any other error.
- *    Pass `--json` for a machine-readable report (used by CI).
+ * Extracted from scripts/check-migration-health.ts so the startup guard
+ * (`src/lib/startup-migration-check.ts`) can import it without violating the
+ * TypeScript `rootDir: "src"` constraint. The CLI entry point and report
+ * formatter stay in scripts/check-migration-health.ts; this module only
+ * exports what the server-side startup check needs.
  */
 
 import { execSync } from "node:child_process";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 export type MigrationHealthStatusCode =
   | "synced"
@@ -42,11 +25,6 @@ export interface MigrationHealthStatus {
   statusCode: MigrationHealthStatusCode;
   message: string;
   diagnostics: string[];
-  /**
-   * Concrete commands an operator can run to resolve this status. Populated
-   * for every unhealthy result so CI logs and JSON consumers do not have to
-   * translate the status code into a fix themselves (#1118).
-   */
   remediation?: string[];
   pendingMigrationsCount?: number;
 }
@@ -56,17 +34,11 @@ export type CommandRunner = (
   opts?: { env?: Record<string, string | undefined>; stdio?: "pipe" | "inherit" | "ignore" }
 ) => string | Buffer;
 
-/** How many lines of drift SQL are echoed before the report is truncated. */
 const DRIFT_PREVIEW_LINES = 12;
-
-/** Preview command an operator runs to see the full, untruncated diff. */
 const DRIFT_PREVIEW_COMMAND =
   "npx prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --script";
-
-/** `postgres://user:password@host/db` credentials, matched anywhere in text. */
 const POSTGRES_CREDENTIALS = /(postgres(?:ql)?:\/\/[^:\s/@]+:)[^@\s/]+(@)/gi;
 
-/** Combined message, stdout and stderr of a failed child process. */
 function errorOutput(err: unknown): string {
   if (!(err instanceof Error)) return String(err);
   const e = err as Error & { stdout?: unknown; stderr?: unknown };
@@ -76,7 +48,6 @@ function errorOutput(err: unknown): string {
     .join("\n");
 }
 
-/** Numeric exit status of a failed child process, when one can be determined. */
 function exitStatus(err: unknown): number | undefined {
   if (typeof err !== "object" || err === null) return undefined;
   const candidate = err as { status?: unknown; exitCode?: unknown; code?: unknown };
@@ -86,15 +57,6 @@ function exitStatus(err: unknown): number | undefined {
   return undefined;
 }
 
-/**
- * Removes connection credentials from diagnostic text.
- *
- * Drift SQL and Prisma error messages are attacker-adjacent input: a schema
- * comment can contain anything, and `prisma migrate diff` occasionally echoes
- * the datasource it resolved. The report is copied into CI logs, so redact the
- * supplied URL, its password, and any postgres URI credentials before the text
- * leaves this module (#1078, #1118).
- */
 export function redactSecrets(text: string, databaseUrl?: string): string {
   let redacted = text;
   if (databaseUrl) {
@@ -113,21 +75,10 @@ export function redactSecrets(text: string, databaseUrl?: string): string {
   return redacted.replace(POSTGRES_CREDENTIALS, "$1***$2");
 }
 
-/**
- * Extracts the SQL statements from a failed `prisma migrate diff` run.
- *
- * For `--from-schema-datasource … --to-schema-datamodel …` Prisma prints the
- * DDL that would bring the database in line with `schema.prisma`, which is
- * exactly what the reader needs to decide whether to generate a migration or
- * investigate a manual database change. Non-SQL boilerplate is discarded and
- * the preview is capped so the report stays readable in a CI log.
- */
 export function extractDriftSql(rawOutput: string, databaseUrl?: string): string[] {
   const lines = redactSecrets(rawOutput, databaseUrl)
     .split(/\r?\n/)
     .map((line) => line.trim())
-    // Unified-diff file headers (`+++`/`---` plus the `--- a/...` form) name
-    // the file but say nothing about what drifted.
     .filter((line) => line.length > 0 && !/^(?:\+\+\+|---)/.test(line));
 
   const sqlLines = lines.filter((line) =>
@@ -135,8 +86,6 @@ export function extractDriftSql(rawOutput: string, databaseUrl?: string): string
       line
     )
   );
-  // An unrecognised Prisma version may print the diff in another shape. Fall
-  // back to any non-boilerplate line rather than silently showing nothing.
   const preview =
     sqlLines.length > 0
       ? sqlLines
@@ -144,10 +93,48 @@ export function extractDriftSql(rawOutput: string, databaseUrl?: string): string
   return preview.slice(0, DRIFT_PREVIEW_LINES);
 }
 
-/**
- * Next commands for a status. Kept in one place so the human report and the
- * `--json` report stay in sync.
- */
+export function summarizeDriftDiagnostics(
+  rawOutput: string,
+  databaseUrl: string | undefined,
+  maxLines = 10
+): string[] {
+  const redact = (value: string): string => {
+    let redacted = databaseUrl ? value.split(databaseUrl).join("<DATABASE_URL>") : value;
+    redacted = redacted.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "<DATABASE_URL>");
+    redacted = redacted.replace(/(\/\/[^:/@\s]+:)[^@\s]+@/g, "$1<REDACTED>@");
+    return redacted.trim();
+  };
+
+  const lines: string[] = [];
+  for (const rawLine of rawOutput.split(/\r?\n/)) {
+    const line = redact(rawLine);
+    if (!/^[+-]/.test(line) || /^(\+\+\+|---)/.test(line)) continue;
+    if (!line || lines.includes(line)) continue;
+    lines.push(line);
+    if (lines.length >= maxLines) break;
+  }
+  return lines;
+}
+
+export function parseConnectionError(rawError: string): string {
+  if (rawError.includes("P1001") || /can't reach database server/i.test(rawError)) {
+    return "Database server unreachable: Verify database host, port, and network reachability.";
+  }
+  if (rawError.includes("P1002") || /timed out/i.test(rawError)) {
+    return "Database connection timed out: Server did not respond within timeout limit.";
+  }
+  if (rawError.includes("P1003") || /database does not exist/i.test(rawError)) {
+    return "Target database does not exist on the database server.";
+  }
+  if (rawError.includes("P1017") || /server closed the connection/i.test(rawError)) {
+    return "Database server unexpectedly closed connection.";
+  }
+  if (/authentication failed|password authentication failed/i.test(rawError)) {
+    return "Database authentication failed: Invalid username or password credentials.";
+  }
+  return "Could not establish connection to the target database.";
+}
+
 function remediationFor(statusCode: MigrationHealthStatusCode): string[] {
   switch (statusCode) {
     case "missing_database_url":
@@ -194,64 +181,6 @@ function remediationFor(statusCode: MigrationHealthStatusCode): string[] {
   }
 }
 
-/**
- * Reduce `prisma migrate diff` output to the change lines an operator can act
- * on, with every connection string scrubbed.
- *
- * The diff body describes schema objects, not credentials, but a Prisma error
- * can echo the datasource URL, so the URL and any userinfo left in it are
- * redacted before the lines enter diagnostics or CI logs (#1078).
- */
-export function summarizeDriftDiagnostics(
-  rawOutput: string,
-  databaseUrl: string | undefined,
-  maxLines = 10
-): string[] {
-  const redact = (value: string): string => {
-    let redacted = databaseUrl ? value.split(databaseUrl).join("<DATABASE_URL>") : value;
-    redacted = redacted.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "<DATABASE_URL>");
-    redacted = redacted.replace(/(\/\/[^:/@\s]+:)[^@\s]+@/g, "$1<REDACTED>@");
-    return redacted.trim();
-  };
-
-  const lines: string[] = [];
-  for (const rawLine of rawOutput.split(/\r?\n/)) {
-    const line = redact(rawLine);
-    // Change lines only: the `+++`/`---` file headers and context lines add
-    // noise without saying what drifted.
-    if (!/^[+-]/.test(line) || /^(\+\+\+|---)/.test(line)) continue;
-    if (!line || lines.includes(line)) continue;
-    lines.push(line);
-    if (lines.length >= maxLines) break;
-  }
-  return lines;
-}
-
-/**
- * Parses connection error details from Prisma error messages.
- */
-export function parseConnectionError(rawError: string): string {
-  if (rawError.includes("P1001") || /can't reach database server/i.test(rawError)) {
-    return "Database server unreachable: Verify database host, port, and network reachability.";
-  }
-  if (rawError.includes("P1002") || /timed out/i.test(rawError)) {
-    return "Database connection timed out: Server did not respond within timeout limit.";
-  }
-  if (rawError.includes("P1003") || /database does not exist/i.test(rawError)) {
-    return "Target database does not exist on the database server.";
-  }
-  if (rawError.includes("P1017") || /server closed the connection/i.test(rawError)) {
-    return "Database server unexpectedly closed connection.";
-  }
-  if (/authentication failed|password authentication failed/i.test(rawError)) {
-    return "Database authentication failed: Invalid username or password credentials.";
-  }
-  return "Could not establish connection to the target database.";
-}
-
-/**
- * Executes migration health diagnostics against target database.
- */
 export function checkMigrationHealth(options?: {
   databaseUrl?: string;
   execSyncFn?: CommandRunner;
@@ -279,9 +208,6 @@ export function checkMigrationHealth(options?: {
     });
     diagnostics.push("✅ Prisma schema syntax and model relations verified");
   } catch {
-    // The raw Prisma error may carry connection details (including parts of
-    // DATABASE_URL). Keep it out of the report: `prisma validate` prints the
-    // precise syntax diagnostics when the operator runs it locally.
     diagnostics.push("❌ Prisma schema validation failed: Syntax or model error detected");
     return {
       healthy: false,
@@ -299,7 +225,6 @@ export function checkMigrationHealth(options?: {
       stdio: "pipe",
     }).toString();
 
-    // Check if unapplied migrations exist
     if (
       /following migration.*have not yet been applied/i.test(statusOutput) ||
       /\d+\s+migrations?\s+have not yet been applied/i.test(statusOutput) ||
@@ -321,9 +246,6 @@ export function checkMigrationHealth(options?: {
       };
     }
 
-    // A failed migration does not always make `migrate status` exit non-zero
-    // (for example when another migration is still pending), so classify the
-    // output before declaring the history healthy.
     if (/failed to apply|migration.*was started but/i.test(statusOutput)) {
       diagnostics.push("❌ A migration failed to apply and must be resolved");
       return {
@@ -338,10 +260,6 @@ export function checkMigrationHealth(options?: {
     diagnostics.push("✅ Database schema is up to date: All migrations successfully applied");
 
     // 3. Confirm the migrated database matches schema.prisma (exit 2 = drift).
-    // `--from-schema-datasource` makes the Prisma CLI resolve the datasource
-    // URL from the DATABASE_URL we pass in `env`. Interpolating the URL into
-    // the shell command would expose the password in argv, process listings,
-    // and CI logs (#1078).
     let driftError: unknown;
     try {
       runner(
@@ -360,12 +278,6 @@ export function checkMigrationHealth(options?: {
       }
 
       const status = exitStatus(driftError);
-      // `prisma migrate diff --exit-code` signals "a diff exists" with exit
-      // code 2. Anything else is a broken invocation (bad flag, broken CLI,
-      // unreadable schema) where the presence or absence of drift is unknown;
-      // reporting that as drift would send the reader chasing the wrong fix
-      // (#1118). When the runner exposes no numeric status (custom runners in
-      // tests), fall back to the previous behaviour and treat it as drift.
       if (status !== undefined && status !== 2) {
         diagnostics.push(
           `❌ Drift check could not complete: \`prisma migrate diff\` exited with code ${status}`
@@ -390,10 +302,6 @@ export function checkMigrationHealth(options?: {
         diagnostics.push("ℹ️ Differing schema statements (redacted):");
         for (const line of driftLines) diagnostics.push(`   ${line}`);
       }
-      // `migrate diff` prints DDL for some Prisma versions and `+/-` model
-      // context for others. The summary above handles the latter; add any SQL
-      // statements it did not already cover so the reader always sees what
-      // would reconcile the database with schema.prisma.
       const driftSql = extractDriftSql(driftOutput, dbUrl).filter(
         (line) => !driftLines.includes(line)
       );
@@ -428,9 +336,6 @@ export function checkMigrationHealth(options?: {
       remediation: remediationFor("synced"),
     };
   } catch (err: unknown) {
-    // `prisma migrate status` exits non-zero when migrations are pending or
-    // failed, so its output must be classified before assuming a connection
-    // problem.
     const errorText = errorOutput(err);
     if (/failed to apply|migration.*(?:failed|was started but)/i.test(errorText)) {
       diagnostics.push("❌ A migration failed to apply and must be resolved");
@@ -458,8 +363,8 @@ export function checkMigrationHealth(options?: {
         pendingMigrationsCount: pendingCount,
       };
     }
-    const connectionReason = parseConnectionError(errorText);
 
+    const connectionReason = parseConnectionError(errorText);
     diagnostics.push(`❌ Migration status check failed: ${connectionReason}`);
     return {
       healthy: false,
@@ -469,63 +374,4 @@ export function checkMigrationHealth(options?: {
       remediation: remediationFor("connection_error"),
     };
   }
-}
-
-/**
- * Formats health report for deployment logging.
- */
-export function formatHealthReport(status: MigrationHealthStatus): string {
-  const lines: string[] = [
-    "==================================================",
-    "  MERGEPAY DATABASE MIGRATION HEALTH REPORT (#806) ",
-    "==================================================",
-  ];
-
-  for (const diagnostic of status.diagnostics) {
-    lines.push(`  ${diagnostic}`);
-  }
-
-  lines.push("--------------------------------------------------");
-  if (status.healthy) {
-    lines.push(`  STATUS: HEALTHY (${status.statusCode.toUpperCase()})`);
-    lines.push(`  ${status.message}`);
-  } else {
-    lines.push(`  STATUS: UNHEALTHY (${status.statusCode.toUpperCase()})`);
-    lines.push(`  REASON: ${status.message}`);
-    if (status.remediation && status.remediation.length > 0) {
-      lines.push("  NEXT STEPS:");
-      status.remediation.forEach((step, index) => lines.push(`    ${index + 1}. ${step}`));
-    }
-  }
-  lines.push("==================================================");
-
-  return lines.join("\n");
-}
-
-/**
- * CLI entry point, extracted so the report/exit-code contract is unit-testable
- * without spawning a process or requiring a live database. Returns the code a
- * CI runner should see: 0 for a synced schema, 1 for every unhealthy status.
- */
-export function runMigrationHealthCli(
-  args: readonly string[],
-  log: (message: string) => void = (message) => console.log(message),
-  exit: (code: number) => void = (code) => process.exit(code),
-  options?: Parameters<typeof checkMigrationHealth>[0]
-): number {
-  const result = checkMigrationHealth(options);
-  log(
-    args.includes("--json")
-      ? JSON.stringify(result, null, 2)
-      : formatHealthReport(result)
-  );
-  const exitCode = result.healthy ? 0 : 1;
-  if (exitCode !== 0) {
-    exit(exitCode);
-  }
-  return exitCode;
-}
-
-if (typeof require !== "undefined" && require.main === module) {
-  runMigrationHealthCli(process.argv);
 }
